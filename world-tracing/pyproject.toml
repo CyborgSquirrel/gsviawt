@@ -1,0 +1,101 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wt"
+version = "0.1.0"
+description = "World Tracing — multilayer-geometry diffusion for image / scene / dynamic-clip 3D point clouds."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Hao Zhang" },
+    { name = "World Labs" },
+]
+keywords = [
+    "3d",
+    "computer-vision",
+    "point-cloud",
+    "diffusion",
+    "depth-estimation",
+    "multilayer-geometry",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: Free for non-commercial use",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+
+dependencies = [
+    "numpy>=1.24",
+    "torch>=2.2",
+    "Pillow>=10.0",
+    "opencv-python>=4.8",
+    "einops>=0.7",
+    "safetensors>=0.4",
+    "huggingface_hub>=0.20",
+    "structlog>=24.1",
+    "beartype>=0.18",
+    "jaxtyping>=0.2.30",
+]
+
+[project.optional-dependencies]
+viz = [
+    "rerun-sdk>=0.22,<0.23",
+    "scipy>=1.11",
+]
+# Foreground matting for object inputs (ZhengPeng7/BiRefNet_HR, MIT).
+# Enables high-quality auto-alpha for RGB → RGBA in load_rgba_image().
+# ``kornia`` is required by BiRefNet's HF ``trust_remote_code`` module.
+bg = [
+    "transformers>=4.40",
+    "torchvision>=0.17",
+    "kornia>=0.7",
+    "einops>=0.7",
+    "timm>=0.9",
+]
+flash = [
+    "flash-attn>=2.5",
+]
+# Textured-mesh export via the public TRELLIS.2 stack.
+# NOTE: trellis2 itself is not on PyPI; clone microsoft/TRELLIS.2 and run
+# its setup.sh, then point --trellis2-path at the checkout (see README).
+textured-mesh = [
+    "scipy>=1.11",
+    "trimesh>=4.0",
+]
+dev = [
+    "ruff>=0.4",
+    "pytest>=7",
+    "build>=1.0",
+]
+
+[project.urls]
+Homepage = "https://haoz19.github.io/world-tracing-page/"
+Repository = "https://github.com/haoz19/world-tracing"
+Issues = "https://github.com/haoz19/world-tracing/issues"
+
+[tool.setuptools.packages.find]
+include = ["wt*"]
+exclude = ["examples*", "tests*"]
+
+[tool.setuptools.package-data]
+"wt" = ["py.typed"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["wt/_core/vendor"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501", "E741"]
