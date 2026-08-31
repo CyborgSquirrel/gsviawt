@@ -1,0 +1,26 @@
+# Core ML libraries
+numpy
+pandas
+polars
+matplotlib
+scipy
+
+# Deep learning
+torch
+torchvision
+
+# Utilities
+tqdm
+jupyter
+ipython
+
+# Hydra
+hydra-core
+hydra-joblib-launcher
+
+# LSP server for editor integration
+python-lsp-server[all]
+python-lsp-isort
+
+#
+objaverse

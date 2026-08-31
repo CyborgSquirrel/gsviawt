@@ -1,0 +1,14 @@
+session = gsviawt
+persistent = 1
+
+layout = _{
+  pane {
+    split = horizontal
+    cmd {
+      size = 2fr
+      args = [
+        hx
+      ]
+    }
+  }
+}

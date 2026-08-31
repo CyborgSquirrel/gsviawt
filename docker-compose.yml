@@ -1,0 +1,52 @@
+services:
+  app-base:
+    profiles: ["_base"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        XUID: ${XUID:-}
+        XGID: ${XGID:-}
+        # DEVICE: ${DEVICE:-}
+    volumes:
+      # Mount current directory so you can edit code without rebuilding
+      - .:/app
+      # Wayland socket for GUI apps
+      - ${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY:-wayland-0}:/tmp/${WAYLAND_DISPLAY:-wayland-0}
+
+      # - ./stable_worldmodel:/home/user/.stable_worldmodel:rw
+      - ./.venv:/mounts/venv:rw
+
+      # - ./data:/mounts/data
+    environment:
+      # Wayland environment
+      - WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-0}
+      - XDG_RUNTIME_DIR=/tmp
+      # X11 fallback
+      # - DISPLAY=${DISPLAY}
+    working_dir: /app
+    # Keep container running for interactive work
+    stdin_open: true
+    tty: true
+    command: /bin/bash
+    # Network mode for better compatibility
+    network_mode: host
+    # IPC for X11
+    ipc: host
+
+  app-cpu:
+    extends:
+      service: app-base
+    profiles: ["cpu"]
+
+  app-gpu:
+    extends:
+      service: app-base
+    profiles: ["gpu"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

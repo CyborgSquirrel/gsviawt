@@ -1,0 +1,41 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# Jupyter
+.ipynb_checkpoints
+*.ipynb_checkpoints
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# Data and models (add specific paths as needed)
+*.pth
+*.pt
+*.h5
+*.pkl
+*.ckpt
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+

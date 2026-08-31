@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+
+source secret.env
+export SSHPASS="$SSH_PASS"
+sshpass -e ssh student@$SSH_ADDR "$@"
+

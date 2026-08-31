@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+
+mount_path="/home/$USER/cluster"
+
+source secret.env
+
+mkdir -p "$mount_path"
+sshfs \
+  -o password_stdin \
+  -o reconnect \
+  -o ServerAliveInterval=15 \
+  -o ServerAliveCountMax=3 \
+  "student@$SSH_ADDR:/home/student" \
+  "$mount_path" \
+  <<< "$SSH_PASS"
+
