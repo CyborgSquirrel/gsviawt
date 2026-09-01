@@ -22,7 +22,12 @@ hydra-joblib-launcher
 python-lsp-server[all]
 python-lsp-isort
 
+# HDF5
+h5py
+hdf5plugin  # compression filters
+
 # unsorted
 objaverse
+rpyc
 # bpy
 

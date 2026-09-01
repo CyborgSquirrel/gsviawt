@@ -57,7 +57,13 @@ def look_at(cam_obj, target_point):
   rot_quat = direction.to_track_quat('-Z', 'Y')
   cam_obj.rotation_euler = rot_quat.to_euler()
 
-def frame_object_robust(obj, cam_obj, scene, view_dir=None, margin=1.05):
+def frame_object_robust(
+  obj,
+  cam_obj,
+  scene,
+  view_dir=None,
+  margin=1.05,
+):
   """
   Position cam_obj so obj is fully framed, using actual FOV/sensor/aspect,
   not a rough distance multiplier.
@@ -70,9 +76,12 @@ def frame_object_robust(obj, cam_obj, scene, view_dir=None, margin=1.05):
   corners = get_combined_bbox_corners_world(obj)
   center = get_bbox_center(corners)
 
+  # Handle view_dir
   if view_dir is None:
-    view_dir = mathutils.Vector((1, -1, 0.6)).normalized()
-  else:
+    view_dir = (1, -1, 0.6)
+  if isinstance(view_dir, tuple):
+    view_dir = mathutils.Vector(view_dir)
+  if isinstance(view_dir, mathutils.Vector):
     view_dir = view_dir.normalized()
 
   # Orient the camera first (rotation doesn't depend on distance)
@@ -147,44 +156,54 @@ def track_imported_objects():
     imported_objects.extend(after - before)
 
 class Service(rpyc.Service):
-  def wip(self):
+  def reset(self, path: str):
     # Remove all default objects (Cube, Camera, Light)
-    bpy.ops.object.select_all(action='SELECT')
-    bpy.ops.object.delete()
+    for obj in list(bpy.data.objects):
+      bpy.data.objects.remove(obj, do_unlink=True)
+    bpy.data.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
 
     # Camera
     cam_data = bpy.data.cameras.new("Camera")
     cam_obj = bpy.data.objects.new("Camera", cam_data)
     bpy.context.collection.objects.link(cam_obj)
     bpy.context.scene.camera = cam_obj
-    # cam_obj.location = (5, -5, 5)
-    # cam_obj.rotation_euler = (1.1, 0, 0.8)  # rough angle toward origin
 
     # Light
-    light_data = bpy.data.lights.new("Light", type='SUN')
+    light_data = bpy.data.lights.new("Light", type="SUN")
     light_obj = bpy.data.objects.new("Light", light_data)
     bpy.context.collection.objects.link(light_obj)
     light_obj.location = (5, -5, 10)
 
     # Load mesh
     with track_imported_objects() as imported_objects:
-      bpy.ops.import_scene.gltf(filepath="/app/data/objaverse/hf-objaverse-v1/glbs/000-147/405f47d6ce6d481d94f54800ee913fa4.glb")
+      bpy.ops.import_scene.gltf(filepath=path)
 
     if len(imported_objects) != 1:
       raise RuntimeError()
 
+    self.obj = imported_objects[0]
+
+  def render(
+    self,
+    *,
+    width: int,
+    height: int,
+    path: str,
+    view_dir,
+  ):
     scene = bpy.context.scene
 
     # Set render engine and output
-    scene.render.engine = 'CYCLES'  # or 'BLENDER_EEVEE_NEXT'
-    scene.render.resolution_x = 504
-    scene.render.resolution_y = 504
-    scene.render.filepath = "/app/data/dingus.png"
+    scene.render.engine = "CYCLES"  # or "BLENDER_EEVEE_NEXT"
+    scene.render.resolution_x = width
+    scene.render.resolution_y = height
+    scene.render.filepath = path
 
-    frame_object_robust(imported_objects[0], cam_obj, bpy.context.scene)
+    frame_object_robust(self.obj, scene.camera, scene, view_dir=view_dir)
 
     # Render a single frame
     bpy.ops.render.render(write_still=True)
+    # bpy.ops.wm.save_as_mainfile(filepath="/app/bla/curr.blend")
 
 def main():
   sep_idx = sys.argv.index("--")
@@ -200,6 +219,7 @@ def main():
     Service,
     socket_path=args.socket_path,
     nbThreads=1,  # NOTE: Only one thread!!! Otherwise they will crash into eachother.
+    protocol_config={"allow_public_attrs": True},
   )
   server.start()
 
