@@ -29,5 +29,6 @@ hdf5plugin  # compression filters
 # unsorted
 objaverse
 rpyc
+trimesh
 # bpy
 

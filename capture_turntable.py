@@ -22,19 +22,27 @@ from rpyc.utils.factory import unix_connect
 from util import LazyDataset
 
 BLENDER_BIN = "/opt/blender/blender"
-RENDER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "render.py")
+RENDER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "render_server.py")
 SOCKET_PATH = "/tmp/blender.sock"
 
 MESH_PATH = "/app/data/objaverse/hf-objaverse-v1/glbs/000-147/405f47d6ce6d481d94f54800ee913fa4.glb"
 OUTPUT_DIR = "/app/bla"
 HDF5_PATH = os.path.join(OUTPUT_DIR, "renders.h5")
 
-# WIDTH, HEIGHT = 504, 504
-WIDTH, HEIGHT = 112, 112
-NUM_AZIMUTHS = 2
-TILTS_DEG = [45, 15, -15]  # high, mid, low
+WIDTH, HEIGHT = 504, 504
+# WIDTH, HEIGHT = 112, 112
+# NUM_AZIMUTHS = 2
+# TILTS_DEG = [45, 15, -15]  # high, mid, low
+NUM_AZIMUTHS = 1
+TILTS_DEG = [15]  # high, mid, low
+MAX_PEEL_LAYERS = 6
 IMAGE_DATASET_KWARGS = {
   "chunks": (1, HEIGHT, WIDTH, 3),  # one chunk per image -> compressed independently
+  "compression": "gzip",
+  "compression_opts": 4,
+}
+DEPTH_PEEL_DATASET_KWARGS = {
+  "chunks": (1, HEIGHT, WIDTH, MAX_PEEL_LAYERS),  # one chunk per view -> compressed independently
   "compression": "gzip",
   "compression_opts": 4,
 }
@@ -109,6 +117,8 @@ def main():
         hf        = stack.enter_context(h5py.File(HDF5_PATH, "w"))
         images_ds = stack.enter_context(LazyDataset(hf, "images", dataset_kwargs=IMAGE_DATASET_KWARGS))
         pose_ds   = stack.enter_context(LazyDataset(hf, "camera_pose"))
+        intr_ds   = stack.enter_context(LazyDataset(hf, "camera_intrinsics"))
+        depth_ds  = stack.enter_context(LazyDataset(hf, "depth_peel", dataset_kwargs=DEPTH_PEEL_DATASET_KWARGS))
 
         for tilt_deg in TILTS_DEG:
           tilt_rad = math.radians(tilt_deg)
@@ -119,12 +129,20 @@ def main():
             # print(f"Rendering azimuth={azimuth_deg:.0f} deg, tilt={tilt_deg} deg")
 
             tmp_path = os.path.join(tmp_dir, "output.png")
-            result = conn.root.render(width=WIDTH, height=HEIGHT, path=tmp_path, view_dir=view_dir)
+            tmp_depth_path = os.path.join(tmp_dir, "depth.npy")
+            result = conn.root.render(
+              width=WIDTH, height=HEIGHT, path=tmp_path, view_dir=view_dir,
+              max_layers=MAX_PEEL_LAYERS, depth_path=tmp_depth_path,
+            )
             image = np.asarray(Image.open(tmp_path).convert("RGB"), dtype=np.uint8)
+            depth_volume = np.load(tmp_depth_path)
             os.remove(tmp_path)
+            os.remove(tmp_depth_path)
 
             images_ds.append(image)
             pose_ds.append(np.array(result["pose_matrix"], dtype=np.float32))
+            intr_ds.append(np.array(result["intrinsics_matrix"], dtype=np.float32))
+            depth_ds.append(depth_volume)
     finally:
       conn.close()
   finally:
