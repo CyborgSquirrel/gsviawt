@@ -5,28 +5,39 @@ of a hardcoded mesh: 8 azimuths equidistant around the z axis, x3 tilts
 (high, mid, low) = 24 renders total.
 """
 
+import contextlib as ctl
 import math
 import os
 import signal
 import subprocess
 import sys
 import time
+from tempfile import TemporaryDirectory
 
+import h5py
+import numpy as np
+from PIL import Image
 from rpyc.utils.factory import unix_connect
+
+from util import LazyDataset
 
 BLENDER_BIN = "/opt/blender/blender"
 RENDER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "render.py")
 SOCKET_PATH = "/tmp/blender.sock"
 
 MESH_PATH = "/app/data/objaverse/hf-objaverse-v1/glbs/000-147/405f47d6ce6d481d94f54800ee913fa4.glb"
-# OUTPUT_DIR = "/tmp/renders"
 OUTPUT_DIR = "/app/bla"
+HDF5_PATH = os.path.join(OUTPUT_DIR, "renders.h5")
 
-WIDTH, HEIGHT = 504, 504
-# WIDTH, HEIGHT = 128, 128
-# NUM_AZIMUTHS = 8
+# WIDTH, HEIGHT = 504, 504
+WIDTH, HEIGHT = 112, 112
 NUM_AZIMUTHS = 2
 TILTS_DEG = [45, 15, -15]  # high, mid, low
+IMAGE_DATASET_KWARGS = {
+  "chunks": (1, HEIGHT, WIDTH, 3),  # one chunk per image -> compressed independently
+  "compression": "gzip",
+  "compression_opts": 4,
+}
 
 _proc = None
 
@@ -92,18 +103,28 @@ def main():
     try:
       conn.root.reset(MESH_PATH)
 
-      for tilt_idx, tilt_deg in enumerate(TILTS_DEG):
-        tilt_rad = math.radians(tilt_deg)
-        for az_idx in range(NUM_AZIMUTHS):
-          azimuth_rad = az_idx * 2 * math.pi / NUM_AZIMUTHS
-          view_dir = view_dir_for(azimuth_rad, tilt_rad)
-          print(view_dir)
-          out_path = os.path.join(OUTPUT_DIR, f"tilt{tilt_idx}_az{az_idx:02d}.png")
-          print(
-            f"Rendering {out_path} "
-            f"(azimuth={math.degrees(azimuth_rad):.0f} deg, tilt={tilt_deg} deg)"
-          )
-          conn.root.render(width=WIDTH, height=HEIGHT, path=out_path, view_dir=view_dir)
+      with ctl.ExitStack() as stack:
+        tmp_dir = stack.enter_context(TemporaryDirectory())
+
+        hf        = stack.enter_context(h5py.File(HDF5_PATH, "w"))
+        images_ds = stack.enter_context(LazyDataset(hf, "images", dataset_kwargs=IMAGE_DATASET_KWARGS))
+        pose_ds   = stack.enter_context(LazyDataset(hf, "camera_pose"))
+
+        for tilt_deg in TILTS_DEG:
+          tilt_rad = math.radians(tilt_deg)
+          for az_idx in range(NUM_AZIMUTHS):
+            azimuth_rad = az_idx * 2 * math.pi / NUM_AZIMUTHS
+            # azimuth_deg = math.degrees(azimuth_rad)
+            view_dir = view_dir_for(azimuth_rad, tilt_rad)
+            # print(f"Rendering azimuth={azimuth_deg:.0f} deg, tilt={tilt_deg} deg")
+
+            tmp_path = os.path.join(tmp_dir, "output.png")
+            result = conn.root.render(width=WIDTH, height=HEIGHT, path=tmp_path, view_dir=view_dir)
+            image = np.asarray(Image.open(tmp_path).convert("RGB"), dtype=np.uint8)
+            os.remove(tmp_path)
+
+            images_ds.append(image)
+            pose_ds.append(np.array(result["pose_matrix"], dtype=np.float32))
     finally:
       conn.close()
   finally:

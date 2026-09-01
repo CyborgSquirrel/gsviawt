@@ -1,9 +1,9 @@
 # Project-specific Helix configuration
 # This configures Python LSP to use the Docker container's pylsp
 
-[[language]]
-name = "python"
-language-servers = ["pylsp-docker"]
+# [[language]]
+# name = "python"
+# language-servers = ["pylsp-docker"]
 
-[language-server.pylsp-docker]
-command = "./docker-pylsp.sh"
+# [language-server.pylsp-docker]
+# command = "./docker-pylsp.sh"

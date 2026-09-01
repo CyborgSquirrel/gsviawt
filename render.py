@@ -203,6 +203,10 @@ class Service(rpyc.Service):
 
     # Render a single frame
     bpy.ops.render.render(write_still=True)
+
+    return {
+      "pose_matrix": [list(row) for row in scene.camera.matrix_world],
+    }
     # bpy.ops.wm.save_as_mainfile(filepath="/app/bla/curr.blend")
 
 def main():
