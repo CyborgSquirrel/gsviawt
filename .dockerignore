@@ -29,6 +29,8 @@ docker-compose*.yml
 *.pkl
 *.ckpt
 
+*.glb
+
 # IDE
 .vscode
 .idea
@@ -39,3 +41,5 @@ docker-compose*.yml
 .DS_Store
 Thumbs.db
 
+
+data/

@@ -24,6 +24,8 @@ services:
       - XDG_RUNTIME_DIR=/tmp
       # X11 fallback
       # - DISPLAY=${DISPLAY}
+    env_file:
+      - container/secret.env
     working_dir: /app
     # Keep container running for interactive work
     stdin_open: true

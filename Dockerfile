@@ -153,7 +153,7 @@ RUN --mount=type=bind,src=container/uv/install.sh,dst=/tmp/install_uv.sh /tmp/in
 ENV UV_PYTHON_CACHE_DIR=/home/user/.cache/uv
 
 # Create virtual environment
-RUN --mount=type=cache,uid=$XUID,gid=$XGID,dst=$UV_PYTHON_CACHE_DIR \
+RUN --mount=type=cache,uid=$XUID,gid=$XGID,dst=$UV_PYTHON_CACHE_DIR,id=uv \
   uv venv --python $PYTHON_VERSION /home/user/venv
 
 # Activate venv by modifying PATH
@@ -161,16 +161,30 @@ ENV UV_PROJECT_ENVIRONMENT=/home/user/venv
 ENV VIRTUAL_ENV=/home/user/venv
 ENV PATH="/home/user/venv/bin:$PATH"
 
-# Copy requirements first for better caching
-COPY --chown=$XUID:$XGID requirements.txt .
-# COPY --chown=$XUID:$XGID requirements.lock .
-RUN --mount=type=cache,uid=$XUID,gid=$XGID,dst=$UV_PYTHON_CACHE_DIR \
+# Install world tracing
+USER root
+RUN \
+  --mount=type=cache,uid=$XUID,gid=$XGID,dst=$UV_PYTHON_CACHE_DIR,id=uv \
+  --mount=type=bind,src=./world-tracing,dst=/app/world-tracing,rw \
+<<EOF
+  cd world-tracing
+  uv lock
+  uv sync
+
+  uv pip install -e '.[viz]'
+EOF
+USER user
+
+# Install other packages
+RUN \
+  --mount=type=cache,uid=$XUID,gid=$XGID,dst=$UV_PYTHON_CACHE_DIR,id=uv \
+  --mount=type=bind,src=requirements.txt,dst=/app/requirements.txt \
 <<EOF
   uv pip compile requirements.txt -o requirements.lock
   uv pip sync requirements.lock
 EOF
 
-# Copy the rest of the application
+# Copy everything
 COPY --chown=$XUID:$XGID . .
 
 # Set entrypoint
