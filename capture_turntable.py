@@ -75,6 +75,7 @@ def main(cfg: DictConfig):
     conn = unix_connect(SOCKET_PATH, config={"sync_request_timeout": 600})
     try:
       view_strategy = hydra.utils.instantiate(cfg.view_strategy)
+      meshes = hydra.utils.instantiate(cfg.mesh_strategy).meshes()
 
       image_kwargs = {
         "chunks": (1, cfg.height, cfg.width, 3),  # one chunk per image -> compressed independently
@@ -93,7 +94,7 @@ def main(cfg: DictConfig):
         hf = stack.enter_context(h5py.File(cfg.output_path, "w"))
 
         hf.attrs["config_json"] = json.dumps(OmegaConf.to_container(cfg, resolve=True))
-        hf.create_dataset("mesh_paths", data=list(cfg.meshes), dtype=h5py.string_dtype(encoding="utf-8"))
+        hf.create_dataset("mesh_paths", data=meshes, dtype=h5py.string_dtype(encoding="utf-8"))
 
         images_ds = None
         if cfg.render:
@@ -103,7 +104,7 @@ def main(cfg: DictConfig):
         depth_ds    = stack.enter_context(LazyDataset(hf, "depth_peel", dataset_kwargs=depth_kwargs))
         mesh_idx_ds = stack.enter_context(LazyDataset(hf, "mesh_index"))
 
-        for mesh_idx, mesh_path in enumerate(cfg.meshes):
+        for mesh_idx, mesh_path in enumerate(meshes):
           conn.root.reset(mesh_path)
 
           for tilt_deg, azimuth_deg, view_dir in view_strategy.views():
