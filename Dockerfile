@@ -161,15 +161,16 @@ ENV UV_PROJECT_ENVIRONMENT=/home/user/venv
 ENV VIRTUAL_ENV=/home/user/venv
 ENV PATH="/home/user/venv/bin:$PATH"
 
-# Install world tracing
+# Install world tracing's dependencies only (no source yet, so nothing to
+# build/register as editable). Cache-friendly: this layer only depends on
+# pyproject.toml, so unrelated source edits don't invalidate it.
 COPY --chown=$XUID:$XGID world-tracing/pyproject.toml world-tracing/pyproject.toml
 RUN \
   --mount=type=cache,uid=$XUID,gid=$XGID,dst=$UV_PYTHON_CACHE_DIR,id=uv \
 <<EOF
   cd world-tracing
   uv lock
-  uv sync --inexact
-  uv pip install -e '.[viz]'
+  uv sync --inexact --extra viz --no-install-project
 EOF
 
 # Install other packages
@@ -181,8 +182,22 @@ RUN \
   uv pip install -r requirements.lock
 EOF
 
-# Copy everything
+# Copy everything (this is the only place world-tracing's actual source
+# lands in the image)
 COPY --chown=$XUID:$XGID . .
+
+# Register world tracing itself now that its source exists. Cheap: all of
+# its dependencies were already installed above, so this just builds/links
+# the `wt` package. Must come after `COPY . .`, not before — `uv pip install
+# -e` run against a source-less directory bakes an editable-install finder
+# with zero packages, so `import wt` fails forever even though uv reports it
+# as installed.
+RUN \
+  --mount=type=cache,uid=$XUID,gid=$XGID,dst=$UV_PYTHON_CACHE_DIR,id=uv \
+<<EOF
+  cd world-tracing
+  uv sync --inexact --extra viz
+EOF
 
 # Set entrypoint
 ENTRYPOINT ["/app/container/entrypoint.sh"]
