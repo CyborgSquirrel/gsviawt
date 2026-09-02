@@ -8,6 +8,8 @@ services:
         XUID: ${XUID:-}
         XGID: ${XGID:-}
         # DEVICE: ${DEVICE:-}
+      x-bake:
+        output: ["type=docker,compression=zstd,compression-level=3,force-compression=true"]
     volumes:
       # Mount current directory so you can edit code without rebuilding
       - .:/app
@@ -18,6 +20,8 @@ services:
       - ./.venv:/mounts/venv:rw
 
       # - ./data:/mounts/data
+
+      - ./mounts/huggingface:/home/user/.cache/huggingface:rw
     environment:
       # Wayland environment
       - WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-0}

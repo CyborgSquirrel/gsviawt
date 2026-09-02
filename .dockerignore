@@ -31,6 +31,9 @@ docker-compose*.yml
 
 *.glb
 
+# Large example/test assets not needed at runtime
+world-tracing/examples/test_images
+
 # IDE
 .vscode
 .idea
