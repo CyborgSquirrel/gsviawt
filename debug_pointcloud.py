@@ -32,12 +32,6 @@ DEFAULT_DATASETS = {
 }
 
 
-def load_dataset(f, index, kind, datasets):
-  """Load one view's array for `kind` from the open HDF5 file `f`, at the
-  dataset name `datasets[kind]`."""
-  return f[datasets[kind]][index]
-
-
 def detect_format(f, datasets):
   """Pick "depth" or "points" based on which of the two dataset names is
   present in the open HDF5 file `f`; error if both or neither are."""
@@ -172,10 +166,10 @@ def main():
         if args.space is None:
           raise ValueError("-s/--space (world or camera) is required for -f depth")
 
-        image = load_dataset(f, args.index, "image", datasets)
-        depth_peel = load_dataset(f, args.index, "depth", datasets)
-        intrinsics = load_dataset(f, args.index, "intrinsics", datasets)
-        pose = load_dataset(f, args.index, "pose", datasets)
+        image = f[datasets["image"]][args.index]
+        depth_peel = f[datasets["depth"]][args.index]
+        intrinsics = f[datasets["intrinsics"]][args.index]
+        pose = f[datasets["pose"]][args.index]
 
         max_layers = depth_peel.shape[2]
         points, u, v, layer_idx = unproject_depth_peel(depth_peel, intrinsics, pose, args.space)
@@ -185,7 +179,7 @@ def main():
         if args.space is not None:
           raise ValueError("-s/--space is not valid for -f points")
 
-        raw_points = load_dataset(f, args.index, "points", datasets)
+        raw_points = f[datasets["points"]][args.index]
         points, colors = colors_for_points(raw_points)
         detail = ""
       case _:
