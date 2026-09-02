@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 
-"""Drive the Blender rpyc render server (render.py) to capture a turntable
-of a hardcoded mesh: 8 azimuths equidistant around the z axis, x3 tilts
-(high, mid, low) = 24 renders total.
+"""Drive the Blender rpyc render server (render.py) to capture turntables of
+a configurable set of meshes. Configured via Hydra -- see conf/config.yaml.
 """
 
 import contextlib as ctl
-import math
+import json
 import os
 import signal
 import subprocess
@@ -15,7 +14,9 @@ import time
 from tempfile import TemporaryDirectory
 
 import h5py
+import hydra
 import numpy as np
+from omegaconf import DictConfig, OmegaConf
 from PIL import Image
 from rpyc.utils.factory import unix_connect
 
@@ -24,28 +25,6 @@ from util import LazyDataset
 BLENDER_BIN = "/opt/blender/blender"
 RENDER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "render_server.py")
 SOCKET_PATH = "/tmp/blender.sock"
-
-MESH_PATH = "/app/data/objaverse/hf-objaverse-v1/glbs/000-147/405f47d6ce6d481d94f54800ee913fa4.glb"
-OUTPUT_DIR = "/app/bla"
-HDF5_PATH = os.path.join(OUTPUT_DIR, "renders.h5")
-
-WIDTH, HEIGHT = 504, 504
-# WIDTH, HEIGHT = 112, 112
-# NUM_AZIMUTHS = 2
-# TILTS_DEG = [45, 15, -15]  # high, mid, low
-NUM_AZIMUTHS = 1
-TILTS_DEG = [15]  # high, mid, low
-MAX_PEEL_LAYERS = 6
-IMAGE_DATASET_KWARGS = {
-  "chunks": (1, HEIGHT, WIDTH, 3),  # one chunk per image -> compressed independently
-  "compression": "gzip",
-  "compression_opts": 4,
-}
-DEPTH_PEEL_DATASET_KWARGS = {
-  "chunks": (1, HEIGHT, WIDTH, MAX_PEEL_LAYERS),  # one chunk per view -> compressed independently
-  "compression": "gzip",
-  "compression_opts": 4,
-}
 
 _proc = None
 
@@ -74,15 +53,8 @@ def wait_for_socket(path, timeout=60):
     time.sleep(0.2)
 
 
-def view_dir_for(azimuth_rad, tilt_rad):
-  return (
-    math.cos(tilt_rad) * math.cos(azimuth_rad),
-    math.cos(tilt_rad) * math.sin(azimuth_rad),
-    math.sin(tilt_rad),
-  )
-
-
-def main():
+@hydra.main(version_base=None, config_path="conf", config_name="config")
+def main(cfg: DictConfig):
   global _proc
 
   signal.signal(signal.SIGINT, _signal_handler)
@@ -91,16 +63,9 @@ def main():
   if os.path.exists(SOCKET_PATH):
     os.remove(SOCKET_PATH)
 
-  os.makedirs(OUTPUT_DIR, exist_ok=True)
+  os.makedirs(os.path.dirname(cfg.output_path), exist_ok=True)
 
-  bg = True
-
-  # Build proc args
-  args = []
-  args += [BLENDER_BIN]
-  if bg:
-    args += ["--background"]
-  args += ["--python", RENDER_SCRIPT, "--", SOCKET_PATH]
+  args = [BLENDER_BIN, "--background", "--python", RENDER_SCRIPT, "--", SOCKET_PATH]
 
   _proc = subprocess.Popen(args)
 
@@ -109,30 +74,42 @@ def main():
 
     conn = unix_connect(SOCKET_PATH, config={"sync_request_timeout": 600})
     try:
-      conn.root.reset(MESH_PATH)
+      view_strategy = hydra.utils.instantiate(cfg.view_strategy)
+
+      image_kwargs = {
+        "chunks": (1, cfg.height, cfg.width, 3),  # one chunk per image -> compressed independently
+        "compression": "gzip",
+        "compression_opts": 4,
+      }
+      depth_kwargs = {
+        "chunks": (1, cfg.height, cfg.width, cfg.max_peel_layers),  # one chunk per view -> compressed independently
+        "compression": "gzip",
+        "compression_opts": 4,
+      }
 
       with ctl.ExitStack() as stack:
         tmp_dir = stack.enter_context(TemporaryDirectory())
 
-        hf        = stack.enter_context(h5py.File(HDF5_PATH, "w"))
-        images_ds = stack.enter_context(LazyDataset(hf, "images", dataset_kwargs=IMAGE_DATASET_KWARGS))
-        pose_ds   = stack.enter_context(LazyDataset(hf, "camera_pose"))
-        intr_ds   = stack.enter_context(LazyDataset(hf, "camera_intrinsics"))
-        depth_ds  = stack.enter_context(LazyDataset(hf, "depth_peel", dataset_kwargs=DEPTH_PEEL_DATASET_KWARGS))
+        hf = stack.enter_context(h5py.File(cfg.output_path, "w"))
 
-        for tilt_deg in TILTS_DEG:
-          tilt_rad = math.radians(tilt_deg)
-          for az_idx in range(NUM_AZIMUTHS):
-            azimuth_rad = az_idx * 2 * math.pi / NUM_AZIMUTHS
-            # azimuth_deg = math.degrees(azimuth_rad)
-            view_dir = view_dir_for(azimuth_rad, tilt_rad)
-            # print(f"Rendering azimuth={azimuth_deg:.0f} deg, tilt={tilt_deg} deg")
+        hf.attrs["config_json"] = json.dumps(OmegaConf.to_container(cfg, resolve=True))
+        hf.create_dataset("mesh_paths", data=list(cfg.meshes), dtype=h5py.string_dtype(encoding="utf-8"))
 
+        images_ds   = stack.enter_context(LazyDataset(hf, "images", dataset_kwargs=image_kwargs))
+        pose_ds     = stack.enter_context(LazyDataset(hf, "camera_pose"))
+        intr_ds     = stack.enter_context(LazyDataset(hf, "camera_intrinsics"))
+        depth_ds    = stack.enter_context(LazyDataset(hf, "depth_peel", dataset_kwargs=depth_kwargs))
+        mesh_idx_ds = stack.enter_context(LazyDataset(hf, "mesh_index"))
+
+        for mesh_idx, mesh_path in enumerate(cfg.meshes):
+          conn.root.reset(mesh_path)
+
+          for tilt_deg, azimuth_deg, view_dir in view_strategy.views():
             tmp_path = os.path.join(tmp_dir, "output.png")
             tmp_depth_path = os.path.join(tmp_dir, "depth.npy")
             result = conn.root.render(
-              width=WIDTH, height=HEIGHT, path=tmp_path, view_dir=view_dir,
-              max_layers=MAX_PEEL_LAYERS, depth_path=tmp_depth_path,
+              width=cfg.width, height=cfg.height, path=tmp_path, view_dir=view_dir,
+              max_layers=cfg.max_peel_layers, depth_path=tmp_depth_path,
             )
             image = np.asarray(Image.open(tmp_path).convert("RGB"), dtype=np.uint8)
             depth_volume = np.load(tmp_depth_path)
@@ -143,6 +120,7 @@ def main():
             pose_ds.append(np.array(result["pose_matrix"], dtype=np.float32))
             intr_ds.append(np.array(result["intrinsics_matrix"], dtype=np.float32))
             depth_ds.append(depth_volume)
+            mesh_idx_ds.append(np.int64(mesh_idx))
     finally:
       conn.close()
   finally:
