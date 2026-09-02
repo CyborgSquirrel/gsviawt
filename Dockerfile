@@ -36,6 +36,22 @@ RUN <<EOF
   mkdir -p /home/user/.local
 EOF
 
+# Point HISTFILE at a symlink into a directory instead of bind-mounting the
+# file directly: if a bind-mounted file's host source doesn't exist yet,
+# Docker creates it as a directory (root-owned) instead, silently breaking
+# history. A directory target has no such ambiguity, and bash creates the
+# history file inside it on first write.
+RUN <<EOF
+  mkdir -p /home/user/.bash_history_dir
+  ln -s /home/user/.bash_history_dir/history /home/user/.bash_history
+EOF
+
+# Flush bash history after every command instead of only on clean shell
+# exit: the entrypoint execs bash as PID 1, so a SIGTERM (e.g. `docker
+# compose down`) skips the normal exit hook and would otherwise drop
+# whatever history hasn't been flushed yet.
+RUN echo "PROMPT_COMMAND=\"history -a\${PROMPT_COMMAND:+; \$PROMPT_COMMAND}\"" >> /home/user/.bashrc
+
 USER root
 
 ############################################################

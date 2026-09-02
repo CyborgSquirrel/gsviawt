@@ -31,7 +31,6 @@ Thumbs.db
 secret.env
 
 data/
-mounts/
 
 # Hydra
 outputs/

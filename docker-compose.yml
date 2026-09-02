@@ -8,8 +8,6 @@ services:
         XUID: ${XUID:-}
         XGID: ${XGID:-}
         # DEVICE: ${DEVICE:-}
-      x-bake:
-        output: ["type=docker,compression=zstd,compression-level=3,force-compression=true"]
     volumes:
       # Mount current directory so you can edit code without rebuilding
       - .:/app
@@ -22,6 +20,10 @@ services:
       # - ./data:/mounts/data
 
       - ./mounts/huggingface:/home/user/.cache/huggingface:rw
+
+      # Persist shell and IPython history across container rebuilds
+      - ./mounts/bash:/home/user/.bash:rw
+      - ./mounts/ipython:/home/user/.ipython:rw
     environment:
       # Wayland environment
       - WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-0}
@@ -44,11 +46,17 @@ services:
     extends:
       service: app-base
     profiles: ["cpu"]
+    build:
+      x-bake:
+        output: ["type=docker,name=gsviawt-app-cpu:latest,compression=zstd,compression-level=3,force-compression=true"]
 
   app-gpu:
     extends:
       service: app-base
     profiles: ["gpu"]
+    build:
+      x-bake:
+        output: ["type=docker,name=gsviawt-app-gpu:latest,compression=zstd,compression-level=3,force-compression=true"]
     deploy:
       resources:
         reservations:
