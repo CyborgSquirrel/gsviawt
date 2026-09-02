@@ -162,26 +162,23 @@ ENV VIRTUAL_ENV=/home/user/venv
 ENV PATH="/home/user/venv/bin:$PATH"
 
 # Install world tracing
-USER root
+COPY --chown=$XUID:$XGID world-tracing/pyproject.toml world-tracing/pyproject.toml
 RUN \
   --mount=type=cache,uid=$XUID,gid=$XGID,dst=$UV_PYTHON_CACHE_DIR,id=uv \
-  --mount=type=bind,src=./world-tracing,dst=/app/world-tracing,rw \
 <<EOF
   cd world-tracing
   uv lock
-  uv sync
-
+  uv sync --inexact
   uv pip install -e '.[viz]'
 EOF
-USER user
 
 # Install other packages
+COPY --chown=$XUID:$XGID requirements.txt requirements.txt
 RUN \
   --mount=type=cache,uid=$XUID,gid=$XGID,dst=$UV_PYTHON_CACHE_DIR,id=uv \
-  --mount=type=bind,src=requirements.txt,dst=/app/requirements.txt \
 <<EOF
   uv pip compile requirements.txt -o requirements.lock
-  uv pip sync requirements.lock
+  uv pip install -r requirements.lock
 EOF
 
 # Copy everything
