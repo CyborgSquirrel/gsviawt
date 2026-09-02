@@ -20,6 +20,7 @@ services:
       # - ./data:/mounts/data
 
       - ./mounts/huggingface:/home/user/.cache/huggingface:rw
+      - ./mounts/objaverse:/home/user/.objaverse:rw
 
       # Persist shell and IPython history across container rebuilds
       - ./mounts/bash:/home/user/.bash:rw
