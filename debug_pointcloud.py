@@ -32,21 +32,17 @@ DEFAULT_DATASETS = {
 }
 
 
-def dataset_name(kind, override):
-  return override or DEFAULT_DATASETS[kind]
+def load_dataset(f, index, kind, datasets):
+  """Load one view's array for `kind` from the open HDF5 file `f`, at the
+  dataset name `datasets[kind]`."""
+  return f[datasets[kind]][index]
 
 
-def load_dataset(f, index, kind, override):
-  """Load one view's array for `kind` from the open HDF5 file `f`, at
-  `override` if given, otherwise at its default dataset name."""
-  return f[dataset_name(kind, override)][index]
-
-
-def detect_format(f, depth_override, points_override):
+def detect_format(f, datasets):
   """Pick "depth" or "points" based on which of the two dataset names is
   present in the open HDF5 file `f`; error if both or neither are."""
-  has_depth = dataset_name("depth", depth_override) in f
-  has_points = dataset_name("points", points_override) in f
+  has_depth = datasets["depth"] in f
+  has_points = datasets["points"] in f
   match (has_depth, has_points):
     case (True, False):
       return "depth"
@@ -160,20 +156,26 @@ def main():
   parser.add_argument("--points", default=None, metavar="DATASET", help="Override the raw point cloud dataset name (default: points)")
   args = parser.parse_args()
 
+  datasets = dict(DEFAULT_DATASETS)
+  for kind in datasets:
+    override = getattr(args, kind)
+    if override is not None:
+      datasets[kind] = override
+
   with h5py.File(args.hdf5_path, "r") as f:
     fmt = args.format
     if fmt == "auto":
-      fmt = detect_format(f, args.depth, args.points)
+      fmt = detect_format(f, datasets)
 
     match fmt:
       case "depth":
         if args.space is None:
           raise ValueError("-s/--space (world or camera) is required for -f depth")
 
-        image = load_dataset(f, args.index, "image", args.image)
-        depth_peel = load_dataset(f, args.index, "depth", args.depth)
-        intrinsics = load_dataset(f, args.index, "intrinsics", args.intrinsics)
-        pose = load_dataset(f, args.index, "pose", args.pose)
+        image = load_dataset(f, args.index, "image", datasets)
+        depth_peel = load_dataset(f, args.index, "depth", datasets)
+        intrinsics = load_dataset(f, args.index, "intrinsics", datasets)
+        pose = load_dataset(f, args.index, "pose", datasets)
 
         max_layers = depth_peel.shape[2]
         points, u, v, layer_idx = unproject_depth_peel(depth_peel, intrinsics, pose, args.space)
@@ -183,7 +185,7 @@ def main():
         if args.space is not None:
           raise ValueError("-s/--space is not valid for -f points")
 
-        raw_points = load_dataset(f, args.index, "points", args.points)
+        raw_points = load_dataset(f, args.index, "points", datasets)
         points, colors = colors_for_points(raw_points)
         detail = ""
       case _:
