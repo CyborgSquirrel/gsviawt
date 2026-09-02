@@ -3,7 +3,7 @@
 
 Usage:
     pip install objaverse
-    python scripts/download_objaverse_sketchfab.py --count 500 --out-dir ./objaverse_meshes
+    python scripts/download_objaverse_sketchfab.py --count 500
 """
 
 import argparse
@@ -13,11 +13,13 @@ from pathlib import Path
 
 import objaverse
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--count", type=int, default=500, help="number of meshes to download")
-    parser.add_argument("--out-dir", type=Path, default=Path("objaverse_meshes"), help="directory to copy the downloaded .glb files into")
+    parser.add_argument("--out-dir", type=Path, default=REPO_ROOT / "data", help="directory to copy the downloaded .glb files into")
     parser.add_argument("--processes", type=int, default=multiprocessing.cpu_count(), help="parallel download processes")
     return parser.parse_args()
 
