@@ -1,0 +1,3 @@
+_target_: mesh_strategy.ListMeshes
+paths:
+  - /app/data/objaverse/hf-objaverse-v1/glbs/000-147/405f47d6ce6d481d94f54800ee913fa4.glb

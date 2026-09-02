@@ -1,5 +1,6 @@
 defaults:
   - view_strategy: turntable
+  - mesh_strategy: list
   - _self_
 
 # Whether to capture the RGB image pass (adds an "images" dataset). Depth
@@ -10,9 +11,6 @@ output_path: /app/bla/renders.h5
 width: 504
 height: 504
 max_peel_layers: 6
-
-meshes:
-  - /app/data/objaverse/hf-objaverse-v1/glbs/000-147/405f47d6ce6d481d94f54800ee913fa4.glb
 
 hydra:
   job:

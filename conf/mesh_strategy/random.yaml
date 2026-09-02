@@ -1,0 +1,4 @@
+_target_: mesh_strategy.RandomMeshes
+pattern: /app/data/objaverse/hf-objaverse-v1/glbs/*/*.glb
+n: 10
+seed: 0
