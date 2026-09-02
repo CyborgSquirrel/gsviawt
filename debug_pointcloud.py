@@ -12,7 +12,7 @@ Two formats (-f/--format):
 
 Each input (image/depth/intrinsics/pose/points) is read from `hdf5_path` at
 its default dataset name unless overridden with the matching flag, given as
-either "path.h5" (same dataset name, different file) or "path.h5:dataset".
+a different dataset name within that same file.
 """
 
 from argparse import ArgumentParser
@@ -31,16 +31,11 @@ DEFAULT_DATASETS = {
 }
 
 
-def load_dataset(hdf5_path, index, kind, override):
-  """Load one view's array for `kind`, either from `hdf5_path` at the
-  default dataset name, or from `override` ("path.h5" or "path.h5:dataset")
-  if given."""
-  path, dataset = hdf5_path, DEFAULT_DATASETS[kind]
-  if override is not None:
-    path, _, ds = override.partition(":")
-    dataset = ds or dataset
-  with h5py.File(path, "r") as f:
-    return f[dataset][index]
+def load_dataset(f, index, kind, override):
+  """Load one view's array for `kind` from the open HDF5 file `f`, at
+  `override` if given, otherwise at its default dataset name."""
+  dataset = override or DEFAULT_DATASETS[kind]
+  return f[dataset][index]
 
 
 def unproject_depth_peel(depth_peel, intrinsics, pose):
@@ -121,27 +116,31 @@ def main():
     help="depth: unproject a depth-peel layer stack (default); "
     "points: re-export a flat point cloud dataset")
   parser.add_argument("-o", "--out", default=None, help="Output .glb path (default: <hdf5>.view<index>.glb)")
-  parser.add_argument("--image", default=None, metavar="PATH[:DATASET]", help="Override the RGB image source (default dataset: images)")
-  parser.add_argument("--depth", default=None, metavar="PATH[:DATASET]", help="Override the depth-peel source (default dataset: depth_peel)")
-  parser.add_argument("--intrinsics", default=None, metavar="PATH[:DATASET]", help="Override the camera intrinsics source (default dataset: camera_intrinsics)")
-  parser.add_argument("--pose", default=None, metavar="PATH[:DATASET]", help="Override the camera pose source (default dataset: camera_pose)")
-  parser.add_argument("--points", default=None, metavar="PATH[:DATASET]", help="Override the raw point cloud source (default dataset: points)")
+  parser.add_argument("--image", default=None, metavar="DATASET", help="Override the RGB image dataset name (default: images)")
+  parser.add_argument("--depth", default=None, metavar="DATASET", help="Override the depth-peel dataset name (default: depth_peel)")
+  parser.add_argument("--intrinsics", default=None, metavar="DATASET", help="Override the camera intrinsics dataset name (default: camera_intrinsics)")
+  parser.add_argument("--pose", default=None, metavar="DATASET", help="Override the camera pose dataset name (default: camera_pose)")
+  parser.add_argument("--points", default=None, metavar="DATASET", help="Override the raw point cloud dataset name (default: points)")
   args = parser.parse_args()
 
-  if args.format == "depth":
-    image = load_dataset(args.hdf5_path, args.index, "image", args.image)
-    depth_peel = load_dataset(args.hdf5_path, args.index, "depth", args.depth)
-    intrinsics = load_dataset(args.hdf5_path, args.index, "intrinsics", args.intrinsics)
-    pose = load_dataset(args.hdf5_path, args.index, "pose", args.pose)
+  with h5py.File(args.hdf5_path, "r") as f:
+    match args.format:
+      case "depth":
+        image = load_dataset(f, args.index, "image", args.image)
+        depth_peel = load_dataset(f, args.index, "depth", args.depth)
+        intrinsics = load_dataset(f, args.index, "intrinsics", args.intrinsics)
+        pose = load_dataset(f, args.index, "pose", args.pose)
 
-    max_layers = depth_peel.shape[2]
-    points, u, v, layer_idx = unproject_depth_peel(depth_peel, intrinsics, pose)
-    colors = colors_for(image, u, v, layer_idx, max_layers)
-    detail = f" ({(layer_idx == 0).sum()} surface)"
-  else:
-    raw_points = load_dataset(args.hdf5_path, args.index, "points", args.points)
-    points, colors = colors_for_points(raw_points)
-    detail = ""
+        max_layers = depth_peel.shape[2]
+        points, u, v, layer_idx = unproject_depth_peel(depth_peel, intrinsics, pose)
+        colors = colors_for(image, u, v, layer_idx, max_layers)
+        detail = f" ({(layer_idx == 0).sum()} surface)"
+      case "points":
+        raw_points = load_dataset(f, args.index, "points", args.points)
+        points, colors = colors_for_points(raw_points)
+        detail = ""
+      case _:
+        raise ValueError(f"Unknown format: {args.format!r}")
 
   point_cloud = trimesh.points.PointCloud(points, colors=colors)
 
