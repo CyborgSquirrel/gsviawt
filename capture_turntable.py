@@ -95,7 +95,9 @@ def main(cfg: DictConfig):
         hf.attrs["config_json"] = json.dumps(OmegaConf.to_container(cfg, resolve=True))
         hf.create_dataset("mesh_paths", data=list(cfg.meshes), dtype=h5py.string_dtype(encoding="utf-8"))
 
-        images_ds   = stack.enter_context(LazyDataset(hf, "images", dataset_kwargs=image_kwargs))
+        images_ds = None
+        if cfg.render:
+          images_ds = stack.enter_context(LazyDataset(hf, "images", dataset_kwargs=image_kwargs))
         pose_ds     = stack.enter_context(LazyDataset(hf, "camera_pose"))
         intr_ds     = stack.enter_context(LazyDataset(hf, "camera_intrinsics"))
         depth_ds    = stack.enter_context(LazyDataset(hf, "depth_peel", dataset_kwargs=depth_kwargs))
@@ -110,13 +112,16 @@ def main(cfg: DictConfig):
             result = conn.root.render(
               width=cfg.width, height=cfg.height, path=tmp_path, view_dir=view_dir,
               max_layers=cfg.max_peel_layers, depth_path=tmp_depth_path,
+              capture_rgb=cfg.render,
             )
-            image = np.asarray(Image.open(tmp_path).convert("RGB"), dtype=np.uint8)
             depth_volume = np.load(tmp_depth_path)
-            os.remove(tmp_path)
             os.remove(tmp_depth_path)
 
-            images_ds.append(image)
+            if cfg.render:
+              image = np.asarray(Image.open(tmp_path).convert("RGB"), dtype=np.uint8)
+              os.remove(tmp_path)
+              images_ds.append(image)
+
             pose_ds.append(np.array(result["pose_matrix"], dtype=np.float32))
             intr_ds.append(np.array(result["intrinsics_matrix"], dtype=np.float32))
             depth_ds.append(depth_volume)

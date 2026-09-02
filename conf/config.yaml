@@ -2,6 +2,10 @@ defaults:
   - view_strategy: turntable
   - _self_
 
+# Whether to capture the RGB image pass (adds an "images" dataset). Depth
+# peel, camera pose, and intrinsics are captured either way.
+render: true
+
 output_path: /app/bla/renders.h5
 width: 504
 height: 504

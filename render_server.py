@@ -291,6 +291,7 @@ class Service(rpyc.Service):
     view_dir,
     max_layers: int,
     depth_path: str,
+    capture_rgb: bool = True,
   ):
     scene = bpy.context.scene
 
@@ -298,12 +299,13 @@ class Service(rpyc.Service):
     scene.render.engine = "CYCLES"  # or "BLENDER_EEVEE_NEXT"
     scene.render.resolution_x = width
     scene.render.resolution_y = height
-    scene.render.filepath = path
 
     frame_object_robust(self.obj, scene.camera, scene, view_dir=view_dir)
 
-    # Render a single frame (real materials, normal quality)
-    bpy.ops.render.render(write_still=True)
+    if capture_rgb:
+      # Render a single frame (real materials, normal quality)
+      scene.render.filepath = path
+      bpy.ops.render.render(write_still=True)
 
     pose_matrix = [list(row) for row in scene.camera.matrix_world]
     intrinsics_matrix = get_camera_intrinsics(scene.camera.data, width, height)
