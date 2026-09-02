@@ -2,11 +2,12 @@
 """Visualize one view of a capture_turntable.py render HDF5 as a colored
 point cloud .glb.
 
-Two formats (-f/--format):
-  depth  (default) -- unproject every depth-peel layer using that view's
-    camera intrinsics/pose, color the surface layer (layer 0) from the RGB
-    image, and color deeper layers with a white -> red gradient by layer
-    index.
+Three formats (-f/--format):
+  auto   (default) -- detect depth vs. points from which dataset is present
+    in the file (error if both or neither are).
+  depth  -- unproject every depth-peel layer using that view's camera
+    intrinsics/pose, color the surface layer (layer 0) from the RGB image,
+    and color deeper layers with a white -> red gradient by layer index.
   points -- re-export an existing flat point cloud dataset ((N, 3) XYZ, or
     (N, 6) XYZRGB) straight to .glb, no unprojection.
 
@@ -31,11 +32,31 @@ DEFAULT_DATASETS = {
 }
 
 
+def dataset_name(kind, override):
+  return override or DEFAULT_DATASETS[kind]
+
+
 def load_dataset(f, index, kind, override):
   """Load one view's array for `kind` from the open HDF5 file `f`, at
   `override` if given, otherwise at its default dataset name."""
-  dataset = override or DEFAULT_DATASETS[kind]
-  return f[dataset][index]
+  return f[dataset_name(kind, override)][index]
+
+
+def detect_format(f, depth_override, points_override):
+  """Pick "depth" or "points" based on which of the two dataset names is
+  present in the open HDF5 file `f`; error if both or neither are."""
+  has_depth = dataset_name("depth", depth_override) in f
+  has_points = dataset_name("points", points_override) in f
+  match (has_depth, has_points):
+    case (True, False):
+      return "depth"
+    case (False, True):
+      return "points"
+    case _:
+      raise ValueError(
+        f"Cannot auto-detect format: depth dataset present={has_depth}, "
+        f"points dataset present={has_points} (need exactly one); pass "
+        "-f/--format explicitly")
 
 
 def unproject_depth_peel(depth_peel, intrinsics, pose, space):
@@ -123,8 +144,9 @@ def main():
   parser.add_argument("hdf5_path", help="Default HDF5 source for any input not overridden below")
   parser.add_argument("index", type=int)
   parser.add_argument(
-    "-f", "--format", choices=["depth", "points"], default="depth",
-    help="depth: unproject a depth-peel layer stack (default); "
+    "-f", "--format", choices=["auto", "depth", "points"], default="auto",
+    help="auto: detect from which dataset is present (default); "
+    "depth: unproject a depth-peel layer stack; "
     "points: re-export a flat point cloud dataset")
   parser.add_argument(
     "-s", "--space", choices=["world", "camera"], default=None,
@@ -139,7 +161,11 @@ def main():
   args = parser.parse_args()
 
   with h5py.File(args.hdf5_path, "r") as f:
-    match args.format:
+    fmt = args.format
+    if fmt == "auto":
+      fmt = detect_format(f, args.depth, args.points)
+
+    match fmt:
       case "depth":
         if args.space is None:
           raise ValueError("-s/--space (world or camera) is required for -f depth")
@@ -161,7 +187,7 @@ def main():
         points, colors = colors_for_points(raw_points)
         detail = ""
       case _:
-        raise ValueError(f"Unknown format: {args.format!r}")
+        raise ValueError(f"Unknown format: {fmt!r}")
 
   point_cloud = trimesh.points.PointCloud(points, colors=colors)
 
