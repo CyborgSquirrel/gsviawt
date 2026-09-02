@@ -38,15 +38,19 @@ def load_dataset(f, index, kind, override):
   return f[dataset][index]
 
 
-def unproject_depth_peel(depth_peel, intrinsics, pose):
+def unproject_depth_peel(depth_peel, intrinsics, pose, space):
   """depth_peel: (H, W, L) float32, -1.0 marks no hit.
   intrinsics: (3, 3) pinhole K matrix (pixel row 0 = top, standard
     computer-vision convention: u right, v down, cx/cy in pixel units).
   pose: (4, 4) camera-to-world matrix (Blender camera-local axes: +X
     right, +Y up, -Z forward -- glTF/OpenGL convention, not OpenCV).
+  space: "camera" to return points_cv as-is (OpenCV convention: X right,
+    Y down, Z forward -- the frame World Tracing itself predicts in, see
+    wt_infer_layers.py), or "world" to additionally flip into Blender's
+    camera-local axes and apply `pose`.
 
-  Returns (points_world, u, v, layer_idx), each length N (one entry per
-  hit), where points_world is (N, 3).
+  Returns (points, u, v, layer_idx), each length N (one entry per hit),
+  where points is (N, 3) in the requested space.
   """
   height, width, max_layers = depth_peel.shape
   v_idx, u_idx, l_idx = np.meshgrid(
@@ -60,16 +64,23 @@ def unproject_depth_peel(depth_peel, intrinsics, pose):
 
   # K^-1 maps homogeneous pixel coords to a ray in OpenCV-style camera space
   # (X right, Y down, Z forward) at unit depth; scale by depth to place the
-  # point, then flip Y/Z into Blender's actual camera-local axes (X right,
-  # Y up, Z backward) before applying `pose`.
+  # point.
   pixels_h = np.stack([u, v, np.ones_like(u)], axis=1)
   rays_cv = pixels_h @ np.linalg.inv(intrinsics).T
   points_cv = rays_cv * depth[:, None]
 
-  local = np.concatenate([points_cv * [1, -1, -1], np.ones_like(depth[:, None])], axis=1)
-  points_world = (local @ pose.T)[:, :3]
+  match space:
+    case "camera":
+      points = points_cv
+    case "world":
+      # Flip Y/Z into Blender's actual camera-local axes (X right, Y up,
+      # Z backward) before applying `pose`.
+      local = np.concatenate([points_cv * [1, -1, -1], np.ones_like(depth[:, None])], axis=1)
+      points = (local @ pose.T)[:, :3]
+    case _:
+      raise ValueError(f"Unknown space: {space!r}")
 
-  return points_world, u.astype(np.int64), v.astype(np.int64), layer_idx
+  return points, u.astype(np.int64), v.astype(np.int64), layer_idx
 
 
 def colors_for(image, u, v, layer_idx, max_layers):
@@ -115,6 +126,10 @@ def main():
     "-f", "--format", choices=["depth", "points"], default="depth",
     help="depth: unproject a depth-peel layer stack (default); "
     "points: re-export a flat point cloud dataset")
+  parser.add_argument(
+    "-s", "--space", choices=["world", "camera"], default=None,
+    help="Space to unproject depth-peel points into (required for -f depth, "
+    "invalid for -f points)")
   parser.add_argument("-o", "--out", default=None, help="Output .glb path (default: <hdf5>.view<index>.glb)")
   parser.add_argument("--image", default=None, metavar="DATASET", help="Override the RGB image dataset name (default: images)")
   parser.add_argument("--depth", default=None, metavar="DATASET", help="Override the depth-peel dataset name (default: depth_peel)")
@@ -126,16 +141,22 @@ def main():
   with h5py.File(args.hdf5_path, "r") as f:
     match args.format:
       case "depth":
+        if args.space is None:
+          raise ValueError("-s/--space (world or camera) is required for -f depth")
+
         image = load_dataset(f, args.index, "image", args.image)
         depth_peel = load_dataset(f, args.index, "depth", args.depth)
         intrinsics = load_dataset(f, args.index, "intrinsics", args.intrinsics)
         pose = load_dataset(f, args.index, "pose", args.pose)
 
         max_layers = depth_peel.shape[2]
-        points, u, v, layer_idx = unproject_depth_peel(depth_peel, intrinsics, pose)
+        points, u, v, layer_idx = unproject_depth_peel(depth_peel, intrinsics, pose, args.space)
         colors = colors_for(image, u, v, layer_idx, max_layers)
         detail = f" ({(layer_idx == 0).sum()} surface)"
       case "points":
+        if args.space is not None:
+          raise ValueError("-s/--space is not valid for -f points")
+
         raw_points = load_dataset(f, args.index, "points", args.points)
         points, colors = colors_for_points(raw_points)
         detail = ""
