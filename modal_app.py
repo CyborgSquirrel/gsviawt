@@ -9,14 +9,14 @@ uv-managed venv, same `wt` package).
 
 Caching mirrors docker-compose.yml's volume layout, just backed by Modal
 Volumes instead of bind mounts:
-  - mounts/huggingface:/home/user/.cache/huggingface -> "wt-hf-cache" volume
+  - mounts/huggingface:/home/user/.cache/huggingface -> "hf-cache" volume
     (checkpoint.py's build_model_and_load_ckpt uses hf_hub_download with the
     default cache dir, so this is a drop-in cache for model weights)
-  - mounts/objaverse:/home/user/.objaverse -> "wt-objaverse-cache" volume.
+  - mounts/objaverse:/home/user/.objaverse -> "objaverse-cache" volume.
     The target mesh is fetched lazily via objaverse.xl (same API
     scripts/download_objaverse_sketchfab.py uses), which downloads straight
     into ~/.objaverse/hf-objaverse-v1/glbs/<uid_prefix>/<uid>.glb.
-  - render + inference output (renders.h5, *.wt.h5) -> "wt-outputs" volume
+  - render + inference output (renders.h5, *.wt.h5) -> "outputs" volume
     mounted at /app/bla, matching conf/config.yaml's output_path default.
 
 conf/mesh_strategy/list.yaml hardcodes a /app/data/... mesh path that this
@@ -44,9 +44,9 @@ image = modal.Image.from_dockerfile(
   build_args={"XUID": "1000", "XGID": "1000"},
 )
 
-hf_cache_volume = modal.Volume.from_name("wt-hf-cache", create_if_missing=True)
-objaverse_volume = modal.Volume.from_name("wt-objaverse-cache", create_if_missing=True)
-outputs_volume = modal.Volume.from_name("wt-outputs", create_if_missing=True)
+hf_cache_volume = modal.Volume.from_name("hf-cache", create_if_missing=True)
+objaverse_volume = modal.Volume.from_name("objaverse-cache", create_if_missing=True)
+outputs_volume = modal.Volume.from_name("outputs", create_if_missing=True)
 
 
 def _download_mesh(uid: str) -> str:
