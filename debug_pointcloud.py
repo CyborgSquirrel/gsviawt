@@ -17,9 +17,11 @@ Each input (image/depth/intrinsics/pose/points) is read from `hdf5_path` at
 its default dataset name unless overridden with the matching flag, given as
 a different dataset name within that same file.
 
-The output .glb holds a "points" root node with one child node per layer
-index ("layer0", "layer1", ...), so a viewer can toggle depth-peel/point
-layers on and off individually instead of seeing one flat merged cloud.
+Output format (-e/--export-format):
+  glb (default) -- a "points" root node with one child node per layer index
+    ("layer0", "layer1", ...), so a viewer can toggle layers individually.
+  ply -- every layer merged into a single flat point cloud (the format has
+    no scene graph, so there is nothing to attach separate layer nodes to).
 """
 
 from argparse import ArgumentParser
@@ -150,7 +152,12 @@ def main():
     "-s", "--space", choices=["world", "camera"], default=None,
     help="Space to unproject depth-peel points into (required for -f depth, "
     "invalid for -f points)")
-  parser.add_argument("-o", "--out", default=None, help="Output .glb path (default: <hdf5>.view<index>.glb)")
+  parser.add_argument(
+    "-e", "--export-format", choices=["glb", "ply"], default="glb",
+    help="glb: one scene node per layer under a \"points\" root (default); "
+    "ply: merge every layer into a single flat point cloud (ply has no "
+    "scene graph)")
+  parser.add_argument("-o", "--out", default=None, help="Output path (default: <hdf5>.view<index>.<export-format>)")
   parser.add_argument("--image", default=None, metavar="DATASET", help="Override the RGB image dataset name (default: images)")
   parser.add_argument("--depth", default=None, metavar="DATASET", help="Override the depth-peel dataset name (default: depth_peel)")
   parser.add_argument("--intrinsics", default=None, metavar="DATASET", help="Override the camera intrinsics dataset name (default: camera_intrinsics)")
@@ -197,17 +204,25 @@ def main():
       case _:
         raise ValueError(f"Unknown format: {fmt!r}")
 
-  scene = trimesh.Scene()
-  scene.graph.update(frame_to="points", frame_from=scene.graph.base_frame, matrix=np.eye(4))
-  layers = np.unique(layer_idx)
-  for layer in layers:
-    mask = layer_idx == layer
-    point_cloud = trimesh.points.PointCloud(points[mask], colors=colors[mask])
-    scene.add_geometry(point_cloud, node_name=f"layer{layer}", parent_node_name="points")
+  out_path = args.out or f"{args.hdf5_path}.view{args.index}.{args.export_format}"
 
-  out_path = args.out or f"{args.hdf5_path}.view{args.index}.glb"
-  scene.export(out_path)
-  print(f"Wrote {len(points)}{detail} points across {len(layers)} layers to {out_path}")
+  match args.export_format:
+    case "glb":
+      scene = trimesh.Scene()
+      scene.graph.update(frame_to="points", frame_from=scene.graph.base_frame, matrix=np.eye(4))
+      layers = np.unique(layer_idx)
+      for layer in layers:
+        mask = layer_idx == layer
+        point_cloud = trimesh.points.PointCloud(points[mask], colors=colors[mask])
+        scene.add_geometry(point_cloud, node_name=f"layer{layer}", parent_node_name="points")
+      scene.export(out_path)
+      print(f"Wrote {len(points)}{detail} points across {len(layers)} layers to {out_path}")
+    case "ply":
+      point_cloud = trimesh.points.PointCloud(points, colors=colors)
+      point_cloud.export(out_path)
+      print(f"Wrote {len(points)}{detail} points to {out_path}")
+    case _:
+      raise ValueError(f"Unknown export format: {args.export_format!r}")
 
 
 if __name__ == "__main__":
