@@ -6,6 +6,7 @@ a configurable set of meshes. Configured via Hydra -- see conf/config.yaml.
 
 import contextlib as ctl
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -57,6 +58,8 @@ def wait_for_socket(path, timeout=60):
 def main(cfg: DictConfig):
   global _proc
 
+  logging.basicConfig(level=logging.INFO)
+
   signal.signal(signal.SIGINT, _signal_handler)
   signal.signal(signal.SIGTERM, _signal_handler)
 
@@ -67,7 +70,8 @@ def main(cfg: DictConfig):
 
   args = [BLENDER_BIN, "--background", "--python", RENDER_SCRIPT, "--", SOCKET_PATH]
 
-  _proc = subprocess.Popen(args)
+  # _proc = subprocess.Popen(args)
+  _proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
   try:
     wait_for_socket(SOCKET_PATH)
