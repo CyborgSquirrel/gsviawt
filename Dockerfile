@@ -180,7 +180,7 @@ ENV PATH="/home/user/venv/bin:$PATH"
 # Install world tracing's dependencies only (no source yet, so nothing to
 # build/register as editable). Cache-friendly: this layer only depends on
 # pyproject.toml, so unrelated source edits don't invalidate it.
-COPY --chown=$XUID:$XGID world-tracing/pyproject.toml world-tracing/pyproject.toml
+COPY world-tracing/pyproject.toml world-tracing/pyproject.toml
 RUN \
   --mount=type=cache,uid=$XUID,gid=$XGID,dst=$UV_PYTHON_CACHE_DIR,id=uv \
 <<EOF
@@ -190,7 +190,7 @@ RUN \
 EOF
 
 # Install other packages
-COPY --chown=$XUID:$XGID requirements.txt requirements.txt
+COPY requirements.txt requirements.txt
 RUN \
   --mount=type=cache,uid=$XUID,gid=$XGID,dst=$UV_PYTHON_CACHE_DIR,id=uv \
 <<EOF
@@ -199,8 +199,12 @@ RUN \
 EOF
 
 # Copy everything (this is the only place world-tracing's actual source
-# lands in the image)
-COPY --chown=$XUID:$XGID . .
+# lands in the image). No --chown=$XUID:$XGID here (or above): Modal's
+# Dockerfile builder rejects COPY --chown with a variable instead of a
+# literal, and it's a no-op for docker-compose anyway since app-base bind-
+# mounts the host repo over /app at container start, replacing whatever
+# ownership the image layer has.
+COPY . .
 
 # Register world tracing itself now that its source exists. Cheap: all of
 # its dependencies were already installed above, so this just builds/links
