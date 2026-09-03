@@ -17,9 +17,9 @@ Each input (image/depth/intrinsics/pose/points) is read from `hdf5_path` at
 its default dataset name unless overridden with the matching flag, given as
 a different dataset name within that same file.
 
-The output .glb holds one scene node per layer index ("layer0", "layer1",
-...), so a viewer can toggle depth-peel/point layers on and off individually
-instead of seeing one flat merged cloud.
+The output .glb holds a "points" root node with one child node per layer
+index ("layer0", "layer1", ...), so a viewer can toggle depth-peel/point
+layers on and off individually instead of seeing one flat merged cloud.
 """
 
 from argparse import ArgumentParser
@@ -198,11 +198,12 @@ def main():
         raise ValueError(f"Unknown format: {fmt!r}")
 
   scene = trimesh.Scene()
+  scene.graph.update(frame_to="points", frame_from=scene.graph.base_frame, matrix=np.eye(4))
   layers = np.unique(layer_idx)
   for layer in layers:
     mask = layer_idx == layer
     point_cloud = trimesh.points.PointCloud(points[mask], colors=colors[mask])
-    scene.add_geometry(point_cloud, node_name=f"layer{layer}")
+    scene.add_geometry(point_cloud, node_name=f"layer{layer}", parent_node_name="points")
 
   out_path = args.out or f"{args.hdf5_path}.view{args.index}.glb"
   scene.export(out_path)
