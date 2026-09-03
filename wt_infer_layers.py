@@ -28,13 +28,18 @@ intermediate inside debug_pointcloud.py's `unproject_depth_peel`, i.e.
 against that, not the world-space output debug_pointcloud.py writes by
 default.
 
-Also note `preprocess_rgba_for_model` re-centers/rescales the object to
-fill ~2/3 of the model's square input canvas (matching its Objaverse
-training data), regardless of how tightly the Blender camera already
-framed it (frame_object_robust uses a 5% margin, i.e. ~full-frame). So
-don't expect pixel-for-pixel alignment with the raw render -- compare
-overall shape/scale/extent, or solve for a similarity transform if you
-need per-pixel error.
+`preprocess_rgba_for_model` can additionally re-center/rescale the
+object to fill ~2/3 of the model's square input canvas via
+`compute_object_crop`, matching its Objaverse training data -- but
+that's now off by default here (`--center-crop` to re-enable) since
+render_server.py's frame_object_robust already frames renders at
+max_object_ratio=2/3 with silhouette recentering, so the raw render
+should already be close to that distribution without an extra re-crop
+moving pixels around. If you turn `--center-crop` on (e.g. for input
+images that weren't rendered by our own pipeline), don't expect
+pixel-for-pixel alignment with the raw render -- compare overall
+shape/scale/extent, or solve for a similarity transform if you need
+per-pixel error.
 
 Usage
 -----
@@ -69,12 +74,24 @@ def main():
   parser.add_argument("--seed", type=int, default=42)
   parser.add_argument("--num-steps", type=int, default=None, help="Override the config's default sampler steps")
   parser.add_argument("--out", default=None, help="Output .h5 path (default: <hdf5>.view<index>.wt.h5)")
-  # Preprocessing knobs mirrored 1:1 from examples/infer_rgba.py's CLI
-  # (wt.cli.add_common_args) so this matches "their procedure" exactly
-  # instead of silently drifting from preprocess_rgba_for_model's own
-  # (different!) defaults.
+  # Preprocessing knobs mirrored from examples/infer_rgba.py's CLI
+  # (wt.cli.add_common_args) so this matches "their procedure" instead
+  # of silently drifting from preprocess_rgba_for_model's own
+  # (different!) defaults -- except --center-crop, deliberately off by
+  # default here (see its help text).
   parser.add_argument("--alpha-erode", type=int, default=0)
-  parser.add_argument("--no-center-crop", action="store_true")
+  parser.add_argument(
+    "--center-crop", action="store_true",
+    help=(
+      "Apply wt's inference-time object-centering re-crop "
+      "(preprocess_rgba_for_model's compute_object_crop). Off by "
+      "default: since render_server.py's frame_object_robust now fits "
+      "framing to real vertices at max_object_ratio=2/3 with silhouette "
+      "recentering, the render should already land close to wt's "
+      "training distribution, so this re-crop would mostly just move "
+      "pixels around and break the correspondence to the raw render."
+    ),
+  )
   parser.add_argument("--bg-color", type=str, default="128,128,128")
   parser.add_argument(
     "--bf16-weights-hack", action="store_true", default=False,
@@ -125,7 +142,7 @@ def main():
     image_size=cfg["image_size"],
     num_layers=cfg["model_kwargs"]["num_layers"],
     alpha_erode_px=args.alpha_erode,
-    center_crop=not args.no_center_crop,
+    center_crop=args.center_crop,
     bg_color=bg_color,
   )
   rgb_t, mask_t, intr_t = rgb_t.to(device), mask_t.to(device), intr_t.to(device)
