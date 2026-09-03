@@ -7,6 +7,10 @@ defaults:
 # peel, camera pose, and intrinsics are captured either way.
 render: true
 
+# Cycles compute device: "auto" (try GPU, fall back to CPU), "gpu" (require
+# GPU), or "cpu" (force CPU).
+device: auto
+
 output_path: /app/bla/renders.h5
 width: 504
 height: 504

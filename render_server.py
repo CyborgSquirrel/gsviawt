@@ -8,6 +8,7 @@ def _head():
 _head(); del _head
 
 import contextlib as ctl
+import logging
 import math
 import os
 import sys
@@ -18,6 +19,8 @@ import mathutils
 import numpy as np
 import rpyc
 from rpyc.utils.server import ThreadPoolServer
+
+logger = logging.getLogger(__name__)
 
 
 def get_mesh_objects(root_obj):
@@ -252,6 +255,62 @@ def setup_depth_compositor(scene, view_layer):
   return rl, composite
 
 class Service(rpyc.Service):
+  def init(self, device: str = "auto"):
+    """Configure which Cycles compute device to render with.
+
+    device: "auto" (try GPU, fall back to CPU), "gpu" (require GPU, raise if
+    none is found), or "cpu" (force CPU).
+    """
+    if device not in ("auto", "gpu", "cpu"):
+      raise ValueError(f"Unknown device {device!r}; expected 'auto', 'gpu', or 'cpu'")
+
+    if device in ("auto", "gpu"):
+      backend, gpu_devices = self._enable_gpu_devices()
+      if backend is not None:
+        bpy.context.scene.cycles.device = "GPU"
+        logger.info(
+          "device=%r: rendering on GPU (backend=%s, devices=%s)",
+          device, backend, [d.name for d in gpu_devices],
+        )
+        return
+
+    if device in ("auto", "cpu"):
+      bpy.context.scene.cycles.device = "CPU"
+      logger.info("device=%r: rendering on CPU", device)
+      return
+
+    raise RuntimeError(f"Requested {device!r}, but no compatible device found")
+
+  def _enable_gpu_devices(self):
+    """Try to select a GPU backend for Cycles, preferring OptiX (uses RT
+    cores for BVH/ray-triangle intersection, faster on RTX-class hardware)
+    and falling back to CUDA (works on GPUs without RT cores, e.g. A100).
+
+    Enables only the matched backend's GPU device(s) -- not CPU -- so
+    device="gpu"/"auto" runs purely on GPU rather than a CPU+GPU hybrid.
+
+    Returns (backend_name, enabled_devices), or (None, []) if neither
+    backend has a usable device.
+    """
+    prefs = bpy.context.preferences.addons["cycles"].preferences
+    for backend in ("OPTIX", "CUDA"):
+      try:
+        prefs.compute_device_type = backend
+        prefs.get_devices()
+      except Exception as exc:
+        logger.warning("Could not query %s devices: %s", backend, exc)
+        continue
+
+      gpu_devices = [d for d in prefs.devices if d.type == backend]
+      if not gpu_devices:
+        continue
+
+      for d in prefs.devices:
+        d.use = d.type == backend
+      return backend, gpu_devices
+
+    return None, []
+
   def reset(self, path: str):
     # Remove all default objects (Cube, Camera, Light)
     for obj in list(bpy.data.objects):
@@ -452,6 +511,8 @@ class Service(rpyc.Service):
       bpy.data.images.remove(img)
 
 def main():
+  logging.basicConfig(level=logging.INFO, format="[render_server] %(levelname)s %(message)s")
+
   sep_idx = sys.argv.index("--")
   if sep_idx == -1:
     raise RuntimeError("Missing command-line args separator")

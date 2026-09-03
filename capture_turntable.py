@@ -74,6 +74,8 @@ def main(cfg: DictConfig):
 
     conn = unix_connect(SOCKET_PATH, config={"sync_request_timeout": 600})
     try:
+      conn.root.init(device=cfg.device)
+
       view_strategy = hydra.utils.instantiate(cfg.view_strategy)
       meshes = hydra.utils.instantiate(cfg.mesh_strategy).meshes()
 

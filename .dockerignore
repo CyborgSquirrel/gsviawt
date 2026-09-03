@@ -3,10 +3,13 @@
 .gitignore
 
 # Python
-__pycache__
-*.py[cod]
-*$py.class
-*.so
+# NOTE: bare patterns like these only match at the context root, not
+# nested dirs (.dockerignore is not gitignore-style anywhere-matching) —
+# use **/ to actually match at any depth.
+**/__pycache__
+**/*.py[cod]
+**/*$py.class
+**/*.so
 .Python
 env/
 venv/
@@ -33,6 +36,8 @@ docker-compose*.yml
 
 # Large example/test assets not needed at runtime
 world-tracing/examples/test_images
+world-tracing/data
+world-tracing/out
 
 # IDE
 .vscode
