@@ -1,0 +1,3 @@
+_target_: view_strategy.Turntable
+tilts_deg: [15]
+num_azi: 4
