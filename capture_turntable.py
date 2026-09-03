@@ -20,7 +20,7 @@ from omegaconf import DictConfig, OmegaConf
 from PIL import Image
 from rpyc.utils.factory import unix_connect
 
-from util import LazyDataset
+from util import LazyDataset, timed
 
 BLENDER_BIN = "/opt/blender/blender"
 RENDER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "render_server.py")
@@ -112,23 +112,34 @@ def main(cfg: DictConfig):
           for tilt_deg, azimuth_deg, view_dir in view_strategy.views():
             tmp_path = os.path.join(tmp_dir, "output.png")
             tmp_depth_path = os.path.join(tmp_dir, "depth.npy")
-            result = conn.root.render(
-              width=cfg.width, height=cfg.height, path=tmp_path, view_dir=view_dir,
-              max_layers=cfg.max_peel_layers, depth_path=tmp_depth_path,
-              capture_rgb=cfg.render,
-            )
-            depth_volume = np.load(tmp_depth_path)
-            os.remove(tmp_depth_path)
+            view_label = f"mesh={mesh_idx} tilt={tilt_deg:.1f} az={azimuth_deg:.1f}"
+
+            with timed(f"{view_label} rpyc_render"):
+              result = conn.root.render(
+                width=cfg.width, height=cfg.height, path=tmp_path, view_dir=view_dir,
+                max_layers=cfg.max_peel_layers, depth_path=tmp_depth_path,
+                capture_rgb=cfg.render,
+              )
+
+            with timed(f"{view_label} depth_load"):
+              depth_volume = np.load(tmp_depth_path)
+              os.remove(tmp_depth_path)
 
             if cfg.render:
-              image = np.asarray(Image.open(tmp_path).convert("RGB"), dtype=np.uint8)
-              os.remove(tmp_path)
-              images_ds.append(image)
+              with timed(f"{view_label} image_decode"):
+                image = np.asarray(Image.open(tmp_path).convert("RGB"), dtype=np.uint8)
+                os.remove(tmp_path)
 
-            pose_ds.append(np.array(result["pose_matrix"], dtype=np.float32))
-            intr_ds.append(np.array(result["intrinsics_matrix"], dtype=np.float32))
-            depth_ds.append(depth_volume)
-            mesh_idx_ds.append(np.int64(mesh_idx))
+              with timed(f"{view_label} image_write"):
+                images_ds.append(image)
+
+            with timed(f"{view_label} depth_write"):
+              depth_ds.append(depth_volume)
+
+            with timed(f"{view_label} other_write"):
+              pose_ds.append(np.array(result["pose_matrix"], dtype=np.float32))
+              intr_ds.append(np.array(result["intrinsics_matrix"], dtype=np.float32))
+              mesh_idx_ds.append(np.int64(mesh_idx))
     finally:
       conn.close()
   finally:

@@ -1,9 +1,24 @@
+import contextlib as ctl
 import logging
+import time
 
 import numpy as np
 import h5py
 
 log = logging.getLogger(__name__)
+
+
+@ctl.contextmanager
+def timed(label: str):
+  """Logs the wall-clock time of the block immediately when it exits, so a
+  crash mid-block still leaves prior timings on record instead of losing
+  them in an end-of-loop summary.
+  """
+  t0 = time.perf_counter()
+  try:
+    yield
+  finally:
+    log.info("%s: %.3fs", label, time.perf_counter() - t0)
 
 
 class LazyDataset:
