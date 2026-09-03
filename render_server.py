@@ -407,6 +407,21 @@ class Service(rpyc.Service):
 
     # Camera
     cam_data = bpy.data.cameras.new("Camera")
+    # A fresh camera datablock defaults to lens=50mm/sensor_width=36mm
+    # (~39.6deg horizontal FOV), which does NOT match world-tracing's
+    # Objaverse training-data camera (wt/data.py: FIXED_FX=500,
+    # FIXED_CX=256 @512px -> horizontal FOV = 2*atan(256/500) ~= 54.2deg,
+    # matching its README's "~54.7deg" claim). frame_object_robust
+    # auto-distances the camera to hit the same *apparent* on-screen
+    # object size (max_object_ratio) either way, but a narrower FOV needs
+    # a farther camera to do that -- so left at the Blender default, our
+    # renders would be ~42% too far away (tan(54.2/2)/tan(39.6/2)) for
+    # the same real object, silently inflating absolute Z depth relative
+    # to what the model was trained to expect, even though the framing
+    # looks right on screen. Match wt's FOV exactly instead.
+    cam_data.sensor_fit = 'HORIZONTAL'
+    cam_data.lens = 50.0
+    cam_data.sensor_width = cam_data.sensor_height = 2 * cam_data.lens * (256.0 / 500.0)
     cam_obj = bpy.data.objects.new("Camera", cam_data)
     bpy.context.collection.objects.link(cam_obj)
     bpy.context.scene.camera = cam_obj
