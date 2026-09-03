@@ -8,8 +8,10 @@ Three formats (-f/--format):
   depth  -- unproject every depth-peel layer using that view's camera
     intrinsics/pose, color the surface layer (layer 0) from the RGB image,
     and color deeper layers with a white -> red gradient by layer index.
-  points -- re-export an existing flat point cloud dataset ((N, 3) XYZ, or
-    (N, 6) XYZRGB) straight to .glb, no unprojection.
+  points -- take an existing (H, W, L, 3) XYZ point grid (NaN marks an
+    invalid entry; same (H, W, L) layout as depth_peel, see
+    wt_infer_layers.py) and color it from the RGB image exactly like the
+    depth case, no unprojection.
 
 Each input (image/depth/intrinsics/pose/points) is read from `hdf5_path` at
 its default dataset name unless overridden with the matching flag, given as
@@ -111,22 +113,24 @@ def colors_for(image, u, v, layer_idx, max_layers):
   return np.clip(np.concatenate([rgb, alpha], axis=1), 0, 255).astype(np.uint8)
 
 
-def colors_for_points(points):
-  """points: (N, 3) or (N, 6) array; columns 3:6, if present, are RGB (either
-  0-255 or 0-1 float). Returns (xyz (N, 3) float32, colors (N, 4) uint8 RGBA).
+def extract_valid_points(points_grid):
+  """points_grid: (H, W, L, 3) float32 XYZ, NaN in any component marks an
+  invalid entry (mirroring depth_peel's (H, W, L) layout and -1.0 sentinel,
+  but a scalar sentinel can't sit inside real XYZ, hence NaN -- see
+  wt_infer_layers.py). Returns (xyz, u, v, layer_idx), each length N (one
+  entry per valid hit), analogous to unproject_depth_peel's outputs.
   """
-  xyz = np.asarray(points[:, :3], dtype=np.float32)
+  height, width, max_layers, _ = points_grid.shape
+  v_idx, u_idx, l_idx = np.meshgrid(
+    np.arange(height), np.arange(width), np.arange(max_layers), indexing="ij")
 
-  if points.shape[1] >= 6:
-    rgb = np.asarray(points[:, 3:6], dtype=np.float32)
-    if np.issubdtype(points.dtype, np.floating) and rgb.max() <= 1.0:
-      rgb = rgb * 255.0
-    alpha = np.full((rgb.shape[0], 1), 255.0)
-    colors = np.clip(np.concatenate([rgb, alpha], axis=1), 0, 255).astype(np.uint8)
-  else:
-    colors = np.tile(np.array([200, 200, 200, 255], dtype=np.uint8), (xyz.shape[0], 1))
+  hit = ~np.isnan(points_grid).any(axis=-1)
+  xyz = points_grid[hit].astype(np.float32)
+  u = u_idx[hit].astype(np.int64)
+  v = v_idx[hit].astype(np.int64)
+  layer_idx = l_idx[hit]
 
-  return xyz, colors
+  return xyz, u, v, layer_idx
 
 
 def main():
@@ -179,9 +183,13 @@ def main():
         if args.space is not None:
           raise ValueError("-s/--space is not valid for -f points")
 
+        image = f[datasets["image"]][args.index]
         raw_points = f[datasets["points"]][args.index]
-        points, colors = colors_for_points(raw_points)
-        detail = ""
+
+        max_layers = raw_points.shape[2]
+        points, u, v, layer_idx = extract_valid_points(raw_points)
+        colors = colors_for(image, u, v, layer_idx, max_layers)
+        detail = f" ({(layer_idx == 0).sum()} surface)"
       case _:
         raise ValueError(f"Unknown format: {fmt!r}")
 
