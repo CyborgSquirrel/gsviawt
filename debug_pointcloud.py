@@ -16,6 +16,10 @@ Three formats (-f/--format):
 Each input (image/depth/intrinsics/pose/points) is read from `hdf5_path` at
 its default dataset name unless overridden with the matching flag, given as
 a different dataset name within that same file.
+
+The output .glb holds one scene node per layer index ("layer0", "layer1",
+...), so a viewer can toggle depth-peel/point layers on and off individually
+instead of seeing one flat merged cloud.
 """
 
 from argparse import ArgumentParser
@@ -193,11 +197,16 @@ def main():
       case _:
         raise ValueError(f"Unknown format: {fmt!r}")
 
-  point_cloud = trimesh.points.PointCloud(points, colors=colors)
+  scene = trimesh.Scene()
+  layers = np.unique(layer_idx)
+  for layer in layers:
+    mask = layer_idx == layer
+    point_cloud = trimesh.points.PointCloud(points[mask], colors=colors[mask])
+    scene.add_geometry(point_cloud, node_name=f"layer{layer}")
 
   out_path = args.out or f"{args.hdf5_path}.view{args.index}.glb"
-  point_cloud.export(out_path)
-  print(f"Wrote {len(points)}{detail} points to {out_path}")
+  scene.export(out_path)
+  print(f"Wrote {len(points)}{detail} points across {len(layers)} layers to {out_path}")
 
 
 if __name__ == "__main__":
