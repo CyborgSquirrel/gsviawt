@@ -1,5 +1,5 @@
 defaults:
-  - view_strategy: turntable
+  - view_strategy: turntable-lite
   - mesh_strategy: list
   - _self_
 
