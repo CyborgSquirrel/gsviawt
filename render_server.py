@@ -28,6 +28,40 @@ def get_mesh_objects(root_obj):
   mesh_objects += [child for child in root_obj.children_recursive if child.type == 'MESH']
   return mesh_objects
 
+def get_combined_vertices_world(root_obj):
+  """World-space vertex positions (float64 (N, 3) numpy array) across
+  root_obj and all its mesh descendants, evaluated post-modifiers so
+  procedural/subdivided geometry is accounted for.
+
+  Used by frame_object_robust for framing: the 8 AABB-corner
+  approximation it used to use is a poor proxy for the actual projected
+  silhouette on an elongated or obliquely-viewed mesh (the corners of
+  the axis-aligned box can sit far outside the object's true 2D
+  outline), which made the resulting on-screen object size vary
+  unpredictably with view angle instead of hitting a consistent
+  fraction of the frame.
+  """
+  depsgraph = bpy.context.evaluated_depsgraph_get()
+  all_verts = []
+  for obj in get_mesh_objects(root_obj):
+    eval_obj = obj.evaluated_get(depsgraph)
+    mesh = eval_obj.to_mesh()
+    n = len(mesh.vertices)
+    if n == 0:
+      eval_obj.to_mesh_clear()
+      continue
+    co = np.empty(n * 3, dtype=np.float64)
+    mesh.vertices.foreach_get("co", co)
+    co = co.reshape(n, 3)
+    mat = np.array(eval_obj.matrix_world, dtype=np.float64)
+    eval_obj.to_mesh_clear()
+    co_h = np.concatenate([co, np.ones((n, 1))], axis=1)
+    all_verts.append((co_h @ mat.T)[:, :3])
+
+  if not all_verts:
+    return np.zeros((0, 3), dtype=np.float64)
+  return np.concatenate(all_verts, axis=0)
+
 def get_combined_bbox_corners_world(root_obj):
   """World-space bbox corners across root_obj and all its mesh descendants."""
   all_corners = []
@@ -95,19 +129,44 @@ def frame_object_robust(
   cam_obj,
   scene,
   view_dir=None,
-  margin=1.05,
+  max_object_ratio=2.0 / 3.0,
+  recenter_silhouette=True,
 ):
   """
-  Position cam_obj so obj is fully framed, using actual FOV/sensor/aspect,
-  not a rough distance multiplier.
+  Position cam_obj so obj's longest on-screen dimension fills
+  `max_object_ratio` of the frame, using actual FOV/sensor/aspect (not a
+  rough distance multiplier) and the object's real vertices rather than
+  its axis-aligned bounding box.
 
+  The old bbox-corner version fit distance to the 8 AABB corners, which
+  for an elongated or obliquely-viewed mesh can sit well outside the
+  true silhouette -- so the resulting on-screen object size drifted
+  with view angle/mesh shape instead of hitting a predictable fraction
+  of the frame (measured: one turntable view came out at ~67% fill with
+  the old margin=1.05 "~full frame" default, purely from AABB slack).
+  Fitting to real vertices makes `max_object_ratio` a much more reliable
+  target across views/meshes.
+
+  max_object_ratio: target fraction of the frame the object's longest
+    side should occupy. Default 2/3 matches wt's own
+    `compute_object_crop` / training-data framing convention (see
+    world-tracing/wt/data.py) so renders land close to what the model
+    expects without its inference-time re-crop having to do much work.
+  recenter_silhouette: if True, do one rotation-only correction pass
+    after positioning: re-aim the (already-placed) camera at the
+    vertices' actual projected-silhouette center instead of the 3D bbox
+    center. Those two centers diverge once you're viewing obliquely
+    (near/far parts of the object project asymmetrically under
+    perspective), which is why a camera pointed straight at the 3D bbox
+    center can still leave the object visibly off-center in frame. This
+    is a single correction pass, not iterated to convergence, so it
+    gets close but isn't pixel-exact.
   view_dir: unit vector pointing FROM object TOWARD camera (i.e. the direction
             you want to view from). Defaults to a nice 3/4 angle.
-  margin: >1.0 adds headroom (1.05 = 5% padding around the object)
   """
   cam_data = cam_obj.data
-  corners = get_combined_bbox_corners_world(obj)
-  center = get_bbox_center(corners)
+  verts = get_combined_vertices_world(obj)
+  center = mathutils.Vector(((verts.min(axis=0) + verts.max(axis=0)) / 2).tolist())
 
   # Handle view_dir
   if view_dir is None:
@@ -117,13 +176,14 @@ def frame_object_robust(
   if isinstance(view_dir, mathutils.Vector):
     view_dir = view_dir.normalized()
 
-  # Orient the camera first (rotation doesn't depend on distance)
-  # temp placement just to get correct basis vectors
+  # Orient the camera first (rotation doesn't depend on distance -- only
+  # on view_dir, since look_at's direction-to-target is always exactly
+  # -view_dir regardless of where along that ray the camera sits).
+  # Temp placement just to get correct basis vectors.
   cam_obj.location = center + view_dir
   look_at(cam_obj, center)
   bpy.context.view_layer.update()  # ensure matrix_world is current
 
-  # Camera's local axes in world space, after orientation
   cam_matrix = cam_obj.matrix_world
   cam_right = cam_matrix.to_3x3() @ mathutils.Vector((1, 0, 0))
   cam_up    = cam_matrix.to_3x3() @ mathutils.Vector((0, 1, 0))
@@ -138,6 +198,11 @@ def frame_object_robust(
   if sensor_fit == 'AUTO':
     sensor_fit = 'HORIZONTAL' if aspect >= 1.0 else 'VERTICAL'
 
+  # 1.0 = object's longest side exactly fills the frame; scaling the
+  # fitted distance by 1/max_object_ratio backs the camera off so the
+  # object only fills that fraction instead.
+  margin = 1.0 / max_object_ratio
+
   if cam_data.type != 'ORTHO':
     if sensor_fit == 'HORIZONTAL':
       half_fov_h = math.atan((cam_data.sensor_width / 2) / cam_data.lens)
@@ -147,33 +212,56 @@ def frame_object_robust(
       half_fov_h = math.atan(math.tan(half_fov_v) * aspect)
   else:
     # Orthographic: no perspective distance solve needed, just scale.
-    # Project corners onto right/up axes relative to center, find max extents.
-    max_right = max(abs((c - center).dot(cam_right)) for c in corners)
-    max_up    = max(abs((c - center).dot(cam_up)) for c in corners)
+    # Project vertices onto right/up axes relative to center, find max extents.
+    rel = verts - np.array(center)
+    max_right = float(np.abs(rel @ np.array(cam_right)).max())
+    max_up    = float(np.abs(rel @ np.array(cam_up)).max())
     cam_data.ortho_scale = 2 * max(max_right, max_up / aspect) * margin
-    cam_obj.location = center + view_dir * (max((c - center).length for c in corners) * 2)
+    cam_obj.location = center + view_dir * (float(np.linalg.norm(rel, axis=1).max()) * 2)
     return
 
-  # For each corner, find the distance along cam_fwd needed so it stays
+  # For each vertex, find the distance along cam_fwd needed so it stays
   # within the horizontal and vertical half-angle, then take the max
-  # (i.e. the most constraining corner) required distance.
-  max_dist = 0.0
-  for c in corners:
-    rel = c - center
-    d_fwd   = rel.dot(cam_fwd)     # depth offset from center along view dir (usually small)
-    d_right = abs(rel.dot(cam_right))
-    d_up    = abs(rel.dot(cam_up))
+  # (i.e. the most constraining vertex) required distance.
+  rel = verts - np.array(center)
+  d_fwd   = rel @ np.array(cam_fwd)     # depth offset from center along view dir (usually small)
+  d_right = np.abs(rel @ np.array(cam_right))
+  d_up    = np.abs(rel @ np.array(cam_up))
 
-    # distance needed so this corner's lateral offset fits within the half-FOV cone,
-    # accounting for its own depth offset relative to the object's center
-    dist_for_h = d_right / math.tan(half_fov_h) - d_fwd
-    dist_for_v = d_up / math.tan(half_fov_v) - d_fwd
+  # distance needed so each vertex's lateral offset fits within the half-FOV
+  # cone, accounting for its own depth offset relative to the object's center
+  dist_for_h = d_right / math.tan(half_fov_h) - d_fwd
+  dist_for_v = d_up / math.tan(half_fov_v) - d_fwd
 
-    max_dist = max(max_dist, dist_for_h, dist_for_v)
-
+  max_dist = float(max(dist_for_h.max(), dist_for_v.max()))
   max_dist *= margin
   cam_obj.location = center + view_dir * max_dist
   look_at(cam_obj, center)
+
+  if recenter_silhouette:
+    # Re-aim (rotation only -- location stays put) at the vertices'
+    # actual projected silhouette center rather than `center` (which by
+    # construction of the look_at call above always projects to exact
+    # frame-center, whether or not that's where the silhouette's
+    # apparent centroid ends up). Must be measured at the real working
+    # distance (max_dist), not an arbitrary placeholder -- the angular
+    # offset u = d_right/d_fwd depends on d_fwd, so measuring it at the
+    # wrong distance gives a wrong correction.
+    cam_pos = np.array(cam_obj.location)
+    rel2 = verts - cam_pos
+    d_fwd2   = rel2 @ np.array(cam_fwd)
+    d_right2 = rel2 @ np.array(cam_right)
+    d_up2    = rel2 @ np.array(cam_up)
+    u = (d_right2 / d_fwd2) / math.tan(half_fov_h)
+    v = (d_up2 / d_fwd2) / math.tan(half_fov_v)
+    u_c = (u.max() + u.min()) / 2.0
+    v_c = (v.max() + v.min()) / 2.0
+    new_target = (
+      center
+      + cam_right * float(u_c * math.tan(half_fov_h) * max_dist)
+      + cam_up * float(v_c * math.tan(half_fov_v) * max_dist)
+    )
+    look_at(cam_obj, new_target)
 
 @ctl.contextmanager
 def track_imported_objects():
