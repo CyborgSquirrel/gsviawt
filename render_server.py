@@ -84,11 +84,11 @@ def get_camera_intrinsics(cam_data, width, height):
   cx = width / 2 - cam_data.shift_x * max(width, height)
   cy = height / 2 + cam_data.shift_y * max(width, height)
 
-  return [
-    [focal_px, 0.0, cx],
-    [0.0, focal_px, cy],
-    [0.0, 0.0, 1.0],
-  ]
+  return (
+    (focal_px, 0.0, cx),
+    (0.0, focal_px, cy),
+    (0.0, 0.0, 1.0),
+  )
 
 def frame_object_robust(
   obj,
@@ -366,7 +366,7 @@ class Service(rpyc.Service):
       scene.render.filepath = path
       bpy.ops.render.render(write_still=True)
 
-    pose_matrix = [list(row) for row in scene.camera.matrix_world]
+    pose_matrix = tuple(tuple(row) for row in scene.camera.matrix_world)
     intrinsics_matrix = get_camera_intrinsics(scene.camera.data, width, height)
 
     depth_volume, num_layers_found = self._depth_peel(width, height, max_layers, os.path.dirname(depth_path))

@@ -140,9 +140,6 @@ def main(cfg: DictConfig):
             with timed(f"{view_label} depth_write"):
               depth_ds.append(depth_volume)
 
-            with timed(f"{view_label} flush"):
-              hf.flush()
-
             with timed(f"{view_label} other_write"):
               pose_ds.append(np.array(result["pose_matrix"], dtype=np.float32))
               intr_ds.append(np.array(result["intrinsics_matrix"], dtype=np.float32))
