@@ -200,7 +200,7 @@ def main():
   if args.out is not None:
     out_path = args.out
   elif args.index is not None:
-    out_path = f"{args.hdf5_path}.view{args.index}.wt.h5"
+    out_path = f"{args.hdf5_path}.view{args.index}.seed{args.seed}.wt.h5"
   else:
     out_path = f"{args.hdf5_path}.wt.h5"
 
