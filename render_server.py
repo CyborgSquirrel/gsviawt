@@ -11,6 +11,7 @@ import contextlib as ctl
 import logging
 import math
 import os
+import socket
 import sys
 from argparse import ArgumentParser
 
@@ -18,7 +19,6 @@ import bpy
 import mathutils
 import numpy as np
 import rpyc
-from rpyc.utils.server import ThreadPoolServer
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +168,19 @@ def frame_object_robust(
   verts = get_combined_vertices_world(obj)
   center = mathutils.Vector(((verts.min(axis=0) + verts.max(axis=0)) / 2).tolist())
 
+  # Bounding-sphere radius about `center`. Objaverse meshes span a huge
+  # range of absolute scales (diag from ~5 to ~2500 units), so the camera
+  # can legitimately end up thousands of units away -- past the camera's
+  # default clip_end of 1000, which silently clips the object out of both
+  # the RGB and the depth-peel passes. Set the clip planes to bracket the
+  # object relative to wherever the camera lands.
+  radius = float(np.linalg.norm(verts - np.array(center), axis=1).max()) if len(verts) else 1.0
+
+  def _set_clip_planes():
+    cam_dist = (cam_obj.location - center).length
+    cam_data.clip_start = max(1e-4, cam_dist - radius * 1.5)
+    cam_data.clip_end = cam_dist + radius * 3.0
+
   # Handle view_dir
   if view_dir is None:
     view_dir = (1, -1, 0.6)
@@ -218,6 +231,7 @@ def frame_object_robust(
     max_up    = float(np.abs(rel @ np.array(cam_up)).max())
     cam_data.ortho_scale = 2 * max(max_right, max_up / aspect) * margin
     cam_obj.location = center + view_dir * (float(np.linalg.norm(rel, axis=1).max()) * 2)
+    _set_clip_planes()
     return
 
   # For each vertex, find the distance along cam_fwd needed so it stays
@@ -262,6 +276,8 @@ def frame_object_robust(
       + cam_up * float(v_c * math.tan(half_fov_v) * max_dist)
     )
     look_at(cam_obj, new_target)
+
+  _set_clip_planes()
 
 @ctl.contextmanager
 def track_imported_objects():
@@ -417,12 +433,15 @@ class Service(rpyc.Service):
     bpy.context.collection.objects.link(light_obj)
     light_obj.location = (5, -5, 10)
 
-    # Load mesh
+    # Load mesh. disable_bone_shape: skip the importer's per-armature bone
+    # display icosphere (viewport-only eye candy, irrelevant to a headless
+    # render, and it otherwise litters the scene with a "glTF_not_exported"
+    # collection).
     with track_imported_objects() as imported_objects:
-      bpy.ops.import_scene.gltf(filepath=path)
+      bpy.ops.import_scene.gltf(filepath=path, disable_bone_shape=True)
 
     if len(imported_objects) != 1:
-      raise RuntimeError()
+      raise RuntimeError(f"expected exactly one root object from {path}, got {len(imported_objects)}")
 
     self.obj = imported_objects[0]
 
@@ -610,12 +629,38 @@ def main():
   parser.add_argument("socket_path")
   args = parser.parse_args(raw_args)
 
-  server = ThreadPoolServer(
-    Service,
-    socket_path=args.socket_path,
-    nbThreads=1,  # NOTE: Only one thread!!! Otherwise they will crash into eachother.
-    protocol_config={"allow_public_attrs": True},
-  )
-  server.start()
+  # Serve on the MAIN thread, not a worker thread. Blender only populates
+  # bpy.context.window / .screen / .object on the thread that owns the
+  # window manager (the main thread); off it they are None. That breaks any
+  # bpy.ops path that reads them -- notably the glTF importer's armature
+  # code (create_bones does `bpy.context.window.scene = ...`), so rigged
+  # glbs would fail to load under the old ThreadPoolServer while un-rigged
+  # ones happened to work. capture_turntable.py opens a single connection
+  # and drives it with sequential blocking calls, so serving that one
+  # connection inline here is all we need (and matches the old nbThreads=1).
+  if os.path.exists(args.socket_path):
+    os.remove(args.socket_path)
+
+  listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+  listener.bind(args.socket_path)
+  listener.listen(1)
+
+  protocol_config = {"allow_public_attrs": True}
+  try:
+    while True:
+      sock, _ = listener.accept()
+      conn = rpyc.connect_stream(
+        rpyc.SocketStream(sock), Service(), config=protocol_config
+      )
+      try:
+        conn.serve_all()
+      except EOFError:
+        pass
+      finally:
+        conn.close()
+  finally:
+    listener.close()
+    with ctl.suppress(OSError):
+      os.remove(args.socket_path)
 
 main()
