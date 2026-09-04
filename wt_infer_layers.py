@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the World Tracing object model (r75b) on one view of a
+"""Run the World Tracing object model (r75b) on one or all views of a
 capture_turntable.py render and dump its per-layer output as an HDF5
 file laid out like renders.h5, for direct comparison against
 debug_pointcloud.py's depth-peel output.
@@ -14,7 +14,9 @@ instead:
     blend) and a 'points' dataset (the predicted per-layer XYZ, one
     (H, W, L, 3) volume per image, NaN where invalid -- the vector
     analogue of renders.h5's depth_peel, which uses -1.0 as its scalar
-    invalid marker).
+    invalid marker), batch-shaped across however many views were run
+    (leading dim N -- 1 for a single --index, or every view in the
+    input file by default).
 
 Coordinate-frame note
 ----------------------
@@ -28,19 +30,29 @@ intermediate inside debug_pointcloud.py's `unproject_depth_peel`, i.e.
 against that, not the world-space output debug_pointcloud.py writes by
 default.
 
-Also note `preprocess_rgba_for_model` re-centers/rescales the object to
-fill ~2/3 of the model's square input canvas (matching its Objaverse
-training data), regardless of how tightly the Blender camera already
-framed it (frame_object_robust uses a 5% margin, i.e. ~full-frame). So
-don't expect pixel-for-pixel alignment with the raw render -- compare
-overall shape/scale/extent, or solve for a similarity transform if you
-need per-pixel error.
+`preprocess_rgba_for_model` can additionally re-center/rescale the
+object to fill ~2/3 of the model's square input canvas via
+`compute_object_crop`, matching its Objaverse training data -- but
+that's now off by default here (`--center-crop` to re-enable) since
+render_server.py's frame_object_robust already frames renders at
+max_object_ratio=2/3 with silhouette recentering, so the raw render
+should already be close to that distribution without an extra re-crop
+moving pixels around. If you turn `--center-crop` on (e.g. for input
+images that weren't rendered by our own pipeline), don't expect
+pixel-for-pixel alignment with the raw render -- compare overall
+shape/scale/extent, or solve for a similarity transform if you need
+per-pixel error.
 
 Usage
 -----
 
-    python wt_infer_layers.py bla/renders.h5 0 \
+    # single view
+    python wt_infer_layers.py bla/renders.h5 --index 0 \
         --ckpt r75b --config r75b --out /tmp/wt_view0.h5
+
+    # every view in the file (default)
+    python wt_infer_layers.py bla/renders.h5 \
+        --ckpt r75b --config r75b --out /tmp/wt_all.h5
 """
 
 from argparse import ArgumentParser
@@ -60,21 +72,100 @@ def rgba_from_render(hf, index):
   return np.concatenate([image, alpha[..., None]], axis=-1)
 
 
+def process_view(
+  hf, index, model, cfg, device, autocast_ctx, *,
+  seed, num_steps, alpha_erode_px, center_crop, bg_color,
+):
+  """Run inference on one view. Returns (rgb_uint8, points, K).
+
+  rgb_uint8: [H, W, 3] uint8, the image actually fed to the model.
+  points:    [H, W, L, 3] float32, NaN where invalid.
+  K:         [3, 3] float32, solved from layer-0 XYZ (or the model-input
+             fallback intrinsics if too few valid pixels to solve).
+  """
+  from wt import inference_diffusion, solve_intrinsics_from_xyz
+  from wt.data import preprocess_rgba_for_model
+  from wt.inference import _bypass_activation_checkpointing
+
+  rgba = rgba_from_render(hf, index)
+
+  inference_kwargs = dict(cfg["inference_kwargs"])
+  if num_steps is not None:
+    inference_kwargs["num_steps"] = num_steps
+
+  rgb_t, mask_t, intr_t = preprocess_rgba_for_model(
+    rgba,
+    image_size=cfg["image_size"],
+    num_layers=cfg["model_kwargs"]["num_layers"],
+    alpha_erode_px=alpha_erode_px,
+    center_crop=center_crop,
+    bg_color=bg_color,
+  )
+  rgb_t, mask_t, intr_t = rgb_t.to(device), mask_t.to(device), intr_t.to(device)
+
+  torch.manual_seed(seed)
+  if device.type == "cuda":
+    torch.cuda.manual_seed(seed)
+
+  print(f"[wt] view {index}: running diffusion (seed={seed}) ...")
+  with torch.no_grad(), autocast_ctx, _bypass_activation_checkpointing(model):
+    xyz_pred, mask_pred, _ = inference_diffusion(
+      model, rgb_t, gt_mask=mask_t, use_gt_mask=True, intrinsics=intr_t,
+      invalid_fill_mode="noise", **inference_kwargs,
+    )
+  xyz = xyz_pred[0].float().cpu().numpy()  # [L, H, W, 3]
+  mask = mask_pred[0].cpu().numpy().astype(bool)  # [L, H, W]
+  rgb_uint8 = (rgb_t[0].permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
+
+  K, fov_x = solve_intrinsics_from_xyz(xyz[0], mask[0], image_size=cfg["image_size"])
+  print(f"[wt] view {index}: solved K from layer-0 XYZ; fov_x ~= {fov_x:.1f} deg")
+  K = K if K is not None else intr_t[0].cpu().numpy()
+
+  # [L, H, W, 3] -> [H, W, L, 3], matching depth_peel's (H, W, L) axis
+  # order; invalid entries get NaN instead of depth_peel's -1.0 sentinel
+  # since a sentinel *vector* would collide with real geometry.
+  points = np.transpose(xyz, (1, 2, 0, 3)).copy()
+  points[~np.transpose(mask, (1, 2, 0))] = np.nan
+
+  n_valid = int(mask.sum())
+  print(f"[wt] view {index}: {n_valid} valid points")
+  return rgb_uint8, points, K
+
+
 def main():
   parser = ArgumentParser(description=__doc__)
   parser.add_argument("hdf5_path", help="Path to a capture_turntable.py renders.h5")
-  parser.add_argument("index", type=int, help="View index within the HDF5")
+  parser.add_argument(
+    "--index", type=int, default=None,
+    help="View index within the HDF5. Default: process every view in the file.",
+  )
   parser.add_argument("--ckpt", default="r75b", help="Checkpoint (config name / hf:// / local path)")
   parser.add_argument("--config", default="r75b", help="Model config (default: r75b, the object model)")
   parser.add_argument("--seed", type=int, default=42)
   parser.add_argument("--num-steps", type=int, default=None, help="Override the config's default sampler steps")
-  parser.add_argument("--out", default=None, help="Output .h5 path (default: <hdf5>.view<index>.wt.h5)")
-  # Preprocessing knobs mirrored 1:1 from examples/infer_rgba.py's CLI
-  # (wt.cli.add_common_args) so this matches "their procedure" exactly
-  # instead of silently drifting from preprocess_rgba_for_model's own
-  # (different!) defaults.
+  parser.add_argument(
+    "--out", default=None,
+    help="Output .h5 path (default: <hdf5>.view<index>.wt.h5 for a single "
+         "--index, or <hdf5>.wt.h5 for the whole file)",
+  )
+  # Preprocessing knobs mirrored from examples/infer_rgba.py's CLI
+  # (wt.cli.add_common_args) so this matches "their procedure" instead
+  # of silently drifting from preprocess_rgba_for_model's own
+  # (different!) defaults -- except --center-crop, deliberately off by
+  # default here (see its help text).
   parser.add_argument("--alpha-erode", type=int, default=0)
-  parser.add_argument("--no-center-crop", action="store_true")
+  parser.add_argument(
+    "--center-crop", action="store_true",
+    help=(
+      "Apply wt's inference-time object-centering re-crop "
+      "(preprocess_rgba_for_model's compute_object_crop). Off by "
+      "default: since render_server.py's frame_object_robust now fits "
+      "framing to real vertices at max_object_ratio=2/3 with silhouette "
+      "recentering, the render should already land close to wt's "
+      "training distribution, so this re-crop would mostly just move "
+      "pixels around and break the correspondence to the raw render."
+    ),
+  )
   parser.add_argument("--bg-color", type=str, default="128,128,128")
   parser.add_argument(
     "--bf16-weights-hack", action="store_true", default=False,
@@ -97,79 +188,56 @@ def main():
   )
   args = parser.parse_args()
 
-  from wt import inference_diffusion, solve_intrinsics_from_xyz
   from wt.checkpoint import build_model_and_load_ckpt
   from wt.cli import parse_bg_color
-  from wt.data import preprocess_rgba_for_model
-  from wt.inference import _bypass_activation_checkpointing
 
-  out_path = args.out or f"{args.hdf5_path}.view{args.index}.wt.h5"
   bg_color = parse_bg_color(args.bg_color)
 
   with h5py.File(args.hdf5_path, "r") as hf:
-    rgba = rgba_from_render(hf, args.index)
+    num_views = hf["images"].shape[0]
+  indices = [args.index] if args.index is not None else list(range(num_views))
+
+  if args.out is not None:
+    out_path = args.out
+  elif args.index is not None:
+    out_path = f"{args.hdf5_path}.view{args.index}.wt.h5"
+  else:
+    out_path = f"{args.hdf5_path}.wt.h5"
 
   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-  print(f"[wt] config={args.config}, device={device}")
+  print(f"[wt] config={args.config}, device={device}, views={indices}")
   model, cfg = build_model_and_load_ckpt(args.config, args.ckpt, device)
   if args.bf16_weights_hack:
     print("[wt] --bf16-weights-hack: casting stored weights to bf16 (see --help for the tradeoff)")
     model = model.to(torch.bfloat16)
-
-  inference_kwargs = dict(cfg["inference_kwargs"])
-  if args.num_steps is not None:
-    inference_kwargs["num_steps"] = args.num_steps
-
-  rgb_t, mask_t, intr_t = preprocess_rgba_for_model(
-    rgba,
-    image_size=cfg["image_size"],
-    num_layers=cfg["model_kwargs"]["num_layers"],
-    alpha_erode_px=args.alpha_erode,
-    center_crop=not args.no_center_crop,
-    bg_color=bg_color,
-  )
-  rgb_t, mask_t, intr_t = rgb_t.to(device), mask_t.to(device), intr_t.to(device)
-
-  torch.manual_seed(args.seed)
-  if device.type == "cuda":
-    torch.cuda.manual_seed(args.seed)
 
   autocast_ctx = (
     torch.autocast(device_type="cuda", dtype=torch.bfloat16)
     if device.type == "cuda"
     else torch.autocast(device_type="cpu", enabled=False)
   )
-  print(f"[wt] running diffusion (seed={args.seed}) ...")
-  with torch.no_grad(), autocast_ctx, _bypass_activation_checkpointing(model):
-    xyz_pred, mask_pred, _ = inference_diffusion(
-      model, rgb_t, gt_mask=mask_t, use_gt_mask=True, intrinsics=intr_t,
-      invalid_fill_mode="noise", **inference_kwargs,
-    )
-  xyz = xyz_pred[0].float().cpu().numpy()  # [L, H, W, 3]
-  mask = mask_pred[0].cpu().numpy().astype(bool)  # [L, H, W]
-  rgb_uint8 = (rgb_t[0].permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
 
-  K, fov_x = solve_intrinsics_from_xyz(xyz[0], mask[0], image_size=cfg["image_size"])
-  print(f"[wt] solved K from layer-0 XYZ; fov_x ~= {fov_x:.1f} deg")
-
-  # [L, H, W, 3] -> [H, W, L, 3], matching depth_peel's (H, W, L) axis
-  # order; invalid entries get NaN instead of depth_peel's -1.0 sentinel
-  # since a sentinel *vector* would collide with real geometry.
-  points = np.transpose(xyz, (1, 2, 0, 3)).copy()
-  points[~np.transpose(mask, (1, 2, 0))] = np.nan
-
-  K = K if K is not None else intr_t[0].cpu().numpy()
+  all_images, all_points, all_K = [], [], []
+  with h5py.File(args.hdf5_path, "r") as hf:
+    for index in indices:
+      rgb_uint8, points, K = process_view(
+        hf, index, model, cfg, device, autocast_ctx,
+        seed=args.seed, num_steps=args.num_steps, alpha_erode_px=args.alpha_erode,
+        center_crop=args.center_crop, bg_color=bg_color,
+      )
+      all_images.append(rgb_uint8)
+      all_points.append(points)
+      all_K.append(K)
 
   with h5py.File(out_path, "w") as out:
-    images_ds = out.create_dataset("images", data=rgb_uint8[None])
-    points_ds = out.create_dataset("points", data=points[None])
-    out.create_dataset("intrinsics", data=K[None])
-    out.create_dataset("seed", data=np.array([args.seed], dtype=np.int64))
-    out.create_dataset("config", data=np.array([args.config], dtype=h5py.string_dtype()))
+    images_ds = out.create_dataset("images", data=np.stack(all_images))
+    points_ds = out.create_dataset("points", data=np.stack(all_points))
+    out.create_dataset("intrinsics", data=np.stack(all_K))
+    out.create_dataset("seed", data=np.array([args.seed] * len(indices), dtype=np.int64))
+    out.create_dataset("config", data=np.array([args.config] * len(indices), dtype=h5py.string_dtype()))
     images_shape, points_shape = images_ds.shape, points_ds.shape
 
-  n_valid = int(mask.sum())
-  print(f"[wt] wrote images{images_shape} points{points_shape} ({n_valid} valid) to {out_path}")
+  print(f"[wt] wrote images{images_shape} points{points_shape} to {out_path}")
 
 
 if __name__ == "__main__":
