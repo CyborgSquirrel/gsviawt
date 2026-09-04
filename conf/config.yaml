@@ -16,13 +16,18 @@ width: 504
 height: 504
 max_peel_layers: 6
 
-# If set, the recorded depth_peel Z and camera pose are scaled per view so
-# the mean layer-0 foreground depth equals this value, making depth
-# comparable across meshes whose glb units are arbitrary (raw values range
-# ~2 to ~3000). 1.904 matches world-tracing r75b's expected mean foreground
-# depth (wt.inference.XYZ_MEAN[2] / DEPTH_MEAN). The RGB render and scene
-# geometry are untouched; the per-view factor is saved to `depth_scale`
-# (divide by it for raw units). null = record raw glb units.
+# SCENE-RESCALE VARIANT (see wt-depth-normalize for the depth-numbers-only
+# version). Imported meshes are always recentered + rescaled to a canonical
+# size (reset()'s bake), so depth_peel Z is roughly consistent across
+# meshes regardless of a glb's arbitrary absolute scale (was ~2 to ~3000
+# raw). If this is also set, each framed scene is additionally rescaled so
+# the object center sits exactly this far down the camera axis -- ~1.904
+# matches world-tracing r75b's expected mean foreground depth
+# (wt.inference.XYZ_MEAN[2]). Both rescales mutate scene geometry (not just
+# the recorded numbers): image-preserving for scale-independent materials,
+# but objaverse meshes with volume/SSS materials will visibly shift. The
+# cumulative per-view factor back to the mesh's original units is saved to
+# `depth_scale`.
 camera_depth_target: null
 
 hydra:

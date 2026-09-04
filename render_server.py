@@ -131,6 +131,7 @@ def frame_object_robust(
   view_dir=None,
   max_object_ratio=2.0 / 3.0,
   recenter_silhouette=True,
+  depth_target=None,
 ):
   """
   Position cam_obj so obj's longest on-screen dimension fills
@@ -163,6 +164,15 @@ def frame_object_robust(
     gets close but isn't pixel-exact.
   view_dir: unit vector pointing FROM object TOWARD camera (i.e. the direction
             you want to view from). Defaults to a nice 3/4 angle.
+  depth_target: if set, uniformly rescale the SCENE after framing so the
+    object's center sits exactly this far down the camera axis. Objaverse
+    meshes carry arbitrary absolute scale, so raw depth_peel Z spans ~2 to
+    ~3000 units across meshes; pinning it removes the per-view/per-mesh
+    scale ambiguity when comparing against a scale-anchored monocular
+    model. The rescale is a similarity about the camera position -> the
+    rendered RGB is unchanged *for scale-independent materials*, only
+    depth_peel and the pose translation move. Returns the applied scale
+    factor `k` (1.0 when depth_target is None) so callers can record it.
   """
   cam_data = cam_obj.data
   verts = get_combined_vertices_world(obj)
@@ -180,6 +190,46 @@ def frame_object_robust(
     cam_dist = (cam_obj.location - center).length
     cam_data.clip_start = max(1e-4, cam_dist - radius * 1.5)
     cam_data.clip_end = cam_dist + radius * 3.0
+
+  def _apply_depth_target():
+    """Rescale so the object center sits `depth_target` down the camera
+    axis, and re-home the camera at the world origin. Both are similarity /
+    rigid maps (image-preserving for scale-independent materials) -- only
+    depth_peel Z and the pose translation change. Re-homing matters: a
+    big-unit mesh leaves the camera thousands of units from the origin,
+    where Cycles' secondary-ray precision degrades once the object is also
+    scaled way down (spurious self-shadowing). CAVEAT vs. the depth-only
+    variant of this feature: this mutates actual scene geometry, so
+    absolute-scale-tuned materials (volume, SSS) visibly shift -- verified
+    on a glass/translucent mesh going dark under extreme downscale. Returns
+    the scale factor applied to geometry.
+    """
+    nonlocal center, radius
+    if depth_target is None:
+      return 1.0
+    if cam_data.type == 'ORTHO':
+      logger.warning("depth_target ignored for orthographic camera (unsupported)")
+      return 1.0
+    d = (cam_obj.location - center).length
+    if d <= 1e-9:
+      return 1.0
+    k = depth_target / d
+    # Map the object by x -> k*(x - p), p = camera position, and drop the
+    # camera onto the origin. Object center -> view_dir * depth_target, so
+    # the depth is exactly depth_target; the map is a rotation-free
+    # similarity so lighting direction is untouched; and keeping the camera
+    # at the origin (rather than thousands of units out for a big-unit
+    # mesh) keeps Cycles' ray math well-conditioned. The SUN light is
+    # position/scale-independent, so it needs no adjustment.
+    p = cam_obj.location.copy()
+    obj.matrix_world = (
+      mathutils.Matrix.Scale(k, 4) @ mathutils.Matrix.Translation(-p) @ obj.matrix_world
+    )
+    cam_obj.location = (0.0, 0.0, 0.0)
+    center = k * (center - p)
+    radius *= k
+    bpy.context.view_layer.update()
+    return k
 
   # Handle view_dir
   if view_dir is None:
@@ -231,8 +281,9 @@ def frame_object_robust(
     max_up    = float(np.abs(rel @ np.array(cam_up)).max())
     cam_data.ortho_scale = 2 * max(max_right, max_up / aspect) * margin
     cam_obj.location = center + view_dir * (float(np.linalg.norm(rel, axis=1).max()) * 2)
+    k = _apply_depth_target()
     _set_clip_planes()
-    return
+    return k
 
   # For each vertex, find the distance along cam_fwd needed so it stays
   # within the horizontal and vertical half-angle, then take the max
@@ -277,7 +328,9 @@ def frame_object_robust(
     )
     look_at(cam_obj, new_target)
 
+  k = _apply_depth_target()
   _set_clip_planes()
+  return k
 
 @ctl.contextmanager
 def track_imported_objects():
@@ -459,9 +512,56 @@ class Service(rpyc.Service):
       raise RuntimeError(f"expected exactly one root object from {path}, got {len(imported_objects)}")
 
     self.obj = imported_objects[0]
+    self._normalize_imported_object()
 
     self._peel_rl, self._peel_composite = setup_depth_compositor(bpy.context.scene, bpy.context.view_layer)
     self._peel_mat, self._peel_img_tex, self._peel_eps_node = build_depth_peel_material()
+
+  def _normalize_imported_object(self, target_longest=2.0):
+    """Recenter self.obj on the origin, rescale so its longest bbox axis is
+    `target_longest`, and BAKE that into the mesh data (transform_apply).
+    Records the applied scale as self._reset_scale.
+
+    objaverse glbs arrive at wildly different scales (mesh coords from ~1 to
+    ~1e5). Leaving that as an object transform is fine on its own, but a
+    later depth-normalization rescale (frame_object_robust's depth_target)
+    would then push the transform to ~1e-5, and Cycles' normal / shading
+    math loses precision there -- extreme-scale meshes render visibly dark.
+    Baking keeps every downstream coordinate O(1). depth_peel is then in
+    "normalized" units; divide by the `depth_scale` result for raw ones.
+    """
+    self._reset_scale = 1.0
+    self._obj_rest_matrix = self.obj.matrix_world.copy()
+    center, extents = get_combined_bbox_center_and_extents(self.obj)
+    longest = max(extents)
+    if longest <= 0:
+      return
+    s = target_longest / longest
+    self.obj.matrix_world = (
+      mathutils.Matrix.Translation(-mathutils.Vector(center) * s)
+      @ mathutils.Matrix.Scale(s, 4)
+      @ self.obj.matrix_world
+    )
+    bpy.context.view_layer.update()
+
+    bpy.ops.object.select_all(action='DESELECT')
+    for o in (self.obj, *self.obj.children_recursive):
+      o.select_set(True)
+    bpy.context.view_layer.objects.active = self.obj
+    try:
+      bpy.ops.object.transform_apply(location=True, rotation=True, scale=True, isolate_users=True)
+    except RuntimeError as exc:
+      # transform_apply refuses meshes with shape keys / multi-user data it
+      # can't isolate. Rare; fall back to the (un-baked) root transform --
+      # still correctly framed, just precision-risky under an extreme
+      # depth_target rescale.
+      logger.warning("transform_apply failed for %s, leaving transform un-baked: %s", self.obj.name, exc)
+    bpy.ops.object.select_all(action='DESELECT')
+    self._reset_scale = s
+    # frame_object_robust's depth_target step mutates self.obj (scale +
+    # reposition); render() restores this snapshot before each view so the
+    # per-view rescales don't compound.
+    self._obj_rest_matrix = self.obj.matrix_world.copy()
 
   def render(
     self,
@@ -482,47 +582,38 @@ class Service(rpyc.Service):
     scene.render.resolution_x = width
     scene.render.resolution_y = height
 
-    frame_object_robust(self.obj, scene.camera, scene, view_dir=view_dir)
+    # Undo the previous view's depth_target rescale so per-view scales don't
+    # compound.
+    self.obj.matrix_world = self._obj_rest_matrix.copy()
+    bpy.context.view_layer.update()
+
+    frame_scale = frame_object_robust(
+      self.obj, scene.camera, scene, view_dir=view_dir,
+      depth_target=camera_depth_target,
+    )
+    # Total factor from the mesh's original units to this render's frame:
+    # reset()'s canonical-size bake, then frame_object_robust's optional
+    # depth_target rescale.
+    depth_scale = self._reset_scale * frame_scale
 
     if capture_rgb:
       # Render a single frame (real materials, normal quality)
       scene.render.filepath = path
       bpy.ops.render.render(write_still=True)
 
-    pose_matrix = [list(row) for row in scene.camera.matrix_world]
+    pose_matrix = tuple(tuple(row) for row in scene.camera.matrix_world)
     intrinsics_matrix = get_camera_intrinsics(scene.camera.data, width, height)
 
     depth_volume, num_layers_found = self._depth_peel(width, height, max_layers, os.path.dirname(depth_path))
-
-    # Optional depth normalization. Geometry / the RGB render are left
-    # untouched (objaverse meshes have absolute-scale-tuned materials --
-    # volume, SSS -- so rescaling the scene shifts their look); instead we
-    # scale the recorded numbers so the mean layer-0 foreground depth equals
-    # `camera_depth_target`. That makes depth_peel Z comparable across
-    # meshes whose glb units are arbitrary (raw values range ~2 to ~3000)
-    # and lands the distribution where a scale-anchored monocular model
-    # (wt r75b: mean fg depth ~1.904) expects it. Uniform Z+XY scaling
-    # leaves the pinhole projection -- hence the intrinsics -- unchanged;
-    # the pose translation scales with it.
-    depth_scale = 1.0
-    if camera_depth_target is not None:
-      surface = depth_volume[..., 0]
-      hit = surface >= 0
-      if hit.any():
-        depth_scale = camera_depth_target / float(surface[hit].mean())
-        depth_volume = np.where(depth_volume >= 0, depth_volume * depth_scale, depth_volume)
-        for i in range(3):
-          pose_matrix[i][3] *= depth_scale
-
     np.save(depth_path, depth_volume)
 
     return {
-      "pose_matrix": tuple(tuple(row) for row in pose_matrix),
+      "pose_matrix": pose_matrix,
       "intrinsics_matrix": intrinsics_matrix,
       "num_layers_found": num_layers_found,
-      # Factor the recorded depth_peel / pose translation were scaled by
-      # (1.0 unless camera_depth_target is set). Divide by it to recover the
-      # mesh's original glb units.
+      # Cumulative geometry scale from the mesh's original units to this
+      # render's frame. depth_peel / pose translation are in the scaled
+      # frame; divide by this to recover the original mesh units.
       "depth_scale": depth_scale,
     }
     # bpy.ops.wm.save_as_mainfile(filepath="/app/bla/curr.blend")
