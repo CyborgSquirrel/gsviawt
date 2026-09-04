@@ -109,6 +109,7 @@ def main(cfg: DictConfig):
         intr_ds     = stack.enter_context(LazyDataset(hf, "camera_intrinsics"))
         depth_ds    = stack.enter_context(LazyDataset(hf, "depth_peel", dataset_kwargs=depth_kwargs))
         mesh_idx_ds = stack.enter_context(LazyDataset(hf, "mesh_index"))
+        scale_ds    = stack.enter_context(LazyDataset(hf, "depth_scale"))
 
         for mesh_idx, mesh_path in enumerate(meshes):
           conn.root.reset(mesh_path)
@@ -123,6 +124,7 @@ def main(cfg: DictConfig):
                 width=cfg.width, height=cfg.height, path=tmp_path, view_dir=view_dir,
                 max_layers=cfg.max_peel_layers, depth_path=tmp_depth_path,
                 capture_rgb=cfg.render,
+                camera_depth_target=cfg.camera_depth_target,
               )
 
             with timed(f"{view_label} depth_load"):
@@ -144,6 +146,7 @@ def main(cfg: DictConfig):
               pose_ds.append(np.array(result["pose_matrix"], dtype=np.float32))
               intr_ds.append(np.array(result["intrinsics_matrix"], dtype=np.float32))
               mesh_idx_ds.append(np.int64(mesh_idx))
+              scale_ds.append(np.float32(result["depth_scale"]))
     finally:
       conn.close()
   finally:

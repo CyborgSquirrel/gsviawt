@@ -458,6 +458,7 @@ class Service(rpyc.Service):
     max_layers: int,
     depth_path: str,
     capture_rgb: bool = True,
+    camera_depth_target: float = None,
   ):
     scene = bpy.context.scene
 
@@ -473,16 +474,41 @@ class Service(rpyc.Service):
       scene.render.filepath = path
       bpy.ops.render.render(write_still=True)
 
-    pose_matrix = tuple(tuple(row) for row in scene.camera.matrix_world)
+    pose_matrix = [list(row) for row in scene.camera.matrix_world]
     intrinsics_matrix = get_camera_intrinsics(scene.camera.data, width, height)
 
     depth_volume, num_layers_found = self._depth_peel(width, height, max_layers, os.path.dirname(depth_path))
+
+    # Optional depth normalization. Geometry / the RGB render are left
+    # untouched (objaverse meshes have absolute-scale-tuned materials --
+    # volume, SSS -- so rescaling the scene shifts their look); instead we
+    # scale the recorded numbers so the mean layer-0 foreground depth equals
+    # `camera_depth_target`. That makes depth_peel Z comparable across
+    # meshes whose glb units are arbitrary (raw values range ~2 to ~3000)
+    # and lands the distribution where a scale-anchored monocular model
+    # (wt r75b: mean fg depth ~1.904) expects it. Uniform Z+XY scaling
+    # leaves the pinhole projection -- hence the intrinsics -- unchanged;
+    # the pose translation scales with it.
+    depth_scale = 1.0
+    if camera_depth_target is not None:
+      surface = depth_volume[..., 0]
+      hit = surface >= 0
+      if hit.any():
+        depth_scale = camera_depth_target / float(surface[hit].mean())
+        depth_volume = np.where(depth_volume >= 0, depth_volume * depth_scale, depth_volume)
+        for i in range(3):
+          pose_matrix[i][3] *= depth_scale
+
     np.save(depth_path, depth_volume)
 
     return {
-      "pose_matrix": pose_matrix,
+      "pose_matrix": tuple(tuple(row) for row in pose_matrix),
       "intrinsics_matrix": intrinsics_matrix,
       "num_layers_found": num_layers_found,
+      # Factor the recorded depth_peel / pose translation were scaled by
+      # (1.0 unless camera_depth_target is set). Divide by it to recover the
+      # mesh's original glb units.
+      "depth_scale": depth_scale,
     }
     # bpy.ops.wm.save_as_mainfile(filepath="/app/bla/curr.blend")
 
@@ -663,4 +689,5 @@ def main():
     with ctl.suppress(OSError):
       os.remove(args.socket_path)
 
-main()
+if __name__ == "__main__":
+  main()
