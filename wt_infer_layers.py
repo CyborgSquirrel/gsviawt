@@ -229,9 +229,22 @@ def main():
       all_points.append(points)
       all_K.append(K)
 
+  images_arr = np.stack(all_images)
+  points_arr = np.stack(all_points)
+  n, height, width = images_arr.shape[:3]
+  num_layers = points_arr.shape[3]
+
+  # One chunk per view -> compressed independently, same convention as
+  # capture_turntable.py's renders.h5 (image_kwargs/depth_kwargs). Without
+  # this the file is dominated by `points`' NaN-padded (H, W, L, 3) float32
+  # volumes -- e.g. 40 views @ 504x504x6 was ~730MB uncompressed for points
+  # alone; gzip on the large invalid (NaN) runs shrinks that a lot.
+  image_kwargs = dict(chunks=(1, height, width, 3), compression="gzip", compression_opts=4)
+  points_kwargs = dict(chunks=(1, height, width, num_layers, 3), compression="gzip", compression_opts=4)
+
   with h5py.File(out_path, "w") as out:
-    images_ds = out.create_dataset("images", data=np.stack(all_images))
-    points_ds = out.create_dataset("points", data=np.stack(all_points))
+    images_ds = out.create_dataset("images", data=images_arr, **image_kwargs)
+    points_ds = out.create_dataset("points", data=points_arr, **points_kwargs)
     out.create_dataset("intrinsics", data=np.stack(all_K))
     out.create_dataset("seed", data=np.array([args.seed] * len(indices), dtype=np.int64))
     out.create_dataset("config", data=np.array([args.config] * len(indices), dtype=h5py.string_dtype()))
