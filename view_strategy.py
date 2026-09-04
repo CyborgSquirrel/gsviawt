@@ -22,6 +22,21 @@ class ViewStrategy:
 
 
 @dataclass
+class SingleView(ViewStrategy):
+  """A single fixed view. Useful for debugging mesh loading without paying
+  for a whole turntable. Defaults to a level shot from the front (tilt 0,
+  azimuth 0), matching the Turntable's first frame.
+  """
+  tilt_deg: float = 0.0
+  azimuth_deg: float = 0.0
+
+  def views(self):
+    tilt_rad = math.radians(self.tilt_deg)
+    azimuth_rad = math.radians(self.azimuth_deg)
+    yield self.tilt_deg, self.azimuth_deg, view_dir_for(azimuth_rad, tilt_rad)
+
+
+@dataclass
 class Turntable(ViewStrategy):
   tilts_deg: List[float]
   num_azi: int
