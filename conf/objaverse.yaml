@@ -24,12 +24,13 @@ max_peel_layers: 6
 normalize_object: true
 camera_distance: 1.9
 
-# Objaverse blender_script uses a 35mm lens on a 32mm sensor
-# (2*atan(16/35) ~= 49.3 deg horizontal FOV). Note this disagrees with
-# wt/data.py's FIXED_FX=500 @ 512 (~54.2 deg) -- kept faithful to the
-# render script the training images actually came from.
-camera_lens: 35.0
-camera_sensor_width: 32.0
+# Camera FOV. wt solves ~54deg from its own predicted XYZ regardless of the
+# input, matching wt/data.py's FIXED_FX=500 @ 512px (2*atan(256/500) ~=
+# 54.25deg) -- so match that, not Objaverse blender_script.py's own 35mm/
+# 32mm lens (~49.3deg). lens/sensor chosen so fx == 500*(504/512) at 504px.
+# For the literal Objaverse render camera use lens=35, sensor_width=32.
+camera_lens: 50.0
+camera_sensor_width: 51.2
 
 render_engine: CYCLES        # CYCLES | BLENDER_EEVEE_NEXT
 cycles_samples: 64
