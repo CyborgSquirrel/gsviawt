@@ -11,10 +11,23 @@ render: true
 device: auto
 
 output_path: /app/bla/objaverse_renders.h5
-# 504 (not Objaverse blender_script's 512) so pixels line up 1:1 with r75b's
-# 504x504 output -- wt_infer_layers.py is run without --center-crop.
+# RGB render resolution. 504 (not Objaverse blender_script's 512) so pixels
+# line up 1:1 with r75b's 504x504 output -- wt_infer_layers.py is run
+# without --center-crop.
 width: 504
 height: 504
+
+# Depth-peel resolution. Defaults to the RGB resolution via interpolation;
+# override to render the depth maps at a different resolution than the RGB
+# pass (e.g. a cheaper low-res peel, or a higher-res one for geometry work).
+# `camera_intrinsics` in the output always matches `depth_peel`; when the
+# two resolutions differ a separate `image_intrinsics` matching `images` is
+# also written. Note the compare_wt_depth.py tooling compares WT's
+# prediction (at RGB res) against `depth_peel` pixel-for-pixel, so it needs
+# these equal unless you resize first.
+depth_width: ${width}
+depth_height: ${height}
+
 max_peel_layers: 6
 
 # --- Objaverse blender_script.py conventions ---
@@ -37,12 +50,14 @@ cycles_samples: 64
 film_transparent: true       # RGBA with a real alpha channel
 
 # "objaverse" = blender_script.py's key/fill/rim/bottom SUN rig on black.
-# "env" = white world + weak key sun (render_server.py style).
+# "env" = white world + a single weak top-down key sun.
 lighting: objaverse
 
 # Optional post-hoc rescale of the recorded depth_peel + pose translation
-# so mean layer-0 surface depth == this value (see render_server.py). null
-# leaves depth in the normalised-object frame (~camera_distance).
+# so mean layer-0 surface depth == this value. null leaves depth in the
+# normalised-object frame (~camera_distance) -- which, with the unit-cube
+# normalize + fixed camera, is already ~constant across meshes, so this is
+# usually unnecessary.
 camera_depth_target: null
 
 hydra:

@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Render turntables of meshes the way Objaverse-XL's `blender_script.py`
-does -- normalise the object into a unit cube at the origin, light it with a
-fixed multi-sun rig, render RGBA on a transparent film -- but driven by our
-Hydra config and view strategies, and dumped to a single HDF5 file laid out
-like capture_turntable.py's renders.h5 (images / depth_peel / camera_pose /
-camera_intrinsics / mesh_index).
+"""Render meshes the way Objaverse-XL's `blender_script.py` does --
+normalise the object into a unit cube at the origin, light it with a fixed
+multi-sun rig, render RGBA on a transparent film -- but driven by our Hydra
+config and view strategies, and dumped to a single HDF5 file
+(images / depth_peel / camera_pose / camera_intrinsics / mesh_index /
+depth_scale) that wt_infer_layers.py + the compare_wt_depth.py tooling read
+directly.
 
 Runs *inside* Blender (no rpyc server):
 
     /opt/blender/blender --background --python render_objaverse.py -- \\
-        view_strategy=turntable mesh_strategy=random \\
+        view_strategy=turntable-lite mesh_strategy=random \\
         output_path=/app/bla/obj.h5
 
 Needs h5py + hydra-core in Blender's Python. Install once:
@@ -18,7 +19,7 @@ Needs h5py + hydra-core in Blender's Python. Install once:
         --target="$BLENDER_USER_PYTHON" h5py hydra-core
 
 (the Dockerfile does this; `_head()` below puts $BLENDER_USER_PYTHON on the
-path, same trick render_server.py uses).
+path).
 """
 
 # --- let Blender's bundled Python see our extra packages + repo modules ---
@@ -196,7 +197,7 @@ def camera_intrinsics(cam_data, w, h):
 
 
 # ---------------------------------------------------------------------------
-# depth peeling  (ported verbatim-ish from render_server.py)
+# depth peeling
 # ---------------------------------------------------------------------------
 
 def build_depth_peel_material():
@@ -268,7 +269,9 @@ def depth_peel(mesh_objs, peel_mat, peel_tex, peel_eps, rl, comp,
   ims = scene.render.image_settings
   saved_fp, saved_ff, saved_cd, saved_cm = (
     scene.render.filepath, ims.file_format, ims.color_depth, ims.color_mode)
+  saved_res = (scene.render.resolution_x, scene.render.resolution_y)
   ims.file_format, ims.color_depth, ims.color_mode = "OPEN_EXR", "32", "BW"
+  scene.render.resolution_x, scene.render.resolution_y = width, height
   scene.node_tree.links.new(rl.outputs["Depth"], comp.inputs["Image"])
 
   lo, hi = scene_bbox()
@@ -325,6 +328,7 @@ def depth_peel(mesh_objs, peel_mat, peel_tex, peel_eps, rl, comp,
     scene.node_tree.links.new(rl.outputs["Image"], comp.inputs["Image"])
     scene.render.filepath = saved_fp
     ims.file_format, ims.color_depth, ims.color_mode = saved_ff, saved_cd, saved_cm
+    scene.render.resolution_x, scene.render.resolution_y = saved_res
     peel_tex.image = None
     bpy.data.images.remove(prev_img)
 
@@ -341,11 +345,14 @@ def render_rgba(path, width, height):
   as the stored 8-bit values (sRGB-encoded) rather than linearised."""
   scene = bpy.context.scene
   ims = scene.render.image_settings
-  saved = (scene.render.filepath, ims.file_format, ims.color_mode, ims.color_depth)
+  saved = (scene.render.filepath, ims.file_format, ims.color_mode, ims.color_depth,
+           scene.render.resolution_x, scene.render.resolution_y)
   ims.file_format, ims.color_mode, ims.color_depth = "PNG", "RGBA", "8"
+  scene.render.resolution_x, scene.render.resolution_y = width, height
   scene.render.filepath = path
   bpy.ops.render.render(write_still=True)
-  scene.render.filepath, ims.file_format, ims.color_mode, ims.color_depth = saved
+  (scene.render.filepath, ims.file_format, ims.color_mode, ims.color_depth,
+   scene.render.resolution_x, scene.render.resolution_y) = saved
 
   img = bpy.data.images.load(path, check_existing=False)
   try:
@@ -402,8 +409,6 @@ def run(cfg):
   logging.basicConfig(level=logging.INFO)
   scene = bpy.context.scene
   scene.render.engine = str(cfg.render_engine)
-  scene.render.resolution_x = int(cfg.width)
-  scene.render.resolution_y = int(cfg.height)
   scene.render.resolution_percentage = 100
   scene.render.film_transparent = bool(cfg.film_transparent)
   if scene.render.engine == "CYCLES":
@@ -413,11 +418,17 @@ def run(cfg):
 
   view_strategy = hydra.utils.instantiate(cfg.view_strategy)
   meshes = list(hydra.utils.instantiate(cfg.mesh_strategy).meshes())
-  W, H, Lmax = int(cfg.width), int(cfg.height), int(cfg.max_peel_layers)
+  Lmax = int(cfg.max_peel_layers)
+  W, H = int(cfg.width), int(cfg.height)
+  if cfg.depth_width is None or cfg.depth_height is None:
+    raise ValueError("depth_width/depth_height must be set (config default is "
+                     "${width}/${height}; use that to match the RGB pass)")
+  DW, DH = int(cfg.depth_width), int(cfg.depth_height)
+  logger.info("RGB %dx%d, depth-peel %dx%d", W, H, DW, DH)
 
   os.makedirs(os.path.dirname(cfg.output_path) or ".", exist_ok=True)
   img_kw = dict(chunks=(1, H, W, 4), compression="gzip", compression_opts=4)
-  depth_kw = dict(chunks=(1, H, W, Lmax), compression="gzip", compression_opts=4)
+  depth_kw = dict(chunks=(1, DH, DW, Lmax), compression="gzip", compression_opts=4)
 
   with ctl.ExitStack() as stack:
     tmp = stack.enter_context(TemporaryDirectory())
@@ -427,7 +438,10 @@ def run(cfg):
 
     ds_img = stack.enter_context(LazyDataset(hf, "images", dataset_kwargs=img_kw)) if cfg.render else None
     ds_pose = stack.enter_context(LazyDataset(hf, "camera_pose"))
-    ds_intr = stack.enter_context(LazyDataset(hf, "camera_intrinsics"))
+    ds_intr = stack.enter_context(LazyDataset(hf, "camera_intrinsics"))  # matches depth_peel
+    # only when the RGB pass runs at a different resolution than the depth peel
+    ds_img_intr = (stack.enter_context(LazyDataset(hf, "image_intrinsics"))
+                   if cfg.render and (W, H) != (DW, DH) else None)
     ds_depth = stack.enter_context(LazyDataset(hf, "depth_peel", dataset_kwargs=depth_kw))
     ds_mesh = stack.enter_context(LazyDataset(hf, "mesh_index"))
     ds_scale = stack.enter_context(LazyDataset(hf, "depth_scale"))
@@ -435,8 +449,8 @@ def run(cfg):
     failed = []
     for mi, mesh_path in enumerate(meshes):
       try:
-        _render_mesh(cfg, scene, mi, mesh_path, view_strategy, W, H, Lmax, tmp,
-                     ds_img, ds_pose, ds_intr, ds_depth, ds_mesh, ds_scale)
+        _render_mesh(cfg, scene, mi, mesh_path, view_strategy, W, H, DW, DH, Lmax, tmp,
+                     ds_img, ds_pose, ds_intr, ds_img_intr, ds_depth, ds_mesh, ds_scale)
       except Exception:
         logger.exception("mesh %d (%s) failed -- skipping", mi, mesh_path)
         failed.append(mi)
@@ -448,11 +462,14 @@ def run(cfg):
   logger.info("wrote %s", cfg.output_path)
 
 
-def _render_mesh(cfg, scene, mi, mesh_path, view_strategy, W, H, Lmax, tmp,
-                 ds_img, ds_pose, ds_intr, ds_depth, ds_mesh, ds_scale):
+def _render_mesh(cfg, scene, mi, mesh_path, view_strategy, W, H, DW, DH, Lmax, tmp,
+                 ds_img, ds_pose, ds_intr, ds_img_intr, ds_depth, ds_mesh, ds_scale):
   """Load, normalize and render one mesh for every view the strategy yields,
   appending a row per view to the open datasets. Raises on any Blender
-  failure (bad glb, degenerate bbox, ...) so run() can skip the mesh."""
+  failure (bad glb, degenerate bbox, ...) so run() can skip the mesh.
+
+  W,H is the RGB resolution; DW,DH the depth-peel resolution (equal unless
+  cfg.depth_width/height override)."""
   from util import timed
 
   reset_scene()  # purges bpy.data objects/materials/images -> rebuild the rig
@@ -481,10 +498,10 @@ def _render_mesh(cfg, scene, mi, mesh_path, view_strategy, W, H, Lmax, tmp,
       if cfg.render:
         rgba = render_rgba(os.path.join(tmp, "rgb.png"), W, H)
       depth_vol, _ = depth_peel(mesh_objs, peel_mat, peel_tex, peel_eps,
-                                rl, comp, W, H, Lmax, tmp)
+                                rl, comp, DW, DH, Lmax, tmp)
 
     pose = np.array(cam.matrix_world, np.float32)
-    intr = camera_intrinsics(cam.data, W, H)
+    intr = camera_intrinsics(cam.data, DW, DH)  # matches depth_vol
 
     depth_scale = 1.0
     if cfg.camera_depth_target is not None:
@@ -497,6 +514,8 @@ def _render_mesh(cfg, scene, mi, mesh_path, view_strategy, W, H, Lmax, tmp,
 
     if ds_img is not None:
       ds_img.append(rgba)
+    if ds_img_intr is not None:
+      ds_img_intr.append(camera_intrinsics(cam.data, W, H))
     ds_pose.append(pose)
     ds_intr.append(intr)
     ds_depth.append(depth_vol.astype(np.float32))
