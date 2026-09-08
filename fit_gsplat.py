@@ -18,6 +18,11 @@ They are then optimized with `gsplat` against the RGB (L1 + D-SSIM) and alpha
 only, never new Gaussians. Fully-occluded deeper-layer Gaussians (seen in no
 supplied view) keep their initial front-pixel colour.
 
+By default (`optimize_means: false`) the Gaussian centers are locked to those
+back-projected seed positions and only scale / rotation / opacity / colour are
+optimized, so `gaussian_means` in the output equals the unprojected depth peel
+exactly. Set `optimize_means: true` to let the centers move too.
+
 Output is written next to the input as:
   <h5>.gsplat.view<primary>.h5  -- Gaussian attributes as (H, W, 6, .) grids
       (NaN marks an empty slot, same layout as `depth_peel` / wt_infer_layers'
@@ -264,6 +269,7 @@ def save_output(path, cfg, views, params_np, uvl, H, W, L, final_loss, scene_sca
     f.attrs["mesh_index"] = views["mesh_index"]
     f.attrs["mesh_path"] = views["mesh_path"]
     f.attrs["iters"] = int(cfg.iters)
+    f.attrs["optimize_means"] = bool(cfg.optimize_means)
     f.attrs["final_loss"] = float(final_loss)
     f.attrs["num_gaussians"] = int(len(means))
     f.attrs["scene_scale"] = float(scene_scale)
@@ -392,7 +398,14 @@ def main(cfg: DictConfig) -> None:
   log.info("seeded %d Gaussians  per-layer counts %s", n_gauss, per_layer.tolist())
 
   scene_scale = float(np.linalg.norm(views["pose"][0][:3, 3])) or 1.0
-  params = {k: torch.nn.Parameter(torch.from_numpy(v).to(device)) for k, v in g.items()}
+  optimize_means = bool(cfg.optimize_means)
+  params = {
+    k: torch.nn.Parameter(torch.from_numpy(v).to(device),
+                          requires_grad=(k != "means" or optimize_means))
+    for k, v in g.items()
+  }
+  log.info("Gaussian centers: %s",
+           "trainable" if optimize_means else "FROZEN at depth-peel seed positions")
 
   viewmats = torch.from_numpy(make_viewmats(views["pose"])).to(device)
   Ks = torch.from_numpy(views["K"]).to(device)
@@ -405,13 +418,15 @@ def main(cfg: DictConfig) -> None:
                 .to(device)[..., None])
   gt_rgb = gt_rgb * gt_alpha  # composite GT over black, matching a black-bg render
 
-  opt = torch.optim.Adam([
-    {"params": [params["means"]], "lr": float(cfg.lr.means) * scene_scale},
+  groups = [
     {"params": [params["scales_log"]], "lr": float(cfg.lr.scales)},
     {"params": [params["quats"]], "lr": float(cfg.lr.quats)},
     {"params": [params["opac_logit"]], "lr": float(cfg.lr.opacities)},
     {"params": [params["colors_logit"]], "lr": float(cfg.lr.colors)},
-  ])
+  ]
+  if optimize_means:
+    groups.insert(0, {"params": [params["means"]], "lr": float(cfg.lr.means) * scene_scale})
+  opt = torch.optim.Adam(groups)
   window = _gaussian_window(device=device)
   ls, lm = float(cfg.lambda_ssim), float(cfg.lambda_mask)
   val_every = int(cfg.val_every)

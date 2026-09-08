@@ -17,6 +17,11 @@ iters: 3000
 seed: 42
 device: cuda              # cuda | cpu
 
+# Whether the optimizer may move Gaussian centers. false = centers stay locked
+# at their depth-peel back-projected seed positions; only scale / rotation /
+# opacity / colour are optimized (and lr.means is unused).
+optimize_means: false
+
 # --- losses ---
 lambda_ssim: 0.2          # weight of the (1 - SSIM) term in the RGB loss
 lambda_mask: 1.0          # weight of the L1 rendered-alpha vs image-alpha term
