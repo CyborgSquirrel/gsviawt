@@ -26,7 +26,7 @@ def main():
   p.add_argument("wt_h5")
   p.add_argument("--layer", type=int, default=0)
   p.add_argument(
-    "--align", choices=["none", "median", "scale", "affine"], default="none",
+    "--align", choices=["none", "median", "scale", "affine", "mad"], default="none",
     help="Align WT to GT per view before boxing (default: none, i.e. raw "
          "pixel values -- shows the same units both were saved in)")
   p.add_argument(

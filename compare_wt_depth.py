@@ -70,6 +70,19 @@ def _align(pred, gt, mode):
     a = np.stack([pred, np.ones_like(pred)], axis=1)
     (s, t), *_ = np.linalg.lstsq(a, gt, rcond=None)
     return float(s), float(t)
+  if mode == "mad":
+    # MiDaS / Depth-Anything scale-and-shift-invariant normalisation:
+    # normalise each of pred and gt by (median, mean-abs-deviation-from-median),
+    # then map pred's normalised frame onto gt's. Robust affine alignment
+    # (median/MAD instead of least-squares), absorbs both scale and shift.
+    def _t_s(x):
+      t = np.median(x)
+      s = np.mean(np.abs(x - t))
+      return float(t), float(max(s, 1e-8))
+    tp, sp = _t_s(pred)
+    tg, sg = _t_s(gt)
+    scale = sg / sp
+    return scale, tg - scale * tp
   raise ValueError(f"unknown align mode {mode!r}")
 
 
@@ -226,7 +239,7 @@ def main():
   p.add_argument("wt_h5")
   p.add_argument("--index", type=int, default=None, help="Compare just this view (default: every shared view)")
   p.add_argument("--layer", type=int, default=0, help="Depth-peel / points layer to compare (default 0, the surface)")
-  p.add_argument("--align", choices=["median", "scale", "affine", "none"], default="median")
+  p.add_argument("--align", choices=["median", "scale", "affine", "mad", "none"], default="median")
   p.add_argument("--out", default=None, help="Figure path (default: <wt_h5>.depthcmp[.viewN].png; '-' to skip)")
   p.add_argument("--csv", default=None, help="Also write per-view metrics as CSV")
   args = p.parse_args()
