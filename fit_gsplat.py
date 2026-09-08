@@ -75,6 +75,7 @@ _setup_cuda_toolchain()
 import h5py  # noqa: E402
 import hydra  # noqa: E402
 import numpy as np  # noqa: E402
+from einops import rearrange, reduce, repeat  # noqa: E402
 import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 from omegaconf import DictConfig, OmegaConf  # noqa: E402
@@ -162,14 +163,15 @@ def init_gaussians(depth_primary, K_primary, pose_primary, image_primary,
   # isotropic initial scale = mean distance to the knn_k nearest neighbours
   from scipy.spatial import cKDTree
   k = min(knn_k + 1, len(pts))
-  dist, _ = cKDTree(pts).query(pts, k=k)
-  dist = np.atleast_2d(dist.T).T
-  nn = dist[:, 1:].mean(axis=1) if dist.shape[1] > 1 else dist[:, 0]
+  dist, _ = cKDTree(pts).query(pts, k=k)                    # (P, k), or (P,) when k == 1
+  dist = rearrange(dist, "p -> p 1") if dist.ndim == 1 else dist
+  neighbours = dist[:, 1:] if k > 1 else dist               # column 0 is the point itself
+  nn = reduce(neighbours, "p k -> p", "mean")
   nn = np.clip(nn, 1e-6, None).astype(np.float32)
 
   return {
     "means": pts.astype(np.float32),
-    "scales_log": np.log(nn)[:, None].repeat(3, axis=1),
+    "scales_log": repeat(np.log(nn), "p -> p xyz", xyz=3).astype(np.float32),
     "quats": np.tile([1.0, 0.0, 0.0, 0.0], (len(pts), 1)).astype(np.float32),
     "opac_logit": np.full(len(pts), _logit(np.float32(init_opacity)), np.float32),
     "colors_logit": _logit(colors).astype(np.float32),
