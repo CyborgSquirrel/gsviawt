@@ -18,6 +18,11 @@ They are then optimized with `gsplat` against the RGB (L1 + D-SSIM) and alpha
 only, never new Gaussians. Fully-occluded deeper-layer Gaussians (seen in no
 supplied view) keep their initial front-pixel colour.
 
+`images` may be a higher resolution than `depth_peel` (render_objaverse writes
+`image_intrinsics` when they differ): the seed grid and the output grids stay
+at the depth-peel resolution, while the photometric loss renders at the image
+resolution using `image_intrinsics`.
+
 By default (`optimize_means: false`) the Gaussian centers are locked to those
 back-projected seed positions and only scale / rotation / opacity / colour are
 optimized, so `gaussian_means` in the output equals the unprojected depth peel
@@ -129,15 +134,21 @@ def load_views(cfg: DictConfig):
       mp = f["mesh_paths"][mesh_idx]
       mesh_path = mp.decode() if isinstance(mp, bytes) else str(mp)
 
-    images = np.stack([np.asarray(f[ds.images][i]) for i in order])          # (V,H,W,3|4) u8
-    depth = np.stack([np.asarray(f[ds.depth][i]) for i in order]).astype(np.float32)  # (V,H,W,L)
-    K = np.stack([np.asarray(f[ds.intrinsics][i]) for i in order]).astype(np.float32)  # (V,3,3)
+    images = np.stack([np.asarray(f[ds.images][i]) for i in order])          # (V,IH,IW,3|4) u8
+    depth = np.stack([np.asarray(f[ds.depth][i]) for i in order]).astype(np.float32)  # (V,DH,DW,L)
+    K = np.stack([np.asarray(f[ds.intrinsics][i]) for i in order]).astype(np.float32)  # (V,3,3), matches depth
     pose = np.stack([np.asarray(f[ds.pose][i]) for i in order]).astype(np.float32)     # (V,4,4) c2w
+    # render_objaverse writes `image_intrinsics` only when the RGB pass ran at a
+    # different resolution than the depth peel; otherwise the depth K applies to both.
+    if ds.image_intrinsics in f:
+      image_K = np.stack([np.asarray(f[ds.image_intrinsics][i]) for i in order]).astype(np.float32)
+    else:
+      image_K = K
 
   return {
     "order": order, "primary": primary, "secondary": secondary,
     "mesh_index": mesh_idx, "mesh_path": mesh_path,
-    "images": images, "depth": depth, "K": K, "pose": pose,
+    "images": images, "depth": depth, "K": K, "image_K": image_K, "pose": pose,
   }
 
 
@@ -153,13 +164,19 @@ def _logit(x, eps=1e-4):
 def init_gaussians(depth_primary, K_primary, pose_primary, image_primary,
                    knn_k, init_opacity):
   """Seed one Gaussian per depth-peel hit in the primary view. Returns numpy
-  arrays; `u/v/layer` record each Gaussian's pixel + peel-layer of origin."""
+  arrays; `u/v/layer` record each Gaussian's pixel + peel-layer of origin (in
+  depth-peel pixels). `image_primary` may be a different resolution than the
+  depth peel -- the seed colour is nearest-sampled at the scaled location."""
   pts, u, v, layer = unproject_depth_peel(
     depth_primary, K_primary, pose_primary, space="world")          # (P,3), (P,), (P,), (P,)
   if len(pts) == 0:
     raise SystemExit("primary view has no depth-peel hits -- nothing to seed")
 
-  colors = image_primary[v, u, :3].astype(np.float32) / 255.0        # front-pixel colour
+  dh, dw = depth_primary.shape[:2]
+  ih, iw = image_primary.shape[:2]
+  iv = np.clip(np.round(v * (ih / dh)), 0, ih - 1).astype(np.int64)
+  iu = np.clip(np.round(u * (iw / dw)), 0, iw - 1).astype(np.int64)
+  colors = image_primary[iv, iu, :3].astype(np.float32) / 255.0      # front-pixel colour
 
   # isotropic initial scale = mean distance to the knn_k nearest neighbours
   from scipy.spatial import cKDTree
@@ -285,7 +302,9 @@ def save_output(path, cfg, views, params_np, uvl, H, W, L, final_loss, scene_sca
 
     # cameras / GT for the views actually used (primary first)
     f.create_dataset("camera_pose_used", data=views["pose"])
-    f.create_dataset("camera_intrinsics_used", data=views["K"])
+    f.create_dataset("camera_intrinsics_used", data=views["K"])          # matches depth / grid
+    if views["image_K"] is not views["K"]:
+      f.create_dataset("image_intrinsics_used", data=views["image_K"])   # matches images_used
     _scene_dataset(f, "depth_peel_primary", views["depth"][0])
     _scene_dataset(f, "images_used", views["images"])
     f.create_dataset("view_index_used", data=np.asarray(views["order"], np.int64))
@@ -372,9 +391,16 @@ def main(cfg: DictConfig) -> None:
 
   with timed("load"):
     views = load_views(cfg)
-  V, H, W, L = views["images"].shape[0], *views["depth"].shape[1:]
-  log.info("primary=%d secondary=%s  %d views  %dx%d  %d peel layers  mesh=%s",
-           views["primary"], views["secondary"], V, W, H, L, views["mesh_path"] or views["mesh_index"])
+  V = views["images"].shape[0]
+  IH, IW = views["images"].shape[1:3]      # RGB render / supervision resolution
+  DH, DW, L = views["depth"].shape[1:]     # depth-peel = seed + output-grid resolution
+  if views["images"].shape[-1] != 4 and (IH, IW) != (DH, DW):
+    raise SystemExit("RGB-only file (no alpha) with images and depth_peel at "
+                     "different resolutions is not supported -- the mask can't be "
+                     "derived. Use an RGBA render or equal resolutions.")
+  log.info("primary=%d secondary=%s  %d views  RGB %dx%d  depth/grid %dx%d  %d peel layers  mesh=%s",
+           views["primary"], views["secondary"], V, IW, IH, DW, DH, L,
+           views["mesh_path"] or views["mesh_index"])
 
   with timed("init"):
     g = init_gaussians(views["depth"][0], views["K"][0], views["pose"][0],
@@ -382,7 +408,8 @@ def main(cfg: DictConfig) -> None:
   uvl = {"u": g.pop("u"), "v": g.pop("v"), "layer": g.pop("layer")}
   n_gauss = len(g["means"])
   per_layer = np.bincount(uvl["layer"], minlength=L)
-  log.info("seeded %d Gaussians  per-layer counts %s", n_gauss, per_layer.tolist())
+  log.info("seeded %d Gaussians (from the %dx%d depth peel)  per-layer counts %s",
+           n_gauss, DW, DH, per_layer.tolist())
 
   scene_scale = float(np.linalg.norm(views["pose"][0][:3, 3])) or 1.0
   optimize_means = bool(cfg.optimize_means)
@@ -395,12 +422,12 @@ def main(cfg: DictConfig) -> None:
            "trainable" if optimize_means else "FROZEN at depth-peel seed positions")
 
   viewmats = torch.from_numpy(make_viewmats(views["pose"])).to(device)
-  Ks = torch.from_numpy(views["K"]).to(device)
+  Ks = torch.from_numpy(views["image_K"]).to(device)   # render/supervise at RGB resolution
 
   gt_rgb = torch.from_numpy(views["images"][..., :3].astype(np.float32) / 255.0).to(device)
   if views["images"].shape[-1] == 4:
     gt_alpha = torch.from_numpy(views["images"][..., 3:4].astype(np.float32) / 255.0).to(device)
-  else:
+  else:  # equal-resolution RGB-only file (guarded above): mask from the surface layer
     gt_alpha = (torch.from_numpy((views["depth"][:, :, :, 0] > 0).astype(np.float32))
                 .to(device)[..., None])  # NaN / -1.0 no-hit both -> 0
   gt_rgb = gt_rgb * gt_alpha  # composite GT over black, matching a black-bg render
@@ -429,7 +456,7 @@ def main(cfg: DictConfig) -> None:
   final_loss = float("nan")
   with timed("optimize"):
     for it in it_range:
-      rgb, alpha = render(params, viewmats, Ks, W, H)
+      rgb, alpha = render(params, viewmats, Ks, IW, IH)
       rgb_c = rgb * alpha  # premultiply so bg stays black on both sides
       l1 = (rgb_c - gt_rgb).abs().mean()
       dssim = 1.0 - ssim(rgb_c.permute(0, 3, 1, 2), gt_rgb.permute(0, 3, 1, 2), window)
@@ -452,7 +479,7 @@ def main(cfg: DictConfig) -> None:
 
   params_np = {k: v.detach().cpu().numpy() for k, v in params.items()}
   with timed("write"):
-    save_output(out_h5, cfg, views, params_np, uvl, H, W, L, final_loss, scene_scale)
+    save_output(out_h5, cfg, views, params_np, uvl, DH, DW, L, final_loss, scene_scale)
     if bool(cfg.write_ply):
       st = write_ply(f"{stem}.ply", params_np, scene_scale,
                      cfg.ply_opacity_threshold,
