@@ -207,6 +207,16 @@ EOF
 ENV CUDA_HOME="/home/user/venv/lib/python3.13/site-packages/nvidia/cu13"
 ENV PATH="/home/user/venv/lib/python3.13/site-packages/nvidia/cu13/bin:$PATH"
 
+# Pre-compile gsplat's CUDA kernels into the image so no container ever
+# JIT-compiles them on first use (that's a ~2-4 min stall, and ~/.cache isn't
+# a mounted volume so it would otherwise recur on every `compose down && up`).
+# The build host has no GPU, so the target archs must be explicit: 8.6 = RTX
+# 3080 (local dev), 8.9 = L4 (Modal); +PTX lets newer cards JIT from PTX. The
+# compiled .so lands in ~/.cache/torch_extensions and is loaded as-is at
+# runtime. This layer only rebuilds when requirements.txt changes.
+ENV TORCH_CUDA_ARCH_LIST="8.6;8.9+PTX"
+RUN python -c "import gsplat; print('gsplat', gsplat.__version__, '- CUDA kernels prebuilt')"
+
 # Copy everything (this is the only place world-tracing's actual source
 # lands in the image)
 COPY --chown=$XUID:$XGID . .
