@@ -27,6 +27,18 @@ python-lsp-isort
 h5py
 hdf5plugin  # compression filters
 
+# 3D Gaussian Splatting (fit_gsplat.py). gsplat's wheel JIT-compiles its CUDA
+# kernels on first import; the base image is a CUDA *runtime* image with no
+# nvcc, so ship the toolchain via pip. Pin the CUDA 13.0.x line to match
+# torch's cu130 build -- a newer nvcc (13.3) mismatches torch's bundled CCCL
+# headers. fit_gsplat._setup_cuda_toolchain() wires CUDA_HOME/PATH + the
+# libcudart.so dev symlink at runtime.
+gsplat
+nvidia-cuda-nvcc==13.0.88
+nvidia-cuda-crt==13.0.88
+nvidia-nvvm==13.0.88
+nvidia-cuda-cccl==13.0.85
+
 # unsorted
 objaverse
 rpyc
