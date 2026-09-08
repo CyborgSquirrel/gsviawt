@@ -297,14 +297,20 @@ def save_output(path, cfg, views, params_np, uvl, H, W, L, final_loss, scene_sca
 
 
 def write_ply(path, params_np):
+  """Standard INRIA-format 3DGS .ply. `gsplat.export_splats` writes every
+  field raw, and viewers apply the activations themselves: exp(scale),
+  sigmoid(opacity), SH_C0*f_dc + 0.5. So pass the *unactivated* optimizer
+  params -- log-scales, logit-opacities, SH-DC colours -- not the activated
+  values stored in the .h5."""
   import gsplat
   colors = 1.0 / (1.0 + np.exp(-params_np["colors_logit"]))
-  sh0 = ((colors - 0.5) / SH_C0)[:, None, :]           # (N,1,3)
+  sh0 = ((colors - 0.5) / SH_C0)[:, None, :]           # (N,1,3) SH band-0 coeff
+  quats = params_np["quats"] / np.linalg.norm(params_np["quats"], axis=-1, keepdims=True)
   gsplat.export_splats(
     means=torch.from_numpy(params_np["means"]),
-    scales=torch.from_numpy(np.exp(params_np["scales_log"])),
-    quats=torch.from_numpy(params_np["quats"]),
-    opacities=torch.from_numpy(params_np["opac_logit"]),   # exporter applies sigmoid
+    scales=torch.from_numpy(params_np["scales_log"]),      # log-space; viewer exp()s
+    quats=torch.from_numpy(quats.astype(np.float32)),
+    opacities=torch.from_numpy(params_np["opac_logit"]),   # logit; viewer sigmoid()s
     sh0=torch.from_numpy(sh0.astype(np.float32)),
     shN=torch.zeros(len(colors), 0, 3),
     format="ply", save_to=path,
