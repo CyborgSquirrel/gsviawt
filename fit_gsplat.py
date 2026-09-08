@@ -26,7 +26,7 @@ exactly. Set `optimize_means: true` to let the centers move too.
 Output is written next to the input as:
   <h5>.gsplat.view<primary>.h5  -- Gaussian attributes as (H, W, 6, .) grids
       (NaN marks an empty slot, same layout as `depth_peel` / wt_infer_layers'
-      `points`), plus flat `*_flat` copies and the primary/secondary cameras.
+      `points`), a `layer_valid` mask, and the views used (cameras + GT).
   <h5>.gsplat.view<primary>.ply  -- standard 3DGS point cloud (if write_ply)
   <h5>.gsplat.view<primary>.val/ -- gt|render comparison PNGs (if val_every)
 
@@ -246,6 +246,13 @@ def _scatter_grid(flat, v, u, layer, H, W, L):
   return grid
 
 
+def _scene_dataset(f, name, data):
+  """One scene's grid, gzipped, chunked as the whole array. A future batched
+  .h5 (many scenes in one file) should chunk one scene at a time the same way."""
+  f.create_dataset(name, data=data, chunks=data.shape,
+                   compression="gzip", compression_opts=4)
+
+
 def save_output(path, cfg, views, params_np, uvl, H, W, L, final_loss, scene_scale):
   v, u, layer = uvl["v"], uvl["u"], uvl["layer"]
   means = params_np["means"]
@@ -265,30 +272,22 @@ def save_output(path, cfg, views, params_np, uvl, H, W, L, final_loss, scene_sca
     f.attrs["scene_scale"] = float(scene_scale)
     f.attrs["layer_layout"] = "(H, W, 6) like depth_peel; NaN = empty slot"
 
-    # per-layer Gaussian grids (H, W, L, .)
-    f.create_dataset("gaussian_means", data=_scatter_grid(means, v, u, layer, H, W, L))
-    f.create_dataset("gaussian_scales", data=_scatter_grid(scales, v, u, layer, H, W, L))
-    f.create_dataset("gaussian_quats", data=_scatter_grid(quats, v, u, layer, H, W, L))
-    f.create_dataset("gaussian_opacities", data=_scatter_grid(opac, v, u, layer, H, W, L))
-    f.create_dataset("gaussian_colors", data=_scatter_grid(colors, v, u, layer, H, W, L))
+    # per-scene Gaussian grids (H, W, 6, .) -- NaN where the primary depth peel
+    # had no hit. Whole-array chunk + gzip (mostly NaN, compresses hard).
+    _scene_dataset(f, "gaussian_means", _scatter_grid(means, v, u, layer, H, W, L))
+    _scene_dataset(f, "gaussian_scales", _scatter_grid(scales, v, u, layer, H, W, L))
+    _scene_dataset(f, "gaussian_quats", _scatter_grid(quats, v, u, layer, H, W, L))
+    _scene_dataset(f, "gaussian_opacities", _scatter_grid(opac, v, u, layer, H, W, L))
+    _scene_dataset(f, "gaussian_colors", _scatter_grid(colors, v, u, layer, H, W, L))
     valid = np.zeros((H, W, L), bool)
     valid[v, u, layer] = True
-    f.create_dataset("layer_valid", data=valid)
-
-    # flat copies (Gaussian order == init order == unproject_depth_peel order)
-    f.create_dataset("means_flat", data=means)
-    f.create_dataset("scales_flat", data=scales.astype(np.float32))
-    f.create_dataset("quats_flat", data=quats.astype(np.float32))
-    f.create_dataset("opacities_flat", data=opac.astype(np.float32))
-    f.create_dataset("colors_flat", data=colors.astype(np.float32))
-    f.create_dataset("layer_index_flat", data=layer)
-    f.create_dataset("uv_flat", data=np.stack([u, v], axis=1))
+    _scene_dataset(f, "layer_valid", valid)
 
     # cameras / GT for the views actually used (primary first)
     f.create_dataset("camera_pose_used", data=views["pose"])
     f.create_dataset("camera_intrinsics_used", data=views["K"])
-    f.create_dataset("depth_peel_primary", data=views["depth"][0])
-    f.create_dataset("images_used", data=views["images"])
+    _scene_dataset(f, "depth_peel_primary", views["depth"][0])
+    _scene_dataset(f, "images_used", views["images"])
     f.create_dataset("view_index_used", data=np.asarray(views["order"], np.int64))
 
 
