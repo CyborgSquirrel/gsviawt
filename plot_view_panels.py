@@ -19,7 +19,7 @@ import numpy as np
 from compare_wt_depth import _align, _layer0_depth_gt, _layer0_depth_pred
 
 
-def panel(rgb_r, rgb_w, gt, wt_al, both, title, out):
+def panel(rgb_r, rgb_w, gt, wt_al, both, title, out, wt_label="depth WT (aligned)"):
   import matplotlib
 
   matplotlib.use("Agg")
@@ -58,7 +58,7 @@ def panel(rgb_r, rgb_w, gt, wt_al, both, title, out):
   show(ax_rgb1, rgb_r, "RGB render")
   show(ax_rgb2, rgb_w, "RGB WT input")
   im1 = show(ax_d1, gt_m, "depth GT", cmap="turbo", vmin=vmin, vmax=vmax)
-  show(ax_d2, wt_m, "depth WT (aligned)", cmap="turbo", vmin=vmin, vmax=vmax)
+  show(ax_d2, wt_m, wt_label, cmap="turbo", vmin=vmin, vmax=vmax)
   im_d = show(ax_delta, delta, "|delta|", cmap="turbo", vmin=0, vmax=dmax)
 
   fig.colorbar(im1, cax=cax_d, orientation="horizontal", label="depth")
@@ -96,7 +96,8 @@ def main():
       m = f"mesh {int(mesh_index[v])}" if mesh_index is not None else ""
       title = (f"view {v}  {m}   align={args.align} (s={s:.3g}, t={t:.3g})   "
                f"AbsRel={absrel:.3f}   n={int(both.sum())}")
-      panel(rgb_r, rgb_w, gt, wt_al, both, title, f"{prefix}.view{v}.png")
+      wt_label = "depth WT (raw)" if args.align == "none" else f"depth WT ({args.align}-aligned)"
+      panel(rgb_r, rgb_w, gt, wt_al, both, title, f"{prefix}.view{v}.png", wt_label=wt_label)
 
 
 if __name__ == "__main__":
