@@ -149,7 +149,7 @@ def _logit(x, eps=1e-4):
 
 
 def init_gaussians(depth_primary, K_primary, pose_primary, image_primary,
-                   knn_k, init_opacity, max_gaussians, rng):
+                   knn_k, init_opacity):
   """Seed one Gaussian per depth-peel hit in the primary view. Returns numpy
   arrays; `u/v/layer` record each Gaussian's pixel + peel-layer of origin."""
   pts, u, v, layer = unproject_depth_peel(
@@ -158,16 +158,6 @@ def init_gaussians(depth_primary, K_primary, pose_primary, image_primary,
     raise SystemExit("primary view has no depth-peel hits -- nothing to seed")
 
   colors = image_primary[v, u, :3].astype(np.float32) / 255.0        # front-pixel colour
-
-  if max_gaussians and len(pts) > max_gaussians:
-    keep = []
-    frac = max_gaussians / len(pts)
-    for lyr in np.unique(layer):
-      idx = np.nonzero(layer == lyr)[0]
-      take = max(1, int(round(len(idx) * frac)))
-      keep.append(rng.choice(idx, size=min(take, len(idx)), replace=False))
-    keep = np.sort(np.concatenate(keep))
-    pts, u, v, layer, colors = pts[keep], u[keep], v[keep], layer[keep], colors[keep]
 
   # isotropic initial scale = mean distance to the knn_k nearest neighbours
   from scipy.spatial import cKDTree
@@ -374,7 +364,6 @@ def dump_val(val_dir, it, gt_rgb, gt_alpha, render_rgb, render_alpha):
 def main(cfg: DictConfig) -> None:
   logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
   torch.manual_seed(int(cfg.seed))
-  rng = np.random.default_rng(int(cfg.seed))
   device = cfg.device if (cfg.device != "cuda" or torch.cuda.is_available()) else "cpu"
   if device != cfg.device:
     log.warning("cuda not available, falling back to cpu")
@@ -390,8 +379,7 @@ def main(cfg: DictConfig) -> None:
 
   with timed("init"):
     g = init_gaussians(views["depth"][0], views["K"][0], views["pose"][0],
-                       views["images"][0], int(cfg.knn_k), float(cfg.init_opacity),
-                       int(cfg.max_gaussians), rng)
+                       views["images"][0], int(cfg.knn_k), float(cfg.init_opacity))
   uvl = {"u": g.pop("u"), "v": g.pop("v"), "layer": g.pop("layer")}
   n_gauss = len(g["means"])
   per_layer = np.bincount(uvl["layer"], minlength=L)

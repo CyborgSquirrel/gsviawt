@@ -37,7 +37,6 @@ lr:
 # --- initialization ---
 init_opacity: 0.1         # starting opacity for every seeded Gaussian
 knn_k: 4                  # neighbours used to size each Gaussian's initial scale
-max_gaussians: 0          # 0 = keep every depth-peel hit; else subsample per layer
 
 # --- validation / output ---
 val_every: 500            # dump gt|render PNGs every N iters (0 disables)
