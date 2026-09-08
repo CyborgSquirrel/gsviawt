@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Visualize one view of a capture_turntable.py render HDF5 as a colored
+"""Visualize one view of a render_objaverse.py render HDF5 as a colored
 point cloud .glb.
 
 Three formats (-f/--format):

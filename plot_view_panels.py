@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Per-view panel: RGB render | RGB WT-input | GT depth | aligned WT depth |
-|delta|, for one or more views of a capture_turntable render vs its
+|delta|, for one or more views of a render_objaverse render vs its
 wt_infer_layers.py prediction.
 
 WT's layer-0 depth (`points[..., 0, 2]`) is aligned to the render's layer-0

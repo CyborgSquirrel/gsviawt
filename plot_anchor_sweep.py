@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare candidate depth-anchor statistics for matching a capture_turntable
+"""Compare candidate depth-anchor statistics for matching a render_objaverse.py
 render's scale to a World Tracing prediction.
 
 WT outputs depth in its own canonical frame (surface ~1.9 regardless of the

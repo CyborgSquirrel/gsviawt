@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Single-panel figure: per-view mean surface depth, World Tracing prediction
-vs capture_turntable render (ground truth), grouped by mesh.
+vs render_objaverse render (ground truth), grouped by mesh.
 
 Just the mean-depth view from compare_wt_depth.py's summary figure, pulled out
 on its own and laid out so the N-views-per-mesh structure is obvious: each mesh

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Run the World Tracing object model (r75b) on one or all views of a
-capture_turntable.py render and dump its per-layer output as an HDF5
-file laid out like renders.h5, for direct comparison against
+render_objaverse.py render and dump its per-layer output as an HDF5
+file laid out like the input h5, for direct comparison against
 debug_pointcloud.py's depth-peel output.
 
 Mirrors world-tracing/examples/infer_rgba.py (model load -> preprocess ->
 inference_diffusion) but skips the Rerun/.rrd visualisation entirely and
 instead:
-  * reads the input RGB + mask straight from our own renders.h5 (the same
-    pixels/alpha capture_turntable.py wrote), instead of a saved PNG;
+  * reads the input RGB + mask straight from our own render h5 (the same
+    pixels/alpha render_objaverse.py wrote), instead of a saved PNG;
   * writes an HDF5 file with an 'images' dataset (the image actually fed
     to the model, i.e. after preprocess_rgba_for_model's crop/resize/bg
     blend) and a 'points' dataset (the predicted per-layer XYZ, one
@@ -34,10 +34,10 @@ default.
 object to fill ~2/3 of the model's square input canvas via
 `compute_object_crop`, matching its Objaverse training data -- but
 that's now off by default here (`--center-crop` to re-enable) since
-render_server.py's frame_object_robust already frames renders at
-max_object_ratio=2/3 with silhouette recentering, so the raw render
-should already be close to that distribution without an extra re-crop
-moving pixels around. If you turn `--center-crop` on (e.g. for input
+render_objaverse.py's unit-cube normalize + fixed camera already frame
+the object consistently at roughly that ratio, so the raw render should
+already be close to that distribution without an extra re-crop moving
+pixels around. If you turn `--center-crop` on (e.g. for input
 images that weren't rendered by our own pipeline), don't expect
 pixel-for-pixel alignment with the raw render -- compare overall
 shape/scale/extent, or solve for a similarity transform if you need
@@ -142,7 +142,7 @@ def process_view(
 
 def main():
   parser = ArgumentParser(description=__doc__)
-  parser.add_argument("hdf5_path", help="Path to a capture_turntable.py renders.h5")
+  parser.add_argument("hdf5_path", help="Path to a render_objaverse.py render h5")
   parser.add_argument(
     "--index", type=int, default=None,
     help="View index within the HDF5. Default: process every view in the file.",
@@ -170,11 +170,11 @@ def main():
     help=(
       "Apply wt's inference-time object-centering re-crop "
       "(preprocess_rgba_for_model's compute_object_crop). Off by "
-      "default: since render_server.py's frame_object_robust now fits "
-      "framing to real vertices at max_object_ratio=2/3 with silhouette "
-      "recentering, the render should already land close to wt's "
-      "training distribution, so this re-crop would mostly just move "
-      "pixels around and break the correspondence to the raw render."
+      "default: since render_objaverse.py normalizes the object to a unit "
+      "cube and shoots it from a fixed camera distance, the render should "
+      "already land close to wt's training distribution, so this re-crop "
+      "would mostly just move pixels around and break the correspondence "
+      "to the raw render."
     ),
   )
   parser.add_argument("--bg-color", type=str, default="0,0,0",
@@ -250,7 +250,7 @@ def main():
   num_layers = points_arr.shape[3]
 
   # One chunk per view -> compressed independently, same convention as
-  # capture_turntable.py's renders.h5 (image_kwargs/depth_kwargs). Without
+  # render_objaverse.py's render h5 (img_kw/depth_kw). Without
   # this the file is dominated by `points`' NaN-padded (H, W, L, 3) float32
   # volumes -- e.g. 40 views @ 504x504x6 was ~730MB uncompressed for points
   # alone; gzip on the large invalid (NaN) runs shrinks that a lot.

@@ -1,4 +1,4 @@
-"""Mesh-selection strategies for capture_turntable.py, instantiated via
+"""Mesh-selection strategies for render_objaverse.py, instantiated via
 Hydra `_target_` from conf/mesh_strategy/*.yaml.
 """
 

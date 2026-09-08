@@ -26,7 +26,7 @@ def main():
   p = ArgumentParser(description=__doc__)
   p.add_argument("wt_h5")
   p.add_argument("--render", default=None,
-                 help="capture_turntable render h5; overlays GT boxes per layer + mesh bands")
+                 help="render_objaverse render h5; overlays GT boxes per layer + mesh bands")
   p.add_argument("--pooled", action="store_true",
                  help="one box per layer over all views (default: per view)")
   p.add_argument("--align", choices=["none", "median", "scale", "affine", "mad"], default="none",

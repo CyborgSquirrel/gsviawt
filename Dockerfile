@@ -144,7 +144,6 @@ RUN \
   --mount=type=cache,target=/home/user/.cache/pip,id=pip \
 <<EOF
   pkgs=(
-    rpyc
     # render_objaverse.py runs the whole render inside Blender and reads
     # our Hydra config + writes the h5 from there.
     h5py

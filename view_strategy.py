@@ -1,4 +1,4 @@
-"""View-sampling strategies for capture_turntable.py, instantiated via Hydra
+"""View-sampling strategies for render_objaverse.py, instantiated via Hydra
 `_target_` from conf/view_strategy/*.yaml.
 """
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare the surface-layer (layer 0) depth of a capture_turntable.py render
+"""Compare the surface-layer (layer 0) depth of a render_objaverse.py render
 against World Tracing's prediction (wt_infer_layers.py output).
 
 Inputs

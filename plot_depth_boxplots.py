@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Boxplots of per-pixel surface depth, World Tracing prediction vs
-capture_turntable render (ground truth), one box pair per view, grouped by
+render_objaverse render (ground truth), one box pair per view, grouped by
 mesh -- the distribution analogue of plot_mean_depth.py's point plot (which
 only shows the mean).
 
