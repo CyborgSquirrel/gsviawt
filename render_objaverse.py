@@ -432,52 +432,76 @@ def run(cfg):
     ds_mesh = stack.enter_context(LazyDataset(hf, "mesh_index"))
     ds_scale = stack.enter_context(LazyDataset(hf, "depth_scale"))
 
+    failed = []
     for mi, mesh_path in enumerate(meshes):
-      reset_scene()  # purges bpy.data objects/materials/images -> rebuild the rig
-      load_object(mesh_path)
-      if cfg.normalize_object:
-        normalize_object()
-      cam = setup_camera(cfg)
-      setup_lighting(str(cfg.lighting))
-      rl, comp = setup_depth_compositor(scene, bpy.context.view_layer)
-      peel_mat, peel_tex, peel_eps = build_depth_peel_material()
-      mesh_objs = scene_meshes()
+      try:
+        _render_mesh(cfg, scene, mi, mesh_path, view_strategy, W, H, Lmax, tmp,
+                     ds_img, ds_pose, ds_intr, ds_depth, ds_mesh, ds_scale)
+      except Exception:
+        logger.exception("mesh %d (%s) failed -- skipping", mi, mesh_path)
+        failed.append(mi)
 
-      for tilt_deg, az_deg, view_dir in view_strategy.views():
-        vd = np.asarray(view_dir, np.float64)
-        vd = vd / (np.linalg.norm(vd) or 1.0)
-        cam.location = Vector(vd * float(cfg.camera_distance))
-        aim_camera(cam)
-        bpy.context.view_layer.update()
-        label = f"mesh={mi} tilt={tilt_deg:.1f} az={az_deg:.1f}"
-
-        with timed(f"{label} render"):
-          if cfg.render:
-            rgba = render_rgba(os.path.join(tmp, "rgb.png"), W, H)
-          depth_vol, _ = depth_peel(mesh_objs, peel_mat, peel_tex, peel_eps,
-                                    rl, comp, W, H, Lmax, tmp)
-
-        pose = np.array(cam.matrix_world, np.float32)
-        intr = camera_intrinsics(cam.data, W, H)
-
-        depth_scale = 1.0
-        if cfg.camera_depth_target is not None:
-          surf = depth_vol[..., 0]
-          hit = surf >= 0
-          if hit.any():
-            depth_scale = float(cfg.camera_depth_target) / float(surf[hit].mean())
-            depth_vol = np.where(depth_vol >= 0, depth_vol * depth_scale, depth_vol)
-            pose[:3, 3] *= depth_scale
-
-        if ds_img is not None:
-          ds_img.append(rgba)
-        ds_pose.append(pose)
-        ds_intr.append(intr)
-        ds_depth.append(depth_vol.astype(np.float32))
-        ds_mesh.append(np.int64(mi))
-        ds_scale.append(np.float32(depth_scale))
+    if failed:
+      hf.attrs["failed_mesh_indices"] = json.dumps(failed)
+      logger.warning("%d/%d meshes failed: %s", len(failed), len(meshes), failed)
 
   logger.info("wrote %s", cfg.output_path)
+
+
+def _render_mesh(cfg, scene, mi, mesh_path, view_strategy, W, H, Lmax, tmp,
+                 ds_img, ds_pose, ds_intr, ds_depth, ds_mesh, ds_scale):
+  """Load, normalize and render one mesh for every view the strategy yields,
+  appending a row per view to the open datasets. Raises on any Blender
+  failure (bad glb, degenerate bbox, ...) so run() can skip the mesh."""
+  from util import timed
+
+  reset_scene()  # purges bpy.data objects/materials/images -> rebuild the rig
+  load_object(mesh_path)
+  if cfg.normalize_object:
+    normalize_object()
+  cam = setup_camera(cfg)
+  setup_lighting(str(cfg.lighting))
+  rl, comp = setup_depth_compositor(scene, bpy.context.view_layer)
+  peel_mat, peel_tex, peel_eps = build_depth_peel_material()
+  mesh_objs = scene_meshes()
+
+  for tilt_deg, az_deg, view_dir in view_strategy.views():
+    vd = np.asarray(view_dir, np.float64)
+    r = float(np.linalg.norm(vd)) or 1.0
+    # A view strategy may encode a per-view camera distance as the view_dir
+    # magnitude (see view_strategy.RandomViews); unit length means "use
+    # cfg.camera_distance".
+    dist = float(cfg.camera_distance) if abs(r - 1.0) < 1e-3 else r
+    cam.location = Vector(vd / r * dist)
+    aim_camera(cam)
+    bpy.context.view_layer.update()
+    label = f"mesh={mi} tilt={tilt_deg:.1f} az={az_deg:.1f}"
+
+    with timed(f"{label} render"):
+      if cfg.render:
+        rgba = render_rgba(os.path.join(tmp, "rgb.png"), W, H)
+      depth_vol, _ = depth_peel(mesh_objs, peel_mat, peel_tex, peel_eps,
+                                rl, comp, W, H, Lmax, tmp)
+
+    pose = np.array(cam.matrix_world, np.float32)
+    intr = camera_intrinsics(cam.data, W, H)
+
+    depth_scale = 1.0
+    if cfg.camera_depth_target is not None:
+      surf = depth_vol[..., 0]
+      hit = surf >= 0
+      if hit.any():
+        depth_scale = float(cfg.camera_depth_target) / float(surf[hit].mean())
+        depth_vol = np.where(depth_vol >= 0, depth_vol * depth_scale, depth_vol)
+        pose[:3, 3] *= depth_scale
+
+    if ds_img is not None:
+      ds_img.append(rgba)
+    ds_pose.append(pose)
+    ds_intr.append(intr)
+    ds_depth.append(depth_vol.astype(np.float32))
+    ds_mesh.append(np.int64(mi))
+    ds_scale.append(np.float32(depth_scale))
 
 
 def main():
