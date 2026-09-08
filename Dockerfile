@@ -196,7 +196,26 @@ RUN \
 <<EOF
   uv pip compile requirements.txt -o requirements.lock
   uv pip install -r requirements.lock
+  # gsplat's JIT link step passes -lcudart; the pip CUDA wheel ships only the
+  # versioned libcudart.so.13, so add the dev symlink it expects. (fit_gsplat
+  # also does this at runtime, for anyone who pip-installs into an existing env.)
+  cudalib="/home/user/venv/lib/python${PYTHON_VERSION}/site-packages/nvidia/cu13/lib"
+  [ -e "$cudalib/libcudart.so.13" ] && ln -sf libcudart.so.13 "$cudalib/libcudart.so"
 EOF
+
+# gsplat: point torch.utils.cpp_extension at the pip CUDA toolchain.
+ENV CUDA_HOME="/home/user/venv/lib/python3.13/site-packages/nvidia/cu13"
+ENV PATH="/home/user/venv/lib/python3.13/site-packages/nvidia/cu13/bin:$PATH"
+
+# Pre-compile gsplat's CUDA kernels into the image so no container ever
+# JIT-compiles them on first use (that's a ~2-4 min stall, and ~/.cache isn't
+# a mounted volume so it would otherwise recur on every `compose down && up`).
+# The build host has no GPU, so the target archs must be explicit: 8.6 = RTX
+# 3080 (local dev), 8.9 = L4 (Modal); +PTX lets newer cards JIT from PTX. The
+# compiled .so lands in ~/.cache/torch_extensions and is loaded as-is at
+# runtime. This layer only rebuilds when requirements.txt changes.
+ENV TORCH_CUDA_ARCH_LIST="8.6;8.9+PTX"
+RUN python -c "import gsplat; print('gsplat', gsplat.__version__, '- CUDA kernels prebuilt')"
 
 # Copy everything (this is the only place world-tracing's actual source
 # lands in the image)

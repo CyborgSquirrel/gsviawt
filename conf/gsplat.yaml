@@ -1,0 +1,61 @@
+# Config for fit_gsplat.py -- optimize a 3D Gaussian Splatting model from one
+# render HDF5 (render_objaverse.py / capture_turntable.py schema), seeded from
+# the primary view's 6-layer depth peel and supervised by primary + secondary
+# views. See fit_gsplat.py's module docstring.
+
+# --- input ---
+hdf5_path: /app/bla/objaverse_renders.h5
+primary: 0                 # primary view index (seeds the Gaussians)
+secondary: []             # extra view indices for supervision, e.g. [1,2,3]
+                          # (primary + secondary must all be the same mesh_index)
+
+# null -> "<hdf5_path>.gsplat.view<primary>.h5" (+ .ply, + .val/ alongside)
+output_path: null
+
+# --- optimization ---
+iters: 3000
+seed: 42
+device: cuda              # cuda | cpu
+
+# Whether the optimizer may move Gaussian centers. false = centers stay locked
+# at their depth-peel back-projected seed positions; only scale / rotation /
+# opacity / colour are optimized (and lr.means is unused).
+optimize_means: false
+
+# --- losses ---
+lambda_ssim: 0.2          # weight of the (1 - SSIM) term in the RGB loss
+lambda_mask: 1.0          # weight of the L1 rendered-alpha vs image-alpha term
+
+# --- Adam learning rates (means additionally scaled by scene_scale) ---
+lr:
+  means: 1.6e-4
+  scales: 5.0e-3
+  quats: 1.0e-3
+  opacities: 5.0e-2
+  colors: 2.5e-3
+
+# --- initialization ---
+init_opacity: 0.1         # starting opacity for every seeded Gaussian
+knn_k: 4                  # neighbours used to size each Gaussian's initial scale
+
+# --- validation / output ---
+val_every: 500            # dump gt|render PNGs every N iters (0 disables)
+write_ply: true           # also write a standard 3DGS .ply next to the .h5
+# .ply pruning -- all off by default (the .h5 always keeps every Gaussian).
+# Set a value to enable that check.
+ply_opacity_threshold: null   # drop splats with sigmoid(opacity) <= this (e.g. 0.0039 ~= 1/255)
+ply_max_scale_ratio: null     # drop splats whose largest scale axis > this * scene_scale (e.g. 0.1)
+ply_max_anisotropy: null      # drop splats whose scale max/min ratio exceeds this (e.g. 50)
+
+# --- dataset-name overrides (for non-standard files) ---
+datasets:
+  images: images
+  depth: depth_peel
+  intrinsics: camera_intrinsics
+  pose: camera_pose
+
+hydra:
+  job:
+    chdir: false          # stay in cwd; output paths are absolute / input-relative
+  run:
+    dir: outputs/fit_gsplat/${now:%Y-%m-%d_%H-%M-%S}   # hydra's .log + .hydra/ land here (gitignored)
