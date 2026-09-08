@@ -11,8 +11,10 @@ render: true
 device: auto
 
 output_path: /app/bla/objaverse_renders.h5
-width: 512
-height: 512
+# 504 (not Objaverse blender_script's 512) so pixels line up 1:1 with r75b's
+# 504x504 output -- wt_infer_layers.py is run without --center-crop.
+width: 504
+height: 504
 max_peel_layers: 6
 
 # --- Objaverse blender_script.py conventions ---

@@ -62,19 +62,27 @@ import numpy as np
 import torch
 
 
-def rgba_from_render(hf, index):
-  """Build an H,W,4 uint8 RGBA array for one view: alpha comes from the
-  layer-0 depth-peel hit mask (same foreground definition
-  debug_pointcloud.py uses for `layer_idx == 0`)."""
-  image = hf["images"][index]  # (H, W, 3) uint8
+def rgba_from_render(hf, index, hard_alpha=False):
+  """Build an H,W,4 uint8 RGBA array for one view.
+
+  If `images` already has an alpha channel (render_objaverse.py renders on a
+  transparent film) that soft alpha is used as-is -- it's the matting the
+  model trained on. Otherwise (or with --hard-alpha) alpha is the binary
+  layer-0 depth-peel hit mask, the same foreground definition
+  debug_pointcloud.py uses for `layer_idx == 0`.
+  """
+  image = hf["images"][index]  # (H, W, 3 or 4) uint8
+  if image.shape[-1] == 4 and not hard_alpha:
+    return image
+  rgb = image[..., :3]
   depth_peel = hf["depth_peel"][index]  # (H, W, L) float32, -1.0 = no hit
   alpha = np.where(depth_peel[..., 0] >= 0, 255, 0).astype(np.uint8)
-  return np.concatenate([image, alpha[..., None]], axis=-1)
+  return np.concatenate([rgb, alpha[..., None]], axis=-1)
 
 
 def process_view(
   hf, index, model, cfg, device, autocast_ctx, *,
-  seed, num_steps, alpha_erode_px, center_crop, bg_color,
+  seed, num_steps, alpha_erode_px, center_crop, bg_color, hard_alpha=False,
 ):
   """Run inference on one view. Returns (rgb_uint8, points, K).
 
@@ -87,7 +95,7 @@ def process_view(
   from wt.data import preprocess_rgba_for_model
   from wt.inference import _bypass_activation_checkpointing
 
-  rgba = rgba_from_render(hf, index)
+  rgba = rgba_from_render(hf, index, hard_alpha=hard_alpha)
 
   inference_kwargs = dict(cfg["inference_kwargs"])
   if num_steps is not None:
@@ -154,6 +162,9 @@ def main():
   # (different!) defaults -- except --center-crop, deliberately off by
   # default here (see its help text).
   parser.add_argument("--alpha-erode", type=int, default=0)
+  parser.add_argument("--hard-alpha", action="store_true",
+                      help="Ignore a stored soft alpha channel and use the binary "
+                           "layer-0 depth-peel hit mask instead.")
   parser.add_argument(
     "--center-crop", action="store_true",
     help=(
@@ -227,7 +238,7 @@ def main():
       rgb_uint8, points, K = process_view(
         hf, index, model, cfg, device, autocast_ctx,
         seed=args.seed, num_steps=args.num_steps, alpha_erode_px=args.alpha_erode,
-        center_crop=args.center_crop, bg_color=bg_color,
+        center_crop=args.center_crop, bg_color=bg_color, hard_alpha=args.hard_alpha,
       )
       all_images.append(rgb_uint8)
       all_points.append(points)
