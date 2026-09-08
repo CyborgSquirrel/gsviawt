@@ -114,10 +114,10 @@ def load_views(cfg: DictConfig):
     if "mesh_index" in f:
       mi = f["mesh_index"][:]
       picked = {int(mi[i]) for i in order}
-      if len(picked) > 1 and not cfg.allow_multi_mesh:
+      if len(picked) > 1:
         raise SystemExit(
-          f"selected views span mesh_index {sorted(picked)} -- they must all be "
-          f"the same object. Pass allow_multi_mesh=true to override.")
+          f"selected views span mesh_index {sorted(picked)} -- primary + secondary "
+          f"views must all be the same object")
       mesh_idx = int(mi[primary])
     else:
       mesh_idx = -1

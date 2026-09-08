@@ -7,7 +7,7 @@
 hdf5_path: /app/bla/objaverse_renders.h5
 primary: 0                 # primary view index (seeds the Gaussians)
 secondary: []             # extra view indices for supervision, e.g. [1,2,3]
-allow_multi_mesh: false   # allow selected views to span different mesh_index
+                          # (primary + secondary must all be the same mesh_index)
 
 # null -> "<hdf5_path>.gsplat.view<primary>.h5" (+ .ply, + .val/ alongside)
 output_path: null
