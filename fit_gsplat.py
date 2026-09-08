@@ -296,19 +296,33 @@ def save_output(path, cfg, views, params_np, uvl, H, W, L, final_loss, scene_sca
     f.create_dataset("view_index_used", data=np.asarray(views["order"], np.int64))
 
 
-def write_ply(path, params_np, opacity_threshold):
+def write_ply(path, params_np, scene_scale, opacity_threshold,
+              max_scale_ratio=None, max_anisotropy=None):
   """Standard INRIA-format 3DGS .ply. `gsplat.export_splats` writes every
   field raw, and viewers apply the activations themselves: exp(scale),
   sigmoid(opacity), SH_C0*f_dc + 0.5. So pass the *unactivated* optimizer
   params -- log-scales, logit-opacities, SH-DC colours -- not the activated
   values stored in the .h5.
 
-  Gaussians with sigmoid(opacity) <= opacity_threshold are dropped first
-  (export_splats' own threshold only applies to the compressed format, not
-  plain "ply"). Returns (kept, total)."""
+  Prunes before export (export_splats' own opacity threshold only applies to
+  the compressed format, not plain "ply"), by:
+    - low opacity:  sigmoid(opacity) <= opacity_threshold
+    - covariance, if enabled (None = off):
+        * huge: largest scale axis  >  max_scale_ratio * scene_scale
+        * sliver: scale max/min ratio  >  max_anisotropy
+  Returns a {reason: count} dict plus "kept"/"total"."""
   import gsplat
   opac = 1.0 / (1.0 + np.exp(-params_np["opac_logit"]))
-  keep = opac > float(opacity_threshold)
+  scales = np.exp(params_np["scales_log"])                 # (N,3) world units
+  ax_max, ax_min = scales.max(1), np.maximum(scales.min(1), 1e-12)
+
+  drop_opacity = opac <= float(opacity_threshold)
+  drop_huge = (np.zeros_like(drop_opacity) if max_scale_ratio is None
+               else ax_max > float(max_scale_ratio) * scene_scale)
+  drop_sliver = (np.zeros_like(drop_opacity) if max_anisotropy is None
+                 else ax_max / ax_min > float(max_anisotropy))
+  keep = ~(drop_opacity | drop_huge | drop_sliver)
+
   colors = (1.0 / (1.0 + np.exp(-params_np["colors_logit"])))[keep]
   sh0 = ((colors - 0.5) / SH_C0)[:, None, :]           # (N,1,3) SH band-0 coeff
   quats = params_np["quats"][keep]
@@ -322,7 +336,11 @@ def write_ply(path, params_np, opacity_threshold):
     shN=torch.zeros(len(colors), 0, 3),
     format="ply", save_to=path,
   )
-  return int(keep.sum()), int(keep.size)
+  return {
+    "total": int(keep.size), "kept": int(keep.sum()),
+    "low_opacity": int(drop_opacity.sum()),
+    "huge": int(drop_huge.sum()), "sliver": int(drop_sliver.sum()),
+  }
 
 
 def dump_val(val_dir, it, gt_rgb, gt_alpha, render_rgb, render_alpha):
@@ -434,8 +452,11 @@ def main(cfg: DictConfig) -> None:
   with timed("write"):
     save_output(out_h5, cfg, views, params_np, uvl, H, W, L, final_loss, scene_scale)
     if bool(cfg.write_ply):
-      kept, total = write_ply(f"{stem}.ply", params_np, cfg.ply_opacity_threshold)
-      log.info(".ply: kept %d/%d Gaussians (opacity > %s)", kept, total, cfg.ply_opacity_threshold)
+      st = write_ply(f"{stem}.ply", params_np, scene_scale,
+                     cfg.ply_opacity_threshold,
+                     cfg.get("ply_max_scale_ratio"), cfg.get("ply_max_anisotropy"))
+      log.info(".ply: kept %d/%d Gaussians  (pruned %d low-opacity, %d huge, %d sliver)",
+               st["kept"], st["total"], st["low_opacity"], st["huge"], st["sliver"])
 
   log.info("final loss %.5f  ->  %s%s%s", final_loss, out_h5,
            f"  {stem}.ply" if cfg.write_ply else "",

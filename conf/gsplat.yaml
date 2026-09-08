@@ -37,7 +37,10 @@ max_gaussians: 0          # 0 = keep every depth-peel hit; else subsample per la
 # --- validation / output ---
 val_every: 500            # dump gt|render PNGs every N iters (0 disables)
 write_ply: true           # also write a standard 3DGS .ply next to the .h5
-ply_opacity_threshold: 0.0039   # drop Gaussians with sigmoid(opacity) <= this from the .ply (~1/255; the .h5 keeps all)
+# .ply pruning (the .h5 always keeps every Gaussian). null disables a check.
+ply_opacity_threshold: 0.0039   # drop splats with sigmoid(opacity) <= this (~1/255, the 8-bit invisibility cutoff)
+ply_max_scale_ratio: 0.1        # drop splats whose largest scale axis > this * scene_scale (inflated floaters)
+ply_max_anisotropy: 50.0        # drop splats whose scale max/min ratio exceeds this (degenerate needles/disks)
 
 # --- dataset-name overrides (for non-standard files) ---
 datasets:
