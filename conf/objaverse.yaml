@@ -1,0 +1,50 @@
+defaults:
+  - view_strategy: turntable-lite
+  - mesh_strategy: random
+  - _self_
+
+# Whether to capture the RGBA image pass (adds an "images" dataset, N x H x
+# W x 4 uint8). Depth peel / pose / intrinsics are captured regardless.
+render: true
+
+# Cycles compute device: "auto" (GPU, fall back to CPU), "gpu", or "cpu".
+device: auto
+
+output_path: /app/bla/objaverse_renders.h5
+width: 512
+height: 512
+max_peel_layers: 6
+
+# --- Objaverse blender_script.py conventions ---
+# Recenter the object on the origin and scale so its longest bbox axis == 1
+# (Objaverse / Shap-E "unit cube" normalisation). With a fixed
+# camera_distance this fully determines framing -- no frame_object_robust.
+normalize_object: true
+camera_distance: 1.9
+
+# Objaverse blender_script uses a 35mm lens on a 32mm sensor
+# (2*atan(16/35) ~= 49.3 deg horizontal FOV). Note this disagrees with
+# wt/data.py's FIXED_FX=500 @ 512 (~54.2 deg) -- kept faithful to the
+# render script the training images actually came from.
+camera_lens: 35.0
+camera_sensor_width: 32.0
+
+render_engine: CYCLES        # CYCLES | BLENDER_EEVEE_NEXT
+cycles_samples: 64
+film_transparent: true       # RGBA with a real alpha channel
+
+# "objaverse" = blender_script.py's key/fill/rim/bottom SUN rig on black.
+# "env" = white world + weak key sun (render_server.py style).
+lighting: objaverse
+
+# Optional post-hoc rescale of the recorded depth_peel + pose translation
+# so mean layer-0 surface depth == this value (see render_server.py). null
+# leaves depth in the normalised-object frame (~camera_distance).
+camera_depth_target: null
+
+hydra:
+  job:
+    chdir: false
+  output_subdir: null
+  run:
+    dir: .
