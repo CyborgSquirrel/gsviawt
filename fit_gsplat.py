@@ -296,7 +296,7 @@ def save_output(path, cfg, views, params_np, uvl, H, W, L, final_loss, scene_sca
     f.create_dataset("view_index_used", data=np.asarray(views["order"], np.int64))
 
 
-def write_ply(path, params_np, scene_scale, opacity_threshold,
+def write_ply(path, params_np, scene_scale, opacity_threshold=None,
               max_scale_ratio=None, max_anisotropy=None):
   """Standard INRIA-format 3DGS .ply. `gsplat.export_splats` writes every
   field raw, and viewers apply the activations themselves: exp(scale),
@@ -304,19 +304,19 @@ def write_ply(path, params_np, scene_scale, opacity_threshold,
   params -- log-scales, logit-opacities, SH-DC colours -- not the activated
   values stored in the .h5.
 
-  Prunes before export (export_splats' own opacity threshold only applies to
-  the compressed format, not plain "ply"), by:
+  All pruning is opt-in (None = off, the default), by:
     - low opacity:  sigmoid(opacity) <= opacity_threshold
-    - covariance, if enabled (None = off):
-        * huge: largest scale axis  >  max_scale_ratio * scene_scale
-        * sliver: scale max/min ratio  >  max_anisotropy
-  Returns a {reason: count} dict plus "kept"/"total"."""
+    - huge: largest scale axis  >  max_scale_ratio * scene_scale
+    - sliver: scale max/min ratio  >  max_anisotropy
+  export_splats' own opacity threshold only applies to the compressed format,
+  not plain "ply". Returns a {reason: count} dict plus "kept"/"total"."""
   import gsplat
   opac = 1.0 / (1.0 + np.exp(-params_np["opac_logit"]))
   scales = np.exp(params_np["scales_log"])                 # (N,3) world units
   ax_max, ax_min = scales.max(1), np.maximum(scales.min(1), 1e-12)
 
-  drop_opacity = opac <= float(opacity_threshold)
+  drop_opacity = (np.zeros(len(opac), bool) if opacity_threshold is None
+                  else opac <= float(opacity_threshold))
   drop_huge = (np.zeros_like(drop_opacity) if max_scale_ratio is None
                else ax_max > float(max_scale_ratio) * scene_scale)
   drop_sliver = (np.zeros_like(drop_opacity) if max_anisotropy is None
