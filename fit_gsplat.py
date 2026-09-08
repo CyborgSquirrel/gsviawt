@@ -296,25 +296,33 @@ def save_output(path, cfg, views, params_np, uvl, H, W, L, final_loss, scene_sca
     f.create_dataset("view_index_used", data=np.asarray(views["order"], np.int64))
 
 
-def write_ply(path, params_np):
+def write_ply(path, params_np, opacity_threshold):
   """Standard INRIA-format 3DGS .ply. `gsplat.export_splats` writes every
   field raw, and viewers apply the activations themselves: exp(scale),
   sigmoid(opacity), SH_C0*f_dc + 0.5. So pass the *unactivated* optimizer
   params -- log-scales, logit-opacities, SH-DC colours -- not the activated
-  values stored in the .h5."""
+  values stored in the .h5.
+
+  Gaussians with sigmoid(opacity) <= opacity_threshold are dropped first
+  (export_splats' own threshold only applies to the compressed format, not
+  plain "ply"). Returns (kept, total)."""
   import gsplat
-  colors = 1.0 / (1.0 + np.exp(-params_np["colors_logit"]))
+  opac = 1.0 / (1.0 + np.exp(-params_np["opac_logit"]))
+  keep = opac > float(opacity_threshold)
+  colors = (1.0 / (1.0 + np.exp(-params_np["colors_logit"])))[keep]
   sh0 = ((colors - 0.5) / SH_C0)[:, None, :]           # (N,1,3) SH band-0 coeff
-  quats = params_np["quats"] / np.linalg.norm(params_np["quats"], axis=-1, keepdims=True)
+  quats = params_np["quats"][keep]
+  quats = quats / np.linalg.norm(quats, axis=-1, keepdims=True)
   gsplat.export_splats(
-    means=torch.from_numpy(params_np["means"]),
-    scales=torch.from_numpy(params_np["scales_log"]),      # log-space; viewer exp()s
+    means=torch.from_numpy(params_np["means"][keep]),
+    scales=torch.from_numpy(params_np["scales_log"][keep]),  # log-space; viewer exp()s
     quats=torch.from_numpy(quats.astype(np.float32)),
-    opacities=torch.from_numpy(params_np["opac_logit"]),   # logit; viewer sigmoid()s
+    opacities=torch.from_numpy(params_np["opac_logit"][keep]),  # logit; viewer sigmoid()s
     sh0=torch.from_numpy(sh0.astype(np.float32)),
     shN=torch.zeros(len(colors), 0, 3),
     format="ply", save_to=path,
   )
+  return int(keep.sum()), int(keep.size)
 
 
 def dump_val(val_dir, it, gt_rgb, gt_alpha, render_rgb, render_alpha):
@@ -426,7 +434,8 @@ def main(cfg: DictConfig) -> None:
   with timed("write"):
     save_output(out_h5, cfg, views, params_np, uvl, H, W, L, final_loss, scene_scale)
     if bool(cfg.write_ply):
-      write_ply(f"{stem}.ply", params_np)
+      kept, total = write_ply(f"{stem}.ply", params_np, cfg.ply_opacity_threshold)
+      log.info(".ply: kept %d/%d Gaussians (opacity > %s)", kept, total, cfg.ply_opacity_threshold)
 
   log.info("final loss %.5f  ->  %s%s%s", final_loss, out_h5,
            f"  {stem}.ply" if cfg.write_ply else "",

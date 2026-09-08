@@ -37,6 +37,7 @@ max_gaussians: 0          # 0 = keep every depth-peel hit; else subsample per la
 # --- validation / output ---
 val_every: 500            # dump gt|render PNGs every N iters (0 disables)
 write_ply: true           # also write a standard 3DGS .ply next to the .h5
+ply_opacity_threshold: 0.0039   # drop Gaussians with sigmoid(opacity) <= this from the .ply (~1/255; the .h5 keeps all)
 
 # --- dataset-name overrides (for non-standard files) ---
 datasets:
