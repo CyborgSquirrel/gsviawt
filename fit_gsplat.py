@@ -39,6 +39,7 @@ gsplat JIT-compiles CUDA kernels on first import; this module points it at the
 pip `nvidia-cuda-nvcc` toolchain (the base image has no system `nvcc`).
 """
 
+import json
 import logging
 import os
 import sys
@@ -254,14 +255,11 @@ def save_output(path, cfg, views, params_np, uvl, H, W, L, final_loss, scene_sca
   colors = 1.0 / (1.0 + np.exp(-params_np["colors_logit"]))
 
   with h5py.File(path, "w") as f:
-    f.attrs["config_json"] = OmegaConf.to_yaml(cfg)
-    f.attrs["source_h5"] = str(cfg.hdf5_path)
-    f.attrs["primary_index"] = views["primary"]
-    f.attrs["secondary_indices"] = np.asarray(views["secondary"], np.int64)
+    # the full run config (resolved), as JSON -- everything the run was given.
+    f.attrs["config_json"] = json.dumps(OmegaConf.to_container(cfg, resolve=True))
+    # things that aren't in the config: derived from the source file or the fit.
     f.attrs["mesh_index"] = views["mesh_index"]
     f.attrs["mesh_path"] = views["mesh_path"]
-    f.attrs["iters"] = int(cfg.iters)
-    f.attrs["optimize_means"] = bool(cfg.optimize_means)
     f.attrs["final_loss"] = float(final_loss)
     f.attrs["num_gaussians"] = int(len(means))
     f.attrs["scene_scale"] = float(scene_scale)
