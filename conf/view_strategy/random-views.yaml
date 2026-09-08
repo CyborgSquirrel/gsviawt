@@ -1,0 +1,19 @@
+_target_: view_strategy.RandomViews
+
+# Objaverse-XL blender_script.py's camera sampling: i.i.d. random
+# viewpoints aimed at the origin, no turntable structure.
+num_views: 12
+seed: 0
+only_northern_hemisphere: false
+
+# Per-view camera-distance jitter (upstream: 1.5 / 2.2). null on both keeps
+# every view_dir unit length so render_objaverse.py uses cfg.camera_distance
+# -- consistent framing for the WT comparison. Set both to reproduce the
+# upstream radius shell.
+radius_min: null
+radius_max: null
+
+# Post-radius camera-height clamp (upstream _sample_spherical); a no-op for
+# a unit sphere.
+maxz: 2.2
+minz: -2.2

@@ -41,7 +41,6 @@ nvidia-cuda-cccl==13.0.85
 
 # unsorted
 objaverse
-rpyc
 trimesh
 # bpy
 

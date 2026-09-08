@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Run the World Tracing object model (r75b) on one or all views of a
-capture_turntable.py render and dump its per-layer output as an HDF5
-file laid out like renders.h5, for direct comparison against
+render_objaverse.py render and dump its per-layer output as an HDF5
+file laid out like the input h5, for direct comparison against
 debug_pointcloud.py's depth-peel output.
 
 Mirrors world-tracing/examples/infer_rgba.py (model load -> preprocess ->
 inference_diffusion) but skips the Rerun/.rrd visualisation entirely and
 instead:
-  * reads the input RGB + mask straight from our own renders.h5 (the same
-    pixels/alpha capture_turntable.py wrote), instead of a saved PNG;
+  * reads the input RGB + mask straight from our own render h5 (the same
+    pixels/alpha render_objaverse.py wrote), instead of a saved PNG;
   * writes an HDF5 file with an 'images' dataset (the image actually fed
     to the model, i.e. after preprocess_rgba_for_model's crop/resize/bg
     blend) and a 'points' dataset (the predicted per-layer XYZ, one
@@ -34,10 +34,10 @@ default.
 object to fill ~2/3 of the model's square input canvas via
 `compute_object_crop`, matching its Objaverse training data -- but
 that's now off by default here (`--center-crop` to re-enable) since
-render_server.py's frame_object_robust already frames renders at
-max_object_ratio=2/3 with silhouette recentering, so the raw render
-should already be close to that distribution without an extra re-crop
-moving pixels around. If you turn `--center-crop` on (e.g. for input
+render_objaverse.py's unit-cube normalize + fixed camera already frame
+the object consistently at roughly that ratio, so the raw render should
+already be close to that distribution without an extra re-crop moving
+pixels around. If you turn `--center-crop` on (e.g. for input
 images that weren't rendered by our own pipeline), don't expect
 pixel-for-pixel alignment with the raw render -- compare overall
 shape/scale/extent, or solve for a similarity transform if you need
@@ -62,19 +62,27 @@ import numpy as np
 import torch
 
 
-def rgba_from_render(hf, index):
-  """Build an H,W,4 uint8 RGBA array for one view: alpha comes from the
-  layer-0 depth-peel hit mask (same foreground definition
-  debug_pointcloud.py uses for `layer_idx == 0`)."""
-  image = hf["images"][index]  # (H, W, 3) uint8
+def rgba_from_render(hf, index, hard_alpha=False):
+  """Build an H,W,4 uint8 RGBA array for one view.
+
+  If `images` already has an alpha channel (render_objaverse.py renders on a
+  transparent film) that soft alpha is used as-is -- it's the matting the
+  model trained on. Otherwise (or with --hard-alpha) alpha is the binary
+  layer-0 depth-peel hit mask, the same foreground definition
+  debug_pointcloud.py uses for `layer_idx == 0`.
+  """
+  image = hf["images"][index]  # (H, W, 3 or 4) uint8
+  if image.shape[-1] == 4 and not hard_alpha:
+    return image
+  rgb = image[..., :3]
   depth_peel = hf["depth_peel"][index]  # (H, W, L) float32, -1.0 = no hit
   alpha = np.where(depth_peel[..., 0] >= 0, 255, 0).astype(np.uint8)
-  return np.concatenate([image, alpha[..., None]], axis=-1)
+  return np.concatenate([rgb, alpha[..., None]], axis=-1)
 
 
 def process_view(
   hf, index, model, cfg, device, autocast_ctx, *,
-  seed, num_steps, alpha_erode_px, center_crop, bg_color,
+  seed, num_steps, alpha_erode_px, center_crop, bg_color, hard_alpha=False,
 ):
   """Run inference on one view. Returns (rgb_uint8, points, K).
 
@@ -87,7 +95,7 @@ def process_view(
   from wt.data import preprocess_rgba_for_model
   from wt.inference import _bypass_activation_checkpointing
 
-  rgba = rgba_from_render(hf, index)
+  rgba = rgba_from_render(hf, index, hard_alpha=hard_alpha)
 
   inference_kwargs = dict(cfg["inference_kwargs"])
   if num_steps is not None:
@@ -134,7 +142,7 @@ def process_view(
 
 def main():
   parser = ArgumentParser(description=__doc__)
-  parser.add_argument("hdf5_path", help="Path to a capture_turntable.py renders.h5")
+  parser.add_argument("hdf5_path", help="Path to a render_objaverse.py render h5")
   parser.add_argument(
     "--index", type=int, default=None,
     help="View index within the HDF5. Default: process every view in the file.",
@@ -154,19 +162,26 @@ def main():
   # (different!) defaults -- except --center-crop, deliberately off by
   # default here (see its help text).
   parser.add_argument("--alpha-erode", type=int, default=0)
+  parser.add_argument("--hard-alpha", action="store_true",
+                      help="Ignore a stored soft alpha channel and use the binary "
+                           "layer-0 depth-peel hit mask instead.")
   parser.add_argument(
     "--center-crop", action="store_true",
     help=(
       "Apply wt's inference-time object-centering re-crop "
       "(preprocess_rgba_for_model's compute_object_crop). Off by "
-      "default: since render_server.py's frame_object_robust now fits "
-      "framing to real vertices at max_object_ratio=2/3 with silhouette "
-      "recentering, the render should already land close to wt's "
-      "training distribution, so this re-crop would mostly just move "
-      "pixels around and break the correspondence to the raw render."
+      "default: since render_objaverse.py normalizes the object to a unit "
+      "cube and shoots it from a fixed camera distance, the render should "
+      "already land close to wt's training distribution, so this re-crop "
+      "would mostly just move pixels around and break the correspondence "
+      "to the raw render."
     ),
   )
-  parser.add_argument("--bg-color", type=str, default="128,128,128")
+  parser.add_argument("--bg-color", type=str, default="0,0,0",
+                      help="RGB the masked-out region is composited to before the "
+                           "model sees it. Default black -- the README says black "
+                           "matches the training-set renders (128,128,128 grey was "
+                           "only the video-selection inference run).")
   parser.add_argument(
     "--bf16-weights-hack", action="store_true", default=False,
     help=(
@@ -223,15 +238,28 @@ def main():
       rgb_uint8, points, K = process_view(
         hf, index, model, cfg, device, autocast_ctx,
         seed=args.seed, num_steps=args.num_steps, alpha_erode_px=args.alpha_erode,
-        center_crop=args.center_crop, bg_color=bg_color,
+        center_crop=args.center_crop, bg_color=bg_color, hard_alpha=args.hard_alpha,
       )
       all_images.append(rgb_uint8)
       all_points.append(points)
       all_K.append(K)
 
+  images_arr = np.stack(all_images)
+  points_arr = np.stack(all_points)
+  n, height, width = images_arr.shape[:3]
+  num_layers = points_arr.shape[3]
+
+  # One chunk per view -> compressed independently, same convention as
+  # render_objaverse.py's render h5 (img_kw/depth_kw). Without
+  # this the file is dominated by `points`' NaN-padded (H, W, L, 3) float32
+  # volumes -- e.g. 40 views @ 504x504x6 was ~730MB uncompressed for points
+  # alone; gzip on the large invalid (NaN) runs shrinks that a lot.
+  image_kwargs = dict(chunks=(1, height, width, 3), compression="gzip", compression_opts=4)
+  points_kwargs = dict(chunks=(1, height, width, num_layers, 3), compression="gzip", compression_opts=4)
+
   with h5py.File(out_path, "w") as out:
-    images_ds = out.create_dataset("images", data=np.stack(all_images))
-    points_ds = out.create_dataset("points", data=np.stack(all_points))
+    images_ds = out.create_dataset("images", data=images_arr, **image_kwargs)
+    points_ds = out.create_dataset("points", data=points_arr, **points_kwargs)
     out.create_dataset("intrinsics", data=np.stack(all_K))
     out.create_dataset("seed", data=np.array([args.seed] * len(indices), dtype=np.int64))
     out.create_dataset("config", data=np.array([args.config] * len(indices), dtype=h5py.string_dtype()))

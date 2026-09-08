@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Visualize one view of a capture_turntable.py render HDF5 as a colored
+"""Visualize one view of a render_objaverse.py render HDF5 as a colored
 point cloud .glb.
 
 Three formats (-f/--format):
@@ -103,8 +103,8 @@ def unproject_depth_peel(depth_peel, intrinsics, pose, space):
 
 
 def colors_for(image, u, v, layer_idx, max_layers):
-  """image: (H, W, 3) uint8. Returns (N, 4) uint8 RGBA."""
-  surface_rgb = image[v, u].astype(np.float32)  # 0-255
+  """image: (H, W, 3) or (H, W, 4) uint8. Returns (N, 4) uint8 RGBA."""
+  surface_rgb = image[v, u][:, :3].astype(np.float32)  # 0-255, drop alpha if present
 
   denom = max(max_layers - 1, 1)
   t = (layer_idx.astype(np.float32) / denom)[:, None]

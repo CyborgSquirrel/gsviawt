@@ -144,13 +144,20 @@ RUN \
   --mount=type=cache,target=/home/user/.cache/pip,id=pip \
 <<EOF
   pkgs=(
-    rpyc
+    # render_objaverse.py runs the whole render inside Blender and reads
+    # our Hydra config + writes the h5 from there.
+    h5py
+    hydra-core
   )
   BLENDER_MAJOR="${BLENDER_VERSION%.*}"
   "/opt/blender/$BLENDER_MAJOR/python/bin/python3.11" \
     -m pip install \
     --target=$BLENDER_USER_PYTHON \
-    "${pkgs[@]}" 
+    "${pkgs[@]}"
+  # h5py pulls in numpy; Blender ships its own and _head() appends
+  # BLENDER_USER_PYTHON *after* Blender's site-packages so Blender's numpy
+  # wins -- but drop the duplicate so it can't shadow anything.
+  rm -rf "$BLENDER_USER_PYTHON"/numpy "$BLENDER_USER_PYTHON"/numpy-*.dist-info
 EOF
 
 ############################################################
