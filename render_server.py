@@ -442,11 +442,29 @@ class Service(rpyc.Service):
     bpy.context.collection.objects.link(cam_obj)
     bpy.context.scene.camera = cam_obj
 
-    # Light
-    light_data = bpy.data.lights.new("Light", type="SUN")
-    light_obj = bpy.data.objects.new("Light", light_data)
-    bpy.context.collection.objects.link(light_obj)
-    light_obj.location = (5, -5, 10)
+    # Lighting: a uniform environment (fills every direction, so no side of
+    # the object goes black) plus a weak top-down key sun for some
+    # directional shading. `cycles_visibility.camera = False` makes the
+    # world invisible to primary rays -- the background renders pure black
+    # (wt's README: black matches the training-set renders, and its frozen
+    # encoder reads the raw RGB regardless of the mask) while it still
+    # lights the scene via diffuse/glossy bounces.
+    world = bpy.data.worlds.get("World") or bpy.data.worlds.new("World")
+    bpy.context.scene.world = world
+    world.use_nodes = True
+    bg_node = world.node_tree.nodes["Background"]
+    bg_node.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
+    bg_node.inputs["Strength"].default_value = 1.0
+    world.cycles_visibility.camera = False
+
+    # Weak top-down sun on top of the flat environment: gives a bit of
+    # directional shading / a soft top highlight so matte objects don't
+    # read completely flat, without darkening any side (the world still
+    # fills everything). A fresh SUN already points straight down (-Z).
+    key_data = bpy.data.lights.new("Key", type="SUN")
+    key_data.energy = 1.5
+    key_obj = bpy.data.objects.new("Key", key_data)
+    bpy.context.collection.objects.link(key_obj)
 
     # Load mesh. disable_bone_shape: skip the importer's per-armature bone
     # display icosphere (viewport-only eye candy, irrelevant to a headless

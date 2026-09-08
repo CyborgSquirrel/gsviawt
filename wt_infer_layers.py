@@ -166,7 +166,11 @@ def main():
       "pixels around and break the correspondence to the raw render."
     ),
   )
-  parser.add_argument("--bg-color", type=str, default="128,128,128")
+  parser.add_argument("--bg-color", type=str, default="0,0,0",
+                      help="RGB the masked-out region is composited to before the "
+                           "model sees it. Default black -- the README says black "
+                           "matches the training-set renders (128,128,128 grey was "
+                           "only the video-selection inference run).")
   parser.add_argument(
     "--bf16-weights-hack", action="store_true", default=False,
     help=(
