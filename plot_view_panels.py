@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Per-view panel: RGB render | RGB WT-input | GT depth | aligned WT depth |
-|delta|, for one or more views of a render_objaverse render vs its
-wt_infer_layers.py prediction.
+"""Per-view panel: RGB render | RGB WT-input | GT depth | WT depth | |delta|,
+for one or more views of a render_objaverse render vs its wt_infer_layers.py
+prediction.
 
-WT's layer-0 depth (`points[..., 0, 2]`) is aligned to the render's layer-0
-`depth_peel` per view on the shared valid pixels (--align, default median)
-before display, so the two depth panels and the delta are on the render's
-scale.
+Both depth panels are RAW by default (`--align none`): the point of these
+views is to see how well the geometry we generate already matches what World
+Tracing predicts, in absolute terms. Scale/shift alignment (`--align
+median|scale|affine|mad`) fits that mismatch away, so it's opt-in only --
+use it when you specifically want to inspect residual *shape* error after
+the scale is taken out.
 
-    python plot_view_panels.py bla/lite_blackbg.h5 bla/lite_blackbg.h5.wt.h5 --views 1 8 12 24
+    python plot_view_panels.py bla/obj_rand40.h5 bla/obj_rand40.h5.wt.h5 --views 1 8 12 24
 """
 
 from argparse import ArgumentParser
@@ -19,7 +21,7 @@ import numpy as np
 from compare_wt_depth import _align, _layer0_depth_gt, _layer0_depth_pred
 
 
-def panel(rgb_r, rgb_w, gt, wt_al, both, title, out, wt_label="depth WT (aligned)"):
+def panel(rgb_r, rgb_w, gt, wt_al, both, title, out, wt_label="depth WT (raw)"):
   import matplotlib
 
   matplotlib.use("Agg")
@@ -75,7 +77,9 @@ def main():
   p.add_argument("wt_h5")
   p.add_argument("--views", type=int, nargs="+", required=True)
   p.add_argument("--layer", type=int, default=0)
-  p.add_argument("--align", choices=["none", "median", "scale", "affine", "mad"], default="median")
+  p.add_argument("--align", choices=["none", "median", "scale", "affine", "mad"], default="none",
+                 help="Scale/shift-fit WT onto GT before display. Default none "
+                      "-- these views are for seeing the raw match to WT.")
   p.add_argument("--out-prefix", default=None,
                  help="default: <wt_h5>.panel  ->  <prefix>.viewN.png")
   args = p.parse_args()
