@@ -273,49 +273,51 @@ def main():
     else torch.autocast(device_type="cpu", enabled=False)
   )
 
-  all_images, all_points, all_K = [], [], []
-  with h5py.File(args.hdf5_path, "r") as hf:
+  # Stream each view straight into the output file via LazyDataset (resizes
+  # the h5 dataset as it goes): accumulating all N in RAM is ~N *
+  # 504*504*6*3 * 4 bytes for `points` alone (~9GB at N=500, and the
+  # end-of-run np.stack + dedupe copy roughly triples that).
+  from util import LazyDataset
+
+  def _one_chunk_per_view(ds, *, shape, dtype):
+    ds.dataset_kwargs = {"chunks": (1, *shape), **ds.dataset_kwargs}
+
+  all_K = []
+  ded_before = ded_after = 0
+  n = len(indices)
+  gz = dict(compression="gzip", compression_opts=4)
+  with (
+    h5py.File(args.hdf5_path, "r") as hf,
+    h5py.File(out_path, "w") as out,
+    LazyDataset(out, "images", dataset_kwargs=gz, init_hook=_one_chunk_per_view) as ds_img,
+    LazyDataset(out, "points", dataset_kwargs=gz, init_hook=_one_chunk_per_view) as ds_pts,
+  ):
     for index in indices:
       rgb_uint8, points, K = process_view(
         hf, index, model, cfg, device, autocast_ctx,
         seed=args.seed, num_steps=args.num_steps, alpha_erode_px=args.alpha_erode,
         center_crop=args.center_crop, bg_color=bg_color, hard_alpha=args.hard_alpha,
       )
-      all_images.append(rgb_uint8)
-      all_points.append(points)
+      if args.dedupe_layers:
+        ded_before += int(np.isfinite(points).all(axis=-1).sum())
+        points = dedupe_forward_fill(points, args.dedupe_tol)
+        ded_after += int(np.isfinite(points).all(axis=-1).sum())
+
+      ds_img.append(rgb_uint8)
+      ds_pts.append(points.astype(np.float32, copy=False))
       all_K.append(K)
 
-  images_arr = np.stack(all_images)
-  points_arr = np.stack(all_points)
+    out.create_dataset("intrinsics", data=np.stack(all_K))
+    out.create_dataset("seed", data=np.array([args.seed] * n, dtype=np.int64))
+    out.create_dataset("config", data=np.array([args.config] * n, dtype=h5py.string_dtype()))
+    out.attrs["dedupe_tol"] = float(args.dedupe_tol) if args.dedupe_layers else 0.0
+    images_shape = (n, *ds_img.dataset.shape[1:])
+    points_shape = (n, *ds_pts.dataset.shape[1:])
 
   if args.dedupe_layers:
-    before = int(np.isfinite(points_arr).all(axis=-1).sum())
-    points_arr = dedupe_forward_fill(points_arr, args.dedupe_tol)
-    after = int(np.isfinite(points_arr).all(axis=-1).sum())
-    print(f"[wt] dedupe-layers (tol={args.dedupe_tol:g}): "
-          f"NaN'd {before - after:,} forward-filled layer points "
-          f"({100 * (before - after) / max(before, 1):.1f}% of valid)")
-
-  n, height, width = images_arr.shape[:3]
-  num_layers = points_arr.shape[3]
-
-  # One chunk per view -> compressed independently, same convention as
-  # render_objaverse.py's render h5 (img_kw/depth_kw). Without
-  # this the file is dominated by `points`' NaN-padded (H, W, L, 3) float32
-  # volumes -- e.g. 40 views @ 504x504x6 was ~730MB uncompressed for points
-  # alone; gzip on the large invalid (NaN) runs shrinks that a lot.
-  image_kwargs = dict(chunks=(1, height, width, 3), compression="gzip", compression_opts=4)
-  points_kwargs = dict(chunks=(1, height, width, num_layers, 3), compression="gzip", compression_opts=4)
-
-  with h5py.File(out_path, "w") as out:
-    images_ds = out.create_dataset("images", data=images_arr, **image_kwargs)
-    points_ds = out.create_dataset("points", data=points_arr, **points_kwargs)
-    out.create_dataset("intrinsics", data=np.stack(all_K))
-    out.create_dataset("seed", data=np.array([args.seed] * len(indices), dtype=np.int64))
-    out.create_dataset("config", data=np.array([args.config] * len(indices), dtype=h5py.string_dtype()))
-    out.attrs["dedupe_tol"] = float(args.dedupe_tol) if args.dedupe_layers else 0.0
-    images_shape, points_shape = images_ds.shape, points_ds.shape
-
+    print(f"[wt] dedupe-layers (tol={args.dedupe_tol:g}): NaN'd "
+          f"{ded_before - ded_after:,} forward-filled layer points "
+          f"({100 * (ded_before - ded_after) / max(ded_before, 1):.1f}% of valid)")
   print(f"[wt] wrote images{images_shape} points{points_shape} to {out_path}")
 
 
