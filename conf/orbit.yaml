@@ -41,6 +41,26 @@ background: [0.0, 0.0, 0.0]   # RGB in [0, 1]; [1,1,1] for white
 near_plane: 0.01
 far_plane: 100.0
 
+# --- mesh comparison (optional) ---
+# Point `mesh_path` at the source mesh to also render it along the SAME orbit
+# (via Blender, render_objaverse.py's scene) and emit a side-by-side
+# comparison instead of the plain showcase: output becomes
+# "<model_stem>.orbit.compare.mp4" + a per-frame ".orbit.compare.csv" of
+# PSNR / SSIM / MAE. `auto` pulls the path from a .h5 model's `mesh_path`
+# attribute; null / a .ply model with no path -> plain showcase.
+mesh_path: null           # null (plain showcase) | auto | /path/to/object.glb
+mesh:
+  blender_bin: /opt/blender/blender
+  device: auto            # auto | gpu | cpu   (Blender/Cycles device)
+  lighting: objaverse     # objaverse | env    (match the 3DGS's training renders)
+  normalize_object: true  # unit-cube normalise, like render_objaverse.py
+  render_engine: CYCLES   # CYCLES | BLENDER_EEVEE_NEXT
+  cycles_samples: 64
+compare:
+  panels: [mesh, gsplat, diff]   # any order/subset of these three
+  diff_gain: 8.0                 # abs-diff heatmap is multiplied by this before the colormap
+  overlay_metrics: true          # burn per-frame PSNR/SSIM into the strip
+
 # --- encoding ---
 crf: 18                  # x264 quality (lower = better/bigger; 18 ~ visually lossless)
 

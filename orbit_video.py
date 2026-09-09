@@ -31,17 +31,31 @@ run in the container venv, e.g.
 
 The .mp4 is encoded through `imageio` / `imageio-ffmpeg`, which ships its own
 static ffmpeg -- nothing is needed on the system PATH.
+
+Mesh comparison
+---------------
+Set `mesh_path` (or leave it `auto` for a .h5 model, which records its source
+mesh) to also render that mesh along the *same* orbit and emit a side-by-side
+[mesh | 3DGS | abs-diff] video plus a per-frame PSNR / SSIM / MAE CSV instead
+of the plain showcase. The mesh render shells out to Blender running
+`orbit_render_mesh.py` (render_objaverse.py's normalise + multi-sun scene, the
+distribution the 3DGS was fit against), so the two renders see pixel-identical
+cameras. Cheap next to the splat pass -- a Cycles frame per pose -- so keep the
+frame count modest for a first look.
 """
 
+import csv
 import logging
 import os
+import subprocess
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # fit_gsplat wires up the pip CUDA toolchain for gsplat's JIT build on import,
-# and gives us the camera-convention helper + SH constant.
-from fit_gsplat import make_viewmats, SH_C0  # noqa: E402
+# and gives us the camera-convention helper, SSIM, and the SH constant.
+from fit_gsplat import make_viewmats, ssim, SH_C0  # noqa: E402
 
 import h5py  # noqa: E402
 import hydra  # noqa: E402
@@ -54,6 +68,7 @@ from util import timed  # noqa: E402
 
 log = logging.getLogger("orbit_video")
 
+HERE = os.path.dirname(os.path.abspath(__file__))
 WORLD_UP = np.array([0.0, 0.0, 1.0], np.float32)  # Blender / render_objaverse is Z-up
 
 
@@ -167,6 +182,32 @@ def load_model(cfg):
   return g
 
 
+def resolve_mesh_path(cfg):
+  """The mesh to compare against, or None for the plain showcase. `auto` reads
+  a .h5 model's `mesh_path` attribute (fit_gsplat records it); an explicit
+  path is taken as-is."""
+  mp = cfg.get("mesh_path")
+  if mp in (None, "null", ""):
+    return None
+  if str(mp) != "auto":
+    if not os.path.exists(mp):
+      raise SystemExit(f"mesh_path {mp} does not exist")
+    return str(mp)
+  if os.path.splitext(cfg.model_path)[1].lower() not in (".h5", ".hdf5"):
+    log.info("mesh_path=auto but model is not a .h5 (no recorded mesh) -- plain showcase")
+    return None
+  with h5py.File(cfg.model_path, "r") as f:
+    rec = f.attrs.get("mesh_path", "")
+  rec = rec.decode() if isinstance(rec, bytes) else str(rec)
+  if not rec:
+    log.info("mesh_path=auto but the .h5 records no mesh_path -- plain showcase")
+    return None
+  if not os.path.exists(rec):
+    raise SystemExit(f"the .h5 records mesh_path {rec!r} but it does not exist here "
+                     f"(pass mesh_path=/path/to/mesh explicitly)")
+  return rec
+
+
 # ---------------------------------------------------------------------------
 # camera path
 # ---------------------------------------------------------------------------
@@ -253,6 +294,112 @@ def render_frames(cfg, g, poses, K, device):
 
 
 # ---------------------------------------------------------------------------
+# mesh render (Blender subprocess) + comparison
+# ---------------------------------------------------------------------------
+
+def render_mesh_frames(cfg, poses, K, mesh_path, workdir):
+  """Render `mesh_path` along `poses` via Blender / orbit_render_mesh.py.
+  Returns (N, H, W, 3) float32 in [0, 1], composited over cfg.background."""
+  job = os.path.join(workdir, "job.npz")
+  out = os.path.join(workdir, "mesh_frames.npy")
+  m = cfg.mesh
+  np.savez(job, poses=poses.astype(np.float64), fx=np.float64(K[0, 0]),
+           width=np.int64(cfg.width), height=np.int64(cfg.height),
+           mesh_path=str(mesh_path), lighting=str(m.lighting),
+           normalize_object=bool(m.normalize_object),
+           cycles_samples=np.int64(m.cycles_samples),
+           render_engine=str(m.render_engine), device=str(m.device))
+
+  cmd = [str(m.blender_bin), "--background", "--python",
+         os.path.join(HERE, "orbit_render_mesh.py"), "--", job, out]
+  log.info("mesh render: %s", " ".join(cmd))
+  r = subprocess.run(cmd)
+  if r.returncode != 0 or not os.path.exists(out):
+    raise SystemExit(f"Blender mesh render failed (exit {r.returncode})")
+
+  rgba = np.load(out).astype(np.float32) / 255.0          # (N,H,W,4)
+  bg = np.asarray(list(cfg.background), np.float32)
+  a = rgba[..., 3:4]
+  return rgba[..., :3] * a + (1.0 - a) * bg               # over the same bg
+
+
+def _frame_metrics(mesh_f, gs_f, device):
+  """mesh_f, gs_f: (H,W,3) float [0,1]. Returns (psnr, ssim, mae)."""
+  diff = np.abs(mesh_f - gs_f)
+  mae = float(diff.mean())
+  mse = float((diff ** 2).mean())
+  psnr = float("inf") if mse == 0 else 10.0 * np.log10(1.0 / mse)
+  a = torch.from_numpy(mesh_f).permute(2, 0, 1)[None].to(device)
+  b = torch.from_numpy(gs_f).permute(2, 0, 1)[None].to(device)
+  s = float(ssim(a, b))
+  return psnr, s, mae
+
+
+def _diff_heatmap(mesh_f, gs_f, gain):
+  """Per-pixel mean abs-diff -> magma RGB uint8, scaled by `gain`."""
+  from matplotlib import colormaps
+  d = np.clip(np.abs(mesh_f - gs_f).mean(-1) * float(gain), 0.0, 1.0)
+  return (colormaps["magma"](d)[..., :3] * 255.0 + 0.5).astype(np.uint8)
+
+
+def build_comparison(cfg, gs_frames, mesh_frames, device):
+  """Returns (panel_frames list of (STRIP+H, panels*W, 3) uint8, metrics list
+  of dicts). Panels/order come from cfg.compare.panels."""
+  from PIL import Image, ImageDraw
+
+  names = [str(p) for p in cfg.compare.panels]
+  W, H = int(cfg.width), int(cfg.height)
+  gain = float(cfg.compare.diff_gain)
+  overlay = bool(cfg.compare.overlay_metrics)
+  strip = 32 if overlay else 16          # room for a label row + a metrics row
+
+  gs_u8 = [(np.clip(f, 0, 1) * 255 + 0.5).astype(np.uint8) if f.dtype != np.uint8 else f
+           for f in gs_frames]
+  mesh_u8 = [(np.clip(f, 0, 1) * 255 + 0.5).astype(np.uint8) for f in mesh_frames]
+
+  out, metrics = [], []
+  psnr_sum = ssim_sum = mae_sum = 0.0
+  for i in range(len(gs_frames)):
+    mf = mesh_frames[i]
+    gf = gs_frames[i].astype(np.float32) / 255.0 if gs_frames[i].dtype == np.uint8 else gs_frames[i]
+    psnr, s, mae = _frame_metrics(mf, gf, device)
+    metrics.append({"frame": i, "psnr": psnr, "ssim": s, "mae": mae})
+    psnr_sum += 0.0 if psnr == float("inf") else psnr
+    ssim_sum += s
+    mae_sum += mae
+
+    tiles = {"mesh": mesh_u8[i], "gsplat": gs_u8[i],
+             "diff": _diff_heatmap(mf, gf, gain)}
+    row = np.concatenate([tiles[n] for n in names], axis=1)
+
+    canvas = Image.new("RGB", (row.shape[1], H + strip), (16, 16, 18))
+    canvas.paste(Image.fromarray(row), (0, strip))
+    d = ImageDraw.Draw(canvas)
+    for j, n in enumerate(names):
+      label = f"diff x{gain:g}" if n == "diff" else ("3DGS" if n == "gsplat" else n)
+      d.text((j * W + 6, 3), label, fill=(230, 230, 230))
+    if overlay:
+      txt = f"frame {i:>4}    PSNR {psnr:5.2f} dB    SSIM {s:.4f}    MAE {mae:.4f}"
+      d.text((6, 17), txt, fill=(150, 210, 255))
+    out.append(np.asarray(canvas))
+
+  n = len(gs_frames)
+  log.info("comparison over %d frames: mean PSNR %.2f dB  SSIM %.4f  MAE %.4f",
+           n, psnr_sum / n, ssim_sum / n, mae_sum / n)
+  return out, metrics
+
+
+def write_metrics_csv(path, metrics):
+  with open(path, "w", newline="") as fh:
+    w = csv.DictWriter(fh, fieldnames=["frame", "psnr", "ssim", "mae"])
+    w.writeheader()
+    for m in metrics:
+      w.writerow({**m, "psnr": f"{m['psnr']:.6f}", "ssim": f"{m['ssim']:.6f}",
+                  "mae": f"{m['mae']:.6f}"})
+  return path
+
+
+# ---------------------------------------------------------------------------
 # encoding
 # ---------------------------------------------------------------------------
 
@@ -283,12 +430,13 @@ def write_mp4(frames, path, fps, crf):
   return path
 
 
-def resolve_output(cfg):
+def resolve_output(cfg, comparing):
   fmt = str(cfg.format).lower()
   if fmt not in ("mp4", "frames"):
     raise SystemExit(f"unknown format {fmt!r} (want mp4 or frames)")
   ext = {"mp4": ".mp4", "frames": ".frames"}[fmt]
-  out = cfg.output_path or (os.path.splitext(cfg.model_path)[0] + ".orbit" + ext)
+  stem = ".orbit.compare" if comparing else ".orbit"
+  out = cfg.output_path or (os.path.splitext(cfg.model_path)[0] + stem + ext)
   return fmt, out
 
 
@@ -306,7 +454,8 @@ def main(cfg: DictConfig) -> None:
   if device != cfg.device:
     log.warning("cuda not available, falling back to cpu")
 
-  fmt, out = resolve_output(cfg)
+  mesh_path = resolve_mesh_path(cfg)
+  fmt, out = resolve_output(cfg, comparing=mesh_path is not None)
   if fmt == "mp4" and (int(cfg.width) % 2 or int(cfg.height) % 2):
     cfg.width, cfg.height = int(cfg.width) + int(cfg.width) % 2, int(cfg.height) + int(cfg.height) % 2
     log.warning("mp4 (yuv420p) needs even dimensions; using %dx%d", int(cfg.width), int(cfg.height))
@@ -320,14 +469,25 @@ def main(cfg: DictConfig) -> None:
            n, int(cfg.width), int(cfg.height), float(cfg.elevation_deg),
            float(cfg.orbit_deg), dist, center.tolist())
 
-  with timed("render"):
+  with timed("render gsplat"):
     frames = render_frames(cfg, g, poses, K, device)
+
+  metrics = None
+  if mesh_path is not None:
+    log.info("mesh comparison against %s", mesh_path)
+    with tempfile.TemporaryDirectory() as workdir, timed("render mesh"):
+      mesh_frames = render_mesh_frames(cfg, poses, K, mesh_path, workdir)
+    with timed("compare"):
+      frames, metrics = build_comparison(cfg, frames, mesh_frames, device)
 
   with timed("encode"):
     if fmt == "frames":
       write_frames_dir(frames, out)
     else:
       write_mp4(frames, out, cfg.fps, cfg.crf)
+    if metrics is not None:
+      csv_path = write_metrics_csv(os.path.splitext(out)[0] + ".csv", metrics)
+      log.info("wrote %s", csv_path)
 
   log.info("wrote %s", out)
 
