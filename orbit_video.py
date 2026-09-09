@@ -265,7 +265,11 @@ def orbit_poses(cfg, means):
 # rendering
 # ---------------------------------------------------------------------------
 
-def render_frames(cfg, g, poses, K, device):
+def render_frames(cfg, g, poses, K, device, out_npy=None):
+  """Rasterise the splat at every pose, each frame composited over
+  cfg.background -> (H,W,3) uint8. Returns a list, or -- if `out_npy` is given
+  -- streams the frames into that (N,H,W,3) uint8 .npy and returns its path
+  (so a long comparison run never holds the whole orbit in RAM)."""
   import gsplat
 
   t = {k: torch.from_numpy(np.ascontiguousarray(v)).to(device) for k, v in g.items()}
@@ -274,7 +278,10 @@ def render_frames(cfg, g, poses, K, device):
 
   Ks = torch.from_numpy(K).to(device)[None]
   W, H = int(cfg.width), int(cfg.height)
-  frames = []
+  sink = (np.lib.format.open_memmap(out_npy, mode="w+", dtype=np.uint8,
+                                    shape=(len(poses), H, W, 3))
+          if out_npy else None)
+  frames = [] if sink is None else None
   for i in range(len(poses)):
     viewmat = torch.from_numpy(make_viewmats(poses[i][None])).to(device)
     rgb, alpha, _ = gsplat.rasterization(
@@ -287,9 +294,16 @@ def render_frames(cfg, g, poses, K, device):
     # colours come back premultiplied by alpha; composite over the bg colour.
     comp = rgb[0].clamp(0.0, 1.0) + (1.0 - alpha[0].clamp(0.0, 1.0)) * bg
     img = (comp.clamp(0.0, 1.0) * 255.0 + 0.5).to(torch.uint8).cpu().numpy()
-    frames.append(img)
+    if sink is None:
+      frames.append(img)
+    else:
+      sink[i] = img
     if (i + 1) % max(1, len(poses) // 10) == 0 or i == len(poses) - 1:
       log.info("rendered %d/%d frames", i + 1, len(poses))
+  if sink is not None:
+    sink.flush()
+    del sink
+    return out_npy
   return frames
 
 
@@ -299,7 +313,9 @@ def render_frames(cfg, g, poses, K, device):
 
 def render_mesh_frames(cfg, poses, K, mesh_path, workdir):
   """Render `mesh_path` along `poses` via Blender / orbit_render_mesh.py.
-  Returns (N, H, W, 3) float32 in [0, 1], composited over cfg.background."""
+  Returns the path to an (N, H, W, 4) uint8 .npy (RGBA, premultiplied-alpha
+  film) -- kept on disk and mmap'd by the comparison, so the frames never all
+  sit in RAM at once."""
   job = os.path.join(workdir, "job.npz")
   out = os.path.join(workdir, "mesh_frames.npy")
   m = cfg.mesh
@@ -316,11 +332,7 @@ def render_mesh_frames(cfg, poses, K, mesh_path, workdir):
   r = subprocess.run(cmd)
   if r.returncode != 0 or not os.path.exists(out):
     raise SystemExit(f"Blender mesh render failed (exit {r.returncode})")
-
-  rgba = np.load(out).astype(np.float32) / 255.0          # (N,H,W,4)
-  bg = np.asarray(list(cfg.background), np.float32)
-  a = rgba[..., 3:4]
-  return rgba[..., :3] * a + (1.0 - a) * bg               # over the same bg
+  return out
 
 
 def _frame_metrics(mesh_f, gs_f, device):
@@ -329,8 +341,8 @@ def _frame_metrics(mesh_f, gs_f, device):
   mae = float(diff.mean())
   mse = float((diff ** 2).mean())
   psnr = float("inf") if mse == 0 else 10.0 * np.log10(1.0 / mse)
-  a = torch.from_numpy(mesh_f).permute(2, 0, 1)[None].to(device)
-  b = torch.from_numpy(gs_f).permute(2, 0, 1)[None].to(device)
+  a = torch.from_numpy(np.ascontiguousarray(mesh_f)).permute(2, 0, 1)[None].to(device)
+  b = torch.from_numpy(np.ascontiguousarray(gs_f)).permute(2, 0, 1)[None].to(device)
   s = float(ssim(a, b))
   return psnr, s, mae
 
@@ -342,51 +354,61 @@ def _diff_heatmap(mesh_f, gs_f, gain):
   return (colormaps["magma"](d)[..., :3] * 255.0 + 0.5).astype(np.uint8)
 
 
-def build_comparison(cfg, gs_frames, mesh_frames, device):
-  """Returns (panel_frames list of (STRIP+H, panels*W, 3) uint8, metrics list
-  of dicts). Panels/order come from cfg.compare.panels."""
+def compare_panels(cfg, gs_source, mesh_npy, device, metrics_out):
+  """Generator: one composited comparison panel (uint8) per frame, streamed so
+  the encoder never holds them all. `gs_source` is anything indexable to
+  (H,W,3) uint8 (a list, or an mmap'd .npy). `metrics_out` is a list this
+  fills with a per-frame dict as it goes; read it once the generator is done."""
   from PIL import Image, ImageDraw
 
   names = [str(p) for p in cfg.compare.panels]
   W, H = int(cfg.width), int(cfg.height)
   gain = float(cfg.compare.diff_gain)
   overlay = bool(cfg.compare.overlay_metrics)
-  strip = 32 if overlay else 16          # room for a label row + a metrics row
+  strip = 32 if overlay else 16          # a label row + (optionally) a metrics row
+  bg = np.asarray(list(cfg.background), np.float32)
 
-  gs_u8 = [(np.clip(f, 0, 1) * 255 + 0.5).astype(np.uint8) if f.dtype != np.uint8 else f
-           for f in gs_frames]
-  mesh_u8 = [(np.clip(f, 0, 1) * 255 + 0.5).astype(np.uint8) for f in mesh_frames]
+  mesh = np.load(mesh_npy, mmap_mode="r")               # (N,H,W,4) uint8 on disk
+  n = len(gs_source)
+  if len(mesh) != n:
+    raise SystemExit(f"mesh render has {len(mesh)} frames, orbit has {n}")
 
-  out, metrics = [], []
-  psnr_sum = ssim_sum = mae_sum = 0.0
-  for i in range(len(gs_frames)):
-    mf = mesh_frames[i]
-    gf = gs_frames[i].astype(np.float32) / 255.0 if gs_frames[i].dtype == np.uint8 else gs_frames[i]
+  for i in range(n):
+    mrgba = np.asarray(mesh[i], np.float32) / 255.0
+    a = mrgba[..., 3:4]
+    mf = mrgba[..., :3] * a + (1.0 - a) * bg            # composite over the same bg
+    gs_u8 = np.asarray(gs_source[i], np.uint8)
+    gf = gs_u8.astype(np.float32) / 255.0
+
     psnr, s, mae = _frame_metrics(mf, gf, device)
-    metrics.append({"frame": i, "psnr": psnr, "ssim": s, "mae": mae})
-    psnr_sum += 0.0 if psnr == float("inf") else psnr
-    ssim_sum += s
-    mae_sum += mae
+    metrics_out.append({"frame": i, "psnr": psnr, "ssim": s, "mae": mae})
 
-    tiles = {"mesh": mesh_u8[i], "gsplat": gs_u8[i],
+    tiles = {"mesh": (np.clip(mf, 0, 1) * 255 + 0.5).astype(np.uint8),
+             "gsplat": gs_u8,
              "diff": _diff_heatmap(mf, gf, gain)}
-    row = np.concatenate([tiles[n] for n in names], axis=1)
+    row = np.concatenate([tiles[nm] for nm in names], axis=1)
 
     canvas = Image.new("RGB", (row.shape[1], H + strip), (16, 16, 18))
     canvas.paste(Image.fromarray(row), (0, strip))
     d = ImageDraw.Draw(canvas)
-    for j, n in enumerate(names):
-      label = f"diff x{gain:g}" if n == "diff" else ("3DGS" if n == "gsplat" else n)
+    for j, nm in enumerate(names):
+      label = f"diff x{gain:g}" if nm == "diff" else ("3DGS" if nm == "gsplat" else nm)
       d.text((j * W + 6, 3), label, fill=(230, 230, 230))
     if overlay:
       txt = f"frame {i:>4}    PSNR {psnr:5.2f} dB    SSIM {s:.4f}    MAE {mae:.4f}"
       d.text((6, 17), txt, fill=(150, 210, 255))
-    out.append(np.asarray(canvas))
+    yield np.asarray(canvas)
 
-  n = len(gs_frames)
+    if (i + 1) % max(1, n // 10) == 0 or i == n - 1:
+      log.info("compared %d/%d frames", i + 1, n)
+
+
+def log_metrics_summary(metrics):
+  n = len(metrics)
+  fin = [m["psnr"] for m in metrics if m["psnr"] != float("inf")]
   log.info("comparison over %d frames: mean PSNR %.2f dB  SSIM %.4f  MAE %.4f",
-           n, psnr_sum / n, ssim_sum / n, mae_sum / n)
-  return out, metrics
+           n, (sum(fin) / len(fin)) if fin else float("inf"),
+           sum(m["ssim"] for m in metrics) / n, sum(m["mae"] for m in metrics) / n)
 
 
 def write_metrics_csv(path, metrics):
@@ -406,9 +428,8 @@ def write_metrics_csv(path, metrics):
 def write_frames_dir(frames, out_dir):
   from PIL import Image
   os.makedirs(out_dir, exist_ok=True)
-  pad = len(str(len(frames)))
   for i, fr in enumerate(frames):
-    Image.fromarray(fr).save(os.path.join(out_dir, f"frame_{i:0{pad}d}.png"))
+    Image.fromarray(fr).save(os.path.join(out_dir, f"frame_{i:06d}.png"))
   return out_dir
 
 
@@ -469,25 +490,36 @@ def main(cfg: DictConfig) -> None:
            n, int(cfg.width), int(cfg.height), float(cfg.elevation_deg),
            float(cfg.orbit_deg), dist, center.tolist())
 
-  with timed("render gsplat"):
-    frames = render_frames(cfg, g, poses, K, device)
+  comparing = mesh_path is not None
+  with tempfile.TemporaryDirectory() as workdir:
+    with timed("render gsplat"):
+      # when comparing, stream the orbit straight to disk so the parent isn't
+      # holding it while Blender (a hungry second process) renders the mesh.
+      gs = render_frames(cfg, g, poses, K, device,
+                         out_npy=os.path.join(workdir, "gs.npy") if comparing else None)
+    del g
+    if device == "cuda":
+      torch.cuda.empty_cache()
 
-  metrics = None
-  if mesh_path is not None:
-    log.info("mesh comparison against %s", mesh_path)
-    with tempfile.TemporaryDirectory() as workdir, timed("render mesh"):
-      mesh_frames = render_mesh_frames(cfg, poses, K, mesh_path, workdir)
-    with timed("compare"):
-      frames, metrics = build_comparison(cfg, frames, mesh_frames, device)
+    frames, metrics = gs, None
+    if comparing:
+      log.info("mesh comparison against %s", mesh_path)
+      with timed("render mesh"):
+        mesh_npy = render_mesh_frames(cfg, poses, K, mesh_path, workdir)
+      metrics = []
+      # generator: each panel is built + encoded one at a time, filling
+      # `metrics` as it runs -- both inputs stay mmap'd on disk.
+      frames = compare_panels(cfg, np.load(gs, mmap_mode="r"), mesh_npy, device, metrics)
 
-  with timed("encode"):
-    if fmt == "frames":
-      write_frames_dir(frames, out)
-    else:
-      write_mp4(frames, out, cfg.fps, cfg.crf)
-    if metrics is not None:
-      csv_path = write_metrics_csv(os.path.splitext(out)[0] + ".csv", metrics)
-      log.info("wrote %s", csv_path)
+    with timed("encode"):
+      if fmt == "frames":
+        write_frames_dir(frames, out)
+      else:
+        write_mp4(frames, out, cfg.fps, cfg.crf)
+      if metrics is not None:
+        log_metrics_summary(metrics)
+        csv_path = write_metrics_csv(os.path.splitext(out)[0] + ".csv", metrics)
+        log.info("wrote %s", csv_path)
 
   log.info("wrote %s", out)
 

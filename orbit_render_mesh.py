@@ -94,7 +94,8 @@ def main():
   setup_lighting(lighting)
   cam = setup_camera_from_fx(fx, W, H)
 
-  frames = np.empty((len(poses), H, W, 4), np.uint8)
+  frames = np.lib.format.open_memmap(out_path, mode="w+", dtype=np.uint8,
+                                     shape=(len(poses), H, W, 4))
   with TemporaryDirectory() as tmp:
     png = os.path.join(tmp, "f.png")
     for i, c2w in enumerate(poses):
@@ -103,8 +104,7 @@ def main():
       frames[i] = render_rgba(png, W, H)
       if (i + 1) % max(1, len(poses) // 10) == 0 or i == len(poses) - 1:
         log.info("rendered %d/%d mesh frames", i + 1, len(poses))
-
-  np.save(out_path, frames)
+  frames.flush()
   log.info("wrote %s  %s", out_path, frames.shape)
 
 
