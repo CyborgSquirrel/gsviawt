@@ -82,6 +82,7 @@ def main():
   scene.render.engine = engine
   scene.render.resolution_percentage = 100
   scene.render.film_transparent = True
+  scene.render.use_persistent_data = False        # don't cache per-frame render data
   if scene.render.engine == "CYCLES":
     scene.cycles.samples = samples
     scene.cycles.use_denoising = True
@@ -102,6 +103,13 @@ def main():
       cam.matrix_world = Matrix(c2w.tolist())
       bpy.context.view_layer.update()
       frames[i] = render_rgba(png, W, H)
+      # keep RSS flat over 100s of frames: drop any stray 0-user image
+      # render_rgba's readback left behind, and flush the mmap page cache.
+      for img in list(bpy.data.images):
+        if img.users == 0 and not img.name.startswith(("Render Result", "Viewer Node")):
+          bpy.data.images.remove(img)
+      if (i + 1) % 24 == 0:
+        frames.flush()
       if (i + 1) % max(1, len(poses) // 10) == 0 or i == len(poses) - 1:
         log.info("rendered %d/%d mesh frames", i + 1, len(poses))
   frames.flush()

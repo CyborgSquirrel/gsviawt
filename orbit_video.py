@@ -471,18 +471,15 @@ def main(cfg: DictConfig) -> None:
   np.random.seed(int(cfg.seed))
   torch.manual_seed(int(cfg.seed))
 
-  device = cfg.device if (cfg.device != "cuda" or torch.cuda.is_available()) else "cpu"
-  if device != cfg.device:
-    log.warning("cuda not available, falling back to cpu")
-
   mesh_path = resolve_mesh_path(cfg)
-  fmt, out = resolve_output(cfg, comparing=mesh_path is not None)
+  comparing = mesh_path is not None
+  fmt, out = resolve_output(cfg, comparing=comparing)
   if fmt == "mp4" and (int(cfg.width) % 2 or int(cfg.height) % 2):
     cfg.width, cfg.height = int(cfg.width) + int(cfg.width) % 2, int(cfg.height) + int(cfg.height) % 2
     log.warning("mp4 (yuv420p) needs even dimensions; using %dx%d", int(cfg.width), int(cfg.height))
 
   with timed("load"):
-    g = load_model(cfg)
+    g = load_model(cfg)                              # numpy only -- no CUDA yet
   log.info("%d Gaussians from %s", len(g["means"]), cfg.model_path)
 
   poses, K, dist, center, n = orbit_poses(cfg, g["means"])
@@ -490,11 +487,20 @@ def main(cfg: DictConfig) -> None:
            n, int(cfg.width), int(cfg.height), float(cfg.elevation_deg),
            float(cfg.orbit_deg), dist, center.tolist())
 
-  comparing = mesh_path is not None
   with tempfile.TemporaryDirectory() as workdir:
+    # Mesh render FIRST, before torch touches CUDA -- Blender then has the GPU
+    # (and RAM) to itself instead of fighting a live gsplat context.
+    mesh_npy = None
+    if comparing:
+      log.info("mesh comparison against %s", mesh_path)
+      with timed("render mesh"):
+        mesh_npy = render_mesh_frames(cfg, poses, K, mesh_path, workdir)
+
+    device = cfg.device if (cfg.device != "cuda" or torch.cuda.is_available()) else "cpu"
+    if device != cfg.device:
+      log.warning("cuda not available, falling back to cpu")
+
     with timed("render gsplat"):
-      # when comparing, stream the orbit straight to disk so the parent isn't
-      # holding it while Blender (a hungry second process) renders the mesh.
       gs = render_frames(cfg, g, poses, K, device,
                          out_npy=os.path.join(workdir, "gs.npy") if comparing else None)
     del g
@@ -503,9 +509,6 @@ def main(cfg: DictConfig) -> None:
 
     frames, metrics = gs, None
     if comparing:
-      log.info("mesh comparison against %s", mesh_path)
-      with timed("render mesh"):
-        mesh_npy = render_mesh_frames(cfg, poses, K, mesh_path, workdir)
       metrics = []
       # generator: each panel is built + encoded one at a time, filling
       # `metrics` as it runs -- both inputs stay mmap'd on disk.
