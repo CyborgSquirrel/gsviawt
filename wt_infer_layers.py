@@ -18,6 +18,12 @@ instead:
     (leading dim N -- 1 for a single --index, or every view in the
     input file by default).
 
+WT forward-fills its per-pixel layer stack (emits num_layers points at
+every valid pixel, so the deeper layers are near-exact copies of the
+surface layer where there's no real occluded geometry). `--dedupe-layers`
+(on by default) collapses those copies back to NaN -- see
+`dedupe_forward_fill`.
+
 Coordinate-frame note
 ----------------------
 World Tracing predicts XYZ in its own camera space only (X right, Y down,
@@ -140,6 +146,28 @@ def process_view(
   return rgb_uint8, points, K
 
 
+def dedupe_forward_fill(points, tol):
+  """points: [..., L, 3] float32, NaN marks invalid. Walk consecutive
+  layers from deepest to shallowest; wherever a layer's predicted XYZ is
+  within `tol` (euclidean distance) of the layer immediately above it, set
+  that deeper layer to NaN.
+
+  World Tracing forward-fills its per-pixel layer stack: it emits
+  `num_layers` points at every valid pixel even where the object has just
+  one surface there, so layers 1..L-1 are near-exact copies of the surface
+  layer (checked: all L validity masks are byte-identical, XYZ differs only
+  by ~1e-4 noise for the filled ones vs ~1e-2+ where there's real occluded
+  geometry). This collapses the redundant copies back to NaN so a deeper
+  layer means an actual second surface. Returns a new array.
+  """
+  out = np.array(points, copy=True)
+  n_layers = points.shape[-2]
+  for k in range(n_layers - 1, 0, -1):
+    close = np.linalg.norm(points[..., k, :] - points[..., k - 1, :], axis=-1) <= tol
+    out[..., k, :][close] = np.nan
+  return out
+
+
 def main():
   parser = ArgumentParser(description=__doc__)
   parser.add_argument("hdf5_path", help="Path to a render_objaverse.py render h5")
@@ -177,6 +205,19 @@ def main():
       "to the raw render."
     ),
   )
+  parser.add_argument(
+    "--dedupe-layers", action="store_true", default=True,
+    help="On by default: collapse World Tracing's forward-filled layer "
+         "stack -- deepest to shallowest, NaN a layer wherever its XYZ is "
+         "within --dedupe-tol of the layer above it, so a deeper layer "
+         "means a real second surface. --no-dedupe-layers keeps the raw "
+         "num_layers-deep stack at every pixel.")
+  parser.add_argument("--no-dedupe-layers", dest="dedupe_layers", action="store_false")
+  parser.add_argument(
+    "--dedupe-tol", type=float, default=5e-3,
+    help="Euclidean XYZ distance under which a layer counts as a copy of "
+         "the one above it, for --dedupe-layers (default 5e-3, in WT's "
+         "~metric units; filled copies sit ~1e-4 apart, real surfaces ~1e-2+).")
   parser.add_argument("--bg-color", type=str, default="0,0,0",
                       help="RGB the masked-out region is composited to before the "
                            "model sees it. Default black -- the README says black "
@@ -246,6 +287,15 @@ def main():
 
   images_arr = np.stack(all_images)
   points_arr = np.stack(all_points)
+
+  if args.dedupe_layers:
+    before = int(np.isfinite(points_arr).all(axis=-1).sum())
+    points_arr = dedupe_forward_fill(points_arr, args.dedupe_tol)
+    after = int(np.isfinite(points_arr).all(axis=-1).sum())
+    print(f"[wt] dedupe-layers (tol={args.dedupe_tol:g}): "
+          f"NaN'd {before - after:,} forward-filled layer points "
+          f"({100 * (before - after) / max(before, 1):.1f}% of valid)")
+
   n, height, width = images_arr.shape[:3]
   num_layers = points_arr.shape[3]
 
@@ -263,6 +313,7 @@ def main():
     out.create_dataset("intrinsics", data=np.stack(all_K))
     out.create_dataset("seed", data=np.array([args.seed] * len(indices), dtype=np.int64))
     out.create_dataset("config", data=np.array([args.config] * len(indices), dtype=h5py.string_dtype()))
+    out.attrs["dedupe_tol"] = float(args.dedupe_tol) if args.dedupe_layers else 0.0
     images_shape, points_shape = images_ds.shape, points_ds.shape
 
   print(f"[wt] wrote images{images_shape} points{points_shape} to {out_path}")
