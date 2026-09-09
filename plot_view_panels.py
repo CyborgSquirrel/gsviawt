@@ -139,33 +139,28 @@ def panel(rgb_r, rgb_w, layers, title, out, wt_label="depth WT (raw)", crop=True
   r0, c0 = max(0, r0), max(0, c0)
   r1, c1 = min(h, r1), min(w, c1)
 
-  # transposed layout: one COLUMN per depth-peel layer; a top RGB strip,
-  # then rows depth GT | depth WT | |delta| | mask disagreement. Equal-aspect
-  # (never stretched) images; grid cells sized to the crop window's aspect so
-  # columns sit flush.
+  # transposed layout: rows = depth GT | depth WT | |delta| | mask
+  # disagreement; columns = the source RGB, then one per depth-peel layer.
+  # "RGB render" sits in the GT row (both come from the render), "RGB WT
+  # input" in the WT row. Equal-aspect (never stretched) images; cells sized
+  # to the crop window's aspect so columns sit flush.
   nL = len(layers)
-  ncol = max(nL, 2)  # the RGB strip always needs 2 slots
+  ncol_img = 1 + nL                 # RGB column + one per layer
   panel_ar = min(1.6, max(0.7, (r1 - r0) / (c1 - c0)))
-  cell_w = 3.4 if ncol <= 2 else 2.5
+  cell_w = 2.5 if nL >= 3 else 3.2
   row_h = cell_w * panel_ar
-  label_w = 1.0                     # inches, left row-labels
-  cbar_cax_w, cbar_lbl_w = 0.26, 0.95   # inches: colorbar bar + its tick labels
-  margin_top, margin_bot, gap = 0.95, 0.3, 0.8  # gap = RGB strip -> grid
-  fig_w = label_w + cell_w * ncol + cbar_cax_w + cbar_lbl_w
-  fig_h = margin_top + row_h * 5 + gap + margin_bot
+  label_w = 1.05                    # inches, left row-labels
+  cbar_cax_w, cbar_lbl_w = 0.26, 0.95
+  margin_top, margin_bot = 1.35, 0.3
+  fig_w = label_w + cell_w * ncol_img + cbar_cax_w + cbar_lbl_w
+  fig_h = margin_top + row_h * 4 + margin_bot
   fig = plt.figure(figsize=(fig_w, fig_h))
-  left, right = label_w / fig_w, 1 - cbar_lbl_w / fig_w
-  cbar_ratio = cbar_cax_w / cell_w
 
-  def _y(inches_from_top):
-    return 1 - inches_from_top / fig_h
-
-  gs_kw = dict(left=left, right=right, width_ratios=[1] * ncol + [cbar_ratio], wspace=0.02)
-  rgb_gs = fig.add_gridspec(1, ncol + 1, top=_y(margin_top),
-                            bottom=_y(margin_top + row_h), **gs_kw)
-  grid = fig.add_gridspec(4, ncol + 1, top=_y(margin_top + row_h + gap),
-                          bottom=margin_bot / fig_h, height_ratios=[1] * 4,
-                          hspace=0.06, **gs_kw)
+  grid = fig.add_gridspec(4, ncol_img + 1,
+                          left=label_w / fig_w, right=1 - cbar_lbl_w / fig_w,
+                          top=1 - margin_top / fig_h, bottom=margin_bot / fig_h,
+                          width_ratios=[1] * ncol_img + [cbar_cax_w / cell_w],
+                          height_ratios=[1] * 4, hspace=0.13, wspace=0.02)
 
   def show(ax, img, cmap=None, vmin=None, vmax=None):
     im = ax.imshow(img, cmap=cmap, vmin=vmin, vmax=vmax)  # aspect "equal"
@@ -176,36 +171,48 @@ def panel(rgb_r, rgb_w, layers, title, out, wt_label="depth WT (raw)", crop=True
       s.set_visible(True); s.set_color("black"); s.set_linewidth(1.4)
     return im
 
-  a = fig.add_subplot(rgb_gs[0, 0]); show(a, rgb_r); a.set_title("RGB render", fontsize=12, pad=5)
-  a = fig.add_subplot(rgb_gs[0, 1]); show(a, rgb_w); a.set_title("RGB WT input", fontsize=12, pad=5)
+  def label_only(ax, text):
+    ax.set_xticks([]); ax.set_yticks([])
+    for s in ax.spines.values():
+      s.set_visible(False)
+    ax.set_ylabel(text, fontsize=13)
 
   gt_of = lambda L: _mask(L["gt"], L["gtv"] & (L["gt"] > 0))
   rows = [
-    ("depth GT",      lambda L: (gt_of(L), "turbo", vmin, vmax)),
-    (wt_label,        lambda L: (_mask(L["wt"], L["wtv"]), "turbo", vmin, vmax)),
-    ("|delta|",       lambda L: (_mask(np.abs(L["gt"] - L["wt"]), L["both"]), "turbo", 0.0, dmax)),
-    ("mask disagree", lambda L: (_disagreement_rgb(L["gtv"] & (L["gt"] > 0), L["wtv"]), None, None, None)),
+    ("depth GT",      rgb_r, "RGB render",
+     lambda L: (gt_of(L), "turbo", vmin, vmax)),
+    (wt_label,        rgb_w, "RGB WT input",
+     lambda L: (_mask(L["wt"], L["wtv"]), "turbo", vmin, vmax)),
+    ("|delta|",       None, None,
+     lambda L: (_mask(np.abs(L["gt"] - L["wt"]), L["both"]), "turbo", 0.0, dmax)),
+    ("mask disagree", None, None,
+     lambda L: (_disagreement_rgb(L["gtv"] & (L["gt"] > 0), L["wtv"]), None, None, None)),
   ]
   ims = {}
-  for ri, (rlabel, fn) in enumerate(rows):
-    for ci, L in enumerate(layers):
+  for ri, (rlabel, rgb, rgb_title, fn) in enumerate(rows):
+    ax0 = fig.add_subplot(grid[ri, 0])
+    if rgb is not None:
+      show(ax0, rgb)
+      ax0.set_title(rgb_title, fontsize=11, pad=5)
+      ax0.set_ylabel(rlabel, fontsize=13)
+    else:
+      label_only(ax0, rlabel)
+    for ci, L in enumerate(layers, start=1):
       ax = fig.add_subplot(grid[ri, ci])
       ims[ri] = show(ax, *fn(L))
       if ri == 0:
         ar = f"AbsRel {L['absrel']:.3f}" if np.isfinite(L["absrel"]) else "AbsRel --"
         cd = f"CD {L['cd']:.4f}" if np.isfinite(L.get("cd", np.nan)) else "CD --"
         ax.set_title(f"layer {L['idx']}\n{ar}  ·  {cd}\nn={L['n']}", fontsize=10, pad=5)
-      if ci == 0:
-        ax.set_ylabel(rlabel, fontsize=13)
 
-  fig.colorbar(ims[0], cax=fig.add_subplot(grid[0:2, ncol]), label="depth")
-  fig.colorbar(ims[2], cax=fig.add_subplot(grid[2, ncol]), label="|delta|")
-  axl = fig.add_subplot(grid[3, ncol]); axl.axis("off")
+  fig.colorbar(ims[0], cax=fig.add_subplot(grid[0:2, ncol_img]), label="depth")
+  fig.colorbar(ims[2], cax=fig.add_subplot(grid[2, ncol_img]), label="|delta|")
+  axl = fig.add_subplot(grid[3, ncol_img]); axl.axis("off")
   axl.legend(handles=[Patch(facecolor=MASK_EXTRA, edgecolor="0.4", label="WT extra"),
                       Patch(facecolor=MASK_MISS, edgecolor="0.4", label="WT missing")],
              loc="center left", fontsize=9, frameon=False, handlelength=1.1,
              borderaxespad=0)
-  fig.suptitle(title, y=_y(0.38), fontsize=min(15, fig_w * 1.7))
+  fig.suptitle(title, y=1 - 0.42 / fig_h, fontsize=min(15, fig_w * 1.6))
   fig.savefig(out, dpi=100)
   plt.close(fig)
   print(f"[fig] {out}")
