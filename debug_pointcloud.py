@@ -58,7 +58,8 @@ def detect_format(f, datasets):
 
 
 def unproject_depth_peel(depth_peel, intrinsics, pose, space):
-  """depth_peel: (H, W, L) float32, -1.0 marks no hit.
+  """depth_peel: (H, W, L) float32, NaN marks no hit (older renders used
+    -1.0; the `depth_peel > 0` test below rejects both).
   intrinsics: (3, 3) pinhole K matrix (pixel row 0 = top, standard
     computer-vision convention: u right, v down, cx/cy in pixel units).
   pose: (4, 4) camera-to-world matrix (Blender camera-local axes: +X
@@ -75,7 +76,7 @@ def unproject_depth_peel(depth_peel, intrinsics, pose, space):
   v_idx, u_idx, l_idx = np.meshgrid(
     np.arange(height), np.arange(width), np.arange(max_layers), indexing="ij")
 
-  hit = depth_peel >= 0
+  hit = depth_peel > 0  # NaN and -1.0 both fail this
   u = u_idx[hit].astype(np.float32)
   v = v_idx[hit].astype(np.float32)
   layer_idx = l_idx[hit]
@@ -121,9 +122,8 @@ def colors_for(image, u, v, layer_idx, max_layers):
 
 def extract_valid_points(points_grid):
   """points_grid: (H, W, L, 3) float32 XYZ, NaN in any component marks an
-  invalid entry (mirroring depth_peel's (H, W, L) layout and -1.0 sentinel,
-  but a scalar sentinel can't sit inside real XYZ, hence NaN -- see
-  wt_infer_layers.py). Returns (xyz, u, v, layer_idx), each length N (one
+  invalid entry (same (H, W, L) layout as depth_peel, which also uses NaN --
+  see wt_infer_layers.py). Returns (xyz, u, v, layer_idx), each length N (one
   entry per valid hit), analogous to unproject_depth_peel's outputs.
   """
   height, width, max_layers, _ = points_grid.shape

@@ -75,8 +75,8 @@ def rgba_from_render(hf, index, hard_alpha=False):
   if image.shape[-1] == 4 and not hard_alpha:
     return image
   rgb = image[..., :3]
-  depth_peel = hf["depth_peel"][index]  # (H, W, L) float32, -1.0 = no hit
-  alpha = np.where(depth_peel[..., 0] >= 0, 255, 0).astype(np.uint8)
+  depth_peel = hf["depth_peel"][index]  # (H, W, L) float32, NaN (or -1.0) = no hit
+  alpha = np.where(depth_peel[..., 0] > 0, 255, 0).astype(np.uint8)
   return np.concatenate([rgb, alpha[..., None]], axis=-1)
 
 
@@ -130,8 +130,8 @@ def process_view(
   K = K if K is not None else intr_t[0].cpu().numpy()
 
   # [L, H, W, 3] -> [H, W, L, 3], matching depth_peel's (H, W, L) axis
-  # order; invalid entries get NaN instead of depth_peel's -1.0 sentinel
-  # since a sentinel *vector* would collide with real geometry.
+  # order; invalid entries get NaN, same as depth_peel (a scalar sentinel
+  # can't sit inside a real XYZ vector anyway).
   points = np.transpose(xyz, (1, 2, 0, 3)).copy()
   points[~np.transpose(mask, (1, 2, 0))] = np.nan
 
