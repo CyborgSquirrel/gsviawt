@@ -1,0 +1,65 @@
+# Config for orbit_video.py -- render a turntable showcase video of a 3DGS
+# model (camera orbiting the object). See orbit_video.py's module docstring.
+
+# --- input ---
+# A 3DGS model: either a fit_gsplat .h5 (gaussian_* grids + layer_valid) or a
+# standard INRIA-format 3DGS .ply. Format is picked from the extension.
+model_path: /app/bla/objaverse_renders.h5.gsplat.view0.h5
+
+# null -> "<model_stem>.orbit.<ext>" next to the input (.mp4, or .frames/ dir).
+output_path: null
+
+# mp4 | frames
+#   mp4    -> H.264 .mp4 (via imageio-ffmpeg's bundled ffmpeg; no system dep)
+#   frames -> a directory of zero-padded PNG frames, no encode
+format: mp4
+
+# --- camera path ---
+num_frames: null         # null -> round(seconds * fps)
+seconds: 6.0
+fps: 30
+orbit_deg: 360.0         # total azimuth swept over the clip
+start_azimuth_deg: 0.0
+elevation_deg: 20.0      # camera tilt above the horizon (clamped to +/-89)
+clockwise: false
+
+# What the camera looks at and how far away it sits.
+look_at: origin          # origin | centroid   (centroid = mean of Gaussian means)
+# null -> auto: fit the object's bounding sphere into the frame with `margin`
+# headroom. Set a number to override (world units, object is ~unit-cube sized).
+camera_distance: null
+margin: 1.35             # only used when camera_distance is null
+
+# --- intrinsics / image (matches render_objaverse.py's pinhole model) ---
+width: 720
+height: 720
+camera_lens: 50.0
+camera_sensor_width: 51.2
+
+# --- look ---
+background: [0.0, 0.0, 0.0]   # RGB in [0, 1]; [1,1,1] for white
+near_plane: 0.01
+far_plane: 100.0
+
+# --- encoding ---
+crf: 18                  # x264 quality (lower = better/bigger; 18 ~ visually lossless)
+
+# --- runtime ---
+device: cuda             # cuda | cpu
+seed: 0
+
+# --- dataset-name overrides (fit_gsplat .h5) ---
+datasets:
+  means: gaussian_means
+  scales: gaussian_scales
+  quats: gaussian_quats
+  opacities: gaussian_opacities
+  colors: gaussian_colors
+  valid: layer_valid
+
+hydra:
+  job:
+    chdir: false          # stay in cwd; output paths are absolute / input-relative
+  output_subdir: null     # no per-run .hydra/ dir
+  run:
+    dir: outputs/orbit_video/${now:%Y-%m-%d_%H-%M-%S}   # hydra's .log lands here (gitignored)
