@@ -57,7 +57,11 @@ mesh:
   render_engine: CYCLES   # CYCLES | BLENDER_EEVEE_NEXT
   cycles_samples: 64
 compare:
-  panels: [mesh, gsplat, diff]   # any order/subset of these three
+  # any order/subset of: mesh | gsplat | points | diff
+  #   points = the same Gaussians drawn as a coloured point cloud (adds a
+  #            second gsplat pass), diff = |mesh - gsplat| heatmap
+  panels: [mesh, gsplat, points, diff]
+  point_size: 0.004              # world-space radius of each dot in the points panel
   diff_gain: 8.0                 # abs-diff heatmap is multiplied by this before the colormap
   overlay_metrics: true          # burn per-frame PSNR/SSIM into the strip
 

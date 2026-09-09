@@ -265,15 +265,22 @@ def orbit_poses(cfg, means):
 # rendering
 # ---------------------------------------------------------------------------
 
-def render_frames(cfg, g, poses, K, device, out_npy=None):
+def render_frames(cfg, g, poses, K, device, out_npy=None, as_points=False):
   """Rasterise the splat at every pose, each frame composited over
   cfg.background -> (H,W,3) uint8. Returns a list, or -- if `out_npy` is given
   -- streams the frames into that (N,H,W,3) uint8 .npy and returns its path
-  (so a long comparison run never holds the whole orbit in RAM)."""
+  (so a long comparison run never holds the whole orbit in RAM).
+
+  `as_points`: shrink every Gaussian to an isotropic `compare.point_size`
+  blob at full opacity -- the same splats drawn as a coloured point cloud."""
   import gsplat
 
   t = {k: torch.from_numpy(np.ascontiguousarray(v)).to(device) for k, v in g.items()}
   quats = F.normalize(t["quats"], dim=-1)
+  scales, opacities = t["scales"], t["opacities"]
+  if as_points:
+    scales = torch.full_like(scales, float(cfg.compare.point_size))
+    opacities = torch.ones_like(opacities)
   bg = torch.tensor(list(cfg.background), dtype=torch.float32, device=device)
 
   Ks = torch.from_numpy(K).to(device)[None]
@@ -285,8 +292,8 @@ def render_frames(cfg, g, poses, K, device, out_npy=None):
   for i in range(len(poses)):
     viewmat = torch.from_numpy(make_viewmats(poses[i][None])).to(device)
     rgb, alpha, _ = gsplat.rasterization(
-      means=t["means"], quats=quats, scales=t["scales"],
-      opacities=t["opacities"], colors=t["colors"],
+      means=t["means"], quats=quats, scales=scales,
+      opacities=opacities, colors=t["colors"],
       viewmats=viewmat, Ks=Ks, width=W, height=H,
       sh_degree=None, render_mode="RGB", packed=True,
       near_plane=float(cfg.near_plane), far_plane=float(cfg.far_plane),
@@ -299,7 +306,7 @@ def render_frames(cfg, g, poses, K, device, out_npy=None):
     else:
       sink[i] = img
     if (i + 1) % max(1, len(poses) // 10) == 0 or i == len(poses) - 1:
-      log.info("rendered %d/%d frames", i + 1, len(poses))
+      log.info("rendered %d/%d %sframes", i + 1, len(poses), "point " if as_points else "")
   if sink is not None:
     sink.flush()
     del sink
@@ -354,14 +361,23 @@ def _diff_heatmap(mesh_f, gs_f, gain):
   return (colormaps["magma"](d)[..., :3] * 255.0 + 0.5).astype(np.uint8)
 
 
-def compare_panels(cfg, gs_source, mesh_npy, device, metrics_out):
+PANEL_LABELS = {"mesh": "mesh", "gsplat": "3DGS", "points": "point cloud", "diff": "diff"}
+
+
+def compare_panels(cfg, gs_source, mesh_npy, device, metrics_out, pts_source=None):
   """Generator: one composited comparison panel (uint8) per frame, streamed so
-  the encoder never holds them all. `gs_source` is anything indexable to
-  (H,W,3) uint8 (a list, or an mmap'd .npy). `metrics_out` is a list this
-  fills with a per-frame dict as it goes; read it once the generator is done."""
+  the encoder never holds them all. `gs_source` / `pts_source` are anything
+  indexable to (H,W,3) uint8 (a list, or an mmap'd .npy). `metrics_out` is a
+  list this fills with a per-frame dict as it goes; read once it's exhausted."""
   from PIL import Image, ImageDraw
 
   names = [str(p) for p in cfg.compare.panels]
+  bad = [nm for nm in names if nm not in PANEL_LABELS]
+  if bad:
+    raise SystemExit(f"unknown compare.panels {bad} (pick from {list(PANEL_LABELS)})")
+  if "points" in names and pts_source is None:
+    raise SystemExit("compare.panels lists 'points' but the point-cloud pass didn't run")
+
   W, H = int(cfg.width), int(cfg.height)
   gain = float(cfg.compare.diff_gain)
   overlay = bool(cfg.compare.overlay_metrics)
@@ -386,13 +402,15 @@ def compare_panels(cfg, gs_source, mesh_npy, device, metrics_out):
     tiles = {"mesh": (np.clip(mf, 0, 1) * 255 + 0.5).astype(np.uint8),
              "gsplat": gs_u8,
              "diff": _diff_heatmap(mf, gf, gain)}
+    if pts_source is not None:
+      tiles["points"] = np.asarray(pts_source[i], np.uint8)
     row = np.concatenate([tiles[nm] for nm in names], axis=1)
 
     canvas = Image.new("RGB", (row.shape[1], H + strip), (16, 16, 18))
     canvas.paste(Image.fromarray(row), (0, strip))
     d = ImageDraw.Draw(canvas)
     for j, nm in enumerate(names):
-      label = f"diff x{gain:g}" if nm == "diff" else ("3DGS" if nm == "gsplat" else nm)
+      label = f"diff x{gain:g}" if nm == "diff" else PANEL_LABELS[nm]
       d.text((j * W + 6, 3), label, fill=(230, 230, 230))
     if overlay:
       txt = f"frame {i:>4}    PSNR {psnr:5.2f} dB    SSIM {s:.4f}    MAE {mae:.4f}"
@@ -500,9 +518,16 @@ def main(cfg: DictConfig) -> None:
     if device != cfg.device:
       log.warning("cuda not available, falling back to cpu")
 
+    want_points = comparing and "points" in [str(p) for p in cfg.compare.panels]
+
     with timed("render gsplat"):
       gs = render_frames(cfg, g, poses, K, device,
                          out_npy=os.path.join(workdir, "gs.npy") if comparing else None)
+    pts = None
+    if want_points:
+      with timed("render points"):
+        pts = render_frames(cfg, g, poses, K, device,
+                            out_npy=os.path.join(workdir, "pts.npy"), as_points=True)
     del g
     if device == "cuda":
       torch.cuda.empty_cache()
@@ -511,8 +536,9 @@ def main(cfg: DictConfig) -> None:
     if comparing:
       metrics = []
       # generator: each panel is built + encoded one at a time, filling
-      # `metrics` as it runs -- both inputs stay mmap'd on disk.
-      frames = compare_panels(cfg, np.load(gs, mmap_mode="r"), mesh_npy, device, metrics)
+      # `metrics` as it runs -- inputs all stay mmap'd on disk.
+      frames = compare_panels(cfg, np.load(gs, mmap_mode="r"), mesh_npy, device, metrics,
+                              pts_source=np.load(pts, mmap_mode="r") if pts else None)
 
     with timed("encode"):
       if fmt == "frames":
