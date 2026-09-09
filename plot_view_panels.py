@@ -16,6 +16,10 @@ validity masks disagree at that layer: red where WT predicts a surface the
 render doesn't have, blue where the render has one WT missed, white where
 they agree.
 
+The title also carries the symmetric Chamfer distance (raw, no alignment)
+between the render's unprojected depth-peel point cloud and WT's predicted
+XYZ -- overall, and per layer in each row's label.
+
     python plot_view_panels.py bla/obj_rand40.h5 bla/obj_rand40.h5.wt.h5 --views 1 8 12 24
 """
 
@@ -32,6 +36,41 @@ MASK_MISS = "#1f6feb"   # render has a surface WT missed
 
 def _mask(a, valid):
   return np.where(valid, a, np.nan)
+
+
+def _unproject(depth_hw, K):
+  """depth_hw: (H, W), -1 = no hit. K: 3x3 pinhole. Returns (N, 3) points in
+  OpenCV camera space (X right, Y down, Z fwd) -- the frame WT predicts in."""
+  hit = depth_hw >= 0
+  vv, uu = np.nonzero(hit)
+  d = depth_hw[hit].astype(np.float64)
+  k_inv = np.linalg.inv(np.asarray(K, np.float64))
+  rays = np.column_stack([uu, vv, np.ones(uu.shape[0])]) @ k_inv.T
+  return (rays * d[:, None]).astype(np.float32)
+
+
+def _xyz_cloud(points_hwlc):
+  """points_hwlc: (H, W, L, 3) or (H, W, 3), NaN = invalid. Returns (N, 3)."""
+  flat = points_hwlc.reshape(-1, 3)
+  return flat[~np.isnan(flat).any(axis=1)]
+
+
+def _chamfer(a, b, cap=40000):
+  """Symmetric Chamfer distance: mean_a min_b|a-b| + mean_b min_a|a-b|.
+  Random-subsampled to `cap` points per side for speed; NaN if either side
+  is empty."""
+  if len(a) == 0 or len(b) == 0:
+    return np.nan
+  from scipy.spatial import cKDTree
+
+  rng = np.random.default_rng(0)
+  if len(a) > cap:
+    a = a[rng.choice(len(a), cap, replace=False)]
+  if len(b) > cap:
+    b = b[rng.choice(len(b), cap, replace=False)]
+  d_ab, _ = cKDTree(b).query(a)
+  d_ba, _ = cKDTree(a).query(b)
+  return float(d_ab.mean() + d_ba.mean())
 
 
 def _disagreement_rgb(gt_present, wt_present):
@@ -87,28 +126,33 @@ def panel(rgb_r, rgb_w, layers, title, out, wt_label="depth WT (raw)", crop=True
   else:
     r0, r1, c0, c1 = 0, h, 0, w
 
-  # cap the crop window's aspect at 1.6:1 by widening the short axis (shows
-  # a little more surrounding space -- the image itself is never stretched)
-  # so a tall thin object x (nL+1) rows doesn't produce an absurd figure.
-  bh, bw, cap = r1 - r0, c1 - c0, 1.6
-  if bh > cap * bw:
-    g = (bh / cap - bw) / 2; c0 -= g; c1 += g
-  elif bw > cap * bh:
-    g = (bw / cap - bh) / 2; r0 -= g; r1 += g
+  # clamp the crop window's aspect to [0.7, 1.6] by widening the short axis
+  # (shows a little more surrounding space -- the image itself is never
+  # stretched) so a very tall/thin or wide/flat object x (nL+1) rows doesn't
+  # produce an absurd figure.
+  bh, bw = r1 - r0, c1 - c0
+  if bh > 1.6 * bw:
+    g = (bh / 1.6 - bw) / 2; c0 -= g; c1 += g
+  elif bw > bh / 0.7:
+    g = (bw * 0.7 - bh) / 2; r0 -= g; r1 += g
   r0, c0 = max(0, r0), max(0, c0)
   r1, c1 = min(h, r1), min(w, c1)
 
   # size the grid cells to the crop window's aspect so an equal-aspect
   # (never stretched) image fills its cell -- columns end up flush.
   nL = len(layers)
-  panel_ar = (r1 - r0) / (c1 - c0)
+  panel_ar = min(1.6, max(0.7, (r1 - r0) / (c1 - c0)))
   cell_w = 9.5 / 3
   fig_w = cell_w * 4
-  fig_h = (cell_w * panel_ar * (nL + 1)) / 0.90  # /0.90 for top+bottom margin
+  row_h = max(cell_w * panel_ar, 2.7)          # inches; keep rows legible
+  margin_top, margin_bot = 1.1, 0.8            # inches for suptitle / colorbars
+  fig_h = row_h * (nL + 1) + margin_top + margin_bot
   fig = plt.figure(figsize=(fig_w, fig_h))
-  gs = GridSpec(2 + nL, 4, height_ratios=[1] + [1] * nL + [0.06 / max(panel_ar, 0.3)],
+  gs = GridSpec(2 + nL, 4,
+                height_ratios=[1] + [1] * nL + [0.35 / row_h],
                 width_ratios=[1, 1, 1, 1], hspace=0.14, wspace=0.02,
-                top=0.955, bottom=0.045, left=0.06, right=0.99, figure=fig)
+                top=1 - margin_top / fig_h, bottom=margin_bot / fig_h,
+                left=0.06, right=0.99, figure=fig)
 
   def show(ax, img, t=None, cmap=None, vmin=None, vmax=None):
     im = ax.imshow(img, cmap=cmap, vmin=vmin, vmax=vmax)  # aspect "equal"
@@ -141,7 +185,8 @@ def panel(rgb_r, rgb_w, layers, title, out, wt_label="depth WT (raw)", crop=True
     show(ax_mk, _disagreement_rgb(gt_present, L["wtv"]),
          "mask disagreement" if first else None)
     ar = f"AbsRel {L['absrel']:.3f}" if np.isfinite(L["absrel"]) else "AbsRel --"
-    ax_gt.set_ylabel(f"layer {L['idx']}\n{ar}   n={L['n']}", fontsize=12)
+    cd = f"CD {L['cd']:.4f}" if np.isfinite(L.get("cd", np.nan)) else "CD --"
+    ax_gt.set_ylabel(f"layer {L['idx']}\n{ar}   n={L['n']}\n{cd}", fontsize=11)
 
   ax_leg = fig.add_subplot(gs[1 + nL, 3]); ax_leg.axis("off")
   ax_leg.legend(handles=[
@@ -152,7 +197,7 @@ def panel(rgb_r, rgb_w, layers, title, out, wt_label="depth WT (raw)", crop=True
                orientation="horizontal", label="depth")
   fig.colorbar(im_delta, cax=fig.add_subplot(gs[1 + nL, 2]),
                orientation="horizontal", label="|delta|")
-  fig.suptitle(title, y=0.985)
+  fig.suptitle(title, y=1 - 0.42 / fig_h)
   fig.savefig(out, dpi=100)
   plt.close(fig)
   print(f"[fig] {out}")
@@ -174,6 +219,11 @@ def main():
                  help="Crop panels to the object bounding box so columns sit "
                       "flush (default). --no-crop keeps the full frame.")
   p.add_argument("--no-crop", dest="crop", action="store_false")
+  p.add_argument("--chamfer", action="store_true", default=True,
+                 help="Compute the raw Chamfer distance between the render's "
+                      "unprojected depth peel and WT's XYZ (default). "
+                      "--no-chamfer skips the KD-tree work.")
+  p.add_argument("--no-chamfer", dest="chamfer", action="store_false")
   p.add_argument("--out-prefix", default=None,
                  help="default: <wt_h5>.panel  ->  <prefix>.viewN.png")
   args = p.parse_args()
@@ -181,6 +231,7 @@ def main():
 
   with h5py.File(args.render_h5, "r") as rf, h5py.File(args.wt_h5, "r") as wf:
     mesh_index = rf["mesh_index"][:] if "mesh_index" in rf else None
+    K_ds = rf["camera_intrinsics"] if args.chamfer and "camera_intrinsics" in rf else None
     for v in args.views:
       dp = rf["depth_peel"][v]      # (H, W, L)
       pts = wf["points"][v]         # (H, W, L, 3)
@@ -191,6 +242,15 @@ def main():
       pr0, prv0 = _layer0_depth_pred(pts, 0)
       both0 = gtv0 & prv0 & np.isfinite(pr0) & (gt0 > 0)
       s, t = _align(pr0[both0], gt0[both0], args.align)
+
+      # Chamfer distance is always on the RAW clouds (a Z-only scale/shift
+      # isn't a valid point-cloud transform), regardless of --align.
+      K = K_ds[v] if K_ds is not None else None
+      wt_cloud_all = _xyz_cloud(pts) if K is not None else None
+      cd_all = (_chamfer(np.concatenate([_unproject(dp[..., li], K)
+                                         for li in range(n_layers)], axis=0),
+                         wt_cloud_all)
+                if K is not None else np.nan)
 
       layers = []
       for li in (args.layers if args.layers is not None else range(n_layers)):
@@ -203,15 +263,18 @@ def main():
           continue  # layer empty in both -> skip
         absrel = (float(np.mean(np.abs(wt[both] - gt[both]) / gt[both]))
                   if both.any() else np.nan)
+        cd = (_chamfer(_unproject(dp[..., li], K), _xyz_cloud(pts[:, :, li, :]))
+              if K is not None else np.nan)
         layers.append(dict(idx=li, gt=gt, gtv=gtv, wt=wt, wtv=wtv, both=both,
-                           absrel=absrel, n=int(both.sum())))
+                           absrel=absrel, n=int(both.sum()), cd=cd))
       if not layers:
         print(f"[skip] view {v}: no populated layers")
         continue
 
       m = f"mesh {int(mesh_index[v])}" if mesh_index is not None else ""
+      cd_str = f"   Chamfer(all) {cd_all:.4f}" if np.isfinite(cd_all) else ""
       title = (f"view {v}  {m}   align={args.align} (s={s:.3g}, t={t:.3g})   "
-               f"{len(layers)} layer(s)")
+               f"{len(layers)} layer(s){cd_str}")
       wt_label = "depth WT (raw)" if args.align == "none" else f"depth WT ({args.align}-aligned)"
       panel(rf["images"][v], wf["images"][v], layers, title,
             f"{prefix}.view{v}.png", wt_label=wt_label, crop=args.crop)
