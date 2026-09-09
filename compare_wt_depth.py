@@ -4,7 +4,8 @@ against World Tracing's prediction (wt_infer_layers.py output).
 
 Inputs
 ------
-render.h5  -- has `depth_peel` (N, H, W, L) float32, -1.0 = no hit. Layer 0 is
+render.h5  -- has `depth_peel` (N, H, W, L) float32, NaN = no hit (older files
+              used -1.0; the readers here treat both as invalid). Layer 0 is
               planar Z in OpenCV camera space (X right, Y down, Z forward): see
               debug_pointcloud.unproject_depth_peel, where `points_cv.z` is
               exactly `depth_peel` (K^-1 @ [u, v, 1] has z == 1, then scaled by
@@ -87,9 +88,10 @@ def _align(pred, gt, mode):
 
 
 def _layer0_depth_gt(depth_peel_view, layer):
-  """depth_peel_view: (H, W, L). Returns (depth HxW float32, valid HxW bool)."""
+  """depth_peel_view: (H, W, L). Returns (depth HxW float32, valid HxW bool).
+  No-hit pixels are NaN (or -1.0 in older renders); `d > 0` rejects both."""
   d = depth_peel_view[..., layer].astype(np.float32)
-  return d, d >= 0.0
+  return d, d > 0.0
 
 
 def _layer0_depth_pred(points_view, layer):

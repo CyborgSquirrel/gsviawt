@@ -401,8 +401,8 @@ def main(cfg: DictConfig) -> None:
   if views["images"].shape[-1] == 4:
     gt_alpha = torch.from_numpy(views["images"][..., 3:4].astype(np.float32) / 255.0).to(device)
   else:
-    gt_alpha = (torch.from_numpy((views["depth"][:, :, :, 0] >= 0).astype(np.float32))
-                .to(device)[..., None])
+    gt_alpha = (torch.from_numpy((views["depth"][:, :, :, 0] > 0).astype(np.float32))
+                .to(device)[..., None])  # NaN / -1.0 no-hit both -> 0
   gt_rgb = gt_rgb * gt_alpha  # composite GT over black, matching a black-bg render
 
   groups = [

@@ -297,8 +297,8 @@ def depth_peel(mesh_objs, peel_mat, peel_tex, peel_eps, rl, comp,
   cyc.transmission_bounces = cyc.volume_bounces = 0
   cyc.transparent_max_bounces = max_layers + 2
 
-  prev = np.full((height, width), -1e6, np.float32)
-  vol = np.full((height, width, max_layers), -1.0, np.float32)
+  prev = np.full((height, width), -1e6, np.float32)  # fed back to the peel shader; not the output
+  vol = np.full((height, width, max_layers), np.nan, np.float32)  # NaN = no hit at this layer
   found = 0
   prev_img = bpy.data.images.new("DepthPeelPrev", width=width, height=height, float_buffer=True)
   peel_tex.image = prev_img
@@ -313,7 +313,7 @@ def depth_peel(mesh_objs, peel_mat, peel_tex, peel_eps, rl, comp,
       hit = d < 1e9
       if not hit.any():
         break
-      vol[:, :, k] = np.where(hit, d, -1.0)
+      vol[:, :, k] = np.where(hit, d, np.nan)
       found = k + 1
       prev = np.where(hit, d, prev)
   finally:
@@ -505,11 +505,10 @@ def _render_mesh(cfg, scene, mi, mesh_path, view_strategy, W, H, DW, DH, Lmax, t
 
     depth_scale = 1.0
     if cfg.camera_depth_target is not None:
-      surf = depth_vol[..., 0]
-      hit = surf >= 0
+      hit = np.isfinite(depth_vol[..., 0])
       if hit.any():
-        depth_scale = float(cfg.camera_depth_target) / float(surf[hit].mean())
-        depth_vol = np.where(depth_vol >= 0, depth_vol * depth_scale, depth_vol)
+        depth_scale = float(cfg.camera_depth_target) / float(depth_vol[..., 0][hit].mean())
+        depth_vol = depth_vol * depth_scale  # NaN * s = NaN, so no-hit stays no-hit
         pose[:3, 3] *= depth_scale
 
     if ds_img is not None:
