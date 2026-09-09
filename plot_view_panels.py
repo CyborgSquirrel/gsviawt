@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Per-view panel: RGB render + RGB WT-input on the first row, then one row
-per depth-peel layer -- GT depth | WT depth | |delta| -- for one or more
-views of a render_objaverse render vs its wt_infer_layers.py prediction.
+per depth-peel layer -- GT depth | WT depth | |delta| | mask -- for one or
+more views of a render_objaverse render vs its wt_infer_layers.py prediction.
 
 Both depth panels are RAW by default (`--align none`): the point of these
 views is to see how well the geometry we generate already matches what World
@@ -11,7 +11,10 @@ that mismatch away, so it's opt-in only -- use it to inspect residual
 *shape* error after the scale is taken out.
 
 All the depth panels (GT + WT, every layer) share one colour range; all the
-|delta| panels share another.
+|delta| panels share another. The `mask` column flags where the two
+validity masks disagree at that layer: red where WT predicts a surface the
+render doesn't have, blue where the render has one WT missed, white where
+they agree.
 
     python plot_view_panels.py bla/obj_rand40.h5 bla/obj_rand40.h5.wt.h5 --views 1 8 12 24
 """
@@ -23,9 +26,23 @@ import numpy as np
 
 from compare_wt_depth import _align, _layer0_depth_gt, _layer0_depth_pred
 
+MASK_EXTRA = "#d7263d"  # WT predicts a surface the render doesn't have
+MASK_MISS = "#1f6feb"   # render has a surface WT missed
+
 
 def _mask(a, valid):
   return np.where(valid, a, np.nan)
+
+
+def _disagreement_rgb(gt_present, wt_present):
+  """White where the two validity masks agree, MASK_EXTRA where only WT has
+  a value, MASK_MISS where only the render does."""
+  from matplotlib.colors import to_rgb
+
+  img = np.ones(gt_present.shape + (3,), np.float32)
+  img[gt_present & ~wt_present] = to_rgb(MASK_MISS)
+  img[~gt_present & wt_present] = to_rgb(MASK_EXTRA)
+  return img
 
 
 def panel(rgb_r, rgb_w, layers, title, out, wt_label="depth WT (raw)", crop=True):
@@ -40,6 +57,7 @@ def panel(rgb_r, rgb_w, layers, title, out, wt_label="depth WT (raw)", crop=True
   matplotlib.use("Agg")
   import matplotlib.pyplot as plt
   from matplotlib.gridspec import GridSpec
+  from matplotlib.patches import Patch
 
   plt.rcParams.update({"font.size": 15})
 
@@ -85,11 +103,12 @@ def panel(rgb_r, rgb_w, layers, title, out, wt_label="depth WT (raw)", crop=True
   nL = len(layers)
   panel_ar = (r1 - r0) / (c1 - c0)
   cell_w = 9.5 / 3
+  fig_w = cell_w * 4
   fig_h = (cell_w * panel_ar * (nL + 1)) / 0.90  # /0.90 for top+bottom margin
-  fig = plt.figure(figsize=(9.5, fig_h))
-  gs = GridSpec(2 + nL, 3, height_ratios=[1] + [1] * nL + [0.06 / max(panel_ar, 0.3)],
-                width_ratios=[1, 1, 1], hspace=0.14, wspace=0.02,
-                top=0.955, bottom=0.045, left=0.08, right=0.99, figure=fig)
+  fig = plt.figure(figsize=(fig_w, fig_h))
+  gs = GridSpec(2 + nL, 4, height_ratios=[1] + [1] * nL + [0.06 / max(panel_ar, 0.3)],
+                width_ratios=[1, 1, 1, 1], hspace=0.14, wspace=0.02,
+                top=0.955, bottom=0.045, left=0.06, right=0.99, figure=fig)
 
   def show(ax, img, t=None, cmap=None, vmin=None, vmax=None):
     im = ax.imshow(img, cmap=cmap, vmin=vmin, vmax=vmax)  # aspect "equal"
@@ -108,18 +127,27 @@ def panel(rgb_r, rgb_w, layers, title, out, wt_label="depth WT (raw)", crop=True
   im_depth = im_delta = None
   for row, L in enumerate(layers, start=1):
     first = row == 1
+    gt_present = L["gtv"] & (L["gt"] > 0)
     ax_gt = fig.add_subplot(gs[row, 0])
     ax_wt = fig.add_subplot(gs[row, 1])
     ax_dl = fig.add_subplot(gs[row, 2])
-    im_depth = show(ax_gt, _mask(L["gt"], L["gtv"] & (L["gt"] > 0)),
+    ax_mk = fig.add_subplot(gs[row, 3])
+    im_depth = show(ax_gt, _mask(L["gt"], gt_present),
                     "depth GT" if first else None, "turbo", vmin, vmax)
     show(ax_wt, _mask(L["wt"], L["wtv"]),
          wt_label if first else None, "turbo", vmin, vmax)
     im_delta = show(ax_dl, _mask(np.abs(L["gt"] - L["wt"]), L["both"]),
                     "|delta|" if first else None, "turbo", 0.0, dmax)
+    show(ax_mk, _disagreement_rgb(gt_present, L["wtv"]),
+         "mask disagreement" if first else None)
     ar = f"AbsRel {L['absrel']:.3f}" if np.isfinite(L["absrel"]) else "AbsRel --"
     ax_gt.set_ylabel(f"layer {L['idx']}\n{ar}   n={L['n']}", fontsize=12)
 
+  ax_leg = fig.add_subplot(gs[1 + nL, 3]); ax_leg.axis("off")
+  ax_leg.legend(handles=[
+      Patch(facecolor=MASK_EXTRA, edgecolor="0.4", label="WT extra"),
+      Patch(facecolor=MASK_MISS, edgecolor="0.4", label="WT missing")],
+      loc="center", fontsize=10, frameon=False, handlelength=1.2, ncol=1)
   fig.colorbar(im_depth, cax=fig.add_subplot(gs[1 + nL, 0:2]),
                orientation="horizontal", label="depth")
   fig.colorbar(im_delta, cax=fig.add_subplot(gs[1 + nL, 2]),
