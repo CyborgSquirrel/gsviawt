@@ -224,8 +224,8 @@ def main():
   p.add_argument("wt_h5")
   p.add_argument("--views", type=int, nargs="+", required=True)
   p.add_argument("--layers", type=int, nargs="+", default=None,
-                 help="Which depth-peel layers to show (default: every layer "
-                      "that has data in GT or WT for the view)")
+                 help="Which depth-peel layers to show (default: all of them, "
+                      "empty ones included)")
   p.add_argument("--align", choices=["none", "median", "scale", "affine", "mad"], default="none",
                  help="Scale/shift-fit WT onto GT (on layer 0, applied to all "
                       "layers) before display. Default none -- these views are "
@@ -274,17 +274,12 @@ def main():
         wt = s * pr + t
         wtv = prv & np.isfinite(wt)
         both = gtv & wtv & (gt > 0)
-        if not (gtv.any() or wtv.any()):
-          continue  # layer empty in both -> skip
         absrel = (float(np.mean(np.abs(wt[both] - gt[both]) / gt[both]))
                   if both.any() else np.nan)
         cd = (_chamfer(_unproject(dp[..., li], K), _xyz_cloud(pts[:, :, li, :]))
               if K is not None else np.nan)
         layers.append(dict(idx=li, gt=gt, gtv=gtv, wt=wt, wtv=wtv, both=both,
                            absrel=absrel, n=int(both.sum()), cd=cd))
-      if not layers:
-        print(f"[skip] view {v}: no populated layers")
-        continue
 
       m = f"mesh {int(mesh_index[v])}" if mesh_index is not None else ""
       tags = [f"view {v}", m, f"{len(layers)} layer(s)"]
