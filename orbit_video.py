@@ -97,55 +97,11 @@ def load_h5(path, ds):
   return out
 
 
-def _read_ply(path):
-  """Minimal reader for the one 'vertex' element of an INRIA 3DGS .ply
-  (binary_little_endian or ascii). Returns {property_name: (N,) float32}."""
-  with open(path, "rb") as fh:
-    if fh.readline().strip() != b"ply":
-      raise SystemExit(f"{path}: not a .ply file")
-    fmt = None
-    count = None
-    names = []
-    _np_of = {
-      "float": "<f4", "float32": "<f4", "double": "<f8", "float64": "<f8",
-      "uchar": "u1", "uint8": "u1", "char": "i1", "int8": "i1",
-      "ushort": "<u2", "uint16": "<u2", "short": "<i2", "int16": "<i2",
-      "uint": "<u4", "uint32": "<u4", "int": "<i4", "int32": "<i4",
-    }
-    dtype = []
-    while True:
-      line = fh.readline()
-      if not line:
-        raise SystemExit(f"{path}: unexpected EOF in header")
-      tok = line.split()
-      if tok[0] == b"format":
-        fmt = tok[1].decode()
-      elif tok[0] == b"element" and tok[1] == b"vertex":
-        count = int(tok[2])
-      elif tok[0] == b"element":
-        raise SystemExit(f"{path}: unsupported extra element {tok[1].decode()!r}")
-      elif tok[0] == b"property":
-        name = tok[2].decode()
-        names.append(name)
-        dtype.append((name, _np_of[tok[1].decode()]))
-      elif tok[0] == b"end_header":
-        break
-
-    if fmt == "binary_little_endian":
-      arr = np.frombuffer(fh.read(np.dtype(dtype).itemsize * count),
-                          dtype=np.dtype(dtype), count=count)
-      cols = {n: arr[n].astype(np.float32) for n in names}
-    elif fmt == "ascii":
-      raw = np.loadtxt(fh, dtype=np.float32, max_rows=count).reshape(count, len(names))
-      cols = {n: raw[:, i] for i, n in enumerate(names)}
-    else:
-      raise SystemExit(f"{path}: unsupported ply format {fmt!r}")
-  return cols
-
-
 def load_ply(path):
   """Standard 3DGS .ply -> dict of flat, activated Gaussian arrays."""
-  c = _read_ply(path)
+  from plyfile import PlyData  # ships with gsplat (its .ply exporter)
+  v = PlyData.read(path)["vertex"]
+  c = {name: np.asarray(v[name], np.float32) for name in v.data.dtype.names}
   need = ["x", "y", "z", "opacity", "scale_0", "scale_1", "scale_2",
           "rot_0", "rot_1", "rot_2", "rot_3", "f_dc_0", "f_dc_1", "f_dc_2"]
   missing = [k for k in need if k not in c]

@@ -4,7 +4,7 @@
 # --- input ---
 # A 3DGS model: either a fit_gsplat .h5 (gaussian_* grids + layer_valid) or a
 # standard INRIA-format 3DGS .ply. Format is picked from the extension.
-model_path: /app/bla/objaverse_renders.h5.gsplat.view0.h5
+model_path: ???           # required -- pass model_path=/app/bla/....h5
 
 # null -> "<model_stem>.orbit.<ext>" next to the input (.mp4, or .frames/ dir).
 output_path: null
