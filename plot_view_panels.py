@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Per-view panel: RGB render + RGB WT-input on the first row, then one row
-per depth-peel layer -- GT depth | WT depth | |delta| | mask -- for one or
-more views of a render_objaverse render vs its wt_infer_layers.py prediction.
+"""Per-view panel: an RGB strip (render + WT input) on top, then a grid with
+one COLUMN per depth-peel layer and rows GT depth | WT depth | |delta| |
+mask disagreement, for one or more views of a render_objaverse render vs its
+wt_infer_layers.py prediction.
 
 Both depth panels are RAW by default (`--align none`): the point of these
 views is to see how well the geometry we generate already matches what World
@@ -11,10 +12,10 @@ that mismatch away, so it's opt-in only -- use it to inspect residual
 *shape* error after the scale is taken out.
 
 All the depth panels (GT + WT, every layer) share one colour range; all the
-|delta| panels share another. The `mask` column flags where the two
-validity masks disagree at that layer: red where WT predicts a surface the
-render doesn't have, blue where the render has one WT missed, white where
-they agree.
+|delta| panels share another. The `mask disagreement` row flags where the
+two validity masks disagree at that layer: red where WT predicts a surface
+the render doesn't have, blue where the render has one WT missed, white
+where they agree.
 
 The title also carries the symmetric Chamfer distance (raw, no alignment)
 between the render's unprojected depth-peel point cloud and WT's predicted
@@ -138,66 +139,73 @@ def panel(rgb_r, rgb_w, layers, title, out, wt_label="depth WT (raw)", crop=True
   r0, c0 = max(0, r0), max(0, c0)
   r1, c1 = min(h, r1), min(w, c1)
 
-  # size the grid cells to the crop window's aspect so an equal-aspect
-  # (never stretched) image fills its cell -- columns end up flush.
+  # transposed layout: one COLUMN per depth-peel layer; a top RGB strip,
+  # then rows depth GT | depth WT | |delta| | mask disagreement. Equal-aspect
+  # (never stretched) images; grid cells sized to the crop window's aspect so
+  # columns sit flush.
   nL = len(layers)
+  ncol = max(nL, 2)  # the RGB strip always needs 2 slots
   panel_ar = min(1.6, max(0.7, (r1 - r0) / (c1 - c0)))
-  cell_w = 9.5 / 3
-  fig_w = cell_w * 4
-  row_h = max(cell_w * panel_ar, 2.7)          # inches; keep rows legible
-  margin_top, margin_bot = 1.1, 0.8            # inches for suptitle / colorbars
-  fig_h = row_h * (nL + 1) + margin_top + margin_bot
+  cell_w = 3.4 if ncol <= 2 else 2.5
+  row_h = cell_w * panel_ar
+  label_w = 1.0                     # inches, left row-labels
+  cbar_cax_w, cbar_lbl_w = 0.26, 0.95   # inches: colorbar bar + its tick labels
+  margin_top, margin_bot, gap = 0.95, 0.3, 0.8  # gap = RGB strip -> grid
+  fig_w = label_w + cell_w * ncol + cbar_cax_w + cbar_lbl_w
+  fig_h = margin_top + row_h * 5 + gap + margin_bot
   fig = plt.figure(figsize=(fig_w, fig_h))
-  gs = GridSpec(2 + nL, 4,
-                height_ratios=[1] + [1] * nL + [0.35 / row_h],
-                width_ratios=[1, 1, 1, 1], hspace=0.14, wspace=0.02,
-                top=1 - margin_top / fig_h, bottom=margin_bot / fig_h,
-                left=0.06, right=0.99, figure=fig)
+  left, right = label_w / fig_w, 1 - cbar_lbl_w / fig_w
+  cbar_ratio = cbar_cax_w / cell_w
 
-  def show(ax, img, t=None, cmap=None, vmin=None, vmax=None):
+  def _y(inches_from_top):
+    return 1 - inches_from_top / fig_h
+
+  gs_kw = dict(left=left, right=right, width_ratios=[1] * ncol + [cbar_ratio], wspace=0.02)
+  rgb_gs = fig.add_gridspec(1, ncol + 1, top=_y(margin_top),
+                            bottom=_y(margin_top + row_h), **gs_kw)
+  grid = fig.add_gridspec(4, ncol + 1, top=_y(margin_top + row_h + gap),
+                          bottom=margin_bot / fig_h, height_ratios=[1] * 4,
+                          hspace=0.06, **gs_kw)
+
+  def show(ax, img, cmap=None, vmin=None, vmax=None):
     im = ax.imshow(img, cmap=cmap, vmin=vmin, vmax=vmax)  # aspect "equal"
-    if t:
-      ax.set_title(t, pad=10)
     ax.set_xlim(c0 - 0.5, c1 - 0.5)
     ax.set_ylim(r1 - 0.5, r0 - 0.5)
     ax.set_xticks([]); ax.set_yticks([])
     for s in ax.spines.values():
-      s.set_visible(True); s.set_color("black"); s.set_linewidth(1.5)
+      s.set_visible(True); s.set_color("black"); s.set_linewidth(1.4)
     return im
 
-  show(fig.add_subplot(gs[0, 0]), rgb_r, "RGB render")
-  show(fig.add_subplot(gs[0, 1]), rgb_w, "RGB WT input")
+  a = fig.add_subplot(rgb_gs[0, 0]); show(a, rgb_r); a.set_title("RGB render", fontsize=12, pad=5)
+  a = fig.add_subplot(rgb_gs[0, 1]); show(a, rgb_w); a.set_title("RGB WT input", fontsize=12, pad=5)
 
-  im_depth = im_delta = None
-  for row, L in enumerate(layers, start=1):
-    first = row == 1
-    gt_present = L["gtv"] & (L["gt"] > 0)
-    ax_gt = fig.add_subplot(gs[row, 0])
-    ax_wt = fig.add_subplot(gs[row, 1])
-    ax_dl = fig.add_subplot(gs[row, 2])
-    ax_mk = fig.add_subplot(gs[row, 3])
-    im_depth = show(ax_gt, _mask(L["gt"], gt_present),
-                    "depth GT" if first else None, "turbo", vmin, vmax)
-    show(ax_wt, _mask(L["wt"], L["wtv"]),
-         wt_label if first else None, "turbo", vmin, vmax)
-    im_delta = show(ax_dl, _mask(np.abs(L["gt"] - L["wt"]), L["both"]),
-                    "|delta|" if first else None, "turbo", 0.0, dmax)
-    show(ax_mk, _disagreement_rgb(gt_present, L["wtv"]),
-         "mask disagreement" if first else None)
-    ar = f"AbsRel {L['absrel']:.3f}" if np.isfinite(L["absrel"]) else "AbsRel --"
-    cd = f"CD {L['cd']:.4f}" if np.isfinite(L.get("cd", np.nan)) else "CD --"
-    ax_gt.set_ylabel(f"layer {L['idx']}\n{ar}   n={L['n']}\n{cd}", fontsize=11)
+  gt_of = lambda L: _mask(L["gt"], L["gtv"] & (L["gt"] > 0))
+  rows = [
+    ("depth GT",      lambda L: (gt_of(L), "turbo", vmin, vmax)),
+    (wt_label,        lambda L: (_mask(L["wt"], L["wtv"]), "turbo", vmin, vmax)),
+    ("|delta|",       lambda L: (_mask(np.abs(L["gt"] - L["wt"]), L["both"]), "turbo", 0.0, dmax)),
+    ("mask disagree", lambda L: (_disagreement_rgb(L["gtv"] & (L["gt"] > 0), L["wtv"]), None, None, None)),
+  ]
+  ims = {}
+  for ri, (rlabel, fn) in enumerate(rows):
+    for ci, L in enumerate(layers):
+      ax = fig.add_subplot(grid[ri, ci])
+      ims[ri] = show(ax, *fn(L))
+      if ri == 0:
+        ar = f"AbsRel {L['absrel']:.3f}" if np.isfinite(L["absrel"]) else "AbsRel --"
+        cd = f"CD {L['cd']:.4f}" if np.isfinite(L.get("cd", np.nan)) else "CD --"
+        ax.set_title(f"layer {L['idx']}\n{ar}  ·  {cd}\nn={L['n']}", fontsize=10, pad=5)
+      if ci == 0:
+        ax.set_ylabel(rlabel, fontsize=13)
 
-  ax_leg = fig.add_subplot(gs[1 + nL, 3]); ax_leg.axis("off")
-  ax_leg.legend(handles=[
-      Patch(facecolor=MASK_EXTRA, edgecolor="0.4", label="WT extra"),
-      Patch(facecolor=MASK_MISS, edgecolor="0.4", label="WT missing")],
-      loc="center", fontsize=10, frameon=False, handlelength=1.2, ncol=1)
-  fig.colorbar(im_depth, cax=fig.add_subplot(gs[1 + nL, 0:2]),
-               orientation="horizontal", label="depth")
-  fig.colorbar(im_delta, cax=fig.add_subplot(gs[1 + nL, 2]),
-               orientation="horizontal", label="|delta|")
-  fig.suptitle(title, y=1 - 0.42 / fig_h)
+  fig.colorbar(ims[0], cax=fig.add_subplot(grid[0:2, ncol]), label="depth")
+  fig.colorbar(ims[2], cax=fig.add_subplot(grid[2, ncol]), label="|delta|")
+  axl = fig.add_subplot(grid[3, ncol]); axl.axis("off")
+  axl.legend(handles=[Patch(facecolor=MASK_EXTRA, edgecolor="0.4", label="WT extra"),
+                      Patch(facecolor=MASK_MISS, edgecolor="0.4", label="WT missing")],
+             loc="center left", fontsize=9, frameon=False, handlelength=1.1,
+             borderaxespad=0)
+  fig.suptitle(title, y=_y(0.38), fontsize=min(15, fig_w * 1.7))
   fig.savefig(out, dpi=100)
   plt.close(fig)
   print(f"[fig] {out}")
@@ -272,9 +280,12 @@ def main():
         continue
 
       m = f"mesh {int(mesh_index[v])}" if mesh_index is not None else ""
-      cd_str = f"   Chamfer(all) {cd_all:.4f}" if np.isfinite(cd_all) else ""
-      title = (f"view {v}  {m}   align={args.align} (s={s:.3g}, t={t:.3g})   "
-               f"{len(layers)} layer(s){cd_str}")
+      tags = [f"view {v}", m, f"{len(layers)} layer(s)"]
+      if args.align != "none":
+        tags.append(f"align={args.align} (s={s:.3g}, t={t:.3g})")
+      if np.isfinite(cd_all):
+        tags.append(f"Chamfer(all) {cd_all:.4f}")
+      title = "    ".join(t for t in tags if t)
       wt_label = "depth WT (raw)" if args.align == "none" else f"depth WT ({args.align}-aligned)"
       panel(rf["images"][v], wf["images"][v], layers, title,
             f"{prefix}.view{v}.png", wt_label=wt_label, crop=args.crop)
