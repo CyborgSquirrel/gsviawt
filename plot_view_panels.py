@@ -48,16 +48,37 @@ def panel(rgb_r, rgb_w, layers, title, out, wt_label="depth WT (raw)"):
   vmin, vmax = np.percentile(depth_pool, [1, 99]) if depth_pool.size else (0.0, 1.0)
   dmax = float(np.percentile(delta_pool, 98)) if delta_pool.size else 1.0
 
+  # crop every panel to the object's bounding box (union of GT/WT valid
+  # pixels over all layers) + a small margin -- kills the dead border so the
+  # three columns sit right next to each other.
+  h, w = layers[0]["gt"].shape
+  occ = np.zeros((h, w), bool)
+  for L in layers:
+    occ |= L["gtv"] | L["wtv"]
+  ys, xs = np.where(occ)
+  if ys.size:
+    pad = max(4, int(0.03 * max(h, w)))
+    r0, r1 = max(0, ys.min() - pad), min(h, ys.max() + 1 + pad)
+    c0, c1 = max(0, xs.min() - pad), min(w, xs.max() + 1 + pad)
+  else:
+    r0, r1, c0, c1 = 0, h, 0, w
+
+  # per-panel height:width, clamped so a very tall/thin (or wide/flat)
+  # object doesn't blow the figure size up x (nL+1) rows.
+  panel_ar = min(1.7, max(0.6, (r1 - r0) / (c1 - c0)))
+
   nL = len(layers)
-  fig = plt.figure(figsize=(13, 2.0 + 3.3 * nL))
+  fig = plt.figure(figsize=(9.5, 1.1 + (9.5 / 3) * panel_ar * (nL + 1)))
   gs = GridSpec(2 + nL, 3, height_ratios=[1] + [1] * nL + [0.08],
-                width_ratios=[1, 1, 1], hspace=0.28, wspace=0.14,
-                top=0.95, bottom=0.05, left=0.06, right=0.98, figure=fig)
+                width_ratios=[1, 1, 1], hspace=0.18, wspace=0.02,
+                top=0.95, bottom=0.05, left=0.08, right=0.99, figure=fig)
 
   def show(ax, img, t=None, cmap=None, vmin=None, vmax=None):
-    im = ax.imshow(img, cmap=cmap, vmin=vmin, vmax=vmax)
+    im = ax.imshow(img, cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto")
     if t:
       ax.set_title(t, pad=10)
+    ax.set_xlim(c0 - 0.5, c1 - 0.5)
+    ax.set_ylim(r1 - 0.5, r0 - 0.5)
     ax.set_xticks([]); ax.set_yticks([])
     for s in ax.spines.values():
       s.set_visible(True); s.set_color("black"); s.set_linewidth(1.5)
