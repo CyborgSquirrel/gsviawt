@@ -28,9 +28,13 @@ def _mask(a, valid):
   return np.where(valid, a, np.nan)
 
 
-def panel(rgb_r, rgb_w, layers, title, out, wt_label="depth WT (raw)"):
+def panel(rgb_r, rgb_w, layers, title, out, wt_label="depth WT (raw)", crop=True):
   """layers: list of dicts {idx, gt, gtv, wt, wtv, both, absrel, n}, one per
-  depth-peel layer to draw (gt/wt/gtv/wtv/both are H x W arrays)."""
+  depth-peel layer to draw (gt/wt/gtv/wtv/both are H x W arrays).
+
+  crop: trim every panel to the object's bounding box so the columns sit
+  flush. Images are never stretched -- the figure just gets taller for a
+  tall thin object. False keeps the full frame."""
   import matplotlib
 
   matplotlib.use("Agg")
@@ -48,33 +52,47 @@ def panel(rgb_r, rgb_w, layers, title, out, wt_label="depth WT (raw)"):
   vmin, vmax = np.percentile(depth_pool, [1, 99]) if depth_pool.size else (0.0, 1.0)
   dmax = float(np.percentile(delta_pool, 98)) if delta_pool.size else 1.0
 
-  # crop every panel to the object's bounding box (union of GT/WT valid
-  # pixels over all layers) + a small margin -- kills the dead border so the
-  # three columns sit right next to each other.
+  # crop window: the object's bounding box (union of GT/WT valid pixels over
+  # all layers) + a small margin, or the full frame.
   h, w = layers[0]["gt"].shape
-  occ = np.zeros((h, w), bool)
-  for L in layers:
-    occ |= L["gtv"] | L["wtv"]
-  ys, xs = np.where(occ)
+  if crop:
+    occ = np.zeros((h, w), bool)
+    for L in layers:
+      occ |= L["gtv"] | L["wtv"]
+    ys, xs = np.where(occ)
+  else:
+    ys = xs = np.array([], int)
   if ys.size:
     pad = max(4, int(0.03 * max(h, w)))
-    r0, r1 = max(0, ys.min() - pad), min(h, ys.max() + 1 + pad)
-    c0, c1 = max(0, xs.min() - pad), min(w, xs.max() + 1 + pad)
+    r0, r1 = ys.min() - pad, ys.max() + 1 + pad
+    c0, c1 = xs.min() - pad, xs.max() + 1 + pad
   else:
     r0, r1, c0, c1 = 0, h, 0, w
 
-  # per-panel height:width, clamped so a very tall/thin (or wide/flat)
-  # object doesn't blow the figure size up x (nL+1) rows.
-  panel_ar = min(1.7, max(0.6, (r1 - r0) / (c1 - c0)))
+  # cap the crop window's aspect at 1.6:1 by widening the short axis (shows
+  # a little more surrounding space -- the image itself is never stretched)
+  # so a tall thin object x (nL+1) rows doesn't produce an absurd figure.
+  bh, bw, cap = r1 - r0, c1 - c0, 1.6
+  if bh > cap * bw:
+    g = (bh / cap - bw) / 2; c0 -= g; c1 += g
+  elif bw > cap * bh:
+    g = (bw / cap - bh) / 2; r0 -= g; r1 += g
+  r0, c0 = max(0, r0), max(0, c0)
+  r1, c1 = min(h, r1), min(w, c1)
 
+  # size the grid cells to the crop window's aspect so an equal-aspect
+  # (never stretched) image fills its cell -- columns end up flush.
   nL = len(layers)
-  fig = plt.figure(figsize=(9.5, 1.1 + (9.5 / 3) * panel_ar * (nL + 1)))
-  gs = GridSpec(2 + nL, 3, height_ratios=[1] + [1] * nL + [0.08],
-                width_ratios=[1, 1, 1], hspace=0.18, wspace=0.02,
-                top=0.95, bottom=0.05, left=0.08, right=0.99, figure=fig)
+  panel_ar = (r1 - r0) / (c1 - c0)
+  cell_w = 9.5 / 3
+  fig_h = (cell_w * panel_ar * (nL + 1)) / 0.90  # /0.90 for top+bottom margin
+  fig = plt.figure(figsize=(9.5, fig_h))
+  gs = GridSpec(2 + nL, 3, height_ratios=[1] + [1] * nL + [0.06 / max(panel_ar, 0.3)],
+                width_ratios=[1, 1, 1], hspace=0.14, wspace=0.02,
+                top=0.955, bottom=0.045, left=0.08, right=0.99, figure=fig)
 
   def show(ax, img, t=None, cmap=None, vmin=None, vmax=None):
-    im = ax.imshow(img, cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto")
+    im = ax.imshow(img, cmap=cmap, vmin=vmin, vmax=vmax)  # aspect "equal"
     if t:
       ax.set_title(t, pad=10)
     ax.set_xlim(c0 - 0.5, c1 - 0.5)
@@ -124,6 +142,10 @@ def main():
                  help="Scale/shift-fit WT onto GT (on layer 0, applied to all "
                       "layers) before display. Default none -- these views are "
                       "for seeing the raw match to WT.")
+  p.add_argument("--crop", action="store_true", default=True,
+                 help="Crop panels to the object bounding box so columns sit "
+                      "flush (default). --no-crop keeps the full frame.")
+  p.add_argument("--no-crop", dest="crop", action="store_false")
   p.add_argument("--out-prefix", default=None,
                  help="default: <wt_h5>.panel  ->  <prefix>.viewN.png")
   args = p.parse_args()
@@ -164,7 +186,7 @@ def main():
                f"{len(layers)} layer(s)")
       wt_label = "depth WT (raw)" if args.align == "none" else f"depth WT ({args.align}-aligned)"
       panel(rf["images"][v], wf["images"][v], layers, title,
-            f"{prefix}.view{v}.png", wt_label=wt_label)
+            f"{prefix}.view{v}.png", wt_label=wt_label, crop=args.crop)
 
 
 if __name__ == "__main__":
