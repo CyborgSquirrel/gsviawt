@@ -15,6 +15,9 @@ format: mp4
 # Text burned into the top-left of the strip (e.g. "view 400  CD 0.131"). null = none.
 caption: null
 
+# Panel arrangement: col = stacked vertically (default), row = side by side.
+layout: col
+
 # --- point rendering ---
 point_size: 0.006        # world-space radius of every dot (object is ~unit-cube sized)
 
@@ -33,7 +36,7 @@ elevation_deg: 20.0
 clockwise: false
 look_at: centroid        # origin | centroid (mean of all points, both clouds)
 camera_distance: null    # null -> fit the combined bounding sphere with `margin`
-margin: 1.4
+margin: 1.15
 
 width: 640
 height: 640

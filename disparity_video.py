@@ -81,24 +81,27 @@ def as_gaussians(xyz, rgb, point_size):
   }
 
 
-def _strip(panels, labels, caption):
-  """panels: list of equal-length lists of (H,W,3) uint8. Yields one hstacked
-  frame per index with a label bar (+ optional caption) on top."""
+def _strip(panels, labels, caption, layout="col"):
+  """panels: list of equal-length lists of (H,W,3) uint8, one list per panel.
+  Yields one composited frame per index: the panels stacked vertically
+  (layout="col", default) or side by side ("row"), each labelled in its
+  top-left corner, with an optional caption bar above everything."""
   from PIL import Image, ImageDraw
 
+  axis = 0 if layout == "col" else 1
   n = len(panels[0])
   h, w = panels[0][0].shape[:2]
-  strip = 34 if caption else 20
+  cap_h = 18 if caption else 0
   for i in range(n):
-    row = np.concatenate([p[i] for p in panels], axis=1)
-    canvas = Image.new("RGB", (row.shape[1], h + strip), (16, 16, 18))
-    canvas.paste(Image.fromarray(row), (0, strip))
+    grid = np.concatenate([p[i] for p in panels], axis=axis)
+    canvas = Image.new("RGB", (grid.shape[1], grid.shape[0] + cap_h), (16, 16, 18))
+    canvas.paste(Image.fromarray(grid), (0, cap_h))
     d = ImageDraw.Draw(canvas)
     if caption:
-      d.text((6, 4), str(caption), fill=(150, 210, 255))
-    labely = 18 if caption else 5
+      d.text((6, 3), str(caption), fill=(150, 210, 255))
     for j, lab in enumerate(labels):
-      d.text((j * w + 6, labely), lab, fill=(230, 230, 230))
+      x, y = (6, cap_h + j * h + 4) if axis == 0 else (j * w + 6, cap_h + 4)
+      d.text((x, y), lab, fill=(230, 230, 230))
     yield np.asarray(canvas)
 
 
@@ -156,8 +159,12 @@ def main(cfg: DictConfig) -> None:
     stem = stem[:-3] if stem.endswith(".gt") else stem   # ...view400.disparity
     out = stem + ".orbit" + (".mp4" if fmt == "mp4" else ".frames")
 
+  layout = str(cfg.layout).lower()
+  if layout not in ("col", "row"):
+    raise SystemExit(f"layout {layout!r} must be 'col' (stacked) or 'row' (side by side)")
   frames = _strip([f_gt, f_wt, f_both],
-                  ["GT  (dist->blue)", "WT  (dist->red)", "overlaid"], cfg.caption)
+                  ["GT  (dist->blue)", "WT  (dist->red)", "overlaid"],
+                  cfg.caption, layout)
   with timed("encode"):
     if fmt == "frames":
       write_frames_dir(frames, out)
