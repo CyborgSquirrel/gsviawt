@@ -1,0 +1,60 @@
+# Config for disparity_video.py -- orbit a camera around two coloured point
+# clouds and write a side-by-side [GT | WT | both] .mp4. See the module docstring.
+
+# --- input: two point-cloud .ply files (vertex colours are used as-is) ---
+gt: ???                   # required -- pass gt=/app/bla/....disparity.gt.ply
+wt: ???                   # required -- pass wt=/app/bla/....disparity.wt.ply
+
+# null -> "<gt stem, ".gt" stripped>.orbit.<ext>" next to `gt`
+# (so ....disparity.gt.ply -> ....disparity.orbit.mp4).
+output_path: null
+
+# mp4 | frames
+format: mp4
+
+# Text burned into the top-left of the strip (e.g. "view 400  CD 0.131"). null = none.
+caption: null
+
+# --- point rendering ---
+point_size: 0.006        # world-space radius of every dot (object is ~unit-cube sized)
+
+# The input clouds are OpenCV camera space (X right, Y down, Z forward). Remap
+# to a Z-up world (screen-up -> orbit axis) so the turntable spins the cloud
+# about its vertical. false = orbit the raw camera-space axes instead.
+upright: true
+
+# --- camera path (same model as orbit_video.py / render_objaverse.py) ---
+num_frames: null         # null -> round(seconds * fps)
+seconds: 6.0
+fps: 30
+orbit_deg: 360.0
+start_azimuth_deg: 0.0
+elevation_deg: 20.0
+clockwise: false
+look_at: centroid        # origin | centroid (mean of all points, both clouds)
+camera_distance: null    # null -> fit the combined bounding sphere with `margin`
+margin: 1.4
+
+width: 640
+height: 640
+camera_lens: 50.0
+camera_sensor_width: 51.2
+
+# --- look ---
+background: [0.06, 0.06, 0.07]   # RGB in [0,1]
+near_plane: 0.01
+far_plane: 100.0
+
+# --- encoding ---
+crf: 18
+
+# --- runtime ---
+device: cuda             # cuda | cpu
+seed: 0
+
+hydra:
+  job:
+    chdir: false
+  output_subdir: null
+  run:
+    dir: outputs/disparity_video/${now:%Y-%m-%d_%H-%M-%S}
