@@ -6,6 +6,8 @@ point cloud and World Tracing's predicted XYZ, over every view in the file.
 One box for the whole predicted cloud ("all"), then one per depth-peel
 layer. Chamfer is symmetric (mean_a min_b|a-b| + mean_b min_a|a-b|), raw --
 no alignment -- and subsampled per side for speed (see plot_view_panels).
+The y axis is log by default (the distribution is long-tailed); --linear
+for a linear axis.
 
     python plot_chamfer_box.py bla/obj_rand40.h5 bla/obj_rand40.h5.wt.h5
 
@@ -16,6 +18,7 @@ any Chamfer distances, pass that CSV back:
     python plot_chamfer_box.py --replot bla/obj_rand40.h5.wt.h5.chamferbox.csv
 """
 
+import csv
 from argparse import ArgumentParser
 
 import h5py
@@ -58,17 +61,16 @@ def _read_csv(path):
 
 def _write_csv(path, cd_all, cd_layer):
   n, n_layers = cd_layer.shape
-  with open(path, "w") as f:
-    f.write("view,cd_all," + ",".join(f"cd_L{li}" for li in range(n_layers)) + "\n")
+  cell = lambda x: f"{x:.6f}" if np.isfinite(x) else ""   # noqa: E731
+  with open(path, "w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow(["view", "cd_all"] + [f"cd_L{li}" for li in range(n_layers)])
     for v in range(n):
-      cells = [f"{cd_all[v]:.6f}"] + [
-        ("" if not np.isfinite(cd_layer[v, li]) else f"{cd_layer[v, li]:.6f}")
-        for li in range(n_layers)]
-      f.write(f"{v}," + ",".join(cells) + "\n")
+      w.writerow([v, cell(cd_all[v])] + [cell(cd_layer[v, li]) for li in range(n_layers)])
   print(f"[csv] {path}")
 
 
-def _draw(groups, n, out):
+def _draw(groups, n, out, log=False):
   import matplotlib
   matplotlib.use("Agg")
   import matplotlib.pyplot as plt
@@ -88,15 +90,22 @@ def _draw(groups, n, out):
     # small dots -- a 500-view run puts hundreds of points on each box
     ax.scatter(x + jitter, vals, s=4, color="tab:blue", alpha=0.35,
                edgecolors="none", zorder=3)
-    ax.text(x, vals.max(), f"  med {np.median(vals):.3f}\n  n={len(vals)}",
-            fontsize=8, va="bottom", ha="center", color="0.3")
+    ax.text(x, 0.99, f"med {np.median(vals):.3f}\nn={len(vals)}",
+            transform=ax.get_xaxis_transform(), fontsize=8, va="top",
+            ha="center", color="0.3")
 
   ax.set_xticks(positions)
   ax.set_xticklabels([g[0] for g in groups])
   ax.set_ylabel("Chamfer distance (raw, WT metric units)")
-  ax.set_ylim(0, max(v.max() for _, v in groups if len(v)) * 1.15)
+  allv = np.concatenate([v for _, v in groups if len(v)])
+  if log:
+    ax.set_yscale("log")
+    lo = allv[allv > 0].min()
+    ax.set_ylim(lo / 1.4, allv.max() * 1.4)
+  else:
+    ax.set_ylim(0, allv.max() * 1.15)
   ax.set_title(f"render vs WT Chamfer distance, {n} views (box + per-view points)")
-  ax.grid(alpha=0.3, axis="y")
+  ax.grid(alpha=0.3, axis="y", which="both" if log else "major")
   fig.tight_layout()
   fig.savefig(out, dpi=120)
   plt.close(fig)
@@ -110,6 +119,9 @@ def main():
   p.add_argument("--replot", metavar="CSV",
                  help="skip all Chamfer computation; re-draw the figure from a "
                       "CSV a previous run wrote")
+  p.add_argument("--linear", action="store_true", help="linear y axis; the "
+                 "default is log (the bulk of the Chamfer distribution sits "
+                 "well below the tail)")
   p.add_argument("--cap", type=int, default=40000, help="points per side for Chamfer (default 40000)")
   p.add_argument("--out", default=None, help="default: <wt_h5>.chamferbox.png "
                  "(or the CSV path with .png for --replot)")
@@ -131,7 +143,7 @@ def main():
   groups = [("all", cd_all[np.isfinite(cd_all)])] + [
     (f"L{li}", cd_layer[np.isfinite(cd_layer[:, li]), li]) for li in range(n_layers)]
 
-  _draw(groups, n, out)
+  _draw(groups, n, out, log=not args.linear)
   if write_csv:
     _write_csv(out.rsplit(".", 1)[0] + ".csv", cd_all, cd_layer)
 
