@@ -12,8 +12,8 @@ Three formats (-f/--format):
     wt_infer_layers.py), no unprojection.
 
 Point colour (-c/--color):
-  rgb    (default) -- surface layer from the RGB image, deeper layers a
-    white -> red gradient by layer index.
+  rgb    (default) -- surface layer from the RGB image, deeper (occluded)
+    layers turbo-colormapped by layer index.
   depth  -- turbo-colormapped by the point's Z in the output frame (= true
     depth in camera space). --depth-range LO HI pins the colour scale
     (default: 1st/99th percentile of this cloud) so two clouds can share one.
@@ -125,15 +125,27 @@ def colors_by_depth(z, lo=None, hi=None):
   return np.clip(rgba * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
 
-def colors_for(image, u, v, layer_idx, max_layers):
-  """image: (H, W, 3) or (H, W, 4) uint8. Returns (N, 4) uint8 RGBA."""
+def colors_for(image, u, v, layer_idx, max_layers, grid_hw=None):
+  """image: (H, W, 3) or (H, W, 4) uint8. Returns (N, 4) uint8 RGBA.
+
+  u, v index the depth-peel / points grid. When the RGB image is a different
+  resolution (split render: `width`/`height` != `depth_width`/`depth_height`),
+  pass grid_hw=(gh, gw) so the sample coords are rescaled onto the image
+  instead of reading a cropped top-left corner of it.
+  """
+  ih, iw = image.shape[:2]
+  if grid_hw is not None and tuple(grid_hw) != (ih, iw):
+    gh, gw = grid_hw
+    u = np.clip((np.asarray(u) * (iw / gw)).astype(np.intp), 0, iw - 1)
+    v = np.clip((np.asarray(v) * (ih / gh)).astype(np.intp), 0, ih - 1)
   surface_rgb = image[v, u][:, :3].astype(np.float32)  # 0-255, drop alpha if present
 
+  # deeper (occluded) layers: turbo-colormapped by layer index
+  import matplotlib
+
   denom = max(max_layers - 1, 1)
-  t = (layer_idx.astype(np.float32) / denom)[:, None]
-  white = np.array([255.0, 255.0, 255.0])
-  red = np.array([255.0, 0.0, 0.0])
-  gradient_rgb = white * (1 - t) + red * t
+  t = layer_idx.astype(np.float32) / denom
+  gradient_rgb = matplotlib.colormaps["turbo"](t)[:, :3] * 255.0
 
   is_surface = (layer_idx == 0)[:, None]
   rgb = np.where(is_surface, surface_rgb, gradient_rgb)
@@ -181,8 +193,8 @@ def main():
     "scene graph)")
   parser.add_argument(
     "-c", "--color", choices=["rgb", "depth"], default="rgb",
-    help="rgb (default): RGB image on the surface, white->red per layer "
-    "deeper; depth: turbo-colormapped by point Z in the output frame")
+    help="rgb (default): RGB image on the surface, deeper layers turbo by "
+    "layer index; depth: turbo-colormapped by point Z in the output frame")
   parser.add_argument(
     "--depth-range", type=float, nargs=2, metavar=("LO", "HI"), default=None,
     help="Pin the -c depth colour scale (default: this cloud's 1st/99th pct)")
@@ -218,6 +230,7 @@ def main():
         pose = f[datasets["pose"]][args.index]
 
         max_layers = depth_peel.shape[2]
+        grid_hw = depth_peel.shape[:2]
         points, u, v, layer_idx = unproject_depth_peel(depth_peel, intrinsics, pose, args.space)
         detail = f" ({(layer_idx == 0).sum()} surface)"
       case "points":
@@ -228,6 +241,7 @@ def main():
         raw_points = f[datasets["points"]][args.index]
 
         max_layers = raw_points.shape[2]
+        grid_hw = raw_points.shape[:2]
         points, u, v, layer_idx = extract_valid_points(raw_points)
         detail = f" ({(layer_idx == 0).sum()} surface)"
       case _:
@@ -237,7 +251,7 @@ def main():
     lo, hi = args.depth_range or (None, None)
     colors = colors_by_depth(points[:, 2], lo, hi)
   else:
-    colors = colors_for(image, u, v, layer_idx, max_layers)
+    colors = colors_for(image, u, v, layer_idx, max_layers, grid_hw=grid_hw)
 
   out_path = args.out or f"{args.hdf5_path}.view{args.index}.{args.export_format}"
 

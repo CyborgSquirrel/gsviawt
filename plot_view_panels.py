@@ -19,7 +19,8 @@ where they agree.
 
 The title also carries the symmetric Chamfer distance (raw, no alignment)
 between the render's unprojected depth-peel point cloud and WT's predicted
-XYZ -- overall, and per layer in each row's label.
+XYZ -- overall, and per layer in each row's label. Below it, the mesh's path
+relative to the objaverse download root (shard dir + file).
 
     python plot_view_panels.py bla/obj_rand40.h5 bla/obj_rand40.h5.wt.h5 --views 1 8 12 24
 """
@@ -75,6 +76,18 @@ def _chamfer(a, b, cap=40000):
   return float(d_ab.mean() + d_ba.mean())
 
 
+def _objaverse_relpath(path):
+  """`mesh_paths` stores absolute .glb paths like
+  `.../.objaverse/hf-objaverse-v1/glbs/000-069/<hash>.glb`. Show just the
+  part below the objaverse download root -- the shard dir + file."""
+  path = str(path)
+  for anchor in ("/glbs/", "/.objaverse/"):
+    i = path.find(anchor)
+    if i != -1:
+      return path[i + len(anchor):]
+  return path.rsplit("/", 1)[-1]
+
+
 def _disagreement_rgb(gt_present, wt_present):
   """White where the two validity masks agree, MASK_EXTRA where only WT has
   a value, MASK_MISS where only the render does."""
@@ -86,7 +99,8 @@ def _disagreement_rgb(gt_present, wt_present):
   return img
 
 
-def panel(rgb_r, rgb_w, layers, title, out, wt_label="depth WT (raw)", crop=True):
+def panel(rgb_r, rgb_w, layers, title, out, wt_label="depth WT (raw)", crop=True,
+          subtitle=None):
   """layers: list of dicts {idx, gt, gtv, wt, wtv, both, absrel, n}, one per
   depth-peel layer to draw (gt/wt/gtv/wtv/both are H x W arrays).
 
@@ -101,6 +115,20 @@ def panel(rgb_r, rgb_w, layers, title, out, wt_label="depth WT (raw)", crop=True
   from matplotlib.patches import Patch
 
   plt.rcParams.update({"font.size": 15})
+
+  # the RGB render can be a higher resolution than the depth peel (split
+  # width/height vs depth_width/depth_height); the crop window below is in
+  # depth-peel pixels, so resample both RGB strips onto that grid first.
+  dh, dw = layers[0]["gt"].shape
+
+  def _fit(img):
+    if img is None or img.shape[:2] == (dh, dw):
+      return img
+    yi = (np.arange(dh) * img.shape[0] / dh).astype(int)
+    xi = (np.arange(dw) * img.shape[1] / dw).astype(int)
+    return img[yi][:, xi]
+
+  rgb_r, rgb_w = _fit(rgb_r), _fit(rgb_w)
 
   # shared ranges: depths over every GT+WT valid pixel of every layer,
   # deltas over every shared-valid pixel of every layer.
@@ -152,7 +180,7 @@ def panel(rgb_r, rgb_w, layers, title, out, wt_label="depth WT (raw)", crop=True
   row_h = cell_w * panel_ar
   label_w = 1.05                    # inches, left row-labels
   cbar_cax_w, cbar_lbl_w = 0.26, 0.95
-  margin_top, margin_bot = 1.35, 0.3
+  margin_top, margin_bot = 1.35 + (0.32 if subtitle else 0.0), 0.3
   fig_w = label_w + cell_w * ncol_img + cbar_cax_w + cbar_lbl_w
   fig_h = margin_top + row_h * 4 + margin_bot
   fig = plt.figure(figsize=(fig_w, fig_h))
@@ -214,6 +242,9 @@ def panel(rgb_r, rgb_w, layers, title, out, wt_label="depth WT (raw)", crop=True
              loc="center left", fontsize=9, frameon=False, handlelength=1.1,
              borderaxespad=0)
   fig.suptitle(title, y=1 - 0.42 / fig_h, fontsize=min(15, fig_w * 1.6))
+  if subtitle:
+    fig.text(0.5, 1 - 0.86 / fig_h, subtitle, ha="center", va="center",
+             fontsize=min(11, fig_w * 1.1), family="monospace", color="0.35")
   fig.savefig(out, dpi=100)
   plt.close(fig)
   print(f"[fig] {out}")
@@ -247,6 +278,7 @@ def main():
 
   with h5py.File(args.render_h5, "r") as rf, h5py.File(args.wt_h5, "r") as wf:
     mesh_index = rf["mesh_index"][:] if "mesh_index" in rf else None
+    mesh_paths = rf["mesh_paths"][:] if "mesh_paths" in rf else None
     K_name = intrinsics_name(rf, "depth", None) if args.chamfer else None
     K_ds = rf[K_name] if K_name else None
     for v in args.views:
@@ -283,7 +315,8 @@ def main():
         layers.append(dict(idx=li, gt=gt, gtv=gtv, wt=wt, wtv=wtv, both=both,
                            absrel=absrel, n=int(both.sum()), cd=cd))
 
-      m = f"mesh {int(mesh_index[v])}" if mesh_index is not None else ""
+      mi = int(mesh_index[v]) if mesh_index is not None else None
+      m = f"mesh {mi}" if mi is not None else ""
       tags = [f"view {v}", m, f"{len(layers)} layer(s)"]
       if args.align != "none":
         tags.append(f"align={args.align} (s={s:.3g}, t={t:.3g})")
@@ -291,8 +324,13 @@ def main():
         tags.append(f"Chamfer(all) {cd_all:.4f}")
       title = "    ".join(t for t in tags if t)
       wt_label = "depth WT (raw)" if args.align == "none" else f"depth WT ({args.align}-aligned)"
+      subtitle = None
+      if mesh_paths is not None and mi is not None and 0 <= mi < len(mesh_paths):
+        mp = mesh_paths[mi]
+        subtitle = _objaverse_relpath(mp.decode() if isinstance(mp, bytes) else mp)
       panel(rf["images"][v], wf["images"][v], layers, title,
-            f"{prefix}.view{v}.png", wt_label=wt_label, crop=args.crop)
+            f"{prefix}.view{v}.png", wt_label=wt_label, crop=args.crop,
+            subtitle=subtitle)
 
 
 if __name__ == "__main__":
