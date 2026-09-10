@@ -102,6 +102,20 @@ def panel(rgb_r, rgb_w, layers, title, out, wt_label="depth WT (raw)", crop=True
 
   plt.rcParams.update({"font.size": 15})
 
+  # the RGB render can be a higher resolution than the depth peel (split
+  # width/height vs depth_width/depth_height); the crop window below is in
+  # depth-peel pixels, so resample both RGB strips onto that grid first.
+  dh, dw = layers[0]["gt"].shape
+
+  def _fit(img):
+    if img is None or img.shape[:2] == (dh, dw):
+      return img
+    yi = (np.arange(dh) * img.shape[0] / dh).astype(int)
+    xi = (np.arange(dw) * img.shape[1] / dw).astype(int)
+    return img[yi][:, xi]
+
+  rgb_r, rgb_w = _fit(rgb_r), _fit(rgb_w)
+
   # shared ranges: depths over every GT+WT valid pixel of every layer,
   # deltas over every shared-valid pixel of every layer.
   depth_pool = np.concatenate(
