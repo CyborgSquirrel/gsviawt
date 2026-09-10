@@ -12,8 +12,8 @@ Three formats (-f/--format):
     wt_infer_layers.py), no unprojection.
 
 Point colour (-c/--color):
-  rgb    (default) -- surface layer from the RGB image, deeper layers a
-    white -> red gradient by layer index.
+  rgb    (default) -- surface layer from the RGB image, deeper (occluded)
+    layers turbo-colormapped by layer index.
   depth  -- turbo-colormapped by the point's Z in the output frame (= true
     depth in camera space). --depth-range LO HI pins the colour scale
     (default: 1st/99th percentile of this cloud) so two clouds can share one.
@@ -140,11 +140,12 @@ def colors_for(image, u, v, layer_idx, max_layers, grid_hw=None):
     v = np.clip((np.asarray(v) * (ih / gh)).astype(np.intp), 0, ih - 1)
   surface_rgb = image[v, u][:, :3].astype(np.float32)  # 0-255, drop alpha if present
 
+  # deeper (occluded) layers: turbo-colormapped by layer index
+  import matplotlib
+
   denom = max(max_layers - 1, 1)
-  t = (layer_idx.astype(np.float32) / denom)[:, None]
-  white = np.array([255.0, 255.0, 255.0])
-  red = np.array([255.0, 0.0, 0.0])
-  gradient_rgb = white * (1 - t) + red * t
+  t = layer_idx.astype(np.float32) / denom
+  gradient_rgb = matplotlib.colormaps["turbo"](t)[:, :3] * 255.0
 
   is_surface = (layer_idx == 0)[:, None]
   rgb = np.where(is_surface, surface_rgb, gradient_rgb)
@@ -192,8 +193,8 @@ def main():
     "scene graph)")
   parser.add_argument(
     "-c", "--color", choices=["rgb", "depth"], default="rgb",
-    help="rgb (default): RGB image on the surface, white->red per layer "
-    "deeper; depth: turbo-colormapped by point Z in the output frame")
+    help="rgb (default): RGB image on the surface, deeper layers turbo by "
+    "layer index; depth: turbo-colormapped by point Z in the output frame")
   parser.add_argument(
     "--depth-range", type=float, nargs=2, metavar=("LO", "HI"), default=None,
     help="Pin the -c depth colour scale (default: this cloud's 1st/99th pct)")
