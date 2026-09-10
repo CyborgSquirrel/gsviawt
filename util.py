@@ -8,6 +8,29 @@ import h5py
 log = logging.getLogger(__name__)
 
 
+_MISSING = object()
+
+
+def intrinsics_name(f, kind="depth", default=_MISSING):
+  """Name of the intrinsics dataset to read from a render_objaverse h5.
+
+  Current files carry both `depth_intrinsics` (matches `depth_peel`) and
+  `image_intrinsics` (matches `images`). Older files have a single
+  `camera_intrinsics` that matched `depth_peel` (and, back then, `images`
+  too since the two resolutions were always equal) -- fall back to that.
+  `kind` is "depth" or "image". Raises KeyError if neither is present,
+  unless `default` is given.
+  """
+  want = f"{kind}_intrinsics"
+  if want in f:
+    return want
+  if "camera_intrinsics" in f:
+    return "camera_intrinsics"
+  if default is not _MISSING:
+    return default
+  raise KeyError(f"no {want} (or legacy camera_intrinsics) in {getattr(f, 'filename', f)!r}")
+
+
 @ctl.contextmanager
 def timed(label: str):
   """Logs the wall-clock time of the block immediately when it exits, so a

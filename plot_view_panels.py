@@ -30,6 +30,7 @@ import h5py
 import numpy as np
 
 from compare_wt_depth import _align, _layer0_depth_gt, _layer0_depth_pred
+from util import intrinsics_name
 
 MASK_EXTRA = "#d7263d"  # WT predicts a surface the render doesn't have
 MASK_MISS = "#1f6feb"   # render has a surface WT missed
@@ -246,7 +247,8 @@ def main():
 
   with h5py.File(args.render_h5, "r") as rf, h5py.File(args.wt_h5, "r") as wf:
     mesh_index = rf["mesh_index"][:] if "mesh_index" in rf else None
-    K_ds = rf["camera_intrinsics"] if args.chamfer and "camera_intrinsics" in rf else None
+    K_name = intrinsics_name(rf, "depth", None) if args.chamfer else None
+    K_ds = rf[K_name] if K_name else None
     for v in args.views:
       dp = rf["depth_peel"][v]      # (H, W, L)
       pts = wf["points"][v]         # (H, W, L, 3)

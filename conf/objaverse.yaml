@@ -20,9 +20,9 @@ height: 504
 # Depth-peel resolution. Defaults to the RGB resolution via interpolation;
 # override to render the depth maps at a different resolution than the RGB
 # pass (e.g. a cheaper low-res peel, or a higher-res one for geometry work).
-# `camera_intrinsics` in the output always matches `depth_peel`; when the
-# two resolutions differ a separate `image_intrinsics` matching `images` is
-# also written. Note the compare_wt_depth.py tooling compares WT's
+# The output always has both `depth_intrinsics` (matches `depth_peel`) and
+# `image_intrinsics` (matches `images`); they're identical when the two
+# resolutions match. Note the compare_wt_depth.py tooling compares WT's
 # prediction (at RGB res) against `depth_peel` pixel-for-pixel, so it needs
 # these equal unless you resize first.
 depth_width: ${width}
