@@ -125,8 +125,19 @@ def colors_by_depth(z, lo=None, hi=None):
   return np.clip(rgba * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
 
-def colors_for(image, u, v, layer_idx, max_layers):
-  """image: (H, W, 3) or (H, W, 4) uint8. Returns (N, 4) uint8 RGBA."""
+def colors_for(image, u, v, layer_idx, max_layers, grid_hw=None):
+  """image: (H, W, 3) or (H, W, 4) uint8. Returns (N, 4) uint8 RGBA.
+
+  u, v index the depth-peel / points grid. When the RGB image is a different
+  resolution (split render: `width`/`height` != `depth_width`/`depth_height`),
+  pass grid_hw=(gh, gw) so the sample coords are rescaled onto the image
+  instead of reading a cropped top-left corner of it.
+  """
+  ih, iw = image.shape[:2]
+  if grid_hw is not None and tuple(grid_hw) != (ih, iw):
+    gh, gw = grid_hw
+    u = np.clip((np.asarray(u) * (iw / gw)).astype(np.intp), 0, iw - 1)
+    v = np.clip((np.asarray(v) * (ih / gh)).astype(np.intp), 0, ih - 1)
   surface_rgb = image[v, u][:, :3].astype(np.float32)  # 0-255, drop alpha if present
 
   denom = max(max_layers - 1, 1)
@@ -218,6 +229,7 @@ def main():
         pose = f[datasets["pose"]][args.index]
 
         max_layers = depth_peel.shape[2]
+        grid_hw = depth_peel.shape[:2]
         points, u, v, layer_idx = unproject_depth_peel(depth_peel, intrinsics, pose, args.space)
         detail = f" ({(layer_idx == 0).sum()} surface)"
       case "points":
@@ -228,6 +240,7 @@ def main():
         raw_points = f[datasets["points"]][args.index]
 
         max_layers = raw_points.shape[2]
+        grid_hw = raw_points.shape[:2]
         points, u, v, layer_idx = extract_valid_points(raw_points)
         detail = f" ({(layer_idx == 0).sum()} surface)"
       case _:
@@ -237,7 +250,7 @@ def main():
     lo, hi = args.depth_range or (None, None)
     colors = colors_by_depth(points[:, 2], lo, hi)
   else:
-    colors = colors_for(image, u, v, layer_idx, max_layers)
+    colors = colors_for(image, u, v, layer_idx, max_layers, grid_hw=grid_hw)
 
   out_path = args.out or f"{args.hdf5_path}.view{args.index}.{args.export_format}"
 
