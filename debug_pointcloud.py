@@ -6,12 +6,17 @@ Three formats (-f/--format):
   auto   (default) -- detect depth vs. points from which dataset is present
     in the file (error if both or neither are).
   depth  -- unproject every depth-peel layer using that view's camera
-    intrinsics/pose, color the surface layer (layer 0) from the RGB image,
-    and color deeper layers with a white -> red gradient by layer index.
+    intrinsics/pose.
   points -- take an existing (H, W, L, 3) XYZ point grid (NaN marks an
     invalid entry; same (H, W, L) layout as depth_peel, see
-    wt_infer_layers.py) and color it from the RGB image exactly like the
-    depth case, no unprojection.
+    wt_infer_layers.py), no unprojection.
+
+Point colour (-c/--color):
+  rgb    (default) -- surface layer from the RGB image, deeper layers a
+    white -> red gradient by layer index.
+  depth  -- turbo-colormapped by the point's Z in the output frame (= true
+    depth in camera space). --depth-range LO HI pins the colour scale
+    (default: 1st/99th percentile of this cloud) so two clouds can share one.
 
 Each input (image/depth/intrinsics/pose/points) is read from `hdf5_path` at
 its default dataset name unless overridden with the matching flag, given as
@@ -103,6 +108,22 @@ def unproject_depth_peel(depth_peel, intrinsics, pose, space):
   return points, u.astype(np.int64), v.astype(np.int64), layer_idx
 
 
+def colors_by_depth(z, lo=None, hi=None):
+  """Turbo-colormap per-point depth `z` (the Z of the output frame). lo/hi
+  pin the scale; unset -> that end is the 1st/99th percentile of `z`.
+  Returns (N, 4) uint8 RGBA."""
+  import matplotlib
+
+  finite = np.isfinite(z)
+  p_lo, p_hi = np.percentile(z[finite], [1, 99]) if finite.any() else (0.0, 1.0)
+  lo = p_lo if lo is None else lo
+  hi = p_hi if hi is None else hi
+  t = np.clip((z - lo) / ((hi - lo) or 1.0), 0.0, 1.0)
+  rgba = matplotlib.colormaps["turbo"](np.nan_to_num(t))
+  print(f"  depth colour scale: [{lo:.4g}, {hi:.4g}]")
+  return np.clip(rgba * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+
 def colors_for(image, u, v, layer_idx, max_layers):
   """image: (H, W, 3) or (H, W, 4) uint8. Returns (N, 4) uint8 RGBA."""
   surface_rgb = image[v, u][:, :3].astype(np.float32)  # 0-255, drop alpha if present
@@ -157,6 +178,13 @@ def main():
     help="glb: one scene node per layer under a \"points\" root (default); "
     "ply: merge every layer into a single flat point cloud (ply has no "
     "scene graph)")
+  parser.add_argument(
+    "-c", "--color", choices=["rgb", "depth"], default="rgb",
+    help="rgb (default): RGB image on the surface, white->red per layer "
+    "deeper; depth: turbo-colormapped by point Z in the output frame")
+  parser.add_argument(
+    "--depth-range", type=float, nargs=2, metavar=("LO", "HI"), default=None,
+    help="Pin the -c depth colour scale (default: this cloud's 1st/99th pct)")
   parser.add_argument("-o", "--out", default=None, help="Output path (default: <hdf5>.view<index>.<export-format>)")
   parser.add_argument("--image", default=None, metavar="DATASET", help="Override the RGB image dataset name (default: images)")
   parser.add_argument("--depth", default=None, metavar="DATASET", help="Override the depth-peel dataset name (default: depth_peel)")
@@ -188,7 +216,6 @@ def main():
 
         max_layers = depth_peel.shape[2]
         points, u, v, layer_idx = unproject_depth_peel(depth_peel, intrinsics, pose, args.space)
-        colors = colors_for(image, u, v, layer_idx, max_layers)
         detail = f" ({(layer_idx == 0).sum()} surface)"
       case "points":
         if args.space is not None:
@@ -199,10 +226,15 @@ def main():
 
         max_layers = raw_points.shape[2]
         points, u, v, layer_idx = extract_valid_points(raw_points)
-        colors = colors_for(image, u, v, layer_idx, max_layers)
         detail = f" ({(layer_idx == 0).sum()} surface)"
       case _:
         raise ValueError(f"Unknown format: {fmt!r}")
+
+  if args.color == "depth":
+    lo, hi = args.depth_range or (None, None)
+    colors = colors_by_depth(points[:, 2], lo, hi)
+  else:
+    colors = colors_for(image, u, v, layer_idx, max_layers)
 
   out_path = args.out or f"{args.hdf5_path}.view{args.index}.{args.export_format}"
 
