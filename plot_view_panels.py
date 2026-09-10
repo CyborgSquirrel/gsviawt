@@ -114,7 +114,7 @@ def panel(rgb_r, rgb_w, layers, title, out, wt_label="depth WT (raw)", crop=True
   from matplotlib.gridspec import GridSpec
   from matplotlib.patches import Patch
 
-  plt.rcParams.update({"font.size": 15})
+  plt.rcParams.update({"font.size": 26})
 
   # the RGB render can be a higher resolution than the depth peel (split
   # width/height vs depth_width/depth_height); the crop window below is in
@@ -178,9 +178,9 @@ def panel(rgb_r, rgb_w, layers, title, out, wt_label="depth WT (raw)", crop=True
   panel_ar = min(1.6, max(0.7, (r1 - r0) / (c1 - c0)))
   cell_w = 2.5 if nL >= 3 else 3.2
   row_h = cell_w * panel_ar
-  label_w = 1.05                    # inches, left row-labels
-  cbar_cax_w, cbar_lbl_w = 0.26, 0.95
-  margin_top, margin_bot = 1.35 + (0.32 if subtitle else 0.0), 0.3
+  label_w = 1.55                    # inches, left row-labels
+  cbar_cax_w, cbar_lbl_w = 0.32, 1.9
+  margin_top, margin_bot = 2.5 + (0.5 if subtitle else 0.0), 0.35
   fig_w = label_w + cell_w * ncol_img + cbar_cax_w + cbar_lbl_w
   fig_h = margin_top + row_h * 4 + margin_bot
   fig = plt.figure(figsize=(fig_w, fig_h))
@@ -204,7 +204,7 @@ def panel(rgb_r, rgb_w, layers, title, out, wt_label="depth WT (raw)", crop=True
     ax.set_xticks([]); ax.set_yticks([])
     for s in ax.spines.values():
       s.set_visible(False)
-    ax.set_ylabel(text, fontsize=13)
+    ax.set_ylabel(text, fontsize=24)
 
   gt_of = lambda L: _mask(L["gt"], L["gtv"] & (L["gt"] > 0))
   rows = [
@@ -222,8 +222,8 @@ def panel(rgb_r, rgb_w, layers, title, out, wt_label="depth WT (raw)", crop=True
     ax0 = fig.add_subplot(grid[ri, 0])
     if rgb is not None:
       show(ax0, rgb)
-      ax0.set_title(rgb_title, fontsize=11, pad=5)
-      ax0.set_ylabel(rlabel, fontsize=13)
+      ax0.set_title(rgb_title, fontsize=20, pad=5)
+      ax0.set_ylabel(rlabel, fontsize=24)
     else:
       label_only(ax0, rlabel)
     for ci, L in enumerate(layers, start=1):
@@ -232,19 +232,20 @@ def panel(rgb_r, rgb_w, layers, title, out, wt_label="depth WT (raw)", crop=True
       if ri == 0:
         ar = f"AbsRel {L['absrel']:.3f}" if np.isfinite(L["absrel"]) else "AbsRel --"
         cd = f"CD {L['cd']:.4f}" if np.isfinite(L.get("cd", np.nan)) else "CD --"
-        ax.set_title(f"layer {L['idx']}\n{ar}  ·  {cd}\nn={L['n']}", fontsize=10, pad=5)
+        # one metric per line -- big text won't fit them side by side in a cell
+        ax.set_title(f"layer {L['idx']}\n{ar}\n{cd}\nn={L['n']}", fontsize=19, pad=6)
 
   fig.colorbar(ims[0], cax=fig.add_subplot(grid[0:2, ncol_img]), label="depth")
   fig.colorbar(ims[2], cax=fig.add_subplot(grid[2, ncol_img]), label="|delta|")
   axl = fig.add_subplot(grid[3, ncol_img]); axl.axis("off")
   axl.legend(handles=[Patch(facecolor=MASK_EXTRA, edgecolor="0.4", label="WT extra"),
                       Patch(facecolor=MASK_MISS, edgecolor="0.4", label="WT missing")],
-             loc="center left", fontsize=9, frameon=False, handlelength=1.1,
+             loc="center left", fontsize=17, frameon=False, handlelength=1.1,
              borderaxespad=0)
-  fig.suptitle(title, y=1 - 0.42 / fig_h, fontsize=min(15, fig_w * 1.6))
+  fig.suptitle(title, y=1 - 0.5 / fig_h, fontsize=min(30, fig_w * 2.6))
   if subtitle:
-    fig.text(0.5, 1 - 0.86 / fig_h, subtitle, ha="center", va="center",
-             fontsize=min(11, fig_w * 1.1), family="monospace", color="0.35")
+    fig.text(0.5, 1 - 1.25 / fig_h, subtitle, ha="center", va="center",
+             fontsize=min(20, fig_w * 2.0), family="monospace", color="0.35")
   fig.savefig(out, dpi=100)
   plt.close(fig)
   print(f"[fig] {out}")
