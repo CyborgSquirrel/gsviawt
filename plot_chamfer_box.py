@@ -17,6 +17,7 @@ import numpy as np
 
 from compare_wt_depth import _layer0_depth_gt
 from plot_view_panels import _chamfer, _unproject, _xyz_cloud
+from util import intrinsics_name
 
 
 def main():
@@ -30,7 +31,7 @@ def main():
   with h5py.File(args.render_h5, "r") as rf, h5py.File(args.wt_h5, "r") as wf:
     n = min(rf["depth_peel"].shape[0], wf["points"].shape[0])
     n_layers = min(rf["depth_peel"].shape[3], wf["points"].shape[3])
-    K_ds = rf["camera_intrinsics"]
+    K_ds = rf[intrinsics_name(rf, "depth")]
 
     cd_all = np.full(n, np.nan)
     cd_layer = np.full((n, n_layers), np.nan)

@@ -51,8 +51,8 @@ ply_max_anisotropy: null      # drop splats whose scale max/min ratio exceeds th
 datasets:
   images: images
   depth: depth_peel
-  intrinsics: camera_intrinsics        # matches depth_peel (seed + output-grid resolution)
-  image_intrinsics: image_intrinsics   # matches images; optional, only when RGB res != depth res
+  intrinsics: depth_intrinsics          # matches depth_peel (seed + output-grid resolution)
+  image_intrinsics: image_intrinsics    # matches images (photometric-loss resolution)
   pose: camera_pose
 
 hydra:

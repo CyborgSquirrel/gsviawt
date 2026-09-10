@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Optimize a layered 3D Gaussian Splatting model from one render HDF5.
 
-Input is an `.h5` in the `render_objaverse.py` / `capture_turntable.py` schema
-(`images`, `depth_peel`, `camera_intrinsics`, `camera_pose`, `mesh_index`). You
-pick one **primary** view index and zero or more **secondary** view indices; all
-must show the same object (same `mesh_index`).
+Input is an `.h5` in the `render_objaverse.py` schema (`images`, `depth_peel`,
+`depth_intrinsics`, `image_intrinsics`, `camera_pose`, `mesh_index`; legacy
+`camera_intrinsics` is also accepted). You pick one **primary** view index and
+zero or more **secondary** view indices; all must show the same object (same
+`mesh_index`).
 
 The Gaussians are seeded entirely from the primary view's 6-layer depth peel --
 every pixel-hit in every peel layer becomes one Gaussian, back-projected to world
@@ -18,10 +19,9 @@ They are then optimized with `gsplat` against the RGB (L1 + D-SSIM) and alpha
 only, never new Gaussians. Fully-occluded deeper-layer Gaussians (seen in no
 supplied view) keep their initial front-pixel colour.
 
-`images` may be a higher resolution than `depth_peel` (render_objaverse writes
-`image_intrinsics` when they differ): the seed grid and the output grids stay
-at the depth-peel resolution, while the photometric loss renders at the image
-resolution using `image_intrinsics`.
+`images` may be a higher resolution than `depth_peel`: the seed grid and the
+output grids stay at the depth-peel resolution (`depth_intrinsics`), while the
+photometric loss renders at the image resolution (`image_intrinsics`).
 
 By default (`optimize_means: false`) the Gaussian centers are locked to those
 back-projected seed positions and only scale / rotation / opacity / colour are
@@ -88,7 +88,7 @@ from omegaconf import DictConfig, OmegaConf  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from debug_pointcloud import unproject_depth_peel  # noqa: E402
-from util import timed  # noqa: E402
+from util import intrinsics_name, timed  # noqa: E402
 
 log = logging.getLogger("fit_gsplat")
 
@@ -134,14 +134,17 @@ def load_views(cfg: DictConfig):
       mp = f["mesh_paths"][mesh_idx]
       mesh_path = mp.decode() if isinstance(mp, bytes) else str(mp)
 
+    depth_intr = ds.intrinsics if ds.intrinsics in f else intrinsics_name(f, "depth")
+    image_intr = ds.image_intrinsics if ds.image_intrinsics in f else intrinsics_name(f, "image", None)
+
     images = np.stack([np.asarray(f[ds.images][i]) for i in order])          # (V,IH,IW,3|4) u8
     depth = np.stack([np.asarray(f[ds.depth][i]) for i in order]).astype(np.float32)  # (V,DH,DW,L)
-    K = np.stack([np.asarray(f[ds.intrinsics][i]) for i in order]).astype(np.float32)  # (V,3,3), matches depth
+    K = np.stack([np.asarray(f[depth_intr][i]) for i in order]).astype(np.float32)   # (V,3,3), matches depth
     pose = np.stack([np.asarray(f[ds.pose][i]) for i in order]).astype(np.float32)     # (V,4,4) c2w
-    # render_objaverse writes `image_intrinsics` only when the RGB pass ran at a
-    # different resolution than the depth peel; otherwise the depth K applies to both.
-    if ds.image_intrinsics in f:
-      image_K = np.stack([np.asarray(f[ds.image_intrinsics][i]) for i in order]).astype(np.float32)
+    # image_intrinsics matches the RGB pass; a legacy file with only
+    # camera_intrinsics (always equal-res) -> the depth K applies to both.
+    if image_intr is not None:
+      image_K = np.stack([np.asarray(f[image_intr][i]) for i in order]).astype(np.float32)
     else:
       image_K = K
 
@@ -300,11 +303,12 @@ def save_output(path, cfg, views, params_np, uvl, H, W, L, final_loss, scene_sca
     valid[v, u, layer] = True
     _scene_dataset(f, "layer_valid", valid)
 
-    # cameras / GT for the views actually used (primary first)
+    # cameras / GT for the views actually used (primary first). Both
+    # intrinsics always written (equal when RGB/depth res match), mirroring
+    # render_objaverse's h5.
     f.create_dataset("camera_pose_used", data=views["pose"])
-    f.create_dataset("camera_intrinsics_used", data=views["K"])          # matches depth / grid
-    if views["image_K"] is not views["K"]:
-      f.create_dataset("image_intrinsics_used", data=views["image_K"])   # matches images_used
+    f.create_dataset("depth_intrinsics_used", data=views["K"])            # matches depth / grid
+    f.create_dataset("image_intrinsics_used", data=views["image_K"])      # matches images_used
     _scene_dataset(f, "depth_peel_primary", views["depth"][0])
     _scene_dataset(f, "images_used", views["images"])
     f.create_dataset("view_index_used", data=np.asarray(views["order"], np.int64))

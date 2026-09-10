@@ -35,11 +35,12 @@ import h5py
 import numpy as np
 import trimesh
 
+from util import intrinsics_name
 
 DEFAULT_DATASETS = {
   "image": "images",
   "depth": "depth_peel",
-  "intrinsics": "camera_intrinsics",
+  "intrinsics": None,   # None -> resolve depth_intrinsics / legacy camera_intrinsics
   "pose": "camera_pose",
   "points": "points",
 }
@@ -188,7 +189,7 @@ def main():
   parser.add_argument("-o", "--out", default=None, help="Output path (default: <hdf5>.view<index>.<export-format>)")
   parser.add_argument("--image", default=None, metavar="DATASET", help="Override the RGB image dataset name (default: images)")
   parser.add_argument("--depth", default=None, metavar="DATASET", help="Override the depth-peel dataset name (default: depth_peel)")
-  parser.add_argument("--intrinsics", default=None, metavar="DATASET", help="Override the camera intrinsics dataset name (default: camera_intrinsics)")
+  parser.add_argument("--intrinsics", default=None, metavar="DATASET", help="Override the intrinsics dataset name (default: depth_intrinsics, or legacy camera_intrinsics)")
   parser.add_argument("--pose", default=None, metavar="DATASET", help="Override the camera pose dataset name (default: camera_pose)")
   parser.add_argument("--points", default=None, metavar="DATASET", help="Override the raw point cloud dataset name (default: points)")
   args = parser.parse_args()
@@ -208,6 +209,8 @@ def main():
       case "depth":
         if args.space is None:
           raise ValueError("-s/--space (world or camera) is required for -f depth")
+        if datasets["intrinsics"] is None:
+          datasets["intrinsics"] = intrinsics_name(f, "depth")
 
         image = f[datasets["image"]][args.index]
         depth_peel = f[datasets["depth"]][args.index]

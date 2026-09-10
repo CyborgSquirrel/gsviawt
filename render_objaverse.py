@@ -2,10 +2,11 @@
 """Render meshes the way Objaverse-XL's `blender_script.py` does --
 normalise the object into a unit cube at the origin, light it with a fixed
 multi-sun rig, render RGBA on a transparent film -- but driven by our Hydra
-config and view strategies, and dumped to a single HDF5 file
-(images / depth_peel / camera_pose / camera_intrinsics / mesh_index /
-depth_scale) that wt_infer_layers.py + the compare_wt_depth.py tooling read
-directly.
+config and view strategies, and dumped to a single HDF5 file (images / depth_peel / camera_pose /
+depth_intrinsics / image_intrinsics / mesh_index / depth_scale) that
+wt_infer_layers.py + the compare_wt_depth.py tooling read directly.
+depth_intrinsics matches depth_peel, image_intrinsics matches images; both
+are always written and are identical when the two resolutions match.
 
 Runs *inside* Blender (no rpyc server):
 
@@ -438,10 +439,11 @@ def run(cfg):
 
     ds_img = stack.enter_context(LazyDataset(hf, "images", dataset_kwargs=img_kw)) if cfg.render else None
     ds_pose = stack.enter_context(LazyDataset(hf, "camera_pose"))
-    ds_intr = stack.enter_context(LazyDataset(hf, "camera_intrinsics"))  # matches depth_peel
-    # only when the RGB pass runs at a different resolution than the depth peel
-    ds_img_intr = (stack.enter_context(LazyDataset(hf, "image_intrinsics"))
-                   if cfg.render and (W, H) != (DW, DH) else None)
+    # two intrinsics datasets, both always written (identical when the RGB and
+    # depth-peel resolutions match) so consumers never have to guess which K a
+    # dataset goes with.
+    ds_depth_intr = stack.enter_context(LazyDataset(hf, "depth_intrinsics"))  # matches depth_peel
+    ds_img_intr = stack.enter_context(LazyDataset(hf, "image_intrinsics")) if cfg.render else None  # matches images
     ds_depth = stack.enter_context(LazyDataset(hf, "depth_peel", dataset_kwargs=depth_kw))
     ds_mesh = stack.enter_context(LazyDataset(hf, "mesh_index"))
     ds_scale = stack.enter_context(LazyDataset(hf, "depth_scale"))
@@ -450,7 +452,7 @@ def run(cfg):
     for mi, mesh_path in enumerate(meshes):
       try:
         _render_mesh(cfg, scene, mi, mesh_path, view_strategy, W, H, DW, DH, Lmax, tmp,
-                     ds_img, ds_pose, ds_intr, ds_img_intr, ds_depth, ds_mesh, ds_scale)
+                     ds_img, ds_pose, ds_depth_intr, ds_img_intr, ds_depth, ds_mesh, ds_scale)
       except Exception:
         logger.exception("mesh %d (%s) failed -- skipping", mi, mesh_path)
         failed.append(mi)
@@ -463,7 +465,7 @@ def run(cfg):
 
 
 def _render_mesh(cfg, scene, mi, mesh_path, view_strategy, W, H, DW, DH, Lmax, tmp,
-                 ds_img, ds_pose, ds_intr, ds_img_intr, ds_depth, ds_mesh, ds_scale):
+                 ds_img, ds_pose, ds_depth_intr, ds_img_intr, ds_depth, ds_mesh, ds_scale):
   """Load, normalize and render one mesh for every view the strategy yields,
   appending a row per view to the open datasets. Raises on any Blender
   failure (bad glb, degenerate bbox, ...) so run() can skip the mesh.
@@ -501,7 +503,8 @@ def _render_mesh(cfg, scene, mi, mesh_path, view_strategy, W, H, DW, DH, Lmax, t
                                 rl, comp, DW, DH, Lmax, tmp)
 
     pose = np.array(cam.matrix_world, np.float32)
-    intr = camera_intrinsics(cam.data, DW, DH)  # matches depth_vol
+    depth_intr = camera_intrinsics(cam.data, DW, DH)  # matches depth_vol
+    image_intr = camera_intrinsics(cam.data, W, H)    # matches rgba (== depth_intr when equal res)
 
     depth_scale = 1.0
     if cfg.camera_depth_target is not None:
@@ -514,9 +517,9 @@ def _render_mesh(cfg, scene, mi, mesh_path, view_strategy, W, H, DW, DH, Lmax, t
     if ds_img is not None:
       ds_img.append(rgba)
     if ds_img_intr is not None:
-      ds_img_intr.append(camera_intrinsics(cam.data, W, H))
+      ds_img_intr.append(image_intr)
     ds_pose.append(pose)
-    ds_intr.append(intr)
+    ds_depth_intr.append(depth_intr)
     ds_depth.append(depth_vol.astype(np.float32))
     ds_mesh.append(np.int64(mi))
     ds_scale.append(np.float32(depth_scale))
