@@ -69,7 +69,9 @@ from einops import rearrange  # noqa: E402
 from omegaconf import DictConfig, OmegaConf  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
-from gs_dataset import OPENGL_TO_OPENCV, GSFixedViewsDataset, GSPairDataset, _EmptyDataset  # noqa: E402
+from gs_dataset import (  # noqa: E402
+  OPENGL_TO_OPENCV, GSFixedViewsDataset, GSPairDataset, GSViewsDataset, _EmptyDataset, split_by_mesh,
+)
 from gs_decoder import GaussianResnetDecoder, GSDecoderStack  # noqa: E402
 from gs_encoder import GSResnetEncoder  # noqa: E402
 from orbit_video import look_at_c2w, write_mp4  # noqa: E402
@@ -313,12 +315,13 @@ def compute_loss(model, item, cfg, device, window):
     "loss": loss.detach(), "l1": parts["l1"].mean().detach(), "ssim": parts["ssim"].mean().detach(),
     "mask": parts["mask"].mean().detach(), "scale_reg": scale_reg.detach(), "color_reg": color_reg.detach(),
     "loss_source": per_view[0].detach(),
-    "loss_targets_mean": (per_view[1:].mean() if n_targets > 0 else per_view[0]).detach(),
     "mean_opacity": flat["opacities"].mean().detach() if flat["opacities"].numel() else torch.zeros((), device=device),
     "mean_scale": flat["scales"].mean().detach() if flat["scales"].numel() else torch.zeros((), device=device),
     "frac_kept": torch.tensor(
       flat["means"].shape[0] / max(1, item["source"]["hit"].numel()), device=device),
   }
+  if n_targets > 0:
+    metrics["loss_targets_mean"] = per_view[1:].mean().detach()
   return loss, metrics, (pred_rgb, pred_alpha, gt_rgb, gt_alpha, gauss)
 
 
@@ -482,16 +485,19 @@ def run_validation(model, val_ds, cfg, device, window, wandb_run, step):
       _, metrics, extras = compute_loss(model, item, cfg, device, window)
       losses.append(metrics["loss"].item())
       losses_source.append(metrics["loss_source"].item())
-      losses_targets.append(metrics["loss_targets_mean"].item())
+      if "loss_targets_mean" in metrics:
+        losses_targets.append(metrics["loss_targets_mean"].item())
       if i == 0 and wandb_run is not None:
         pred_rgb, _, gt_rgb, _, gauss = extras
         log_render_panel(wandb_run, step, "val", pred_rgb, gt_rgb, gauss)
   model.train()
-  return {
+  out = {
     "val/rec_loss": float(np.mean(losses)),
     "val/loss_source": float(np.mean(losses_source)),
-    "val/loss_targets_mean": float(np.mean(losses_targets)),
   }
+  if losses_targets:
+    out["val/loss_targets_mean"] = float(np.mean(losses_targets))
+  return out
 
 
 @hydra.main(version_base=None, config_path="conf", config_name="train_gs")
@@ -515,15 +521,15 @@ def main(cfg: DictConfig) -> None:
     )
     val_ds = _EmptyDataset()
   else:
+    views_ds = GSViewsDataset(cfg.data.h5_paths, num_layers=cfg.data.num_layers)
+    train_keys, val_keys = split_by_mesh(views_ds, val_fraction=cfg.data.val_fraction, seed=cfg.train.seed)
     train_ds = GSPairDataset(
-      cfg.data.h5_paths, split="train", num_layers=cfg.data.num_layers,
-      num_target_views=cfg.data.num_target_views, val_fraction=cfg.data.val_fraction,
-      seed=cfg.train.seed,
+      views_ds, train_keys, num_target_views=cfg.data.num_target_views,
+      seed=cfg.train.seed, deterministic_targets=False,
     )
     val_ds = GSPairDataset(
-      cfg.data.h5_paths, split="val", num_layers=cfg.data.num_layers,
-      num_target_views=cfg.data.num_target_views, val_fraction=cfg.data.val_fraction,
-      seed=cfg.train.seed,
+      views_ds, val_keys, num_target_views=cfg.data.num_target_views,
+      seed=cfg.train.seed, deterministic_targets=True,
     )
   if len(train_ds) == 0:
     raise SystemExit("train split is empty -- check data.h5_paths / data.val_fraction")
@@ -630,25 +636,28 @@ def main(cfg: DictConfig) -> None:
         maybe_render_orbits(epoch, step)
 
       if step % cfg.train.log_every == 0:
+        tgt_str = f"tgt {accum_metrics['loss_targets_mean']:.5f}" if "loss_targets_mean" in accum_metrics else "tgt n/a"
         log.info(
-          "step %d/%d  loss %.5f  (l1 %.5f ssim %.5f mask %.5f)  src %.5f tgt %.5f  "
+          "step %d/%d  loss %.5f  (l1 %.5f ssim %.5f mask %.5f)  src %.5f %s  "
           "kept %.3f  grad_norm %.3f",
           step, cfg.train.max_steps, accum_loss, accum_metrics["l1"], accum_metrics["ssim"],
-          accum_metrics["mask"], accum_metrics["loss_source"], accum_metrics["loss_targets_mean"],
+          accum_metrics["mask"], accum_metrics["loss_source"], tgt_str,
           accum_metrics["frac_kept"], float(grad_norm),
         )
         if wandb_run is not None:
-          wandb_run.log({
+          log_dict = {
             "train/loss": accum_loss, "train/loss_l1": accum_metrics["l1"],
             "train/loss_ssim": accum_metrics["ssim"], "train/loss_mask": accum_metrics["mask"],
             "train/loss_scale_reg": accum_metrics["scale_reg"], "train/loss_color_reg": accum_metrics["color_reg"],
             "train/loss_source": accum_metrics["loss_source"],
-            "train/loss_targets_mean": accum_metrics["loss_targets_mean"],
             "train/mean_opacity": accum_metrics["mean_opacity"], "train/mean_scale": accum_metrics["mean_scale"],
             "train/frac_gaussians_kept": accum_metrics["frac_kept"],
             "train/grad_norm": float(grad_norm), "train/lr": sched.get_last_lr()[0],
             "train/epoch": epoch,
-          }, step=step)
+          }
+          if "loss_targets_mean" in accum_metrics:
+            log_dict["train/loss_targets_mean"] = accum_metrics["loss_targets_mean"]
+          wandb_run.log(log_dict, step=step)
 
       if cfg.val.every > 0 and step > 0 and step % cfg.val.every == 0:
         with timed(f"validation@step{step}"):
