@@ -21,9 +21,6 @@ and the splat see pixel-identical cameras.
 def _head():
   import os
   import sys
-  extra = os.environ.get("BLENDER_USER_PYTHON", "")
-  if extra.strip():
-    sys.path.append(extra)
   sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 _head(); del _head
 

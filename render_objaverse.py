@@ -19,17 +19,14 @@ Needs h5py + hydra-core in Blender's Python. Install once:
     /opt/blender/4.2/python/bin/python3.11 -m pip install \\
         --target="$BLENDER_USER_PYTHON" h5py hydra-core
 
-(the Dockerfile does this; `_head()` below puts $BLENDER_USER_PYTHON on the
-path).
+(the Dockerfile does this; a sitecustomize.py it drops into Blender's own
+site-packages puts $BLENDER_USER_PYTHON on sys.path automatically).
 """
 
-# --- let Blender's bundled Python see our extra packages + repo modules ---
+# --- let Blender's bundled Python see our repo modules ---
 def _head():
   import os
   import sys
-  extra = os.environ.get("BLENDER_USER_PYTHON", "")
-  if extra.strip():
-    sys.path.append(extra)  # append: Blender's own numpy still wins
   sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 _head(); del _head
 
