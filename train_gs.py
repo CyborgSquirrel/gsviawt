@@ -474,18 +474,24 @@ def run_validation(model, val_ds, cfg, device, window, wandb_run, step):
   if len(val_ds) == 0:
     return {}
   model.eval()
-  losses = []
+  losses, losses_source, losses_targets = [], [], []
   with torch.no_grad():
     n = min(int(cfg.val.num_scenes), len(val_ds))
     for i in range(n):
       item = val_ds[i]
       _, metrics, extras = compute_loss(model, item, cfg, device, window)
       losses.append(metrics["loss"].item())
+      losses_source.append(metrics["loss_source"].item())
+      losses_targets.append(metrics["loss_targets_mean"].item())
       if i == 0 and wandb_run is not None:
         pred_rgb, _, gt_rgb, _, gauss = extras
         log_render_panel(wandb_run, step, "val", pred_rgb, gt_rgb, gauss)
   model.train()
-  return {"val/rec_loss": float(np.mean(losses))}
+  return {
+    "val/rec_loss": float(np.mean(losses)),
+    "val/loss_source": float(np.mean(losses_source)),
+    "val/loss_targets_mean": float(np.mean(losses_targets)),
+  }
 
 
 @hydra.main(version_base=None, config_path="conf", config_name="train_gs")
