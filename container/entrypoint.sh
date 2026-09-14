@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# /app/scripts/wandb_login || true
+/app/scripts/wandb_login || true
 
 [ -d "/mounts/venv" ] && {
   rm -rf /mounts/venv/*
