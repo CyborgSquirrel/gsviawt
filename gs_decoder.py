@@ -34,6 +34,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
 
 
 def upsample(x, mode="nearest"):
@@ -113,8 +114,9 @@ class GaussianResnetDecoder(nn.Module):
     self.num_output_channels = sum(self.split_dimensions)
 
     convs = OrderedDict()
-    for i in range(4, -1, -1):
-      num_ch_in = self.num_ch_enc[-1] if i == 4 else self.num_ch_dec[i + 1]
+    top = len(self.num_ch_dec) - 1
+    for i in range(top, -1, -1):
+      num_ch_in = self.num_ch_enc[-1] if i == top else self.num_ch_dec[i + 1]
       num_ch_out = self.num_ch_dec[i]
       convs[("upconv", i, 0)] = ConvBlock(num_ch_in, num_ch_out)
 
@@ -138,7 +140,7 @@ class GaussianResnetDecoder(nn.Module):
     (GSResnetEncoder's output). Returns a dict of (B, num_layers, C, H, W):
     opacity(1), scale(3), rotation(4), sh_dc(3)[, sh_rest(K)]."""
     x = input_features[-1]
-    for i in range(4, -1, -1):
+    for i in range(len(self.num_ch_dec) - 1, -1, -1):
       x = self.convs[("upconv", i, 0)](x)
       x = upsample(x, mode=self.upsample_mode)
       if self.use_skips and i > 0:
@@ -159,14 +161,18 @@ class GaussianResnetDecoder(nn.Module):
       for name, raw in zip(field_names, layer_parts):
         per_field[name].append(raw)
 
+    def stack_layers(tensors):
+      # tensors: num_layers entries, each (B,C,H,W) -> (B,L,C,H,W)
+      return rearrange(tensors, "l b c h w -> b l c h w")
+
     out = {
-      "opacity": torch.sigmoid(torch.stack(per_field["opacity"], dim=1)),
-      "scale": torch.exp(torch.stack(per_field["scale"], dim=1)) * self.scale_lambda,
-      "rotation": F.normalize(torch.stack(per_field["rotation"], dim=1), dim=2),
-      "sh_dc": torch.stack(per_field["sh_dc"], dim=1),
+      "opacity": torch.sigmoid(stack_layers(per_field["opacity"])),
+      "scale": torch.exp(stack_layers(per_field["scale"])) * self.scale_lambda,
+      "rotation": F.normalize(stack_layers(per_field["rotation"]), dim=2),
+      "sh_dc": stack_layers(per_field["sh_dc"]),
     }
     if self.max_sh_degree != 0:
-      out["sh_rest"] = torch.stack(per_field["sh_rest"], dim=1)
+      out["sh_rest"] = stack_layers(per_field["sh_rest"])
     return out
 
 

@@ -22,7 +22,8 @@ import random
 import h5py
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from einops import rearrange
+from torch.utils.data import Dataset, random_split
 
 from util import intrinsics_name
 
@@ -132,7 +133,7 @@ def _build_item(f, path, source_view, target_views, num_layers, mesh_id, mesh_pa
 
   def to_view_dict(v, viewmat):
     return {
-      "rgb": torch.from_numpy(v["rgb"]).permute(2, 0, 1).contiguous(),   # (3,H,W)
+      "rgb": rearrange(torch.from_numpy(v["rgb"]), "h w c -> c h w").contiguous(),  # (3,H,W)
       "alpha": torch.from_numpy(v["alpha"])[None],                       # (1,H,W)
       "K_image": torch.from_numpy(v["K_image"]),                        # (3,3)
       "viewmat": torch.from_numpy(viewmat),                             # (4,4)
@@ -141,8 +142,8 @@ def _build_item(f, path, source_view, target_views, num_layers, mesh_id, mesh_pa
   return {
     "source": {
       **to_view_dict(src, viewmats[0]),
-      "xyz_cam": torch.from_numpy(xyz_cam).permute(2, 0, 1, 3).contiguous(),  # (L,H,W,3)
-      "hit": torch.from_numpy(hit).permute(2, 0, 1).contiguous(),             # (L,H,W)
+      "xyz_cam": rearrange(torch.from_numpy(xyz_cam), "h w l c -> l h w c").contiguous(),  # (L,H,W,3)
+      "hit": rearrange(torch.from_numpy(hit), "h w l -> l h w").contiguous(),              # (L,H,W)
       "K_depth": torch.from_numpy(src["K_depth"]),
       "pose_gl": torch.from_numpy(src["pose"]),          # raw camera-to-world, Blender/OpenGL
                                                            # axes -- only used to derive a stable
@@ -175,7 +176,7 @@ class GSPairDataset(Dataset):
 
   def __init__(
     self, h5_paths, split="train", num_layers=6, num_target_views=3,
-    val_fraction=0.1, seed=42,
+    val_fraction=0.1, seed=42, deterministic_targets=None,
   ):
     assert split in ("train", "val")
     self.paths = _expand_h5_paths(h5_paths)
@@ -183,6 +184,12 @@ class GSPairDataset(Dataset):
     self.num_target_views = num_target_views
     self.split = split
     self.seed = seed
+    # Whether target-view sampling is reproducible (seeded off idx) or fresh
+    # every __getitem__ call. Defaults to "val" being deterministic (stable
+    # visualizations/metrics across runs) and "train" fresh (data variety
+    # across epochs); override explicitly if you want either mode regardless
+    # of split.
+    self.deterministic_targets = (split == "val") if deterministic_targets is None else deterministic_targets
     self._handles = {}
 
     groups = {}       # (file_idx, mesh_id) -> [view_idx, ...]
@@ -199,13 +206,12 @@ class GSPairDataset(Dataset):
             mesh_paths[key] = mp.decode() if isinstance(mp, bytes) else str(mp)
 
     keys = sorted(groups)
-    rng = random.Random(seed)
     if len(keys) > 1:
-      shuffled = keys[:]
-      rng.shuffle(shuffled)
-      n_val = max(1, round(len(shuffled) * val_fraction)) if val_fraction > 0 else 0
-      val_keys = set(shuffled[:n_val])
-      chosen_groups = val_keys if split == "val" else set(shuffled[n_val:])
+      n_val = max(1, round(len(keys) * val_fraction)) if val_fraction > 0 else 0
+      n_train = len(keys) - n_val
+      generator = torch.Generator().manual_seed(seed)
+      train_subset, val_subset = random_split(keys, [n_train, n_val], generator=generator)
+      chosen_groups = set(val_subset) if split == "val" else set(train_subset)
     else:
       # single-mesh corpus: nothing to hold out at the group level -- the
       # source/target view sampling inside __getitem__ already provides
@@ -252,10 +258,17 @@ class GSPairDataset(Dataset):
     f = self._h5(file_idx)
     views = self.groups[(file_idx, mesh_id)]
 
-    rng = random.Random(f"{self.seed}_{idx}") if self.split == "val" else random.Random()
-    others = [v for v in views if v != source_view]
-    k = min(self.num_target_views, len(others))
-    target_views = rng.sample(others, k) if k > 0 else []
+    rng = random.Random(f"{self.seed}_{idx}") if self.deterministic_targets else random.Random()
+    # Sample num_target_views+1 candidates (all still <= len(views), since
+    # num_target_views <= len(views)-1) and drop source_view from that small
+    # sample instead of first filtering it out of the whole (possibly much
+    # larger) views list -- avoids an O(len(views)) scan every call.
+    k = min(self.num_target_views, len(views) - 1)
+    if k > 0:
+      sampled = rng.sample(views, k + 1)
+      target_views = [v for v in sampled if v != source_view][:k]
+    else:
+      target_views = []
 
     return _build_item(
       f, path, source_view, target_views, self.num_layers,

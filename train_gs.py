@@ -65,6 +65,7 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 import torch.nn as nn  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
+from einops import rearrange  # noqa: E402
 from omegaconf import DictConfig, OmegaConf  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
@@ -129,7 +130,7 @@ class GSModel(nn.Module):
 
     xyz_filled = torch.nan_to_num(xyz_cam, nan=0.0)
     xyz_norm = (xyz_filled - self.xyz_mean) / self.xyz_std   # (L,DH,DW,3)
-    xyz_norm = xyz_norm.permute(0, 3, 1, 2)                   # (L,3,DH,DW)
+    xyz_norm = rearrange(xyz_norm, "l h w c -> l c h w")
     valid = hit.to(xyz_norm.dtype).unsqueeze(1)               # (L,1,DH,DW)
     per_layer = torch.cat([xyz_norm, valid], dim=1).reshape(-1, dh, dw)  # (4L,DH,DW)
     return torch.cat([rgb_norm, per_layer], dim=0)            # (3+4L,DH,DW)
@@ -180,13 +181,12 @@ def flatten_gaussians(xyz_cam, hit, gauss):
   means_flat = xyz_cam.reshape(-1, 3)
   valid_flat = hit.reshape(-1)
 
-  opacity_flat = gauss["opacity"].permute(0, 2, 3, 1).reshape(-1) * valid_flat.to(gauss["opacity"].dtype)
-  scale_flat = gauss["scale"].permute(0, 2, 3, 1).reshape(-1, 3)
-  rotation_flat = gauss["rotation"].permute(0, 2, 3, 1).reshape(-1, 4)
-  sh_dc_flat = gauss["sh_dc"].permute(0, 2, 3, 1).reshape(-1, 1, 3)
+  opacity_flat = rearrange(gauss["opacity"], "l c h w -> (l h w c)") * valid_flat.to(gauss["opacity"].dtype)
+  scale_flat = rearrange(gauss["scale"], "l c h w -> (l h w) c")
+  rotation_flat = rearrange(gauss["rotation"], "l c h w -> (l h w) c")
+  sh_dc_flat = rearrange(gauss["sh_dc"], "l c h w -> (l h w) 1 c")
   if "sh_rest" in gauss:
-    k_rest = gauss["sh_rest"].shape[1] // 3
-    sh_rest_flat = gauss["sh_rest"].permute(0, 2, 3, 1).reshape(-1, k_rest, 3)
+    sh_rest_flat = rearrange(gauss["sh_rest"], "l (k c) h w -> (l h w) k c", c=3)
     colors_flat = torch.cat([sh_dc_flat, sh_rest_flat], dim=1)
   else:
     colors_flat = sh_dc_flat
@@ -219,10 +219,10 @@ def render_scene(model, item, sh_degree, device):
   flat = flatten_gaussians(xyz_cam, hit, gauss)
 
   views = [src] + item["targets"]
-  viewmats = torch.stack([v["viewmat"] for v in views]).to(device)
-  Ks = torch.stack([v["K_image"] for v in views]).to(device)
-  gt_rgb = torch.stack([v["rgb"] for v in views]).to(device).permute(0, 2, 3, 1)
-  gt_alpha = torch.stack([v["alpha"] for v in views]).to(device).permute(0, 2, 3, 1)
+  viewmats = rearrange([v["viewmat"] for v in views], "v a b -> v a b").to(device)
+  Ks = rearrange([v["K_image"] for v in views], "v a b -> v a b").to(device)
+  gt_rgb = rearrange([v["rgb"] for v in views], "v c h w -> v h w c").to(device)
+  gt_alpha = rearrange([v["alpha"] for v in views], "v c h w -> v h w c").to(device)
   ih, iw = gt_rgb.shape[1:3]
 
   pred_rgb, pred_alpha, _ = gsplat.rasterization(
@@ -266,8 +266,8 @@ def per_view_losses(pred_rgb, pred_alpha, gt_rgb, gt_alpha, window, cfg_loss):
   """pred/gt _rgb: (V,H,W,3), _alpha: (V,H,W,1). Returns (per_view (V,) total
   weighted loss, parts dict of (V,) component losses), all premultiplied by
   alpha (matches fit_gsplat.py's convention: bg stays black on both sides)."""
-  pred_c = (pred_rgb * pred_alpha).permute(0, 3, 1, 2)
-  gt_c = (gt_rgb * gt_alpha).permute(0, 3, 1, 2)
+  pred_c = rearrange(pred_rgb * pred_alpha, "v h w c -> v c h w")
+  gt_c = rearrange(gt_rgb * gt_alpha, "v h w c -> v c h w")
   l1 = (pred_c - gt_c).abs().mean(dim=(1, 2, 3))
   dssim = 1.0 - ssim_map(pred_c, gt_c, window).mean(dim=(1, 2, 3))
   mask_l1 = (pred_alpha - gt_alpha).abs().mean(dim=(1, 2, 3))
@@ -347,11 +347,13 @@ def _layer_opacity_panel(gauss):
   return np.concatenate(cols, axis=1)
 
 
-def log_val_images(wandb_run, step, pred_rgb, gt_rgb, gauss):
+def log_render_panel(wandb_run, step, tag, pred_rgb, gt_rgb, gauss):
+  """tag: e.g. "train" or "val" -- one row per rendered view (source/primary
+  first, then each target/secondary), [GT | render | |diff|] per row."""
   import wandb
   wandb_run.log({
-    "val/panel": wandb.Image(_val_panel(gt_rgb, pred_rgb), caption="GT | render | |diff|, one row per view"),
-    "val/layer_opacity": wandb.Image(_layer_opacity_panel(gauss), caption="mean opacity per layer, front layer first"),
+    f"{tag}/panel": wandb.Image(_val_panel(gt_rgb, pred_rgb), caption="GT | render | |diff|, one row per view (source first, then targets)"),
+    f"{tag}/layer_opacity": wandb.Image(_layer_opacity_panel(gauss), caption="mean opacity per layer, front layer first"),
   }, step=step)
 
 
@@ -481,7 +483,7 @@ def run_validation(model, val_ds, cfg, device, window, wandb_run, step):
       losses.append(metrics["loss"].item())
       if i == 0 and wandb_run is not None:
         pred_rgb, _, gt_rgb, _, gauss = extras
-        log_val_images(wandb_run, step, pred_rgb, gt_rgb, gauss)
+        log_render_panel(wandb_run, step, "val", pred_rgb, gt_rgb, gauss)
   model.train()
   return {"val/rec_loss": float(np.mean(losses))}
 
@@ -571,14 +573,24 @@ def main(cfg: DictConfig) -> None:
       return
     model.eval()
     with timed(f"orbit_preview@epoch{epoch}"):
-      for tag, item in (("orbit/train", orbit_train_item), ("orbit/val", orbit_val_item)):
+      for tag, item in (("train", orbit_train_item), ("val", orbit_val_item)):
         if item is None:
           continue
         frames = render_orbit(model, item, cfg, device)
         if frames is None:
-          log.warning("%s: source view seeded zero Gaussians, skipping orbit", tag)
+          log.warning("orbit/%s: source view seeded zero Gaussians, skipping orbit", tag)
         elif wandb_run is not None:
-          log_orbit_video(wandb_run, step, tag, frames, cfg.orbit.fps, cfg.orbit.crf, orbit_workdir)
+          log_orbit_video(wandb_run, step, f"orbit/{tag}", frames, cfg.orbit.fps, cfg.orbit.crf, orbit_workdir)
+        # Also log a static [GT | render | |diff|] panel for the source
+        # (primary) view and every target (secondary) view of this same
+        # fixed item, on the same cheap cadence -- covers the case with no
+        # real val split (e.g. single-batch overfit mode), where
+        # run_validation never fires.
+        if wandb_run is not None:
+          with torch.no_grad():
+            _, _, extras = compute_loss(model, item, cfg, device, window)
+          pred_rgb, _, gt_rgb, _, gauss = extras
+          log_render_panel(wandb_run, step, tag, pred_rgb, gt_rgb, gauss)
     model.train()
 
   data_iter = iter(train_loader)
