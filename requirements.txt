@@ -15,6 +15,9 @@ tqdm
 jupyter
 ipython
 
+# train_gs.py: experiment tracking
+wandb
+
 # Hydra
 hydra-core
 hydra-joblib-launcher

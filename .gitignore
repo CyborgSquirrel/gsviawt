@@ -35,3 +35,6 @@ data/
 # Hydra
 outputs/
 multirun/
+
+# wandb
+wandb/
