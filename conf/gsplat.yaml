@@ -55,6 +55,26 @@ datasets:
   image_intrinsics: image_intrinsics    # matches images (photometric-loss resolution)
   pose: camera_pose
 
+wandb:
+  project: gsviawt
+  mode: disabled              # online | offline | disabled
+  tags: [fit-gsplat]
+  name: null
+
+# Turntable orbit preview, logged as wandb.Video (needs wandb.mode != disabled).
+# Anchored to the primary view's own actual capture distance (scene_scale),
+# NOT an auto-fit/bounding-sphere distance -- this optimization has no floor
+# forcing Gaussian scale to stay above ~1 pixel of spacing, so a
+# tighter-than-capture orbit can expose a false "gaps" artifact. See
+# fit_gsplat.py's render_orbit_frames docstring.
+orbit:
+  enabled: true
+  every: 500                 # iterations between orbit renders (0 effectively via enabled=false)
+  num_frames: 24
+  fps: 12
+  crf: 28
+  elevation_deg: 20.0
+
 hydra:
   job:
     chdir: false          # stay in cwd; output paths are absolute / input-relative

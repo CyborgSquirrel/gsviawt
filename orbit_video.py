@@ -168,12 +168,15 @@ def resolve_mesh_path(cfg):
 # camera path
 # ---------------------------------------------------------------------------
 
-def look_at_c2w(eye, target):
+def look_at_c2w(eye, target, up=WORLD_UP):
   """OpenGL camera-to-world (X right, Y up, -Z forward) looking from `eye` at
-  `target`, world up = +Z. Matches render_objaverse's `to_track_quat('-Z','Y')`."""
+  `target`, world up = +Z by default. Matches render_objaverse's
+  `to_track_quat('-Z','Y')`. `up` can be overridden for callers whose "world"
+  isn't Blender's Z-up frame (e.g. train_gs.py's orbit preview, which works
+  entirely within an arbitrary camera's own frame)."""
   z = eye - target                                        # camera +Z points back
   z /= np.linalg.norm(z)
-  up = WORLD_UP if abs(np.dot(z, WORLD_UP)) < 0.999 else np.array([0.0, 1.0, 0.0], np.float32)
+  up = up if abs(np.dot(z, up)) < 0.999 else np.array([0.0, 1.0, 0.0], np.float32)
   x = np.cross(up, z); x /= np.linalg.norm(x)
   y = np.cross(z, x)
   c2w = np.eye(4, dtype=np.float32)
