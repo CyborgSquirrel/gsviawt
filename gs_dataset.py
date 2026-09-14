@@ -7,11 +7,11 @@ Reads render_objaverse.py-schema HDF5 files (`images`, `depth_peel`,
     no mesh-group index is cached, no sampling, no splitting.
   - split_by_mesh: a plain function computing a train/val split over the
     distinct mesh groups found in a GSViewsDataset (whole meshes, never
-    split across), grouped on the fly from its `items`.
-  - GSPairDataset: wraps a GSViewsDataset restricted to a set of mesh
-    groups (e.g. one half of a split_by_mesh result), grouping its own
-    restricted items by mesh on the fly, and yielding items of one source
-    view + up to `num_target_views` other views of the same mesh.
+    split across), returned as a pair of torch.utils.data.Subset objects.
+  - GSPairDataset: wraps a Subset of a GSViewsDataset (e.g. one half of a
+    split_by_mesh result), grouping the subset's own items by mesh on the
+    fly, and yielding items of one source view + up to `num_target_views`
+    other views of the same mesh.
 
 All geometry stays in the SOURCE camera's own frame -- never Blender world
 space. The source view's point cloud is unprojected directly into its own
@@ -31,7 +31,7 @@ import h5py
 import numpy as np
 import torch
 from einops import rearrange
-from torch.utils.data import Dataset, random_split
+from torch.utils.data import Dataset, Subset, random_split
 
 from util import intrinsics_name
 
@@ -220,47 +220,56 @@ class GSViewsDataset(Dataset):
 
 
 def split_by_mesh(views_ds, val_fraction=0.1, seed=42):
-  """Splits `views_ds`'s MESH GROUPS (not individual views) into train/val
-  key lists, via torch's random_split over the sorted group keys, so whole
-  meshes never leak across the split. Mesh keys are derived on the fly from
-  `views_ds.items` (see GSViewsDataset's docstring for why). Pass the
-  result to GSPairDataset's `mesh_keys` argument.
+  """Splits `views_ds` into train/val torch.utils.data.Subset objects, at
+  the MESH-GROUP level (whole meshes, never split a mesh's views across
+  train/val). Collects a (file_idx, mesh_id) -> [dataset index, ...] dict
+  by iterating `views_ds.items` (indices into `views_ds`, NOT view_idx --
+  that's what Subset needs), splits the dict's keys via torch's
+  random_split, then collects each split's dataset indices and wraps them
+  in a Subset.
 
   A single-mesh corpus can't be split at the group level (nothing to hold
-  out) -- returns (all keys, []) regardless of val_fraction; the view-level
-  source/target sampling inside GSPairDataset already provides variety
-  there (the expected setting is val_fraction=0, pure overfit)."""
-  keys = sorted({(file_idx, mesh_id) for file_idx, mesh_id, _ in views_ds.items})
+  out) -- returns (Subset(views_ds, <all indices>), Subset(views_ds, []))
+  regardless of val_fraction; the view-level source/target sampling inside
+  GSPairDataset already provides variety there (the expected setting is
+  val_fraction=0, pure overfit)."""
+  groups = {}   # (file_idx, mesh_id) -> [dataset index, ...]
+  for i, (file_idx, mesh_id, _) in enumerate(views_ds.items):
+    groups.setdefault((file_idx, mesh_id), []).append(i)
+
+  keys = sorted(groups)
   if len(keys) <= 1:
-    return keys, []
+    return Subset(views_ds, list(range(len(views_ds)))), Subset(views_ds, [])
+
   n_val = max(1, round(len(keys) * val_fraction)) if val_fraction > 0 else 0
   n_train = len(keys) - n_val
   generator = torch.Generator().manual_seed(seed)
-  train_subset, val_subset = random_split(keys, [n_train, n_val], generator=generator)
-  return list(train_subset), list(val_subset)
+  train_keys, val_keys = random_split(keys, [n_train, n_val], generator=generator)
+
+  train_indices = [i for k in train_keys for i in groups[k]]
+  val_indices = [i for k in val_keys for i in groups[k]]
+  return Subset(views_ds, train_indices), Subset(views_ds, val_indices)
 
 
 class GSPairDataset(Dataset):
-  """Wraps a GSViewsDataset, restricted to `mesh_keys` (compute train/val
-  splits with split_by_mesh above -- this class doesn't split anything
-  itself). One item = one (fixed) source view among those groups, indexed
-  directly like Flash3D's own RealEstate10K dataset (index -> a specific
-  source frame), plus up to `num_target_views` OTHER views of the same mesh
-  sampled given that source (Flash3D samples target frames near the source
-  frame in a video; we have no frame order, so target views are just drawn
-  from the rest of the same mesh's views). `len(dataset)` is therefore the
-  number of VIEWS in `mesh_keys`, not the number of meshes -- one epoch =
-  every view in the split used as source exactly once.
+  """Wraps a torch.utils.data.Subset of a GSViewsDataset (see split_by_mesh
+  above -- this class doesn't split anything itself). One item = one
+  (fixed) source view among the subset's views, indexed directly like
+  Flash3D's own RealEstate10K dataset (index -> a specific source frame),
+  plus up to `num_target_views` OTHER views of the same mesh sampled given
+  that source (Flash3D samples target frames near the source frame in a
+  video; we have no frame order, so target views are just drawn from the
+  rest of the same mesh's views). `len(dataset)` is therefore the number of
+  VIEWS in the subset, not the number of meshes -- one epoch = every view
+  in the subset used as source exactly once.
 
   Mesh grouping (which views are siblings of a given source view) is
-  derived once here at construction, from `views_ds.items` restricted to
-  `mesh_keys` -- not read off a persistent index on GSViewsDataset (see its
-  docstring). Still O(1) per __getitem__ lookup; just computed locally
-  instead of being someone else's cached state.
+  derived once here at construction, from the subset's own items -- not
+  read off any persistent index on GSViewsDataset (see its docstring).
   """
 
-  def __init__(self, views_ds, mesh_keys, num_target_views=3, seed=42, deterministic_targets=False):
-    self.views_ds = views_ds
+  def __init__(self, views_subset, num_target_views=3, seed=42, deterministic_targets=False):
+    self.views_ds = views_subset.dataset
     self.num_target_views = num_target_views
     self.seed = seed
     # Whether target-view sampling is reproducible (seeded off idx) or fresh
@@ -270,19 +279,17 @@ class GSPairDataset(Dataset):
     # see train_gs.py's main().
     self.deterministic_targets = deterministic_targets
 
-    chosen = set(mesh_keys)
-    self.groups = {}   # (file_idx, mesh_id) -> [view_idx, ...], this split only
-    self.items = []    # (file_idx, mesh_id, view_idx), this split only
-    for file_idx, mesh_id, view_idx in views_ds.items:
+    self.groups = {}   # (file_idx, mesh_id) -> [view_idx, ...], this subset only
+    self.items = []    # (file_idx, mesh_id, view_idx), this subset only
+    for i in range(len(views_subset)):
+      file_idx, mesh_id, view_idx = views_subset[i]
       key = (file_idx, mesh_id)
-      if key not in chosen:
-        continue
       self.groups.setdefault(key, []).append(view_idx)
       self.items.append((file_idx, mesh_id, view_idx))
 
     log.info(
       "GSPairDataset: %d mesh groups / %d views selected (of %d views total in the underlying GSViewsDataset)",
-      len(chosen), len(self.items), len(views_ds),
+      len(self.groups), len(self.items), len(self.views_ds),
     )
 
   def __len__(self):
