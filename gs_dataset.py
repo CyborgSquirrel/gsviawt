@@ -3,13 +3,15 @@
 Reads render_objaverse.py-schema HDF5 files (`images`, `depth_peel`,
 `depth_intrinsics`/`image_intrinsics` (or legacy `camera_intrinsics`),
 `camera_pose`, `mesh_index`). Three pieces, kept deliberately separate:
-  - GSViewsDataset: flat catalog of every (file_idx, view_idx), plus the
-    mesh-group structure -- no sampling, no splitting.
-  - split_by_mesh: a plain function computing a train/val split over a
-    GSViewsDataset's mesh groups (whole meshes, never split across).
+  - GSViewsDataset: flat catalog of every (file_idx, mesh_id, view_idx) --
+    no mesh-group index is cached, no sampling, no splitting.
+  - split_by_mesh: a plain function computing a train/val split over the
+    distinct mesh groups found in a GSViewsDataset (whole meshes, never
+    split across), grouped on the fly from its `items`.
   - GSPairDataset: wraps a GSViewsDataset restricted to a set of mesh
-    groups (e.g. one half of a split_by_mesh result), yielding items of one
-    source view + up to `num_target_views` other views of the same mesh.
+    groups (e.g. one half of a split_by_mesh result), grouping its own
+    restricted items by mesh on the fly, and yielding items of one source
+    view + up to `num_target_views` other views of the same mesh.
 
 All geometry stays in the SOURCE camera's own frame -- never Blender world
 space. The source view's point cloud is unprojected directly into its own
@@ -165,14 +167,14 @@ def _build_item(f, path, source_view, target_views, num_layers, mesh_id, mesh_pa
 
 
 class GSViewsDataset(Dataset):
-  """Flat, ungrouped catalog of every view across `h5_paths`: one item per
-  (file_idx, view_idx) tuple. Holds the mesh-group structure (which views
-  belong to which mesh) and lazy per-process h5py.File handles, but does
-  NOT do any source/target sampling or train/val splitting -- that's
-  GSPairDataset (wraps this, does the sampling given a chosen set of mesh
-  groups) and split_by_mesh (a plain function that computes a train/val
-  split over this dataset's mesh groups) below, kept deliberately separate
-  so the split logic isn't tangled up with the dataset class itself.
+  """Flat catalog of every view across `h5_paths`: one item per
+  (file_idx, mesh_id, view_idx) tuple -- `items` is the single source of
+  truth for this dataset's contents, nothing else is cached from it. In
+  particular, no view->mesh-group index is precomputed/stored here: mesh
+  grouping is only ever needed transiently (to compute a split, or to find
+  a source view's sibling views), so split_by_mesh and GSPairDataset below
+  each derive it on the fly, locally, from `items` -- avoids keeping a
+  derived index in sync with `items` for its own sake.
   """
 
   def __init__(self, h5_paths, num_layers=6):
@@ -180,32 +182,22 @@ class GSViewsDataset(Dataset):
     self.num_layers = num_layers
     self._handles = {}
 
-    self.groups = {}      # (file_idx, mesh_id) -> [view_idx, ...]
-    self.mesh_paths = {}  # (file_idx, mesh_id) -> str
-    self.items = []       # (file_idx, view_idx), flat, one per view
-    self.group_of = {}    # (file_idx, view_idx) -> (file_idx, mesh_id)
+    self.mesh_paths = {}  # (file_idx, mesh_id) -> str -- static per-mesh metadata,
+                            # unrelated to any grouping/split, fine to cache as-is.
+    self.items = []        # (file_idx, mesh_id, view_idx), flat, one per view
     for file_idx, path in enumerate(self.paths):
       with h5py.File(path, "r") as f:
         mesh_index = f["mesh_index"][:]
         paths_ds = f["mesh_paths"][:] if "mesh_paths" in f else None
         for view_idx, mi in enumerate(mesh_index):
-          key = (file_idx, int(mi))
-          self.groups.setdefault(key, []).append(view_idx)
-          item = (file_idx, view_idx)
-          self.items.append(item)
-          self.group_of[item] = key
+          mesh_id = int(mi)
+          self.items.append((file_idx, mesh_id, view_idx))
+          key = (file_idx, mesh_id)
           if paths_ds is not None and key not in self.mesh_paths:
-            mp = paths_ds[int(mi)]
+            mp = paths_ds[mesh_id]
             self.mesh_paths[key] = mp.decode() if isinstance(mp, bytes) else str(mp)
 
-    log.info(
-      "GSViewsDataset: %d files, %d mesh groups, %d views total",
-      len(self.paths), len(self.groups), len(self.items),
-    )
-
-  def mesh_keys(self):
-    """Sorted list of every (file_idx, mesh_id) group present."""
-    return sorted(self.groups)
+    log.info("GSViewsDataset: %d files, %d views total", len(self.paths), len(self.items))
 
   def __len__(self):
     return len(self.items)
@@ -221,23 +213,24 @@ class GSViewsDataset(Dataset):
     return h
 
   def __getitem__(self, idx):
-    """Returns the raw (file_idx, view_idx) tuple -- a single view has no
-    meaningful source/target structure on its own; GSPairDataset does the
-    actual h5 reading, via this dataset's groups/_h5()."""
+    """Returns the raw (file_idx, mesh_id, view_idx) tuple -- a single view
+    has no meaningful source/target structure on its own; GSPairDataset
+    does the actual h5 reading, via this dataset's _h5()."""
     return self.items[idx]
 
 
 def split_by_mesh(views_ds, val_fraction=0.1, seed=42):
   """Splits `views_ds`'s MESH GROUPS (not individual views) into train/val
   key lists, via torch's random_split over the sorted group keys, so whole
-  meshes never leak across the split. Pass the result to GSPairDataset's
-  `mesh_keys` argument.
+  meshes never leak across the split. Mesh keys are derived on the fly from
+  `views_ds.items` (see GSViewsDataset's docstring for why). Pass the
+  result to GSPairDataset's `mesh_keys` argument.
 
   A single-mesh corpus can't be split at the group level (nothing to hold
   out) -- returns (all keys, []) regardless of val_fraction; the view-level
   source/target sampling inside GSPairDataset already provides variety
   there (the expected setting is val_fraction=0, pure overfit)."""
-  keys = views_ds.mesh_keys()
+  keys = sorted({(file_idx, mesh_id) for file_idx, mesh_id, _ in views_ds.items})
   if len(keys) <= 1:
     return keys, []
   n_val = max(1, round(len(keys) * val_fraction)) if val_fraction > 0 else 0
@@ -258,6 +251,12 @@ class GSPairDataset(Dataset):
   from the rest of the same mesh's views). `len(dataset)` is therefore the
   number of VIEWS in `mesh_keys`, not the number of meshes -- one epoch =
   every view in the split used as source exactly once.
+
+  Mesh grouping (which views are siblings of a given source view) is
+  derived once here at construction, from `views_ds.items` restricted to
+  `mesh_keys` -- not read off a persistent index on GSViewsDataset (see its
+  docstring). Still O(1) per __getitem__ lookup; just computed locally
+  instead of being someone else's cached state.
   """
 
   def __init__(self, views_ds, mesh_keys, num_target_views=3, seed=42, deterministic_targets=False):
@@ -272,7 +271,14 @@ class GSPairDataset(Dataset):
     self.deterministic_targets = deterministic_targets
 
     chosen = set(mesh_keys)
-    self.items = [item for item in views_ds.items if views_ds.group_of[item] in chosen]
+    self.groups = {}   # (file_idx, mesh_id) -> [view_idx, ...], this split only
+    self.items = []    # (file_idx, mesh_id, view_idx), this split only
+    for file_idx, mesh_id, view_idx in views_ds.items:
+      key = (file_idx, mesh_id)
+      if key not in chosen:
+        continue
+      self.groups.setdefault(key, []).append(view_idx)
+      self.items.append((file_idx, mesh_id, view_idx))
 
     log.info(
       "GSPairDataset: %d mesh groups / %d views selected (of %d views total in the underlying GSViewsDataset)",
@@ -283,9 +289,8 @@ class GSPairDataset(Dataset):
     return len(self.items)
 
   def __getitem__(self, idx):
-    file_idx, source_view = self.items[idx]
-    mesh_key = self.views_ds.group_of[(file_idx, source_view)]
-    views = self.views_ds.groups[mesh_key]
+    file_idx, mesh_id, source_view = self.items[idx]
+    views = self.groups[(file_idx, mesh_id)]
     path = self.views_ds.paths[file_idx]
     f = self.views_ds._h5(file_idx)
 
@@ -303,7 +308,7 @@ class GSPairDataset(Dataset):
 
     return _build_item(
       f, path, source_view, target_views, self.views_ds.num_layers,
-      mesh_key[1], self.views_ds.mesh_paths.get(mesh_key, ""),
+      mesh_id, self.views_ds.mesh_paths.get((file_idx, mesh_id), ""),
     )
 
 
