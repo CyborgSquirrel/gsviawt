@@ -441,20 +441,20 @@ def write_mp4(frames, path, fps, crf):
 def render_orbit_frames(params, K_ref, dist, width, height, device, num_frames=24, elevation_deg=20.0):
   """Renders a turntable orbit around the world origin at radius `dist`
   (the primary view's own capture distance), reusing this module's own
-  `render()`. Returns a list of (H,W,3) uint8 frames."""
+  `render()`. Yields (H,W,3) uint8 frames one at a time (one gsplat call per
+  frame, rather than batching all num_frames cameras into one call) to keep
+  peak memory bounded regardless of num_frames -- write_mp4 consumes frames
+  one at a time anyway, so nothing needs the full orbit in memory at once."""
   elev = np.radians(float(elevation_deg))
   azimuths = np.linspace(0.0, 2 * np.pi, int(num_frames), endpoint=False)
-  poses = []
+  K_t = torch.from_numpy(K_ref[None]).to(device)
   for az in azimuths:
     d = np.array([np.cos(elev) * np.cos(az), np.cos(elev) * np.sin(az), np.sin(elev)], np.float32)
-    poses.append(look_at_c2w(d * dist, np.zeros(3, np.float32)))
-  poses = np.stack(poses).astype(np.float32)
-  viewmats = torch.from_numpy(make_viewmats(poses)).to(device)
-  Ks = torch.from_numpy(np.tile(K_ref[None], (len(poses), 1, 1))).to(device)
-  with torch.no_grad():
-    rgb, alpha = render(params, viewmats, Ks, width, height)
-  frames = (rgb.clamp(0.0, 1.0).cpu().numpy() * 255).astype(np.uint8)
-  return [frames[i] for i in range(frames.shape[0])]
+    pose = look_at_c2w(d * dist, np.zeros(3, np.float32))
+    viewmat = torch.from_numpy(make_viewmats(pose[None])).to(device)
+    with torch.no_grad():
+      rgb, _ = render(params, viewmat, K_t, width, height)
+    yield (rgb[0].clamp(0.0, 1.0).cpu().numpy() * 255).astype(np.uint8)
 
 
 def log_orbit_video(wandb_run, step, frames, fps, crf, workdir):
