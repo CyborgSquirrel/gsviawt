@@ -74,6 +74,7 @@ from gs_dataset import (  # noqa: E402
 )
 from gs_decoder import GaussianResnetDecoder, GSDecoderStack  # noqa: E402
 from gs_encoder import GSResnetEncoder  # noqa: E402
+from fit_gsplat import SH_C0  # noqa: E402
 from orbit_video import look_at_c2w, write_mp4  # noqa: E402
 from util import timed  # noqa: E402
 
@@ -203,14 +204,13 @@ def flatten_gaussians(xyz_cam, hit, gauss):
   }
 
 
-def render_scene(model, item, sh_degree, device):
-  """Runs the model on `item`'s source view and renders source+targets in
-  one gsplat call. Returns (pred_rgb, pred_alpha, gt_rgb, gt_alpha, flat,
-  gauss): the first four are (V,H,W,3)/(V,H,W,1), `flat` is
-  flatten_gaussians' output, `gauss` is the raw (L,C,H,W) per-layer dict
-  (for validation visualizations)."""
-  import gsplat
-
+def run_model_source(model, item, device):
+  """Runs the model on `item`'s source view once. Returns (gauss, hit, flat):
+  `gauss` is the raw (L,C,H,W) per-layer decoder output dict, `hit` is
+  (L,H,W) bool, `flat` is flatten_gaussians' output -- shared by both the
+  photometric render path and the direct-parameter-loss path below (see
+  compute_loss), computed exactly once regardless of which (or both) are
+  active this step."""
   src = item["source"]
   rgb = src["rgb"].to(device)
   xyz_cam = src["xyz_cam"].to(device)
@@ -219,8 +219,18 @@ def render_scene(model, item, sh_degree, device):
 
   gauss = model(rgb, xyz_cam, hit, fx)
   flat = flatten_gaussians(xyz_cam, hit, gauss)
+  return gauss, hit, flat
 
-  views = [src] + item["targets"]
+
+def render_photometric(item, flat, sh_degree, device):
+  """Renders source+targets in one gsplat call -- the actually-expensive
+  part of what used to be render_scene, split out so it can be skipped
+  entirely when no photometric loss term is active this step (see
+  compute_loss's `need_photo` gate). Returns (pred_rgb, pred_alpha, gt_rgb,
+  gt_alpha), all (V,H,W,3)/(V,H,W,1)."""
+  import gsplat
+
+  views = [item["source"]] + item["targets"]
   viewmats = rearrange([v["viewmat"] for v in views], "v a b -> v a b").to(device)
   Ks = rearrange([v["K_image"] for v in views], "v a b -> v a b").to(device)
   gt_rgb = rearrange([v["rgb"] for v in views], "v c h w -> v h w c").to(device)
@@ -233,7 +243,7 @@ def render_scene(model, item, sh_degree, device):
     viewmats=viewmats, Ks=Ks, width=int(iw), height=int(ih),
     sh_degree=sh_degree, render_mode="RGB", packed=True,
   )
-  return pred_rgb.clamp(0.0, 1.0), pred_alpha.clamp(0.0, 1.0), gt_rgb, gt_alpha, flat, gauss
+  return pred_rgb.clamp(0.0, 1.0), pred_alpha.clamp(0.0, 1.0), gt_rgb, gt_alpha
 
 
 # ---------------------------------------------------------------------------
@@ -279,11 +289,80 @@ def per_view_losses(pred_rgb, pred_alpha, gt_rgb, gt_alpha, window, cfg_loss):
   return per_view, {"l1": l1, "ssim": dssim, "mask": mask_l1}
 
 
-def compute_loss(model, item, cfg, device, window):
-  pred_rgb, pred_alpha, gt_rgb, gt_alpha, flat, gauss = render_scene(
-    model, item, cfg.model.max_sh_degree, device)
-  per_view, parts = per_view_losses(pred_rgb, pred_alpha, gt_rgb, gt_alpha, window, cfg.loss)
-  loss = per_view.mean()
+def compute_direct_loss(gauss, gt, hit, cfg_loss, device):
+  """Direct per-pixel supervision of the model's own predicted Gaussian
+  params against a fit_gsplat.py ground-truth grid (gs_dataset's
+  _load_ground_truth output -- rotation already converted into the source
+  camera's own frame, positions never compared since they're fixed to the
+  same point cloud by construction). `gauss`: raw decoder output, each
+  (L,C,H,W). `hit`: (L,H,W) bool. Returns (total, parts) -- `parts` only has
+  keys for fields whose weight is actually nonzero (omit-if-skipped, same
+  convention as the rest of this file's metrics dicts)."""
+  mask = hit & gt["valid"].to(device)
+  parts = {}
+  total = torch.zeros((), device=device)
+  if not mask.any():
+    return total, parts
+
+  eps = 1e-6
+  if cfg_loss.direct_opacity_weight > 0:
+    opacity_pred = rearrange(gauss["opacity"], "l c h w -> l h w c")[..., 0]
+    parts["opacity"] = (opacity_pred - gt["opacity"].to(device)).abs()[mask].mean()
+    total = total + cfg_loss.direct_opacity_weight * parts["opacity"]
+
+  if cfg_loss.direct_scale_weight > 0:
+    # Log-space: both sides are already absolute world-unit sizes (see
+    # GSModel.forward's pixel-relative scale transform / gs_dataset's
+    # _load_ground_truth), and scale is strictly positive/multiplicative,
+    # so a linear L1 would let a few large Gaussians dominate the loss.
+    scale_pred = rearrange(gauss["scale"], "l c h w -> l h w c")
+    log_diff = torch.log(scale_pred.clamp_min(eps)) - torch.log(gt["scale"].to(device).clamp_min(eps))
+    parts["scale"] = log_diff.abs()[mask].mean()
+    total = total + cfg_loss.direct_scale_weight * parts["scale"]
+
+  if cfg_loss.direct_rotation_weight > 0:
+    # Sign-invariant: q and -q represent the same rotation (quaternion
+    # double-cover), a naive L1/L2 would be wrong on that half of cases.
+    rot_pred = rearrange(gauss["rotation"], "l c h w -> l h w c")
+    dot = (rot_pred * gt["rotation"].to(device)).sum(-1).abs().clamp(max=1.0)
+    parts["rotation"] = (1.0 - dot)[mask].mean()
+    total = total + cfg_loss.direct_rotation_weight * parts["rotation"]
+
+  if cfg_loss.direct_color_weight > 0:
+    # fit_gsplat.py has no SH>0 -- its ground truth is flat RGB, comparable
+    # to our sh_dc via SH degree-0 evaluation. Only sh_dc gets a gradient
+    # from this; sh_rest has no ground-truth signal in this source at all.
+    shdc_pred = rearrange(gauss["sh_dc"], "l c h w -> l h w c")
+    color_pred = SH_C0 * shdc_pred + 0.5
+    parts["color"] = (color_pred - gt["color"].to(device)).abs()[mask].mean()
+    total = total + cfg_loss.direct_color_weight * parts["color"]
+
+  return total, parts
+
+
+def compute_loss(model, item, cfg, device, window, force_render=False):
+  gauss, hit, flat = run_model_source(model, item, device)
+
+  need_photo = (force_render or cfg.loss.l1_weight > 0
+                or cfg.loss.ssim_weight > 0 or cfg.loss.mask_weight > 0)
+  need_direct = (cfg.loss.direct_opacity_weight > 0 or cfg.loss.direct_scale_weight > 0
+                 or cfg.loss.direct_rotation_weight > 0 or cfg.loss.direct_color_weight > 0)
+
+  loss = torch.zeros((), device=device)
+  pred_rgb = pred_alpha = gt_rgb = gt_alpha = None
+  metrics = {}
+
+  if need_photo:
+    pred_rgb, pred_alpha, gt_rgb, gt_alpha = render_photometric(item, flat, cfg.model.max_sh_degree, device)
+    per_view, parts = per_view_losses(pred_rgb, pred_alpha, gt_rgb, gt_alpha, window, cfg.loss)
+    loss = loss + per_view.mean()
+    metrics["l1"] = parts["l1"].mean().detach()
+    metrics["ssim"] = parts["ssim"].mean().detach()
+    metrics["mask"] = parts["mask"].mean().detach()
+    metrics["loss_source"] = per_view[0].detach()
+    n_targets = per_view.shape[0] - 1
+    if n_targets > 0:
+      metrics["loss_targets_mean"] = per_view[1:].mean().detach()
 
   scale_reg = torch.zeros((), device=device)
   if cfg.loss.scale_reg_weight > 0:
@@ -310,18 +389,24 @@ def compute_loss(model, item, cfg, device, window):
       color_reg = big_color.mean()
       loss = loss + cfg.loss.color_reg_weight * color_reg
 
-  n_targets = per_view.shape[0] - 1
-  metrics = {
-    "loss": loss.detach(), "l1": parts["l1"].mean().detach(), "ssim": parts["ssim"].mean().detach(),
-    "mask": parts["mask"].mean().detach(), "scale_reg": scale_reg.detach(), "color_reg": color_reg.detach(),
-    "loss_source": per_view[0].detach(),
-    "mean_opacity": flat["opacities"].mean().detach() if flat["opacities"].numel() else torch.zeros((), device=device),
-    "mean_scale": flat["scales"].mean().detach() if flat["scales"].numel() else torch.zeros((), device=device),
-    "frac_kept": torch.tensor(
-      flat["means"].shape[0] / max(1, item["source"]["hit"].numel()), device=device),
-  }
-  if n_targets > 0:
-    metrics["loss_targets_mean"] = per_view[1:].mean().detach()
+  if need_direct:
+    gt = item.get("ground_truth")
+    if gt is None:
+      raise ValueError(
+        "loss.direct_*_weight > 0 but item has no 'ground_truth' -- set data.ground_truth_h5")
+    direct_total, direct_parts = compute_direct_loss(gauss, gt, hit, cfg.loss, device)
+    loss = loss + direct_total
+    for k, v in direct_parts.items():
+      metrics[f"direct_{k}"] = v.detach()
+
+  metrics["loss"] = loss.detach()
+  metrics["scale_reg"] = scale_reg.detach()
+  metrics["color_reg"] = color_reg.detach()
+  metrics["mean_opacity"] = flat["opacities"].mean().detach() if flat["opacities"].numel() else torch.zeros((), device=device)
+  metrics["mean_scale"] = flat["scales"].mean().detach() if flat["scales"].numel() else torch.zeros((), device=device)
+  metrics["frac_kept"] = torch.tensor(
+    flat["means"].shape[0] / max(1, item["source"]["hit"].numel()), device=device)
+
   return loss, metrics, (pred_rgb, pred_alpha, gt_rgb, gt_alpha, gauss)
 
 
@@ -482,7 +567,7 @@ def run_validation(model, val_ds, cfg, device, window, wandb_run, step):
     n = min(int(cfg.val.num_scenes), len(val_ds))
     for i in range(n):
       item = val_ds[i]
-      _, metrics, extras = compute_loss(model, item, cfg, device, window)
+      _, metrics, extras = compute_loss(model, item, cfg, device, window, force_render=True)
       losses.append(metrics["loss"].item())
       losses_source.append(metrics["loss_source"].item())
       if "loss_targets_mean" in metrics:
@@ -508,6 +593,13 @@ def main(cfg: DictConfig) -> None:
   if device != cfg.train.device:
     log.warning("cuda not available, falling back to cpu")
 
+  if cfg.data.ground_truth_h5 is not None and cfg.data.fixed_source_view is None:
+    raise SystemExit("data.ground_truth_h5 requires data.fixed_source_view (single-fixed-view scope only)")
+  direct_enabled = any(cfg.loss[k] > 0 for k in (
+    "direct_opacity_weight", "direct_scale_weight", "direct_rotation_weight", "direct_color_weight"))
+  if direct_enabled and cfg.data.ground_truth_h5 is None:
+    raise SystemExit("loss.direct_*_weight > 0 requires data.ground_truth_h5 to be set")
+
   if cfg.data.fixed_source_view is not None:
     # Single-batch overfit mode (fit_gsplat.py's primary/secondary terms
     # applied here): the exact same source+target views every step, no
@@ -518,6 +610,7 @@ def main(cfg: DictConfig) -> None:
     train_ds = GSFixedViewsDataset(
       h5_path, source_view=cfg.data.fixed_source_view,
       target_views=list(cfg.data.fixed_target_views), num_layers=cfg.data.num_layers,
+      ground_truth_h5=cfg.data.ground_truth_h5,
     )
     val_ds = _EmptyDataset()
   else:
@@ -605,7 +698,7 @@ def main(cfg: DictConfig) -> None:
         # run_validation never fires.
         if wandb_run is not None:
           with torch.no_grad():
-            _, _, extras = compute_loss(model, item, cfg, device, window)
+            _, _, extras = compute_loss(model, item, cfg, device, window, force_render=True)
           pred_rgb, _, gt_rgb, _, gauss = extras
           log_render_panel(wandb_run, step, tag, pred_rgb, gt_rgb, gauss)
     model.train()
@@ -641,27 +734,48 @@ def main(cfg: DictConfig) -> None:
         maybe_render_orbits(epoch, step)
 
       if step % cfg.train.log_every == 0:
+        if "l1" in accum_metrics:
+          photo_str = (
+            f"(l1 {accum_metrics['l1']:.5f} ssim {accum_metrics['ssim']:.5f} "
+            f"mask {accum_metrics['mask']:.5f})  src {accum_metrics['loss_source']:.5f}"
+          )
+        else:
+          photo_str = "(photometric off)"
         tgt_str = f"tgt {accum_metrics['loss_targets_mean']:.5f}" if "loss_targets_mean" in accum_metrics else "tgt n/a"
+        direct_str = "  ".join(
+          f"direct_{k} {accum_metrics[f'direct_{k}']:.5f}"
+          for k in ("opacity", "scale", "rotation", "color") if f"direct_{k}" in accum_metrics
+        )
         log.info(
-          "step %d/%d  loss %.5f  (l1 %.5f ssim %.5f mask %.5f)  src %.5f %s  "
-          "kept %.3f  grad_norm %.3f",
-          step, cfg.train.max_steps, accum_loss, accum_metrics["l1"], accum_metrics["ssim"],
-          accum_metrics["mask"], accum_metrics["loss_source"], tgt_str,
+          "step %d/%d  loss %.5f  %s %s  %s  kept %.3f  grad_norm %.3f",
+          step, cfg.train.max_steps, accum_loss, photo_str, tgt_str, direct_str,
           accum_metrics["frac_kept"], float(grad_norm),
         )
         if wandb_run is not None:
           log_dict = {
-            "train/loss": accum_loss, "train/loss_l1": accum_metrics["l1"],
-            "train/loss_ssim": accum_metrics["ssim"], "train/loss_mask": accum_metrics["mask"],
-            "train/loss_scale_reg": accum_metrics["scale_reg"], "train/loss_color_reg": accum_metrics["color_reg"],
-            "train/loss_source": accum_metrics["loss_source"],
-            "train/mean_opacity": accum_metrics["mean_opacity"], "train/mean_scale": accum_metrics["mean_scale"],
-            "train/frac_gaussians_kept": accum_metrics["frac_kept"],
-            "train/grad_norm": float(grad_norm), "train/lr": sched.get_last_lr()[0],
+            "train/loss": accum_loss,
+            "train/grad_norm": float(grad_norm),
+            "train/lr": sched.get_last_lr()[0],
             "train/epoch": epoch,
           }
-          if "loss_targets_mean" in accum_metrics:
-            log_dict["train/loss_targets_mean"] = accum_metrics["loss_targets_mean"]
+          for key, wandb_key in (
+            ("l1", "train/loss_l1"),
+            ("ssim", "train/loss_ssim"),
+            ("mask", "train/loss_mask"),
+            ("loss_source", "train/loss_source"),
+            ("loss_targets_mean", "train/loss_targets_mean"),
+            ("direct_opacity", "train/loss_direct_opacity"),
+            ("direct_scale", "train/loss_direct_scale"),
+            ("direct_rotation", "train/loss_direct_rotation"),
+            ("direct_color", "train/loss_direct_color"),
+            ("scale_reg", "train/loss_scale_reg"),
+            ("color_reg", "train/loss_color_reg"),
+            ("mean_opacity", "train/mean_opacity"),
+            ("mean_scale", "train/mean_scale"),
+            ("frac_kept", "train/frac_gaussians_kept"),
+          ):
+            if key in accum_metrics:
+              log_dict[wandb_key] = accum_metrics[key]
           wandb_run.log(log_dict, step=step)
 
       if cfg.val.every > 0 and step > 0 and step % cfg.val.every == 0:

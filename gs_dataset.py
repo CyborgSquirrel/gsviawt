@@ -30,6 +30,7 @@ view's transform the identity matrix by construction.
 """
 
 import glob as _glob
+import json
 import logging
 import os
 import random
@@ -86,6 +87,140 @@ def relative_viewmats(poses):
 
 def xyz_to_x0(xyz):
   return (xyz - XYZ_MEAN) / XYZ_STD
+
+
+def _rotate_quats_wxyz(q_wxyz, R_transform):
+  """q_wxyz: (...,4) numpy wxyz unit quaternions. R_transform: (3,3) rotation
+  matrix applied on the left (R_out = R_transform @ R_in). Returns (...,4)
+  wxyz, same shape. Uses scipy.spatial.transform.Rotation (already a project
+  dependency -- fit_gsplat.py uses it too) rather than hand-rolled quaternion
+  composition, which is an easy place to get sign/order conventions wrong."""
+  from scipy.spatial.transform import Rotation
+  shape = q_wxyz.shape
+  flat = q_wxyz.reshape(-1, 4)
+  xyzw = flat[:, [1, 2, 3, 0]]
+  rot_out = Rotation.from_matrix(R_transform) * Rotation.from_quat(xyzw)
+  out_xyzw = rot_out.as_quat()
+  out_wxyz = out_xyzw[:, [3, 0, 1, 2]]
+  return out_wxyz.reshape(shape).astype(np.float32)
+
+
+def _load_ground_truth(gt_h5_path, source_pose_gl):
+  """Reads a fit_gsplat.py-schema .h5 (per-pixel ground-truth Gaussian
+  params from ONE direct 3DGS fit, primary view first). Returns
+  (tensors, attrs).
+
+  tensors, in this file's (L,H,W,...) convention (matching xyz_cam/hit):
+    opacity (L,H,W) f32 in (0,1); scale (L,H,W,3) f32, absolute world-unit
+    size (same units GSModel.forward's own "scale" output already ends up
+    in -- no rescaling needed); rotation (L,H,W,4) f32 wxyz, ROTATED INTO
+    THE SOURCE CAMERA'S OWN FRAME (fit_gsplat.py optimizes in true Blender
+    world space; this codebase's Gaussians live in the source camera's own
+    frame -- see this module's docstring / relative_viewmats); color
+    (L,H,W,3) f32, flat sigmoid RGB (NOT SH -- fit_gsplat.py has no SH>0 at
+    all); valid (L,H,W) bool; means_world (L,H,W,3) f32, sanity-check-only
+    (see _check_ground_truth_consistency), callers should drop it after.
+  attrs: {"config": parsed config_json dict, "mesh_index": int, "mesh_path": str}.
+
+  source_pose_gl: (4,4) torch tensor, the SAME source view's own raw
+  camera-to-world pose (Blender/OpenGL axes) the caller already read --
+  used only to build the world->source-camera rotation applied to `rotation`.
+  """
+  with h5py.File(gt_h5_path, "r") as f:
+    opacity = np.asarray(f["gaussian_opacities"])      # (H,W,L)
+    scale = np.asarray(f["gaussian_scales"])            # (H,W,L,3)
+    quat_world = np.asarray(f["gaussian_quats"])        # (H,W,L,4) wxyz, WORLD frame
+    color = np.asarray(f["gaussian_colors"])            # (H,W,L,3)
+    valid = np.asarray(f["layer_valid"])                # (H,W,L) bool
+    means_world = np.asarray(f["gaussian_means"])       # (H,W,L,3)
+    attrs = {
+      "config": json.loads(f.attrs["config_json"]),
+      "mesh_index": int(f.attrs["mesh_index"]),
+      "mesh_path": str(f.attrs.get("mesh_path", "")),
+    }
+
+  c2w_cv = source_pose_gl.numpy() @ OPENGL_TO_OPENCV
+  r_w2c = c2w_cv[:3, :3].T
+  quat_world_lhwc = rearrange(quat_world, "h w l c -> l h w c")
+  valid_lhw = rearrange(valid, "h w l -> l h w")
+  # Invalid (never-optimized) slots are zero-norm, not unit quaternions --
+  # scipy's Rotation rejects those outright. They're always excluded by
+  # `valid` downstream anyway, so only rotate the valid subset and leave the
+  # rest as a harmless identity quaternion.
+  quat_cam_lhwc = np.zeros_like(quat_world_lhwc)
+  quat_cam_lhwc[..., 0] = 1.0
+  if valid_lhw.any():
+    quat_cam_lhwc[valid_lhw] = _rotate_quats_wxyz(quat_world_lhwc[valid_lhw], r_w2c)
+
+  tensors = {
+    "opacity": rearrange(torch.from_numpy(opacity), "h w l -> l h w").contiguous().float(),
+    "scale": rearrange(torch.from_numpy(scale), "h w l c -> l h w c").contiguous().float(),
+    "rotation": torch.from_numpy(quat_cam_lhwc).contiguous(),
+    "color": rearrange(torch.from_numpy(color), "h w l c -> l h w c").contiguous().float(),
+    "valid": rearrange(torch.from_numpy(valid), "h w l -> l h w").contiguous(),
+    "means_world": rearrange(torch.from_numpy(means_world), "h w l c -> l h w c").contiguous().float(),
+  }
+  return tensors, attrs
+
+
+def _check_ground_truth_consistency(attrs, gt, gt_h5_path, source_h5_path, source_view,
+                                     mesh_id, xyz_cam, hit, pose_gl):
+  """Startup-time (not per-step) cross-check between a loaded ground-truth
+  grid and the render/view it's meant to supervise -- a silent mismatch here
+  (wrong view/mesh pairing, optimize_means=true, wrong resolution) would
+  corrupt training with no visible failure otherwise. Hard-errors on
+  structural mismatches; logs+warns on softer signals."""
+  cfg = attrs["config"]
+  gt_primary = int(cfg.get("primary", -1))
+  if gt_primary != source_view:
+    raise ValueError(
+      f"ground truth {gt_h5_path!r}: primary={gt_primary} != "
+      f"data.fixed_source_view={source_view} -- per-pixel correspondence "
+      "is keyed exactly to one view")
+  if attrs["mesh_index"] != mesh_id:
+    raise ValueError(
+      f"ground truth {gt_h5_path!r}: mesh_index={attrs['mesh_index']} != "
+      f"source view's mesh_index={mesh_id} -- wrong object pairing")
+  if bool(cfg.get("optimize_means", False)):
+    raise ValueError(
+      f"ground truth {gt_h5_path!r} was fit with optimize_means=true -- "
+      "this first pass only supports optimize_means=false (gaussian_means "
+      "must equal the unprojected depth peel exactly)")
+  if tuple(gt["valid"].shape) != tuple(hit.shape):
+    raise ValueError(
+      f"ground truth grid shape {tuple(gt['valid'].shape)} != source "
+      f"view's depth-peel grid {tuple(hit.shape)}")
+
+  gt_src_path = cfg.get("hdf5_path", "")
+  if os.path.basename(gt_src_path) != os.path.basename(source_h5_path):
+    log.warning(
+      "ground truth %r was fit from %r, training is reading %r (comparing "
+      "basenames only) -- double check these are really the same render",
+      gt_h5_path, gt_src_path, source_h5_path)
+
+  mismatch = (gt["valid"] != hit).float().mean().item()
+  if mismatch > 1e-6:
+    log.warning(
+      "ground truth %r: layer_valid disagrees with this view's own hit "
+      "mask on %.4f%% of grid cells -- expected 0", gt_h5_path, mismatch * 100)
+
+  c2w_cv = pose_gl.numpy() @ OPENGL_TO_OPENCV
+  xyz_h = np.concatenate([xyz_cam.numpy(), np.ones((*xyz_cam.shape[:-1], 1), np.float32)], axis=-1)
+  xyz_world_reproj = (xyz_h @ c2w_cv.T)[..., :3]
+  both_valid = (hit & gt["valid"]).numpy()
+  if both_valid.any():
+    err = np.abs(xyz_world_reproj[both_valid] - gt["means_world"].numpy()[both_valid]).mean()
+    log.info(
+      "ground truth %r position sanity check: mean |reprojected xyz_cam - "
+      "gaussian_means| = %.6g over %d pixels (expect ~1e-5)",
+      gt_h5_path, err, int(both_valid.sum()))
+    if err > 1e-3:
+      log.warning("ground truth %r position mismatch larger than expected (%.6g)", gt_h5_path, err)
+
+  log.info(
+    "ground truth OK: %r primary=%d mesh_index=%d valid_frac=%.4f",
+    gt_h5_path, gt_primary, attrs["mesh_index"], float(gt["valid"].float().mean()),
+  )
 
 
 _h5_cache = {}       # path -> h5py.File, process-global
@@ -386,7 +521,7 @@ class GSFixedViewsDataset(Dataset):
   and every entry of `targets` must share the same mesh_index, checked at
   construction (mirrors fit_gsplat.py's own primary/secondary check)."""
 
-  def __init__(self, h5_path, source_view, target_views, num_layers=6):
+  def __init__(self, h5_path, source_view, target_views, num_layers=6, ground_truth_h5=None):
     self.path = h5_path
     self.source_view = int(source_view)
     self.target_views = [int(v) for v in target_views]
@@ -411,6 +546,29 @@ class GSFixedViewsDataset(Dataset):
       self.source_view, self.target_views, self.mesh_id,
     )
 
+    self.ground_truth = None
+    if ground_truth_h5 is not None:
+      # Direct-parameter-supervision ground truth (fit_gsplat.py output) for
+      # the source view only. Re-reads/unprojects that one view independently
+      # of __getitem__'s own _build_item call below -- a duplicate I/O given
+      # __len__()==1 (this item never changes), not worth sharing state for.
+      with h5py.File(h5_path, "r") as f:
+        k_depth_name = intrinsics_name(f, "depth")
+        k_image_name = intrinsics_name(f, "image", None)
+        src = _read_view(f, h5_path, self.source_view, k_depth_name, k_image_name)
+      xyz_cam_np, hit_np = dense_unproject_camera(src["depth_peel"], src["K_depth"])
+      xyz_cam = rearrange(torch.from_numpy(xyz_cam_np), "h w l c -> l h w c").contiguous()
+      hit = rearrange(torch.from_numpy(hit_np), "h w l -> l h w").contiguous()
+      pose_gl = torch.from_numpy(src["pose"])
+
+      gt_tensors, gt_attrs = _load_ground_truth(ground_truth_h5, pose_gl)
+      _check_ground_truth_consistency(
+        gt_attrs, gt_tensors, ground_truth_h5, h5_path, self.source_view,
+        self.mesh_id, xyz_cam, hit, pose_gl,
+      )
+      gt_tensors.pop("means_world", None)
+      self.ground_truth = gt_tensors
+
   def __len__(self):
     return 1
 
@@ -418,10 +576,13 @@ class GSFixedViewsDataset(Dataset):
     return _get_h5(self.path)
 
   def __getitem__(self, idx):
-    return _build_item(
+    item = _build_item(
       self._h5(), self.path, self.source_view, self.target_views,
       self.num_layers, self.mesh_id,
     )
+    if self.ground_truth is not None:
+      item["ground_truth"] = self.ground_truth
+    return item
 
 
 class _EmptyDataset(Dataset):

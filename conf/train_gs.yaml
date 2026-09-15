@@ -13,6 +13,12 @@ data:
   # fixed_target_views is required when fixed_source_view is set.
   fixed_source_view: null    # int, e.g. 0
   fixed_target_views: null   # list of ints, e.g. [1, 2, 3]
+  # fit_gsplat.py output .h5 (per-pixel ground-truth Gaussian params for ONE
+  # view). Only used when set, and only together with fixed_source_view --
+  # its config_json "primary" must equal fixed_source_view (checked at
+  # startup, see gs_dataset._check_ground_truth_consistency). Enables
+  # loss.direct_*_weight below.
+  ground_truth_h5: null
 
 model:
   backbone:
@@ -69,6 +75,22 @@ loss:
   # compute_loss). |dc| > ~2 already saturates degree-0 color via SH_C0*dc+0.5.
   color_reg_weight: 1.0e-3
   color_reg_thresh: 2.0
+
+  # Direct per-pixel supervision of the model's own predicted Gaussian
+  # params against a fit_gsplat.py ground-truth .h5 (data.ground_truth_h5),
+  # as an alternative/complement to the photometric losses above. All
+  # default 0 (opt-in); when ALL of l1_weight/ssim_weight/mask_weight AND
+  # these are left at their defaults, behavior is unchanged from today. When
+  # all photometric weights are 0 and at least one of these is nonzero, the
+  # per-step gsplat rasterization call is skipped entirely (see
+  # train_gs.compute_loss); render panels/orbit videos still work regardless
+  # (force_render=True at those call sites).
+  direct_opacity_weight: 0.0
+  direct_scale_weight: 0.0     # compared in log-space (both sides are
+                                 # already absolute world-unit sizes)
+  direct_rotation_weight: 0.0  # sign-invariant (1 - |dot(q_pred, q_gt)|)
+  direct_color_weight: 0.0     # only touches sh_dc's gradient (SH_C0*sh_dc+0.5
+                                 # vs. gt's flat RGB) -- sh_rest has no GT signal
 
 train:
   device: cuda
