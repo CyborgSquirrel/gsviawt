@@ -170,10 +170,12 @@ class GSModel(nn.Module):
     # for the ones that collapsed). Adding a constant floor to the
     # dimensionless multiplier -- not just to its initial value -- closes the
     # loophole structurally: scale can never render below
+
     # min_scale_mult * pixel_scale, regardless of what raw drifts to.
-    pixel_scale = torch.nan_to_num(xyz_cam[..., 2], nan=1.0) / fx   # (L,H,W)
-    multiplier = self.min_scale_mult + out["scale"]                 # (L,3,H,W), floor + exp(raw)*scale_lambda
-    out["scale"] = multiplier * pixel_scale.unsqueeze(1)            # (L,3,H,W)
+    # pixel_scale = torch.nan_to_num(xyz_cam[..., 2], nan=1.0) / fx   # (L,H,W)
+    # multiplier = self.min_scale_mult + out["scale"]                 # (L,3,H,W), floor + exp(raw)*scale_lambda
+    # out["scale"] = multiplier * pixel_scale.unsqueeze(1)            # (L,3,H,W)
+
     return out
 
 
@@ -311,12 +313,33 @@ def compute_direct_loss(gauss, gt, hit, cfg_loss, device):
     total = total + cfg_loss.direct_opacity_weight * parts["opacity"]
 
   if cfg_loss.direct_scale_weight > 0:
-    # Log-space: both sides are already absolute world-unit sizes (see
-    # GSModel.forward's pixel-relative scale transform / gs_dataset's
-    # _load_ground_truth), and scale is strictly positive/multiplicative,
-    # so a linear L1 would let a few large Gaussians dominate the loss.
-    scale_pred = rearrange(gauss["scale"], "l c h w -> l h w c")
-    log_diff = torch.log(scale_pred.clamp_min(eps)) - torch.log(gt["scale"].to(device).clamp_min(eps))
+    # Log-space: both sides are already absolute world-unit sizes BY THIS
+    # POINT -- gauss["scale"] is GSModel.forward's fully floor+pixel_scale-
+    # transformed output, not gauss["raw_scale"] (the decoder's pre-transform
+    # logit, which skips both the min_scale_mult floor and the pixel_scale
+    # multiply -- comparing that directly against gt["scale"] mismatches
+    # units). Scale is strictly positive/multiplicative, so a linear L1
+    # would let a few large Gaussians dominate.
+    #
+    # Clamped on both sides: clamp_min guards log(0)=-inf; clamp_max matters
+    # more -- exp(raw) can overflow to inf at a high LR (float32 overflows
+    # above raw~88), and unlike the photometric path (routed through
+    # gsplat's own internal handling), nothing here would otherwise stop an
+    # overflowed scale from becoming an inf/NaN loss that permanently
+    # corrupts Adam's moment buffers. 1e4 is generously above anything
+    # physically plausible for a unit-cube-normalized object (the whole
+    # object spans ~1.0) -- it only ever engages once something has already
+    # gone wrong upstream, it doesn't touch legitimate values.
+
+    # scale_pred = rearrange(gauss["scale"], "l c h w -> l h w c").clamp(eps, 1e4)
+    # gt_scale = gt["scale"].to(device).clamp(eps, 1e4)
+    # log_diff = torch.log(scale_pred) - torch.log(gt_scale)
+    # parts["scale"] = log_diff.abs()[mask].mean()
+    # total = total + cfg_loss.direct_scale_weight * parts["scale"]
+
+    scale_pred = rearrange(gauss["raw_scale"], "l c h w -> l h w c")
+    gt_scale = gt["scale"].to(device)
+    log_diff = scale_pred - torch.log(gt_scale)
     parts["scale"] = log_diff.abs()[mask].mean()
     total = total + cfg_loss.direct_scale_weight * parts["scale"]
 
@@ -589,6 +612,7 @@ def run_validation(model, val_ds, cfg, device, window, wandb_run, step):
 def main(cfg: DictConfig) -> None:
   logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
   torch.manual_seed(int(cfg.train.seed))
+  torch.autograd.set_detect_anomaly(cfg.torch_detect_anomaly)
   device = cfg.train.device if (cfg.train.device != "cuda" or torch.cuda.is_available()) else "cpu"
   if device != cfg.train.device:
     log.warning("cuda not available, falling back to cpu")
@@ -642,7 +666,7 @@ def main(cfg: DictConfig) -> None:
     model = GSModel(cfg).to(device)
   model.train()
 
-  opt = torch.optim.Adam(model.parameters(), lr=float(cfg.train.lr))
+  opt = torch.optim.AdamW(model.parameters(), lr=float(cfg.train.lr))
 
   def lr_lambda(step):
     if step < cfg.train.warmup_steps:

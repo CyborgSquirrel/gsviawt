@@ -2,6 +2,8 @@
 # Splatting prediction model (Flash3D-style encoder/decoder) on
 # render_objaverse.py-schema HDF5 files. See train_gs.py's module docstring.
 
+torch_detect_anomaly: false
+
 data:
   h5_paths: /app/bla/lite_blackbg.h5   # str, list, or glob(s)
   num_layers: 6                         # must match the file(s)' depth_peel layer count
