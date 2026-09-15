@@ -198,10 +198,6 @@ def _build_item(f, path, source_view, target_views, num_layers, mesh_id):
   }
 
 
-_H5_PATH_COL = "__h5_path"    # reserved: this row's file path, broadcast per file
-_H5_INDEX_COL = "__h5_index"  # reserved: this row's index within its file
-
-
 class H5Catalog(Dataset):
   """A flat, declarative catalog over one or more h5 files, not specific to
   this project's schema at all. Each column argument is a plain `pl.Expr`
@@ -221,13 +217,16 @@ class H5Catalog(Dataset):
   itself owned.
   """
 
+  _PATH_COL = "__h5_path"    # reserved: this row's file path, broadcast per file
+  _INDEX_COL = "__h5_index"  # reserved: this row's index within its file
+
   @staticmethod
   def path() -> pl.Expr:
-    return pl.col(_H5_PATH_COL).alias("path")
+    return pl.col(H5Catalog._PATH_COL).alias("path")
 
   @staticmethod
   def index() -> pl.Expr:
-    return pl.col(_H5_INDEX_COL).alias("index")
+    return pl.col(H5Catalog._INDEX_COL).alias("index")
 
   @staticmethod
   def dataset(name: str) -> pl.Expr:
@@ -242,7 +241,7 @@ class H5Catalog(Dataset):
     needed = set()
     for e in exprs:
       needed.update(e.meta.root_names())
-    needed -= {_H5_PATH_COL, _H5_INDEX_COL}
+    needed -= {self._PATH_COL, self._INDEX_COL}
     if not needed:
       raise ValueError(
         "H5Catalog needs at least one column backed by a real per-view h5 "
@@ -255,8 +254,11 @@ class H5Catalog(Dataset):
       with h5py.File(path, "r") as f:
         n = f[needed[0]].shape[0]
         raw = {
-          _H5_PATH_COL: [path] * n,
-          _H5_INDEX_COL: np.arange(n),
+          # pl.repeat(..., eager=True): a Series filled by polars itself,
+          # not a materialized n-long Python list -- matters once n (views
+          # per file) gets large.
+          self._PATH_COL: pl.repeat(path, n, eager=True),
+          self._INDEX_COL: np.arange(n),
           **{name: np.asarray(f[name][:]) for name in needed},
         }
       frames.append(pl.DataFrame(raw).select(exprs))
