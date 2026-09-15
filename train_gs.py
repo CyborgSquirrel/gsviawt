@@ -754,17 +754,25 @@ def main(cfg: DictConfig) -> None:
         if wandb_run is not None:
           log_dict = {
             "train/loss": accum_loss,
-            "train/loss_scale_reg": accum_metrics["scale_reg"], "train/loss_color_reg": accum_metrics["color_reg"],
-            "train/mean_opacity": accum_metrics["mean_opacity"], "train/mean_scale": accum_metrics["mean_scale"],
-            "train/frac_gaussians_kept": accum_metrics["frac_kept"],
-            "train/grad_norm": float(grad_norm), "train/lr": sched.get_last_lr()[0],
+            "train/grad_norm": float(grad_norm),
+            "train/lr": sched.get_last_lr()[0],
             "train/epoch": epoch,
           }
           for key, wandb_key in (
-            ("l1", "train/loss_l1"), ("ssim", "train/loss_ssim"), ("mask", "train/loss_mask"),
-            ("loss_source", "train/loss_source"), ("loss_targets_mean", "train/loss_targets_mean"),
-            ("direct_opacity", "train/loss_direct_opacity"), ("direct_scale", "train/loss_direct_scale"),
-            ("direct_rotation", "train/loss_direct_rotation"), ("direct_color", "train/loss_direct_color"),
+            ("l1", "train/loss_l1"),
+            ("ssim", "train/loss_ssim"),
+            ("mask", "train/loss_mask"),
+            ("loss_source", "train/loss_source"),
+            ("loss_targets_mean", "train/loss_targets_mean"),
+            ("direct_opacity", "train/loss_direct_opacity"),
+            ("direct_scale", "train/loss_direct_scale"),
+            ("direct_rotation", "train/loss_direct_rotation"),
+            ("direct_color", "train/loss_direct_color"),
+            ("scale_reg", "train/loss_scale_reg"),
+            ("color_reg", "train/loss_color_reg"),
+            ("mean_opacity", "train/mean_opacity"),
+            ("mean_scale", "train/mean_scale"),
+            ("frac_kept", "train/frac_gaussians_kept"),
           ):
             if key in accum_metrics:
               log_dict[wandb_key] = accum_metrics[key]
