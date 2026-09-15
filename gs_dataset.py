@@ -220,13 +220,13 @@ class H5Catalog(Dataset):
   _PATH_COL = "__h5_path"    # reserved: this row's file path, broadcast per file
   _INDEX_COL = "__h5_index"  # reserved: this row's index within its file
 
-  @staticmethod
-  def path() -> pl.Expr:
-    return pl.col(H5Catalog._PATH_COL).alias("path")
+  @classmethod
+  def path(cls) -> pl.Expr:
+    return pl.col(cls._PATH_COL).alias("path")
 
-  @staticmethod
-  def index() -> pl.Expr:
-    return pl.col(H5Catalog._INDEX_COL).alias("index")
+  @classmethod
+  def index(cls) -> pl.Expr:
+    return pl.col(cls._INDEX_COL).alias("index")
 
   @staticmethod
   def dataset(name: str) -> pl.Expr:
@@ -274,7 +274,7 @@ class H5Catalog(Dataset):
     return self._from_df(self.df.filter(predicate))
 
   def take(self, indices) -> "H5Catalog":
-    return self._from_df(self.df[list(indices)])
+    return self._from_df(self.df[np.asarray(indices)])
 
   def __len__(self):
     return self.df.height
@@ -306,8 +306,8 @@ def split_by_mesh(catalog: H5Catalog, val_fraction=0.1, seed=42):
   generator = torch.Generator().manual_seed(seed)
   train_pos, val_pos = random_split(range(n_keys), [n_train, n_val], generator=generator)
 
-  train_keys_df = keys_df[list(train_pos)]
-  val_keys_df = keys_df[list(val_pos)]
+  train_keys_df = keys_df[np.array(train_pos.indices)]
+  val_keys_df = keys_df[np.array(val_pos.indices)]
   train_df = catalog.df.join(train_keys_df, on=["path", "mesh_id"], how="semi")
   val_df = catalog.df.join(val_keys_df, on=["path", "mesh_id"], how="semi")
   return H5Catalog._from_df(train_df), H5Catalog._from_df(val_df)
