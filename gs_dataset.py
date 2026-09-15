@@ -25,6 +25,7 @@ view's transform the identity matrix by construction.
 
 import glob as _glob
 import logging
+import os
 import random
 
 import h5py
@@ -78,6 +79,31 @@ def relative_viewmats(poses):
 
 def xyz_to_x0(xyz):
   return (xyz - XYZ_MEAN) / XYZ_STD
+
+
+_h5_cache = {}       # path -> h5py.File, process-global
+_h5_cache_pid = None  # pid that populated _h5_cache
+
+
+def _get_h5(path):
+  """Process-safe global h5py.File cache, keyed by path. h5py.File handles
+  aren't fork-safe -- if a DataLoader worker is forked (the default
+  multiprocessing start method on Linux) after this cache already holds an
+  open handle, the child would otherwise inherit that same handle baked
+  into its copy of the dict. Guard against that by resetting the cache
+  whenever the current pid doesn't match the pid that populated it, so
+  each process (including each forked worker) always opens its own
+  handles rather than reusing a parent's."""
+  global _h5_cache, _h5_cache_pid
+  pid = os.getpid()
+  if _h5_cache_pid != pid:
+    _h5_cache = {}
+    _h5_cache_pid = pid
+  h = _h5_cache.get(path)
+  if h is None:
+    h = h5py.File(path, "r")
+    _h5_cache[path] = h
+  return h
 
 
 def _expand_h5_paths(h5_paths):
@@ -180,7 +206,6 @@ class GSViewsDataset(Dataset):
   def __init__(self, h5_paths, num_layers=6):
     self.paths = _expand_h5_paths(h5_paths)
     self.num_layers = num_layers
-    self._handles = {}
 
     self.mesh_paths = {}  # (file_idx, mesh_id) -> str -- static per-mesh metadata,
                             # unrelated to any grouping/split, fine to cache as-is.
@@ -203,14 +228,7 @@ class GSViewsDataset(Dataset):
     return len(self.items)
 
   def _h5(self, file_idx):
-    # lazy per-process open -- h5py.File handles aren't fork-safe, so each
-    # DataLoader worker must open its own (this runs inside __getitem__,
-    # i.e. inside the worker process).
-    h = self._handles.get(file_idx)
-    if h is None:
-      h = h5py.File(self.paths[file_idx], "r")
-      self._handles[file_idx] = h
-    return h
+    return _get_h5(self.paths[file_idx])
 
   def __getitem__(self, idx):
     """Returns the raw (file_idx, mesh_id, view_idx) tuple -- a single view
@@ -332,7 +350,6 @@ class GSFixedViewsDataset(Dataset):
     self.source_view = int(source_view)
     self.target_views = [int(v) for v in target_views]
     self.num_layers = num_layers
-    self._handle = None
 
     with h5py.File(h5_path, "r") as f:
       self.mesh_paths_ds = f["mesh_paths"][:] if "mesh_paths" in f else None
@@ -364,9 +381,7 @@ class GSFixedViewsDataset(Dataset):
     return 1
 
   def _h5(self):
-    if self._handle is None:
-      self._handle = h5py.File(self.path, "r")
-    return self._handle
+    return _get_h5(self.path)
 
   def __getitem__(self, idx):
     return _build_item(
