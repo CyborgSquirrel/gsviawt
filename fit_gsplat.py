@@ -47,8 +47,10 @@ pip `nvidia-cuda-nvcc` toolchain (the base image has no system `nvcc`).
 import json
 import logging
 import os
+import shutil
 import sys
 import sysconfig
+import tempfile
 
 
 def _setup_cuda_toolchain() -> None:
@@ -361,9 +363,9 @@ def write_ply(path, params_np, scene_scale, opacity_threshold=None,
   }
 
 
-def dump_val(val_dir, it, gt_rgb, gt_alpha, render_rgb, render_alpha):
-  from PIL import Image
-  os.makedirs(val_dir, exist_ok=True)
+def _build_val_panel(gt_rgb, gt_alpha, render_rgb, render_alpha):
+  """Returns the [gt | render | gt_alpha | render_alpha] panel as one
+  (H_total, W_total, 3) uint8 array, one row per view."""
   V = gt_rgb.shape[0]
   rows = []
   for i in range(V):
@@ -374,8 +376,92 @@ def dump_val(val_dir, it, gt_rgb, gt_alpha, render_rgb, render_alpha):
     ga3 = np.repeat(ga[..., None], 3, axis=2)
     ra3 = np.repeat(ra[..., None], 3, axis=2)
     rows.append(np.concatenate([g, r, ga3, ra3], axis=1))
-  Image.fromarray(np.concatenate(rows, axis=0)).save(
-    os.path.join(val_dir, f"iter{it:05d}.png"))
+  return np.concatenate(rows, axis=0)
+
+
+def dump_val(val_dir, it, panel):
+  from PIL import Image
+  os.makedirs(val_dir, exist_ok=True)
+  Image.fromarray(panel).save(os.path.join(val_dir, f"iter{it:05d}.png"))
+
+
+# ---------------------------------------------------------------------------
+# orbit previews (wandb.Video, periodic during optimization)
+#
+# Unlike train_gs.py's Gaussians (anchored in an arbitrary source camera's own
+# frame -- see gs_dataset.py), these are seeded via unproject_depth_peel's
+# "world" branch, i.e. already in true Blender world coordinates (object
+# recentred near the origin by render_objaverse.py's normalize_object). So the
+# orbit can use the same look_at_c2w construction orbit_video.py uses,
+# directly, no per-scene "up" derivation needed. Deliberately anchored to the
+# PRIMARY view's own actual capture distance (`scene_scale`), not an
+# auto-fit/bounding-sphere distance like orbit_video.py's default: this
+# optimization has no floor forcing Gaussian scale to stay above ~1 pixel of
+# spacing (see train_gs.py's GSModel.forward for why that matters), so a
+# tighter-than-capture orbit distance can expose the same false "gaps"
+# artifact that turned out to be a real bug there -- keeping the same
+# distance the model was actually supervised at avoids manufacturing that
+# confusion here.
+# ---------------------------------------------------------------------------
+
+WORLD_UP = np.array([0.0, 0.0, 1.0], np.float32)  # Blender / render_objaverse is Z-up
+
+
+def look_at_c2w(eye, target, up=WORLD_UP):
+  """OpenGL camera-to-world (X right, Y up, -Z forward) looking from `eye` at
+  `target`. Same construction as orbit_video.py's look_at_c2w."""
+  z = eye - target
+  z = z / (np.linalg.norm(z) + 1e-8)
+  if abs(np.dot(z, up)) > 0.999:
+    up = np.array([0.0, 1.0, 0.0], np.float32) if abs(up[1]) < 0.9 else np.array([1.0, 0.0, 0.0], np.float32)
+  x = np.cross(up, z); x = x / (np.linalg.norm(x) + 1e-8)
+  y = np.cross(z, x)
+  c2w = np.eye(4, dtype=np.float32)
+  c2w[:3, 0], c2w[:3, 1], c2w[:3, 2], c2w[:3, 3] = x, y, z, eye
+  return c2w
+
+
+def write_mp4(frames, path, fps, crf):
+  """H.264 .mp4 via imageio's ffmpeg backend (imageio-ffmpeg ships a static
+  binary -- nothing needed on the system PATH). Same as orbit_video.py's."""
+  import imageio.v2 as imageio
+  writer = imageio.get_writer(
+    path, format="FFMPEG", mode="I", fps=float(fps),
+    codec="libx264", macro_block_size=1, pixelformat="yuv420p",
+    ffmpeg_params=["-crf", str(int(crf))],
+  )
+  try:
+    for fr in frames:
+      writer.append_data(np.ascontiguousarray(fr))
+  finally:
+    writer.close()
+  return path
+
+
+def render_orbit_frames(params, K_ref, dist, width, height, device, num_frames=24, elevation_deg=20.0):
+  """Renders a turntable orbit around the world origin at radius `dist`
+  (the primary view's own capture distance), reusing this module's own
+  `render()`. Yields (H,W,3) uint8 frames one at a time (one gsplat call per
+  frame, rather than batching all num_frames cameras into one call) to keep
+  peak memory bounded regardless of num_frames -- write_mp4 consumes frames
+  one at a time anyway, so nothing needs the full orbit in memory at once."""
+  elev = np.radians(float(elevation_deg))
+  azimuths = np.linspace(0.0, 2 * np.pi, int(num_frames), endpoint=False)
+  K_t = torch.from_numpy(K_ref[None]).to(device)
+  for az in azimuths:
+    d = np.array([np.cos(elev) * np.cos(az), np.cos(elev) * np.sin(az), np.sin(elev)], np.float32)
+    pose = look_at_c2w(d * dist, np.zeros(3, np.float32))
+    viewmat = torch.from_numpy(make_viewmats(pose[None])).to(device)
+    with torch.no_grad():
+      rgb, _ = render(params, viewmat, K_t, width, height)
+    yield (rgb[0].clamp(0.0, 1.0).cpu().numpy() * 255).astype(np.uint8)
+
+
+def log_orbit_video(wandb_run, step, frames, fps, crf, workdir):
+  import wandb
+  path = os.path.join(workdir, f"orbit_{step}.mp4")
+  write_mp4(frames, path, fps, crf)
+  wandb_run.log({"orbit": wandb.Video(path, caption=f"iter {step}", format="mp4")}, step=step)
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +478,14 @@ def main(cfg: DictConfig) -> None:
 
   out_h5 = cfg.output_path or f"{cfg.hdf5_path}.gsplat.view{int(cfg.primary)}.h5"
   stem = out_h5[:-3] if out_h5.endswith(".h5") else out_h5
+
+  wandb_run = None
+  if cfg.wandb.mode != "disabled":
+    import wandb
+    wandb_run = wandb.init(
+      project=cfg.wandb.project, mode=cfg.wandb.mode, tags=list(cfg.wandb.tags),
+      name=cfg.wandb.name, config=OmegaConf.to_container(cfg, resolve=True),
+    )
 
   with timed("load"):
     views = load_views(cfg)
@@ -457,6 +551,10 @@ def main(cfg: DictConfig) -> None:
     it_range = range(iters)
   log_every = max(1, iters // 10)
 
+  orbit_every = int(cfg.orbit.every) if cfg.orbit.enabled else 0
+  orbit_workdir = tempfile.mkdtemp(prefix="fit_gsplat_orbit_") if orbit_every else None
+  K_orbit = views["image_K"][0]
+
   final_loss = float("nan")
   with timed("optimize"):
     for it in it_range:
@@ -478,8 +576,23 @@ def main(cfg: DictConfig) -> None:
       if it % log_every == 0 or last:
         log.info("iter %d/%d  loss %.5f  (l1 %.5f  dssim %.5f  mask %.5f)",
                  it, iters, final_loss, l1.item(), dssim.item(), mask.item())
+      if wandb_run is not None and (it % 10 == 0 or last):
+        wandb_run.log({
+          "train/loss": final_loss, "train/l1": l1.item(),
+          "train/dssim": dssim.item(), "train/mask": mask.item(),
+        }, step=it)
       if val_every and (it % val_every == 0 or last):
-        dump_val(f"{stem}.val", it, gt_rgb, gt_alpha, rgb_c, alpha)
+        panel = _build_val_panel(gt_rgb, gt_alpha, rgb_c, alpha)
+        dump_val(f"{stem}.val", it, panel)
+        if wandb_run is not None:
+          import wandb
+          wandb_run.log({"val/panel": wandb.Image(panel, caption=f"iter {it}")}, step=it)
+      if orbit_every and wandb_run is not None and (it % orbit_every == 0 or last):
+        frames = render_orbit_frames(
+          params, K_orbit, scene_scale, IW, IH, device,
+          num_frames=cfg.orbit.num_frames, elevation_deg=cfg.orbit.elevation_deg,
+        )
+        log_orbit_video(wandb_run, it, frames, cfg.orbit.fps, cfg.orbit.crf, orbit_workdir)
 
   params_np = {k: v.detach().cpu().numpy() for k, v in params.items()}
   with timed("write"):
@@ -494,6 +607,12 @@ def main(cfg: DictConfig) -> None:
   log.info("final loss %.5f  ->  %s%s%s", final_loss, out_h5,
            f"  {stem}.ply" if cfg.write_ply else "",
            f"  {stem}.val/" if val_every else "")
+  if wandb_run is not None:
+    wandb_run.summary["final_loss"] = final_loss
+    wandb_run.summary["num_gaussians"] = n_gauss
+    wandb_run.finish()
+  if orbit_workdir is not None:
+    shutil.rmtree(orbit_workdir, ignore_errors=True)
 
 
 if __name__ == "__main__":

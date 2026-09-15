@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Logs into wandb inside the container using WANDB_KEY (container/secret.env,
+# loaded via docker-compose's env_file). Run from container/entrypoint.sh on
+# every container start. No-ops quietly if the key isn't set, so containers
+# without it still start fine.
+set -euo pipefail
+
+if [ -z "${WANDB_KEY:-}" ]; then
+  echo "wandb_login: WANDB_KEY not set, skipping wandb login" >&2
+  exit 0
+fi
+
+wandb login --relogin "$WANDB_KEY"
