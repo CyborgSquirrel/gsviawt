@@ -70,7 +70,7 @@ from omegaconf import DictConfig, OmegaConf  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
 from gs_dataset import (  # noqa: E402
-  OPENGL_TO_OPENCV, GSFixedViewsDataset, GSPairDataset, GSViewsDataset, _EmptyDataset, split_by_mesh,
+  OPENGL_TO_OPENCV, GSFixedViewsDataset, GSPairDataset, H5Catalog, _EmptyDataset, split_by_mesh,
 )
 from gs_decoder import GaussianResnetDecoder, GSDecoderStack  # noqa: E402
 from gs_encoder import GSResnetEncoder  # noqa: E402
@@ -521,14 +521,19 @@ def main(cfg: DictConfig) -> None:
     )
     val_ds = _EmptyDataset()
   else:
-    views_ds = GSViewsDataset(cfg.data.h5_paths, num_layers=cfg.data.num_layers)
-    train_subset, val_subset = split_by_mesh(views_ds, val_fraction=cfg.data.val_fraction, seed=cfg.train.seed)
+    catalog = H5Catalog(
+      cfg.data.h5_paths,
+      H5Catalog.path().alias("path"),
+      H5Catalog.index().alias("view_idx"),
+      H5Catalog.dataset("mesh_index").alias("mesh_id"),
+    )
+    train_catalog, val_catalog = split_by_mesh(catalog, val_fraction=cfg.data.val_fraction, seed=cfg.train.seed)
     train_ds = GSPairDataset(
-      train_subset, num_target_views=cfg.data.num_target_views,
+      train_catalog, num_layers=cfg.data.num_layers, num_target_views=cfg.data.num_target_views,
       seed=cfg.train.seed, deterministic_targets=False,
     )
     val_ds = GSPairDataset(
-      val_subset, num_target_views=cfg.data.num_target_views,
+      val_catalog, num_layers=cfg.data.num_layers, num_target_views=cfg.data.num_target_views,
       seed=cfg.train.seed, deterministic_targets=True,
     )
   if len(train_ds) == 0:

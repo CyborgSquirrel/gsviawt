@@ -3,15 +3,21 @@
 Reads render_objaverse.py-schema HDF5 files (`images`, `depth_peel`,
 `depth_intrinsics`/`image_intrinsics` (or legacy `camera_intrinsics`),
 `camera_pose`, `mesh_index`). Three pieces, kept deliberately separate:
-  - GSViewsDataset: flat catalog of every (file_idx, mesh_id, view_idx) --
-    no mesh-group index is cached, no sampling, no splitting.
+  - H5Catalog: a declarative, polars-backed flat catalog over one or more
+    h5 files -- columns are either a real per-view h5 dataset (read
+    verbatim) or a synthetic per-row value (this row's file path / its
+    index within that file). Not specific to this project's schema at all;
+    subsetting (.filter()/.take()) returns another H5Catalog built directly
+    from the filtered/selected rows, so nothing downstream ever needs to
+    unwrap anything to reach a "parent" dataset -- every row already
+    carries its own file path.
   - split_by_mesh: a plain function computing a train/val split over the
-    distinct mesh groups found in a GSViewsDataset (whole meshes, never
-    split across), returned as a pair of torch.utils.data.Subset objects.
-  - GSPairDataset: wraps a Subset of a GSViewsDataset (e.g. one half of a
-    split_by_mesh result), grouping the subset's own items by mesh on the
-    fly, and yielding items of one source view + up to `num_target_views`
-    other views of the same mesh.
+    distinct (path, mesh_id) groups found in an H5Catalog (whole meshes,
+    never split across), returned as a pair of H5Catalogs.
+  - GSPairDataset: wraps an H5Catalog (e.g. one half of a split_by_mesh
+    result), grouping its rows by mesh on the fly, and yielding items of
+    one source view + up to `num_target_views` other views of the same
+    mesh.
 
 All geometry stays in the SOURCE camera's own frame -- never Blender world
 space. The source view's point cloud is unprojected directly into its own
@@ -30,9 +36,10 @@ import random
 
 import h5py
 import numpy as np
+import polars as pl
 import torch
 from einops import rearrange
-from torch.utils.data import Dataset, Subset, random_split
+from torch.utils.data import Dataset, random_split
 
 from util import intrinsics_name
 
@@ -145,7 +152,7 @@ def _read_view(f, path, view_idx, k_depth_name, k_image_name):
   }
 
 
-def _build_item(f, path, source_view, target_views, num_layers, mesh_id, mesh_path):
+def _build_item(f, path, source_view, target_views, num_layers, mesh_id):
   """Shared by GSPairDataset (sampled source/targets) and GSFixedViewsDataset
   (fixed source/targets, for single-batch overfit sanity checks): given a
   DECIDED source view + target view list, reads them and builds the full
@@ -186,108 +193,145 @@ def _build_item(f, path, source_view, target_views, num_layers, mesh_id, mesh_pa
     },
     "targets": [to_view_dict(t, viewmats[1 + i]) for i, t in enumerate(targets)],
     "mesh_index": mesh_id,
-    "mesh_path": mesh_path,
     "source_view": int(source_view),
     "target_views": [int(v) for v in target_views],
   }
 
 
-class GSViewsDataset(Dataset):
-  """Flat catalog of every view across `h5_paths`: one item per
-  (file_idx, mesh_id, view_idx) tuple -- `items` is the single source of
-  truth for this dataset's contents, nothing else is cached from it. In
-  particular, no view->mesh-group index is precomputed/stored here: mesh
-  grouping is only ever needed transiently (to compute a split, or to find
-  a source view's sibling views), so split_by_mesh and GSPairDataset below
-  each derive it on the fly, locally, from `items` -- avoids keeping a
-  derived index in sync with `items` for its own sake.
+_H5_PATH_COL = "__h5_path"    # reserved: this row's file path, broadcast per file
+_H5_INDEX_COL = "__h5_index"  # reserved: this row's index within its file
+
+
+class H5Catalog(Dataset):
+  """A flat, declarative catalog over one or more h5 files, not specific to
+  this project's schema at all. Each column argument is a plain `pl.Expr`
+  (or a bare string, shorthand for `pl.col(name)`):
+    H5Catalog.path()                            -- this row's file path
+    H5Catalog.index()                            -- this row's index within its file
+    H5Catalog.dataset("mesh_index").alias("mesh_id")  -- an h5 dataset, renamed
+    "mesh_index"                                  -- same, unaliased
+  `.alias(...)` is just `pl.Expr.alias` -- these are real expressions, not a
+  custom DSL, so anything else `pl.Expr` supports works too.
+
+  Subsetting (.filter()/.take()) returns another H5Catalog built directly
+  from the filtered/selected rows. Since every row already carries its own
+  file path, nothing downstream ever needs to reach back to a "parent"
+  dataset to resolve anything -- unlike torch.utils.data.Subset, which
+  requires unwrapping `.dataset` to reach whatever the wrapped dataset
+  itself owned.
   """
 
-  def __init__(self, h5_paths, num_layers=6):
-    self.paths = _expand_h5_paths(h5_paths)
-    self.num_layers = num_layers
+  @staticmethod
+  def path() -> pl.Expr:
+    return pl.col(_H5_PATH_COL).alias("path")
 
-    self.mesh_paths = {}  # (file_idx, mesh_id) -> str -- static per-mesh metadata,
-                            # unrelated to any grouping/split, fine to cache as-is.
-    self.items = []        # (file_idx, mesh_id, view_idx), flat, one per view
-    for file_idx, path in enumerate(self.paths):
+  @staticmethod
+  def index() -> pl.Expr:
+    return pl.col(_H5_INDEX_COL).alias("index")
+
+  @staticmethod
+  def dataset(name: str) -> pl.Expr:
+    return pl.col(name)
+
+  def __init__(self, h5_paths, *columns):
+    exprs = [pl.col(c) if isinstance(c, str) else c for c in columns]
+
+    # Which real h5 datasets do these expressions actually need to be read
+    # from each file? (root column names, minus the two synthetic ones we
+    # always provide ourselves -- never read from the file.)
+    needed = set()
+    for e in exprs:
+      needed.update(e.meta.root_names())
+    needed -= {_H5_PATH_COL, _H5_INDEX_COL}
+    if not needed:
+      raise ValueError(
+        "H5Catalog needs at least one column backed by a real per-view h5 "
+        'dataset (e.g. H5Catalog.dataset("mesh_index")) to know how many '
+        "rows each file has -- path()/index() alone aren't enough.")
+    needed = sorted(needed)
+
+    frames = []
+    for path in _expand_h5_paths(h5_paths):
       with h5py.File(path, "r") as f:
-        mesh_index = f["mesh_index"][:]
-        paths_ds = f["mesh_paths"][:] if "mesh_paths" in f else None
-        for view_idx, mi in enumerate(mesh_index):
-          mesh_id = int(mi)
-          self.items.append((file_idx, mesh_id, view_idx))
-          key = (file_idx, mesh_id)
-          if paths_ds is not None and key not in self.mesh_paths:
-            mp = paths_ds[mesh_id]
-            self.mesh_paths[key] = mp.decode() if isinstance(mp, bytes) else str(mp)
+        n = f[needed[0]].shape[0]
+        raw = {
+          _H5_PATH_COL: [path] * n,
+          _H5_INDEX_COL: np.arange(n),
+          **{name: np.asarray(f[name][:]) for name in needed},
+        }
+      frames.append(pl.DataFrame(raw).select(exprs))
+    self.df = pl.concat(frames)
 
-    log.info("GSViewsDataset: %d files, %d views total", len(self.paths), len(self.items))
+  @classmethod
+  def _from_df(cls, df: pl.DataFrame) -> "H5Catalog":
+    self = cls.__new__(cls)
+    self.df = df
+    return self
+
+  def filter(self, predicate: pl.Expr) -> "H5Catalog":
+    return self._from_df(self.df.filter(predicate))
+
+  def take(self, indices) -> "H5Catalog":
+    return self._from_df(self.df[list(indices)])
 
   def __len__(self):
-    return len(self.items)
-
-  def _h5(self, file_idx):
-    return _get_h5(self.paths[file_idx])
+    return self.df.height
 
   def __getitem__(self, idx):
-    """Returns the raw (file_idx, mesh_id, view_idx) tuple -- a single view
-    has no meaningful source/target structure on its own; GSPairDataset
-    does the actual h5 reading, via this dataset's _h5()."""
-    return self.items[idx]
+    return self.df.row(idx, named=True)
 
 
-def split_by_mesh(views_ds, val_fraction=0.1, seed=42):
-  """Splits `views_ds` into train/val torch.utils.data.Subset objects, at
-  the MESH-GROUP level (whole meshes, never split a mesh's views across
-  train/val). Collects a (file_idx, mesh_id) -> [dataset index, ...] dict
-  by iterating `views_ds.items` (indices into `views_ds`, NOT view_idx --
-  that's what Subset needs), splits the dict's keys via torch's
-  random_split, then collects each split's dataset indices and wraps them
-  in a Subset.
+def split_by_mesh(catalog: H5Catalog, val_fraction=0.1, seed=42):
+  """Splits `catalog` into train/val H5Catalogs, at the MESH-GROUP level
+  (whole meshes, never split a mesh's views across train/val). The distinct
+  ("path", "mesh_id") keys are split via torch's random_split (operating
+  just on their count/positions -- there are few meshes, many views), then
+  each split's rows are pulled out with a vectorized semi-join, not a
+  per-row Python scan.
 
   A single-mesh corpus can't be split at the group level (nothing to hold
-  out) -- returns (Subset(views_ds, <all indices>), Subset(views_ds, []))
-  regardless of val_fraction; the view-level source/target sampling inside
-  GSPairDataset already provides variety there (the expected setting is
-  val_fraction=0, pure overfit)."""
-  groups = {}   # (file_idx, mesh_id) -> [dataset index, ...]
-  for i, (file_idx, mesh_id, _) in enumerate(views_ds.items):
-    groups.setdefault((file_idx, mesh_id), []).append(i)
+  out) -- returns (catalog, <empty catalog>) regardless of val_fraction;
+  the view-level source/target sampling inside GSPairDataset already
+  provides variety there (the expected setting is val_fraction=0, pure
+  overfit)."""
+  keys_df = catalog.df.select(["path", "mesh_id"]).unique().sort(["path", "mesh_id"])
+  n_keys = keys_df.height
+  if n_keys <= 1:
+    return catalog, H5Catalog._from_df(catalog.df.clear())
 
-  keys = sorted(groups)
-  if len(keys) <= 1:
-    return Subset(views_ds, list(range(len(views_ds)))), Subset(views_ds, [])
-
-  n_val = max(1, round(len(keys) * val_fraction)) if val_fraction > 0 else 0
-  n_train = len(keys) - n_val
+  n_val = max(1, round(n_keys * val_fraction)) if val_fraction > 0 else 0
+  n_train = n_keys - n_val
   generator = torch.Generator().manual_seed(seed)
-  train_keys, val_keys = random_split(keys, [n_train, n_val], generator=generator)
+  train_pos, val_pos = random_split(range(n_keys), [n_train, n_val], generator=generator)
 
-  train_indices = [i for k in train_keys for i in groups[k]]
-  val_indices = [i for k in val_keys for i in groups[k]]
-  return Subset(views_ds, train_indices), Subset(views_ds, val_indices)
+  train_keys_df = keys_df[list(train_pos)]
+  val_keys_df = keys_df[list(val_pos)]
+  train_df = catalog.df.join(train_keys_df, on=["path", "mesh_id"], how="semi")
+  val_df = catalog.df.join(val_keys_df, on=["path", "mesh_id"], how="semi")
+  return H5Catalog._from_df(train_df), H5Catalog._from_df(val_df)
 
 
 class GSPairDataset(Dataset):
-  """Wraps a torch.utils.data.Subset of a GSViewsDataset (see split_by_mesh
-  above -- this class doesn't split anything itself). One item = one
-  (fixed) source view among the subset's views, indexed directly like
-  Flash3D's own RealEstate10K dataset (index -> a specific source frame),
-  plus up to `num_target_views` OTHER views of the same mesh sampled given
-  that source (Flash3D samples target frames near the source frame in a
-  video; we have no frame order, so target views are just drawn from the
-  rest of the same mesh's views). `len(dataset)` is therefore the number of
-  VIEWS in the subset, not the number of meshes -- one epoch = every view
-  in the subset used as source exactly once.
+  """Wraps an H5Catalog with "path", "mesh_id", "view_idx" columns (e.g. one
+  half of a split_by_mesh result -- this class doesn't split anything
+  itself). One item = one (fixed) source view among the catalog's rows,
+  indexed directly like Flash3D's own RealEstate10K dataset (index -> a
+  specific source frame), plus up to `num_target_views` OTHER views of the
+  same mesh sampled given that source (Flash3D samples target frames near
+  the source frame in a video; we have no frame order, so target views are
+  just drawn from the rest of the same mesh's views). `len(dataset)` is
+  therefore the number of VIEWS in the catalog, not the number of meshes --
+  one epoch = every view in the catalog used as source exactly once.
 
   Mesh grouping (which views are siblings of a given source view) is
-  derived once here at construction, from the subset's own items -- not
-  read off any persistent index on GSViewsDataset (see its docstring).
+  derived once here at construction, via a vectorized group_by over the
+  catalog's own rows.
   """
 
-  def __init__(self, views_subset, num_target_views=3, seed=42, deterministic_targets=False):
-    self.views_ds = views_subset.dataset
+  def __init__(self, catalog: H5Catalog, num_layers=6, num_target_views=3, seed=42,
+              deterministic_targets=False):
+    self.catalog = catalog
+    self.num_layers = num_layers
     self.num_target_views = num_target_views
     self.seed = seed
     # Whether target-view sampling is reproducible (seeded off idx) or fresh
@@ -297,27 +341,25 @@ class GSPairDataset(Dataset):
     # see train_gs.py's main().
     self.deterministic_targets = deterministic_targets
 
-    self.groups = {}   # (file_idx, mesh_id) -> [view_idx, ...], this subset only
-    self.items = []    # (file_idx, mesh_id, view_idx), this subset only
-    for i in range(len(views_subset)):
-      file_idx, mesh_id, view_idx = views_subset[i]
-      key = (file_idx, mesh_id)
-      self.groups.setdefault(key, []).append(view_idx)
-      self.items.append((file_idx, mesh_id, view_idx))
+    groups_df = catalog.df.group_by(["path", "mesh_id"], maintain_order=True).agg(pl.col("view_idx"))
+    self.groups = {
+      (row["path"], row["mesh_id"]): row["view_idx"]
+      for row in groups_df.iter_rows(named=True)
+    }
 
     log.info(
-      "GSPairDataset: %d mesh groups / %d views selected (of %d views total in the underlying GSViewsDataset)",
-      len(self.groups), len(self.items), len(self.views_ds),
+      "GSPairDataset: %d mesh groups / %d views",
+      len(self.groups), len(catalog),
     )
 
   def __len__(self):
-    return len(self.items)
+    return len(self.catalog)
 
   def __getitem__(self, idx):
-    file_idx, mesh_id, source_view = self.items[idx]
-    views = self.groups[(file_idx, mesh_id)]
-    path = self.views_ds.paths[file_idx]
-    f = self.views_ds._h5(file_idx)
+    row = self.catalog[idx]
+    path, mesh_id, source_view = row["path"], row["mesh_id"], row["view_idx"]
+    views = self.groups[(path, mesh_id)]
+    f = _get_h5(path)
 
     rng = random.Random(f"{self.seed}_{idx}") if self.deterministic_targets else random.Random()
     # Sample num_target_views+1 candidates (all still <= len(views), since
@@ -331,10 +373,7 @@ class GSPairDataset(Dataset):
     else:
       target_views = []
 
-    return _build_item(
-      f, path, source_view, target_views, self.views_ds.num_layers,
-      mesh_id, self.views_ds.mesh_paths.get((file_idx, mesh_id), ""),
-    )
+    return _build_item(f, path, source_view, target_views, self.num_layers, mesh_id)
 
 
 class GSFixedViewsDataset(Dataset):
@@ -352,7 +391,6 @@ class GSFixedViewsDataset(Dataset):
     self.num_layers = num_layers
 
     with h5py.File(h5_path, "r") as f:
-      self.mesh_paths_ds = f["mesh_paths"][:] if "mesh_paths" in f else None
       if "mesh_index" in f:
         mi = f["mesh_index"][:]
         order = [self.source_view] + self.target_views
@@ -366,15 +404,9 @@ class GSFixedViewsDataset(Dataset):
       else:
         self.mesh_id = -1
 
-    mesh_path = ""
-    if self.mesh_paths_ds is not None and 0 <= self.mesh_id < len(self.mesh_paths_ds):
-      mp = self.mesh_paths_ds[self.mesh_id]
-      mesh_path = mp.decode() if isinstance(mp, bytes) else str(mp)
-    self.mesh_path = mesh_path
-
     log.info(
-      "GSFixedViewsDataset: source=%d targets=%s mesh=%s",
-      self.source_view, self.target_views, mesh_path or self.mesh_id,
+      "GSFixedViewsDataset: source=%d targets=%s mesh_id=%s",
+      self.source_view, self.target_views, self.mesh_id,
     )
 
   def __len__(self):
@@ -386,7 +418,7 @@ class GSFixedViewsDataset(Dataset):
   def __getitem__(self, idx):
     return _build_item(
       self._h5(), self.path, self.source_view, self.target_views,
-      self.num_layers, self.mesh_id, self.mesh_path,
+      self.num_layers, self.mesh_id,
     )
 
 
