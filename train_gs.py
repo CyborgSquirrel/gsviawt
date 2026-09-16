@@ -334,8 +334,16 @@ def compute_direct_loss(gauss, gt, hit, cfg_loss, device):
   same point cloud by construction). `gauss`: raw decoder output, each
   (L,C,H,W). `hit`: (L,H,W) bool. Returns (total, parts) -- `parts` only has
   keys for fields whose weight is actually nonzero (omit-if-skipped, same
-  convention as the rest of this file's metrics dicts)."""
+  convention as the rest of this file's metrics dicts). cfg_loss.supervised_layers
+  (None or a list of layer indices), when set, restricts which depth-peel
+  layers actually contribute to this loss -- everything else about the
+  model (input point cloud, predicted/rendered layers) is unchanged, only
+  which layers get gradient from THIS loss."""
   mask = hit & gt["valid"].to(device)
+  if cfg_loss.supervised_layers is not None:
+    layer_mask = torch.zeros(hit.shape[0], dtype=torch.bool, device=device)
+    layer_mask[list(cfg_loss.supervised_layers)] = True
+    mask = mask & layer_mask[:, None, None]
   parts = {}
   total = torch.zeros((), device=device)
   if not mask.any():
@@ -1086,6 +1094,16 @@ def main(cfg: DictConfig) -> None:
     "direct_opacity_weight", "direct_scale_weight", "direct_rotation_weight", "direct_color_weight"))
   if direct_enabled and cfg.data.gauss_h5 is None:
     raise SystemExit("loss.direct_*_weight > 0 requires data.gauss_h5 to be set")
+  if cfg.loss.supervised_layers is not None:
+    if not direct_enabled:
+      log.warning(
+        "loss.supervised_layers is set but no loss.direct_*_weight is nonzero -- "
+        "it only restricts compute_direct_loss, so it has no effect here")
+    out_of_range = [l for l in cfg.loss.supervised_layers if not (0 <= l < cfg.data.num_layers)]
+    if out_of_range:
+      raise SystemExit(
+        f"loss.supervised_layers has out-of-range indices {out_of_range} -- "
+        f"must be within [0, data.num_layers={cfg.data.num_layers})")
 
   if cfg.data.photom_h5_val is not None and cfg.data.fixed_source_view is None:
     log.info(

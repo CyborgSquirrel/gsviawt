@@ -140,6 +140,16 @@ loss:
   direct_rotation_weight: 0.0  # sign-invariant (1 - |dot(q_pred, q_gt)|)
   direct_color_weight: 0.0     # only touches sh_dc's gradient (SH_C0*sh_dc+0.5
                                  # vs. gt's flat RGB) -- sh_rest has no GT signal
+  # Restricts which depth-peel layers actually contribute to the direct
+  # losses above -- e.g. [0] to only supervise the front/surface layer, or
+  # [2, 3] for a couple of middle layers. null (default): all layers, i.e.
+  # unchanged behavior. Everything else (the input point cloud, which layers
+  # the network predicts/renders) is untouched -- this only narrows
+  # compute_direct_loss's own mask, a way to "reduce the problem" to a
+  # subset of layers without changing the model or the data. No effect on
+  # the photometric losses (l1/ssim/mask above), which have no per-layer
+  # concept -- they compare full rendered images.
+  supervised_layers: null   # e.g. [0], [1], [2, 3]
 
 train:
   accelerator: auto        # auto (cuda if available else cpu) | cuda | cpu
