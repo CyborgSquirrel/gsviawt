@@ -416,8 +416,20 @@ def compute_loss(model, item, cfg, device, window, force_render=False):
 
   need_photo = (force_render or cfg.loss.l1_weight > 0
                 or cfg.loss.ssim_weight > 0 or cfg.loss.mask_weight > 0)
-  need_direct = (cfg.loss.direct_opacity_weight > 0 or cfg.loss.direct_scale_weight > 0
-                 or cfg.loss.direct_rotation_weight > 0 or cfg.loss.direct_color_weight > 0)
+  need_direct_cfg = (cfg.loss.direct_opacity_weight > 0 or cfg.loss.direct_scale_weight > 0
+                      or cfg.loss.direct_rotation_weight > 0 or cfg.loss.direct_color_weight > 0)
+  gt = item.get("ground_truth")
+  if need_direct_cfg and gt is None and not force_render:
+    # force_render is True exactly at validation/orbit-preview call sites --
+    # a GT-less item there (e.g. from an external data.val_h5_paths corpus,
+    # which never carries "ground_truth") is expected and fine to silently
+    # skip. A GT-less item during an actual training_step (force_render is
+    # only ever False there) means something's wired wrong -- loud error.
+    raise ValueError(
+      "loss.direct_*_weight > 0 but a TRAINING item has no 'ground_truth' -- "
+      "set data.ground_truth_h5 (validation/orbit-preview items from an external "
+      "data.val_h5_paths corpus are expected to lack it and are fine)")
+  need_direct = need_direct_cfg and gt is not None
 
   loss = torch.zeros((), device=device)
   pred_rgb = pred_alpha = gt_rgb = gt_alpha = None
@@ -461,10 +473,6 @@ def compute_loss(model, item, cfg, device, window, force_render=False):
       loss = loss + cfg.loss.color_reg_weight * color_reg
 
   if need_direct:
-    gt = item.get("ground_truth")
-    if gt is None:
-      raise ValueError(
-        "loss.direct_*_weight > 0 but item has no 'ground_truth' -- set data.ground_truth_h5")
     direct_total, direct_parts = compute_direct_loss(gauss, gt, hit, cfg.loss, device)
     loss = loss + direct_total
     for k, v in direct_parts.items():
@@ -633,6 +641,25 @@ def log_orbit_video(wandb_run, step, tag, frames, fps, crf, workdir):
 # training loop
 # ---------------------------------------------------------------------------
 
+def _external_val_dataset(cfg):
+  """Builds val_ds as a standalone GSPairDataset over its OWN H5Catalog
+  (data.val_h5_paths), completely independent of whatever train_ds is doing
+  -- source AND target views are both drawn from this corpus itself
+  (deterministic_targets=True, exactly like today's multi-scene val split),
+  not from data.h5_paths / data.fixed_source_view. See conf/train_gs.yaml's
+  data.val_h5_paths comment for why this is the deliberate design."""
+  catalog = H5Catalog(
+    cfg.data.val_h5_paths,
+    H5Catalog.path().alias("path"),
+    H5Catalog.index().alias("view_idx"),
+    H5Catalog.dataset("mesh_index").alias("mesh_id"),
+  )
+  return GSPairDataset(
+    catalog, num_layers=cfg.data.num_layers, num_target_views=cfg.data.num_target_views,
+    seed=cfg.train.seed, deterministic_targets=True,
+  )
+
+
 class GSDataModule(pl.LightningDataModule):
   """Mechanical extraction of the dataset-construction branch that used to
   live at the top of main(): single-batch overfit mode (GSFixedViewsDataset)
@@ -667,7 +694,28 @@ class GSDataModule(pl.LightningDataModule):
         target_views=list(cfg.data.fixed_target_views), num_layers=cfg.data.num_layers,
         ground_truth_h5=cfg.data.ground_truth_h5,
       )
-      self.val_ds = _EmptyDataset()
+      # data.val_h5_paths is orthogonal to this mode's own view selection --
+      # if set, val still comes from that wholly separate corpus (source AND
+      # targets both drawn from it), not from fixed_source_view/targets.
+      self.val_ds = (
+        _external_val_dataset(cfg) if cfg.data.val_h5_paths is not None else _EmptyDataset()
+      )
+    elif cfg.data.val_h5_paths is not None:
+      # Multi-scene training with an external validation corpus: bypass
+      # split_by_mesh/val_fraction entirely and use the WHOLE h5_paths
+      # catalog for train_ds -- val_fraction becomes a no-op here (logged in
+      # main()'s config-validation block, not silently swallowed).
+      catalog = H5Catalog(
+        cfg.data.h5_paths,
+        H5Catalog.path().alias("path"),
+        H5Catalog.index().alias("view_idx"),
+        H5Catalog.dataset("mesh_index").alias("mesh_id"),
+      )
+      self.train_ds = GSPairDataset(
+        catalog, num_layers=cfg.data.num_layers, num_target_views=cfg.data.num_target_views,
+        seed=cfg.train.seed, deterministic_targets=False,
+      )
+      self.val_ds = _external_val_dataset(cfg)
     else:
       catalog = H5Catalog(
         cfg.data.h5_paths,
@@ -848,6 +896,16 @@ class GSLightningModule(pl.LightningModule):
     self._val_losses = []
     self._val_losses_source = []
     self._val_losses_targets = []
+    # Unweighted per-component photometric metrics (metrics["l1"/"ssim"/
+    # "mask"], computed unconditionally whenever need_photo -- always true at
+    # validation, force_render=True) -- tracked separately from the WEIGHTED
+    # composite above (val/rec_loss etc., driven by cfg.loss.{l1,ssim,mask}_
+    # weight) because those weights are legitimately 0 in pure-direct-loss
+    # training, which would make val/rec_loss read 0.0 every pass even though
+    # a real render did happen. See conf/train_gs.yaml's val: comment.
+    self._val_l1 = []
+    self._val_ssim = []
+    self._val_mask = []
 
   def validation_step(self, batch, batch_idx):
     if self.trainer.sanity_checking:
@@ -868,6 +926,9 @@ class GSLightningModule(pl.LightningModule):
     self._val_losses_source.append(metrics["loss_source"].item())
     if "loss_targets_mean" in metrics:
       self._val_losses_targets.append(metrics["loss_targets_mean"].item())
+    for key, bucket in (("l1", self._val_l1), ("ssim", self._val_ssim), ("mask", self._val_mask)):
+      if key in metrics:
+        bucket.append(metrics[key].item())
     if batch_idx == 0 and self.logger is not None:
       pred_rgb, _, gt_rgb, _, gauss = extras
       log_render_panel(self.logger.experiment, self.global_train_step, "val", pred_rgb, gt_rgb, gauss)
@@ -881,6 +942,11 @@ class GSLightningModule(pl.LightningModule):
     }
     if self._val_losses_targets:
       val_metrics["val/loss_targets_mean"] = float(np.mean(self._val_losses_targets))
+    for key, bucket in (
+      ("val/loss_l1", self._val_l1), ("val/loss_ssim", self._val_ssim), ("val/loss_mask", self._val_mask),
+    ):
+      if bucket:
+        val_metrics[key] = float(np.mean(bucket))
     log.info("step %d  validation: %s", self.global_train_step, val_metrics)
     if self.logger is not None:
       self.logger.experiment.log(val_metrics, step=self.global_train_step)
@@ -973,6 +1039,16 @@ def main(cfg: DictConfig) -> None:
     "direct_opacity_weight", "direct_scale_weight", "direct_rotation_weight", "direct_color_weight"))
   if direct_enabled and cfg.data.ground_truth_h5 is None:
     raise SystemExit("loss.direct_*_weight > 0 requires data.ground_truth_h5 to be set")
+
+  if cfg.data.val_h5_paths is not None and cfg.data.fixed_source_view is None:
+    log.info(
+      "data.val_h5_paths set -- data.val_fraction is ignored, the full "
+      "training corpus is used for train_ds.")
+  if cfg.data.val_h5_paths is not None and all(
+      cfg.loss[k] == 0 for k in ("l1_weight", "ssim_weight", "mask_weight")):
+    log.warning(
+      "val/rec_loss will read 0 by construction with all photometric weights "
+      "at 0 -- check val/loss_l1 / val/loss_ssim / val/loss_mask instead.")
 
   predict_params = set(cfg.model.predict_params)
   unknown = predict_params - set(PREDICTABLE_PARAMS)
