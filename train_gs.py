@@ -251,11 +251,6 @@ def apply_ground_truth_overrides(gauss, gt, hit, predict_params, device):
   return out
 
 
-def _predict_params(cfg):
-  """The set of PREDICTABLE_PARAMS entries in cfg.model.predict_params."""
-  return set(cfg.model.predict_params)
-
-
 def run_model_source(model, item, device, predict_params):
   """Runs the model on `item`'s source view once. Returns (gauss, gauss_render,
   hit, flat): `gauss` is the raw (L,C,H,W) per-layer decoder output dict --
@@ -417,7 +412,7 @@ def compute_direct_loss(gauss, gt, hit, cfg_loss, device):
 
 
 def compute_loss(model, item, cfg, device, window, force_render=False):
-  gauss, gauss_render, hit, flat = run_model_source(model, item, device, _predict_params(cfg))
+  gauss, gauss_render, hit, flat = run_model_source(model, item, device, set(cfg.model.predict_params))
 
   need_photo = (force_render or cfg.loss.l1_weight > 0
                 or cfg.loss.ssim_weight > 0 or cfg.loss.mask_weight > 0)
@@ -598,7 +593,7 @@ def render_orbit(model, item, cfg, device):
   fx = src["K_depth"][0, 0].to(device)
   ih, iw = src["rgb"].shape[-2:]
 
-  predict_params = _predict_params(cfg)
+  predict_params = set(cfg.model.predict_params)
   with torch.no_grad():
     gauss = model(rgb, xyz_cam, hit, fx)
     gt = item.get("ground_truth")
@@ -977,7 +972,7 @@ def main(cfg: DictConfig) -> None:
   if direct_enabled and cfg.data.ground_truth_h5 is None:
     raise SystemExit("loss.direct_*_weight > 0 requires data.ground_truth_h5 to be set")
 
-  predict_params = _predict_params(cfg)
+  predict_params = set(cfg.model.predict_params)
   unknown = predict_params - set(PREDICTABLE_PARAMS)
   if unknown:
     raise SystemExit(
