@@ -103,7 +103,7 @@ class GaussianResnetDecoder(nn.Module):
     self.num_ch_dec = np.array(num_ch_dec)
     self.max_sh_degree = max_sh_degree
     self.num_layers = num_layers
-    # self.scale_lambda = scale_lambda
+    self.scale_lambda = scale_lambda
 
     per_layer_dims = gaussian_split_dims(max_sh_degree)
     per_layer_scales, per_layer_biases = gaussian_init_scales_biases(
@@ -165,11 +165,17 @@ class GaussianResnetDecoder(nn.Module):
       # tensors: num_layers entries, each (B,C,H,W) -> (B,L,C,H,W)
       return rearrange(tensors, "l b c h w -> b l c h w")
 
-    raw_scale = stack_layers(per_field["scale"])
+    # scale_lambda folded in as an ADDITIVE log-space bias (log(exp(raw)*lambda)
+    # == raw + log(lambda)) rather than a separate post-exp multiply, so
+    # "raw_scale" stays log(the multiplier that "scale" actually uses) --
+    # matters for compute_direct_loss's direct_scale_weight term, which
+    # compares raw_scale directly against log(gt_scale) in log-space; without
+    # folding lambda in here that comparison would be off by a constant
+    # log(scale_lambda) offset.
+    raw_scale = stack_layers(per_field["scale"]) + float(np.log(self.scale_lambda))
 
     out = {
       "opacity": torch.sigmoid(stack_layers(per_field["opacity"])),
-      # "scale": torch.exp(stack_layers(per_field["scale"])) * self.scale_lambda,
       "raw_scale": raw_scale,
       "scale": torch.exp(raw_scale),
       "rotation": F.normalize(stack_layers(per_field["rotation"]), dim=2),

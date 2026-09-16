@@ -173,11 +173,17 @@ class GSModel(nn.Module):
     # for the ones that collapsed). Adding a constant floor to the
     # dimensionless multiplier -- not just to its initial value -- closes the
     # loophole structurally: scale can never render below
-
-    # min_scale_mult * pixel_scale, regardless of what raw drifts to.
-    # pixel_scale = torch.nan_to_num(xyz_cam[..., 2], nan=1.0) / fx   # (L,H,W)
-    # multiplier = self.min_scale_mult + out["scale"]                 # (L,3,H,W), floor + exp(raw)*scale_lambda
-    # out["scale"] = multiplier * pixel_scale.unsqueeze(1)            # (L,3,H,W)
+    # min_scale_mult * pixel_scale, regardless of what raw drifts to. This
+    # was previously disabled by accident (dead code, out["scale"] left as
+    # the decoder's raw unconstrained exp(raw)*scale_lambda in absolute
+    # world units) -- found while tracking down render_orbit's sporadic
+    # CUDA OOM: an un-anchored scale has no incentive to stay near object
+    # size, and an occasional outlier pixel's huge projected radius blows up
+    # gsplat's isect_tiles allocation (gsplat itself has no upper-bound
+    # safety valve -- radius_clip only skips gaussians BELOW a threshold).
+    pixel_scale = torch.nan_to_num(xyz_cam[..., 2], nan=1.0) / fx   # (L,H,W)
+    multiplier = self.min_scale_mult + out["scale"]                 # (L,3,H,W), floor + exp(raw)*scale_lambda
+    out["scale"] = multiplier * pixel_scale.unsqueeze(1)            # (L,3,H,W)
 
     return out
 
@@ -592,10 +598,32 @@ def _orbit_c2w_gl(means, up, num_frames, elevation_deg):
   return np.stack(poses).astype(np.float32)
 
 
+def _guarded_render(fn, tag):
+  """Runs a zero-arg render callable, catching CUDA OOM so a single bad
+  preview/validation render can't crash the whole training run. gsplat has
+  no built-in memory-budget/OOM-catch mechanism of its own -- an outlier
+  Gaussian scale (e.g. from an undertrained network early in training) can
+  blow up isect_tiles' allocation regardless of what else is using the GPU
+  (confirmed against gsplat's own GitHub issues #464/#487: same failure
+  mode, same root cause -- excessive Gaussian volume -- no upstream fix).
+  Only used at preview/validation call sites (render_orbit, the orbit
+  panel log, validation_step) where skipping one frame is safe and
+  correct -- NOT in the main training step, where an OOM mid-step should
+  still surface loudly rather than silently dropping an optimizer step.
+  Returns fn()'s result, or None on OOM (after log.warning + empty_cache)."""
+  try:
+    return fn()
+  except torch.OutOfMemoryError as e:
+    log.warning("%s: CUDA OOM during render, skipping this frame -- %s", tag, e)
+    torch.cuda.empty_cache()
+    return None
+
+
 def render_orbit(model, item, cfg, device):
   """Renders a turntable orbit of `item`'s source-view Gaussians. Returns a
   generator of (H,W,3) uint8 frames, or None if the source view seeded zero
-  Gaussians (nothing to show)."""
+  Gaussians (nothing to show) or the render hit a CUDA OOM (see
+  _guarded_render)."""
   src = item["source"]
   rgb, xyz_cam, hit = src["rgb"].to(device), src["xyz_cam"].to(device), src["hit"].to(device)
   fx = src["K_depth"][0, 0].to(device)
@@ -619,15 +647,19 @@ def render_orbit(model, item, cfg, device):
   ks = src["K_image"].to(device)[None].expand(len(poses_gl), -1, -1)
 
   import gsplat
-  with torch.no_grad():
-    rgb_out, _, _ = gsplat.rasterization(
-      means=flat["means"], quats=flat["quats"], scales=flat["scales"],
-      opacities=flat["opacities"], colors=flat["colors"],
-      viewmats=viewmats, Ks=ks, width=int(iw), height=int(ih),
-      sh_degree=cfg.model.max_sh_degree, render_mode="RGB", packed=True,
-    )
-  frames = (rgb_out.clamp(0.0, 1.0).cpu().numpy() * 255).astype(np.uint8)
-  return [frames[i] for i in range(frames.shape[0])]
+
+  def _do_render():
+    with torch.no_grad():
+      rgb_out, _, _ = gsplat.rasterization(
+        means=flat["means"], quats=flat["quats"], scales=flat["scales"],
+        opacities=flat["opacities"], colors=flat["colors"],
+        viewmats=viewmats, Ks=ks, width=int(iw), height=int(ih),
+        sh_degree=cfg.model.max_sh_degree, render_mode="RGB", packed=True,
+      )
+    frames = (rgb_out.clamp(0.0, 1.0).cpu().numpy() * 255).astype(np.uint8)
+    return [frames[i] for i in range(frames.shape[0])]
+
+  return _guarded_render(_do_render, "orbit render")
 
 
 def log_orbit_video(wandb_run, step, tag, frames, fps, crf, workdir):
@@ -929,7 +961,13 @@ class GSLightningModule(pl.LightningModule):
       # numbers worth keeping.
       return
     item = batch
-    _, metrics, extras = compute_loss(self.model, item, self.cfg, self.device, self.window, force_render=True)
+    def _do_val():
+      with torch.no_grad():
+        return compute_loss(self.model, item, self.cfg, self.device, self.window, force_render=True)
+    result = _guarded_render(_do_val, f"validation batch {batch_idx}")
+    if result is None:
+      return   # CUDA OOM -- skip this batch rather than crash the whole validation pass
+    _, metrics, extras = result
     self._val_losses.append(metrics["loss"].item())
     self._val_losses_source.append(metrics["loss_source"].item())
     if "loss_targets_mean" in metrics:
@@ -1003,9 +1041,10 @@ class OrbitCallback(pl.Callback):
         if item is None:
           continue
         frames = render_orbit(model, item, cfg, device)
-        if frames is None:
-          log.warning("orbit/%s: source view seeded zero Gaussians, skipping orbit", tag)
-        elif wandb_run is not None:
+        # None: either the source view seeded zero Gaussians, or the render
+        # hit a CUDA OOM (_guarded_render already logged which) -- either
+        # way, nothing to show this epoch, skip and move on.
+        if frames is not None and wandb_run is not None:
           log_orbit_video(wandb_run, step, f"orbit/{tag}", frames, cfg.orbit.fps, cfg.orbit.crf, self.orbit_workdir)
         # Also log a static [GT | render | |diff|] panel for the source
         # (primary) view and every target (secondary) view of this same
@@ -1013,10 +1052,14 @@ class OrbitCallback(pl.Callback):
         # real val split (e.g. single-batch overfit mode), where
         # validation_step never fires.
         if wandb_run is not None:
-          with torch.no_grad():
-            _, _, extras = compute_loss(model, item, cfg, device, pl_module.window, force_render=True)
-          pred_rgb, _, gt_rgb, _, gauss = extras
-          log_render_panel(wandb_run, step, tag, pred_rgb, gt_rgb, gauss)
+          def _do_panel():
+            with torch.no_grad():
+              return compute_loss(model, item, cfg, device, pl_module.window, force_render=True)
+          result = _guarded_render(_do_panel, f"orbit/{tag} panel")
+          if result is not None:
+            _, _, extras = result
+            pred_rgb, _, gt_rgb, _, gauss = extras
+            log_render_panel(wandb_run, step, tag, pred_rgb, gt_rgb, gauss)
     model.train()
 
   def on_fit_end(self, trainer, pl_module):

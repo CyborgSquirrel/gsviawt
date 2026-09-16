@@ -63,29 +63,35 @@ model:
                               # true: one decoder emits all layers via channel-slicing
                               # (cheaper once num_layers scales up, e.g. to 6).
   # Xavier-uniform init scale/bias per output group. opacity/rotation/sh are
-  # Flash3D's own values; scale_bias/scale_lambda are NOT (see below).
+  # Flash3D's own values; scale_bias is NOT (see below); scale_lambda IS
+  # (Flash3D's own 0.01) -- damps how far exp(raw) can push the multiplier
+  # away from the min_scale_mult floor, an extra safety margin on top of
+  # pixel-anchoring against scale blowing up (see min_scale_mult below and
+  # GSModel.forward -- an un-anchored, undamped scale sitting near
+  # object-size, not pixel-size, was confirmed to blow up gsplat's
+  # isect_tiles memory allocation).
   opacity_scale: 1.0e-3
   opacity_bias: 0.0
   scale_scale: 1.0e-1
   # "scale" is a MULTIPLIER on each pixel's own real geometric footprint
   # (depth/fx at that pixel -- see GSModel.forward), not an absolute
-  # world-unit value like Flash3D's own scale_bias=0.02/scale_lambda=0.01
-  # (tuned for their real-world-scale video scenes, meaningless for our
-  # unit-cube-normalized objects). bias=log(scale_bias) -> multiplier~1 at
-  # init, i.e. "start at one pixel of spacing". Un-anchored absolute scale
-  # let the network settle on sub-pixel Gaussians that only looked fine
-  # because gsplat's antialiasing eps2d floor (hard-coded ~3px minimum)
-  # papered over the gap -- visible the moment a render's true projected
-  # size (novel distance, etc.) exceeds that floor. A good INIT value alone
-  # isn't enough either: eps2d makes the loss gradient vanish once a
-  # Gaussian is already sub-floor, so exp(raw) can (and empirically does,
-  # given enough steps) drift back below the floor during training with
-  # nothing to stop it. min_scale_mult is a HARD floor added on top of the
-  # multiplier (final scale = (min_scale_mult + exp(raw)*scale_lambda) *
-  # pixel_scale) -- scale can never render below min_scale_mult pixels of
-  # spacing, regardless of what raw learns.
+  # world-unit value like Flash3D's own scale_bias=0.02 (tuned for their
+  # real-world-scale video scenes, meaningless for our unit-cube-normalized
+  # objects). bias=log(scale_bias) -> multiplier~1 at init, i.e. "start at
+  # one pixel of spacing". Un-anchored absolute scale let the network settle
+  # on sub-pixel Gaussians that only looked fine because gsplat's
+  # antialiasing eps2d floor (hard-coded ~3px minimum) papered over the gap
+  # -- visible the moment a render's true projected size (novel distance,
+  # etc.) exceeds that floor. A good INIT value alone isn't enough either:
+  # eps2d makes the loss gradient vanish once a Gaussian is already
+  # sub-floor, so exp(raw) can (and empirically does, given enough steps)
+  # drift back below the floor during training with nothing to stop it.
+  # min_scale_mult is a HARD floor added on top of the multiplier (final
+  # scale = (min_scale_mult + exp(raw)*scale_lambda) * pixel_scale) --
+  # scale can never render below min_scale_mult pixels of spacing,
+  # regardless of what raw learns.
   scale_bias: 1.0
-  scale_lambda: 1.0
+  scale_lambda: 0.01
   min_scale_mult: 1.0
   sh_scale: 1.0
   # Which Gaussian fields the network is trained/trusted to predict; the rest
