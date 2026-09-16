@@ -591,7 +591,7 @@ def _orbit_c2w_gl(means, up, num_frames, elevation_deg):
 
 def render_orbit(model, item, cfg, device):
   """Renders a turntable orbit of `item`'s source-view Gaussians. Returns a
-  list of (H,W,3) uint8 frames, or None if the source view seeded zero
+  generator of (H,W,3) uint8 frames, or None if the source view seeded zero
   Gaussians (nothing to show)."""
   src = item["source"]
   rgb, xyz_cam, hit = src["rgb"].to(device), src["xyz_cam"].to(device), src["hit"].to(device)
@@ -624,7 +624,7 @@ def render_orbit(model, item, cfg, device):
       sh_degree=cfg.model.max_sh_degree, render_mode="RGB", packed=True,
     )
   frames = (rgb_out.clamp(0.0, 1.0).cpu().numpy() * 255).astype(np.uint8)
-  return [frames[i] for i in range(frames.shape[0])]
+  return (frames[i] for i in range(frames.shape[0]))
 
 
 def log_orbit_video(wandb_run, step, tag, frames, fps, crf, workdir):
@@ -749,15 +749,16 @@ class GSLightningModule(pl.LightningModule):
   def configure_optimizers(self):
     opt = torch.optim.AdamW(self.model.parameters(), lr=float(self.cfg.train.lr))
 
-    def lr_lambda(step):
-      if step < self.cfg.train.warmup_steps:
-        return (step + 1) / self.cfg.train.warmup_steps
-      progress = (step - self.cfg.train.warmup_steps) / max(1, self.total_steps - self.cfg.train.warmup_steps)
-      progress = min(progress, 1.0)
-      min_ratio = self.cfg.train.min_lr / self.cfg.train.lr
-      return min_ratio + (1 - min_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
-
-    sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+    # Linear warmup -> cosine decay to min_lr, built from torch's own
+    # scheduler classes (LinearLR + CosineAnnealingLR chained via
+    # SequentialLR) rather than a hand-rolled LambdaLR closure.
+    warmup_steps = max(1, int(self.cfg.train.warmup_steps))
+    warmup = torch.optim.lr_scheduler.LinearLR(
+      opt, start_factor=1.0 / warmup_steps, end_factor=1.0, total_iters=warmup_steps)
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+      opt, T_max=max(1, self.total_steps - warmup_steps), eta_min=float(self.cfg.train.min_lr))
+    sched = torch.optim.lr_scheduler.SequentialLR(
+      opt, schedulers=[warmup, cosine], milestones=[warmup_steps])
     # "interval"/"frequency" are automatic-optimization-only metadata -- under
     # automatic_optimization=False we step `sched` ourselves (training_step),
     # but returning it this way still lets Lightning checkpoint its
@@ -853,11 +854,16 @@ class GSLightningModule(pl.LightningModule):
 
   def validation_step(self, batch, batch_idx):
     if self.trainer.sanity_checking:
-      # Real-metric logging uses our own step counter/omit-if-absent-key
-      # convention (see _log_train_wandb), not Lightning's; the sanity check
-      # only needs to prove validation_step doesn't crash, not produce
-      # numbers worth keeping (self.global_train_step is still 0 here, which
-      # would otherwise collide with/pollute the first real log at step 0).
+      # Lightning's own convention: self.log(name, value) auto-reduces
+      # (mean by default) over the epoch and is keyed to
+      # self.trainer.global_step, which stays 0 through the whole sanity
+      # check (it only advances on real optimizer steps) -- so a sanity-check
+      # self.log call would log real-looking numbers under the same step key
+      # training will use for its first genuine log. We bypass self.log
+      # entirely and use our own counter/omit-if-absent-key convention (see
+      # _log_train_wandb) instead, so this guard just needs to prove
+      # validation_step doesn't crash during the sanity pass, not produce
+      # numbers worth keeping.
       return
     item = batch
     _, metrics, extras = compute_loss(self.model, item, self.cfg, self.device, self.window, force_render=True)
@@ -910,8 +916,6 @@ class OrbitCallback(pl.Callback):
 
   def on_train_epoch_end(self, trainer, pl_module):
     cfg = self.cfg
-    if not cfg.orbit.enabled:
-      return
     # Count of COMPLETED epochs (Lightning hasn't bumped trainer.current_epoch
     # yet at this point in the hook) -- "every_n_epochs=1" means "every
     # epoch", matching conf/train_gs.yaml's comment on that field.
@@ -955,9 +959,13 @@ def main(cfg: DictConfig) -> None:
   logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
   torch.manual_seed(int(cfg.train.seed))
   torch.autograd.set_detect_anomaly(cfg.torch_detect_anomaly)
-  device = cfg.train.device if (cfg.train.device != "cuda" or torch.cuda.is_available()) else "cpu"
-  if device != cfg.train.device:
+  if cfg.train.accelerator == "auto":
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+  elif cfg.train.accelerator == "cuda" and not torch.cuda.is_available():
     log.warning("cuda not available, falling back to cpu")
+    device = "cpu"
+  else:
+    device = cfg.train.accelerator
 
   # ---- config validation (unchanged SystemExit checks, plus the new
   # grad_accum_steps==1 assertion for GSFixedViewsDataset -- see
@@ -1037,7 +1045,7 @@ def main(cfg: DictConfig) -> None:
     accelerator="gpu" if device == "cuda" else "cpu",
     devices=1,
     logger=logger,
-    callbacks=[OrbitCallback(cfg)],
+    callbacks=[OrbitCallback(cfg)] if cfg.orbit.enabled else [],
     enable_checkpointing=False,   # we save checkpoints ourselves (see
                                     # GSLightningModule.training_step /
                                     # on_train_end), driven by our own step

@@ -101,7 +101,7 @@ loss:
                                  # vs. gt's flat RGB) -- sh_rest has no GT signal
 
 train:
-  device: cuda
+  accelerator: auto        # auto (cuda if available else cpu) | cuda | cpu
   seed: 42
   num_workers: 4
   grad_accum_steps: 4        # effective batch size (batch_size is fixed at 1 scene/step)
