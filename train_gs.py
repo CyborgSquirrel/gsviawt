@@ -619,7 +619,7 @@ def render_orbit(model, item, cfg, device):
       sh_degree=cfg.model.max_sh_degree, render_mode="RGB", packed=True,
     )
   frames = (rgb_out.clamp(0.0, 1.0).cpu().numpy() * 255).astype(np.uint8)
-  return (frames[i] for i in range(frames.shape[0]))
+  return [frames[i] for i in range(frames.shape[0])]
 
 
 def log_orbit_video(wandb_run, step, tag, frames, fps, crf, workdir):
@@ -955,12 +955,12 @@ def main(cfg: DictConfig) -> None:
   torch.manual_seed(int(cfg.train.seed))
   torch.autograd.set_detect_anomaly(cfg.torch_detect_anomaly)
   if cfg.train.accelerator == "auto":
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    accelerator = "gpu" if torch.cuda.is_available() else "cpu"
   elif cfg.train.accelerator == "cuda" and not torch.cuda.is_available():
     log.warning("cuda not available, falling back to cpu")
-    device = "cpu"
+    accelerator = "cpu"
   else:
-    device = cfg.train.accelerator
+    accelerator = cfg.train.accelerator
 
   # ---- config validation (unchanged SystemExit checks, plus the new
   # grad_accum_steps==1 assertion for GSFixedViewsDataset -- see
@@ -1014,8 +1014,8 @@ def main(cfg: DictConfig) -> None:
 
   model = GSLightningModule(cfg, total_steps=total_steps)
 
-  log.info("train=%d val=%d views, device=%s, output=%s, total_steps=%d",
-           len(datamodule.train_ds), len(datamodule.val_ds), device, model.ckpt_path, total_steps)
+  log.info("train=%d val=%d views, accelerator=%s, output=%s, total_steps=%d",
+           len(datamodule.train_ds), len(datamodule.val_ds), accelerator, model.ckpt_path, total_steps)
 
   logger = False
   if cfg.wandb.mode != "disabled":
@@ -1025,6 +1025,10 @@ def main(cfg: DictConfig) -> None:
       name=cfg.wandb.name, config=OmegaConf.to_container(cfg, resolve=True),
     )
     logger = WandbLogger(experiment=wandb_run)
+
+  callbacks = []
+  if cfg.orbit.enabled:
+    callbacks.append(OrbitCallback(cfg))
 
   # GSDataModule.val_dataloader() returns None when there's no val split at
   # all (fixed-view overfit mode). Lightning does NOT treat that as "skip
@@ -1037,10 +1041,10 @@ def main(cfg: DictConfig) -> None:
   trainer = pl.Trainer(
     max_epochs=int(cfg.train.max_epochs),
     max_steps=-1,
-    accelerator="gpu" if device == "cuda" else "cpu",
+    accelerator=accelerator,
     devices=1,
     logger=logger,
-    callbacks=[OrbitCallback(cfg)] if cfg.orbit.enabled else [],
+    callbacks=callbacks,
     enable_checkpointing=False,   # we save checkpoints ourselves (see
                                     # GSLightningModule.training_step /
                                     # on_train_end), driven by our own step
