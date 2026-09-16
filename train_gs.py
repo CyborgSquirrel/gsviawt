@@ -697,9 +697,11 @@ class GSDataModule(pl.LightningDataModule):
     # cfg.val.every<=0 (validation disabled entirely, independent of whether
     # there's data to validate against) is handled by main()'s
     # Trainer(limit_val_batches=...) -- this only covers "no data at all"
-    # (replaces today's _EmptyDataset-guarded skip in run_validation).
-    if len(self.val_ds) == 0:
-      return None
+    # (replaces today's _EmptyDataset-guarded skip in run_validation). Always
+    # a real DataLoader, even over a zero-length _EmptyDataset -- Lightning
+    # handles an empty DataLoader (0 batches) fine; it does NOT handle
+    # val_dataloader() itself returning None (see main()'s Trainer comment,
+    # this was tried first and crashed).
     return DataLoader(self.val_ds, batch_size=1, shuffle=False, num_workers=0, collate_fn=lambda batch: batch[0])
 
 
@@ -1030,14 +1032,6 @@ def main(cfg: DictConfig) -> None:
   if cfg.orbit.enabled:
     callbacks.append(OrbitCallback(cfg))
 
-  # GSDataModule.val_dataloader() returns None when there's no val split at
-  # all (fixed-view overfit mode). Lightning does NOT treat that as "skip
-  # validation" -- it raises TypeError the next time it actually tries to
-  # iterate the dataloader, whether that's the sanity check or (if the
-  # sanity check was disabled) the first real check_val_every_n_epoch
-  # boundary later in training. limit_val_batches=0 is the only setting that
-  # reliably keeps Lightning from calling val_dataloader() at all.
-  has_val = len(datamodule.val_ds) > 0
   trainer = pl.Trainer(
     max_epochs=int(cfg.train.max_epochs),
     max_steps=-1,
@@ -1050,8 +1044,7 @@ def main(cfg: DictConfig) -> None:
                                     # on_train_end), driven by our own step
                                     # counter -- not Lightning's ModelCheckpoint.
     check_val_every_n_epoch=max(1, int(cfg.val.every)),
-    limit_val_batches=0 if (cfg.val.every <= 0 or not has_val) else 1.0,
-    num_sanity_val_steps=0 if not has_val else 2,
+    limit_val_batches=0 if cfg.val.every <= 0 else 1.0,
     log_every_n_steps=1,   # irrelevant to us -- we bypass self.log entirely
                              # and log via self.logger.experiment.log
                              # ourselves; keeps Lightning's unrelated internal
