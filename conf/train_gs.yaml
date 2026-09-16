@@ -160,7 +160,7 @@ val:
 # views of the already-fixed Gaussian set -- see train_gs.py's render_orbit.
 orbit:
   enabled: true
-  every_n_epochs: 1          # one pass over the train DataLoader = one epoch
+  every_n_epochs: 1000       # one pass over the train DataLoader = one epoch
   num_frames: 24             # keep modest -- this runs frequently
   fps: 12
   crf: 28                    # x264 quality (higher = smaller/faster; fine for monitoring)
