@@ -1092,8 +1092,19 @@ def main(cfg: DictConfig) -> None:
 
   model = GSLightningModule(cfg, total_steps=total_steps)
 
-  log.info("train=%d val=%d views, accelerator=%s, output=%s, total_steps=%d",
-           len(datamodule.train_ds), len(datamodule.val_ds), accelerator, model.ckpt_path, total_steps)
+  # Stashed into cfg (not just logged) so it lands in wandb's persisted run
+  # config below (OmegaConf.to_container(cfg, ...)) -- unlike the console-only
+  # "Total params" line from Lightning's own ModelSummary table, this is
+  # queryable after the fact. set_struct(False) since Hydra's cfg is
+  # struct-locked by default (adding a key not in the yaml schema would
+  # otherwise raise ConfigAttributeError).
+  OmegaConf.set_struct(cfg, False)
+  cfg.model.num_params = sum(p.numel() for p in model.parameters())
+  OmegaConf.set_struct(cfg, True)
+
+  log.info("train=%d val=%d views, accelerator=%s, output=%s, total_steps=%d, num_params=%d",
+           len(datamodule.train_ds), len(datamodule.val_ds), accelerator, model.ckpt_path, total_steps,
+           cfg.model.num_params)
 
   logger = False
   if cfg.wandb.mode != "disabled":
