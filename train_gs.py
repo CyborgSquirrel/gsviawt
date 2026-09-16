@@ -1023,6 +1023,14 @@ def main(cfg: DictConfig) -> None:
     )
     logger = WandbLogger(experiment=wandb_run)
 
+  # GSDataModule.val_dataloader() returns None when there's no val split at
+  # all (fixed-view overfit mode). Lightning does NOT treat that as "skip
+  # validation" -- it raises TypeError the next time it actually tries to
+  # iterate the dataloader, whether that's the sanity check or (if the
+  # sanity check was disabled) the first real check_val_every_n_epoch
+  # boundary later in training. limit_val_batches=0 is the only setting that
+  # reliably keeps Lightning from calling val_dataloader() at all.
+  has_val = len(datamodule.val_ds) > 0
   trainer = pl.Trainer(
     max_epochs=int(cfg.train.max_epochs),
     max_steps=-1,
@@ -1035,14 +1043,8 @@ def main(cfg: DictConfig) -> None:
                                     # on_train_end), driven by our own step
                                     # counter -- not Lightning's ModelCheckpoint.
     check_val_every_n_epoch=max(1, int(cfg.val.every)),
-    limit_val_batches=0 if cfg.val.every <= 0 else 1.0,
-    # GSDataModule.val_dataloader() returns None when there's no val split
-    # at all (fixed-view overfit mode) -- Lightning's sanity check calls it
-    # unconditionally before training starts whenever num_sanity_val_steps>0
-    # (its own default), and crashes on a None dataloader instead of
-    # skipping gracefully. Disable the sanity check outright when we already
-    # know (via the datamodule.setup() call above) there's no val data.
-    num_sanity_val_steps=0 if len(datamodule.val_ds) == 0 else 2,
+    limit_val_batches=0 if (cfg.val.every <= 0 or not has_val) else 1.0,
+    num_sanity_val_steps=0 if not has_val else 2,
     log_every_n_steps=1,   # irrelevant to us -- we bypass self.log entirely
                              # and log via self.logger.experiment.log
                              # ourselves; keeps Lightning's unrelated internal
