@@ -66,10 +66,10 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 import torch.nn as nn  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
-from einops import rearrange  # noqa: E402
+from einops import rearrange, repeat  # noqa: E402
 from lightning.pytorch.loggers import WandbLogger  # noqa: E402
 from omegaconf import DictConfig, OmegaConf  # noqa: E402
-from torch.utils.data import DataLoader, Subset  # noqa: E402
+from torch.utils.data import DataLoader  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
 from gs_dataset import (  # noqa: E402
@@ -216,18 +216,7 @@ def apply_ground_truth_overrides(gauss, gt, hit, predict_params, device):
   """Overwrites gauss's fields NOT listed in `predict_params` with values
   taken directly from `gt` (gs_dataset._load_ground_truth's output),
   converted to gauss's own units/shape. Only overrides where hit &
-  gt["valid"] agree -- elsewhere keeps the model's own prediction (nothing to
-  substitute there). Fields still listed in predict_params are untouched.
-
-  This is the mechanism behind model.predict_params (see conf/train_gs.yaml):
-  restricting which fields the network is actually trained/trusted to
-  predict, so a field with NO loss on it at all can't silently drift via the
-  shared decoder trunk while a DIFFERENT field is being trained. Concretely:
-  a direct-color-only run (direct_scale_weight=0 AND scale_reg_weight=0)
-  left scale completely unconstrained; it drifted far enough by step ~1000
-  that the next periodic orbit render's gsplat call OOM'd trying to allocate
-  ~14GB for tile intersections. Pinning scale (and opacity/rotation) to
-  ground truth here removes that drift entirely instead of just bounding it."""
+  gt["valid"] agree -- elsewhere keeps the model's own prediction."""
   out = dict(gauss)
   mask = (hit & gt["valid"].to(device)).unsqueeze(1)   # (L,1,H,W)
 
@@ -237,50 +226,48 @@ def apply_ground_truth_overrides(gauss, gt, hit, predict_params, device):
 
   if "scale" not in predict_params:
     gt_scale = rearrange(gt["scale"].to(device), "l h w c -> l c h w")
-    m3 = mask.expand(-1, 3, -1, -1)
+    m3 = repeat(mask, "l 1 h w -> l c h w", c=3)
     out["scale"] = torch.where(m3, gt_scale, gauss["scale"])
     if "raw_scale" in gauss:
       out["raw_scale"] = torch.where(m3, torch.log(gt_scale.clamp(min=1e-8)), gauss["raw_scale"])
 
   if "rotation" not in predict_params:
     gt_rotation = rearrange(gt["rotation"].to(device), "l h w c -> l c h w")
-    out["rotation"] = torch.where(mask.expand(-1, 4, -1, -1), gt_rotation, gauss["rotation"])
+    m4 = repeat(mask, "l 1 h w -> l c h w", c=4)
+    out["rotation"] = torch.where(m4, gt_rotation, gauss["rotation"])
 
   if "color" not in predict_params:
     gt_color = rearrange(gt["color"].to(device), "l h w c -> l c h w")
     gt_sh_dc = (gt_color - 0.5) / SH_C0
-    m3 = mask.expand(-1, 3, -1, -1)
+    m3 = repeat(mask, "l 1 h w -> l c h w", c=3)
     out["sh_dc"] = torch.where(m3, gt_sh_dc, gauss["sh_dc"])
     if "sh_rest" in gauss:
       # No ground-truth signal exists for view-dependent shading at all
       # (fit_gsplat.py has no SH>0) -- zero it rather than leave an
       # untrained network output riding on top of a now-fixed flat color.
-      m_rest = mask.expand(-1, gauss["sh_rest"].shape[1], -1, -1)
+      m_rest = repeat(mask, "l 1 h w -> l c h w", c=gauss["sh_rest"].shape[1])
       out["sh_rest"] = torch.where(m_rest, torch.zeros_like(gauss["sh_rest"]), gauss["sh_rest"])
 
   return out
 
 
 def _predict_params(cfg):
-  """None (predict everything -- today's default, unchanged behavior) or the
-  set of PREDICTABLE_PARAMS entries in cfg.model.predict_params."""
-  if cfg.model.predict_params is None:
-    return None
+  """The set of PREDICTABLE_PARAMS entries in cfg.model.predict_params."""
   return set(cfg.model.predict_params)
 
 
-def run_model_source(model, item, device, predict_params=None):
+def run_model_source(model, item, device, predict_params):
   """Runs the model on `item`'s source view once. Returns (gauss, gauss_render,
   hit, flat): `gauss` is the raw (L,C,H,W) per-layer decoder output dict --
   always the network's own unmodified prediction, so compute_direct_loss's
   metrics stay meaningful even for fields not being trained. `gauss_render` is
   the same dict with any non-predicted fields overridden by ground truth (see
   apply_ground_truth_overrides) -- what rendering and visualization should
-  actually use (identical to `gauss` when predict_params is None). `hit` is
-  (L,H,W) bool. `flat` is flatten_gaussians' output built from `gauss_render`
-  -- shared by both the photometric render path and the direct-parameter-loss
-  path below (see compute_loss), computed exactly once regardless of which
-  (or both) are active this step."""
+  actually use (identical to `gauss` when predict_params covers every field).
+  `hit` is (L,H,W) bool. `flat` is flatten_gaussians' output built from
+  `gauss_render` -- shared by both the photometric render path and the
+  direct-parameter-loss path below (see compute_loss), computed exactly once
+  regardless of which (or both) are active this step."""
   src = item["source"]
   rgb = src["rgb"].to(device)
   xyz_cam = src["xyz_cam"].to(device)
@@ -289,10 +276,9 @@ def run_model_source(model, item, device, predict_params=None):
 
   gauss = model(rgb, xyz_cam, hit, fx)
   gauss_render = gauss
-  if predict_params is not None:
-    gt = item.get("ground_truth")
-    if gt is not None:
-      gauss_render = apply_ground_truth_overrides(gauss, gt, hit, predict_params, device)
+  gt = item.get("ground_truth")
+  if gt is not None:
+    gauss_render = apply_ground_truth_overrides(gauss, gt, hit, predict_params, device)
   flat = flatten_gaussians(xyz_cam, hit, gauss_render)
   return gauss, gauss_render, hit, flat
 
@@ -382,54 +368,26 @@ def compute_direct_loss(gauss, gt, hit, cfg_loss, device):
   eps = 1e-6
   if cfg_loss.direct_opacity_weight > 0:
     opacity_pred = rearrange(gauss["opacity"], "l c h w -> l h w c")[..., 0]
-    parts["opacity"] = (opacity_pred - gt["opacity"].to(device)).abs()[mask].mean()
+    # nan_to_num: outside `mask` (invalid/padding grid cells) gt_opacity is
+    # NaN-filled at the source, same as gt_scale -- those cells are excluded
+    # from the loss value via [mask] below, but pow(2)'s backward (2*x) still
+    # propagates NaN through the unselected positions' local Jacobian even
+    # though their incoming gradient is zero (0*NaN=NaN). abs()'s backward
+    # (sign(x)) never had this problem; L2 does, so the guard is required now.
+    gt_opacity = torch.nan_to_num(gt["opacity"].to(device), nan=0.0)
+    parts["opacity"] = (opacity_pred - gt_opacity).pow(2)[mask].mean()
     total = total + cfg_loss.direct_opacity_weight * parts["opacity"]
 
   if cfg_loss.direct_scale_weight > 0:
-    # Log-space: both sides are already absolute world-unit sizes BY THIS
-    # POINT -- gauss["scale"] is GSModel.forward's fully floor+pixel_scale-
-    # transformed output, not gauss["raw_scale"] (the decoder's pre-transform
-    # logit, which skips both the min_scale_mult floor and the pixel_scale
-    # multiply -- comparing that directly against gt["scale"] mismatches
-    # units). Scale is strictly positive/multiplicative, so a linear L1
-    # would let a few large Gaussians dominate.
-    #
-    # Clamped on both sides: clamp_min guards log(0)=-inf; clamp_max matters
-    # more -- exp(raw) can overflow to inf at a high LR (float32 overflows
-    # above raw~88), and unlike the photometric path (routed through
-    # gsplat's own internal handling), nothing here would otherwise stop an
-    # overflowed scale from becoming an inf/NaN loss that permanently
-    # corrupts Adam's moment buffers. 1e4 is generously above anything
-    # physically plausible for a unit-cube-normalized object (the whole
-    # object spans ~1.0) -- it only ever engages once something has already
-    # gone wrong upstream, it doesn't touch legitimate values.
-
-    # scale_pred = rearrange(gauss["scale"], "l c h w -> l h w c").clamp(eps, 1e4)
-    # gt_scale = gt["scale"].to(device).clamp(eps, 1e4)
-    # log_diff = torch.log(scale_pred) - torch.log(gt_scale)
-    # parts["scale"] = log_diff.abs()[mask].mean()
-    # total = total + cfg_loss.direct_scale_weight * parts["scale"]
-
+    # Log-space L2 against gauss["raw_scale"] (pre-floor/pixel_scale logit,
+    # not the activated "scale" -- units must match gt after log()). L2 over
+    # L1 concentrates gradient on the worst-residual pixels instead of
+    # applying equal pressure everywhere. gt_scale is NaN-padded outside
+    # `mask`; nan_to_num guards pow(2)'s backward (2*x) from propagating
+    # that NaN even though the incoming gradient there is zero.
     scale_pred = rearrange(gauss["raw_scale"], "l c h w -> l h w c")
-    # nan_to_num then clamp: outside `mask` (invalid/padding grid cells)
-    # gt_scale is NaN-filled at the source (_load_ground_truth reads the h5's
-    # raw never-optimized slots as-is), and those cells are excluded from the
-    # loss value itself via [mask] below -- but pow(2)'s backward is 2*x, and
-    # NaN propagates through both the forward value AND (independently of
-    # the masked-out incoming gradient being zero) the backward Jacobian
-    # itself, so 0*NaN is still NaN. clamp() alone doesn't help since clamp
-    # passes NaN through unchanged. abs()'s backward (sign(x), well-defined
-    # even where x is otherwise huge/degenerate) never hit this; pow(2) does.
     gt_scale = torch.nan_to_num(gt["scale"].to(device), nan=eps).clamp(min=eps)
     log_diff = scale_pred - torch.log(gt_scale)
-    # L2 (not L1): L1's gradient is constant-magnitude regardless of residual
-    # size, so once the bulk of pixels are roughly right, the remaining
-    # signal is just as strong per-pixel as it was at the start -- observed
-    # in practice as a fast initial drop then a long, slow grind (loss
-    # plateaued around 0.27 after 22k steps instead of continuing to zero).
-    # L2's gradient scales with the residual, concentrating pressure on the
-    # still-wrong pixels instead of fighting the shared decoder trunk with
-    # equal force from every pixel, including already-converged ones.
     parts["scale"] = log_diff.pow(2)[mask].mean()
     total = total + cfg_loss.direct_scale_weight * parts["scale"]
 
@@ -445,9 +403,14 @@ def compute_direct_loss(gauss, gt, hit, cfg_loss, device):
     # fit_gsplat.py has no SH>0 -- its ground truth is flat RGB, comparable
     # to our sh_dc via SH degree-0 evaluation. Only sh_dc gets a gradient
     # from this; sh_rest has no ground-truth signal in this source at all.
+    # nan_to_num guard: same reasoning as direct_scale_weight/direct_opacity_weight
+    # above -- gt["color"] is NaN-padded outside `mask`, and pow(2)'s backward
+    # (2*x) propagates that NaN through the unselected positions' local Jacobian
+    # even though their incoming gradient is zero (0*NaN=NaN).
     shdc_pred = rearrange(gauss["sh_dc"], "l c h w -> l h w c")
     color_pred = SH_C0 * shdc_pred + 0.5
-    parts["color"] = (color_pred - gt["color"].to(device)).abs()[mask].mean()
+    gt_color = torch.nan_to_num(gt["color"].to(device), nan=0.0)
+    parts["color"] = (color_pred - gt_color).pow(2)[mask].mean()
     total = total + cfg_loss.direct_color_weight * parts["color"]
 
   return total, parts
@@ -638,10 +601,9 @@ def render_orbit(model, item, cfg, device):
   predict_params = _predict_params(cfg)
   with torch.no_grad():
     gauss = model(rgb, xyz_cam, hit, fx)
-    if predict_params is not None:
-      gt = item.get("ground_truth")
-      if gt is not None:
-        gauss = apply_ground_truth_overrides(gauss, gt, hit, predict_params, device)
+    gt = item.get("ground_truth")
+    if gt is not None:
+      gauss = apply_ground_truth_overrides(gauss, gt, hit, predict_params, device)
     flat = flatten_gaussians(xyz_cam, hit, gauss)
   if flat["means"].shape[0] == 0:
     return None
@@ -743,9 +705,7 @@ class GSDataModule(pl.LightningDataModule):
     # (replaces today's _EmptyDataset-guarded skip in run_validation).
     if len(self.val_ds) == 0:
       return None
-    n = min(int(self.cfg.val.num_scenes), len(self.val_ds))
-    subset = Subset(self.val_ds, range(n))
-    return DataLoader(subset, batch_size=1, shuffle=False, num_workers=0, collate_fn=lambda batch: batch[0])
+    return DataLoader(self.val_ds, batch_size=1, shuffle=False, num_workers=0, collate_fn=lambda batch: batch[0])
 
 
 class GSLightningModule(pl.LightningModule):
@@ -1010,22 +970,21 @@ def main(cfg: DictConfig) -> None:
     raise SystemExit("loss.direct_*_weight > 0 requires data.ground_truth_h5 to be set")
 
   predict_params = _predict_params(cfg)
-  if predict_params is not None:
-    unknown = predict_params - set(PREDICTABLE_PARAMS)
-    if unknown:
-      raise SystemExit(
-        f"model.predict_params has unknown entries {sorted(unknown)} -- "
-        f"must be a subset of {PREDICTABLE_PARAMS}")
-    if cfg.data.ground_truth_h5 is None:
-      raise SystemExit(
-        "model.predict_params (restricting which fields the network predicts) "
-        "requires data.ground_truth_h5 to supply the rest")
-    for field in PREDICTABLE_PARAMS:
-      if field not in predict_params and cfg.loss[f"direct_{field}_weight"] > 0:
-        log.warning(
-          "model.predict_params excludes '%s' but loss.direct_%s_weight > 0 -- "
-          "that field is forced to ground truth everywhere it's used, so this "
-          "loss term trains a head with no effect on rendering/output", field, field)
+  unknown = predict_params - set(PREDICTABLE_PARAMS)
+  if unknown:
+    raise SystemExit(
+      f"model.predict_params has unknown entries {sorted(unknown)} -- "
+      f"must be a subset of {PREDICTABLE_PARAMS}")
+  if predict_params != set(PREDICTABLE_PARAMS) and cfg.data.ground_truth_h5 is None:
+    raise SystemExit(
+      "model.predict_params (restricting which fields the network predicts) "
+      "requires data.ground_truth_h5 to supply the rest")
+  for field in PREDICTABLE_PARAMS:
+    if field not in predict_params and cfg.loss[f"direct_{field}_weight"] > 0:
+      log.warning(
+        "model.predict_params excludes '%s' but loss.direct_%s_weight > 0 -- "
+        "that field is forced to ground truth everywhere it's used, so this "
+        "loss term trains a head with no effect on rendering/output", field, field)
 
   if cfg.data.fixed_source_view is not None:
     # Single-batch overfit mode (fit_gsplat.py's primary/secondary terms
@@ -1077,6 +1036,13 @@ def main(cfg: DictConfig) -> None:
                                     # counter -- not Lightning's ModelCheckpoint.
     check_val_every_n_epoch=max(1, int(cfg.val.every)),
     limit_val_batches=0 if cfg.val.every <= 0 else 1.0,
+    # GSDataModule.val_dataloader() returns None when there's no val split
+    # at all (fixed-view overfit mode) -- Lightning's sanity check calls it
+    # unconditionally before training starts whenever num_sanity_val_steps>0
+    # (its own default), and crashes on a None dataloader instead of
+    # skipping gracefully. Disable the sanity check outright when we already
+    # know (via the datamodule.setup() call above) there's no val data.
+    num_sanity_val_steps=0 if len(datamodule.val_ds) == 0 else 2,
     log_every_n_steps=1,   # irrelevant to us -- we bypass self.log entirely
                              # and log via self.logger.experiment.log
                              # ourselves; keeps Lightning's unrelated internal

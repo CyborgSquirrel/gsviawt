@@ -59,27 +59,12 @@ model:
   scale_lambda: 1.0
   min_scale_mult: 1.0
   sh_scale: 1.0
-  # Restrict which Gaussian fields the network is actually trained/trusted to
-  # predict. null (default) = predict everything, today's behavior,
-  # unchanged. When set to a subset of [opacity, scale, rotation, color],
-  # requires data.ground_truth_h5: fields NOT listed here are overwritten
-  # with ground-truth values (wherever hit & ground truth agree) before
-  # flattening/rendering, instead of being left as whatever the network's
-  # decoder head currently outputs. Two reasons to use this: (1) cleaner
-  # visualizations when isolating one field's training (e.g.
-  # predict_params: [scale] to see only scale's own learning signal,
-  # unpolluted by an untrained opacity/rotation/color), and (2) safety -- a
-  # field with NO loss on it at all (not even loss.scale_reg_weight /
-  # loss.color_reg_weight) doesn't just sit at its init value; the shared
-  # encoder/decoder trunk keeps changing from gradients on whichever OTHER
-  # field IS being trained, so its output can drift arbitrarily far with
-  # nothing to check it. This bit us for real: a direct-color-only run
-  # (direct_scale_weight=0 AND scale_reg_weight=0) drifted its unsupervised
-  # scale far enough by step ~1000 that the next periodic orbit render's
-  # gsplat call tried to allocate ~14GB for tile intersections and OOM'd.
-  # predict_params: [color] for that run pins scale/opacity/rotation to
-  # ground truth instead, so there's nothing left to drift.
-  predict_params: null
+  # Which Gaussian fields the network is trained/trusted to predict; the rest
+  # are overwritten with data.ground_truth_h5 values before
+  # flattening/rendering. E.g. [scale] isolates scale's own learning signal
+  # and pins everything else to ground truth, so an unsupervised field can't
+  # silently drift via the shared decoder trunk.
+  predict_params: [opacity, scale, rotation, color]
   # z-score constants for the input point cloud's camera-space xyz channels
   # (WT's own training-distribution stats; derived from render_objaverse.py's
   # convention -- unit-cube-normalized objects, camera_distance~=1.9).
@@ -120,15 +105,6 @@ train:
   seed: 42
   num_workers: 4
   grad_accum_steps: 4        # effective batch size (batch_size is fixed at 1 scene/step)
-  # Duration control is epoch-based (Trainer(max_epochs=...)), not step-based
-  # -- see train_gs_lightning_plan.md. The LR schedule still needs a total
-  # step count, derived as max_epochs * ceil(len(train_dataloader) /
-  # grad_accum_steps) rather than hardcoded (see main()'s `total_steps`).
-  # For fixed-view mode (grad_accum_steps required ==1, dataloader length 1),
-  # epoch == optimizer step, so this numeric value carries over unchanged
-  # from the old max_steps=20000. For multi-scene mode this is a real epoch
-  # count against actual corpus size -- recalibrate it, don't assume it
-  # still means what max_steps=20000 used to.
   max_epochs: 20000
   lr: 1.0e-4
   min_lr: 1.0e-6            # cosine floor (never fully reaches 0, avoids a dead-flat tail)
@@ -139,7 +115,6 @@ train:
 
 val:
   every: 500                 # 0 disables
-  num_scenes: 8
 
 # Turntable orbit preview, rendered from a fixed train scene and (if the
 # corpus has one) a fixed val scene, logged as wandb.Video. Cheap: one
