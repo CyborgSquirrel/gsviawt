@@ -647,6 +647,62 @@ class GSFixedViewsDataset(Dataset):
     return item
 
 
+class GaussH5ValDataset(Dataset):
+  """Single-item validation dataset built entirely from a fit_gsplat.py
+  ground-truth .h5's own embedded views: the primary view as source, every
+  one of its embedded secondary views (images_used[1:]/camera_pose_used[1:]/
+  image_intrinsics_used[1:] -- the exact views fit_gsplat.py itself fit
+  against) as photometric targets. ground_truth is attached too, so
+  apply_ground_truth_overrides pins whichever fields the model isn't
+  predicting to the real per-pixel fit instead of exposing untrained decoder
+  heads on render. Used as GSDataModule's val_ds whenever data.gauss_h5 is
+  set and there's no separate data.photom_h5_val corpus -- gives real
+  photometric val numbers (logged via the ordinary val/loss_l1 etc. path)
+  even for a direct-supervision-only training run, with no extra render
+  corpus needed on disk."""
+
+  def __init__(self, gauss_h5, num_layers=6):
+    self.gauss_h5 = gauss_h5
+    self.num_layers = num_layers
+    with h5py.File(gauss_h5, "r") as f:
+      images_used = np.asarray(f["images_used"])             # (V,H,W,4) uint8
+      poses_used = np.asarray(f["camera_pose_used"])          # (V,4,4)
+      k_image_used = np.asarray(f["image_intrinsics_used"])   # (V,3,3)
+      view_index_used = np.asarray(f["view_index_used"])      # (V,)
+      src = _read_primary_from_gauss_h5(f)
+
+    pose_gl = torch.from_numpy(src["pose"])
+    gt_tensors, gt_attrs = _load_ground_truth(gauss_h5, pose_gl)
+    gt_tensors.pop("means_world", None)
+
+    targets = [
+      {
+        "rgb": images_used[i, ..., :3].astype(np.float32) / 255.0,
+        "alpha": images_used[i, ..., 3].astype(np.float32) / 255.0,
+        "K_image": k_image_used[i].astype(np.float32),
+        "pose": poses_used[i].astype(np.float32),
+      }
+      for i in range(1, images_used.shape[0])
+    ]
+    self._item = _assemble_item(
+      src, targets, num_layers=num_layers, mesh_id=gt_attrs["mesh_index"],
+      source_view=int(view_index_used[0]), target_views=[int(v) for v in view_index_used[1:]],
+    )
+    self._item["ground_truth"] = gt_tensors
+
+    log.info(
+      "GaussH5ValDataset: %r source_view=%d, %d embedded target views (the real "
+      "fit_gsplat.py corpus, ground-truth-pinned)",
+      gauss_h5, self._item["source_view"], len(targets),
+    )
+
+  def __len__(self):
+    return 1
+
+  def __getitem__(self, idx):
+    return self._item
+
+
 class _EmptyDataset(Dataset):
   """A zero-length placeholder for `val_ds` when there's nothing to validate
   against (e.g. GSFixedViewsDataset's single-batch overfit mode) -- every

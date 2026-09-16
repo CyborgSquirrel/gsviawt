@@ -74,7 +74,8 @@ from torch.utils.data import DataLoader  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
 from gs_dataset import (  # noqa: E402
-  OPENGL_TO_OPENCV, GSFixedViewsDataset, GSPairDataset, H5Catalog, _EmptyDataset, split_by_mesh,
+  OPENGL_TO_OPENCV, GaussH5ValDataset, GSFixedViewsDataset, GSPairDataset, H5Catalog, _EmptyDataset,
+  split_by_mesh,
 )
 from gs_decoder import GaussianResnetDecoder, GSDecoderStack  # noqa: E402
 from gs_encoder import GSResnetEncoder  # noqa: E402
@@ -711,9 +712,16 @@ class GSDataModule(pl.LightningDataModule):
       # data.photom_h5_val is orthogonal to this mode's own view selection --
       # if set, val still comes from that wholly separate corpus (source AND
       # targets both drawn from it), not from fixed_source_view/targets.
-      self.val_ds = (
-        _external_val_dataset(cfg) if cfg.data.photom_h5_val is not None else _EmptyDataset()
-      )
+      # Otherwise, when data.gauss_h5 is set, fall back to ITS OWN embedded
+      # views (GaussH5ValDataset) -- gives real photometric val numbers for
+      # a direct-supervision-only run without needing any separate render
+      # corpus on disk.
+      if cfg.data.photom_h5_val is not None:
+        self.val_ds = _external_val_dataset(cfg)
+      elif cfg.data.gauss_h5 is not None:
+        self.val_ds = GaussH5ValDataset(cfg.data.gauss_h5, num_layers=cfg.data.num_layers)
+      else:
+        self.val_ds = _EmptyDataset()
     elif cfg.data.photom_h5_val is not None:
       # Multi-scene training with an external validation corpus: bypass
       # split_by_mesh/photom_val_fraction entirely and use the WHOLE
@@ -1081,8 +1089,22 @@ def main(cfg: DictConfig) -> None:
     log.info(
       "data.photom_h5_val set -- data.photom_val_fraction is ignored, the full "
       "training corpus is used for train_ds.")
-  if cfg.data.photom_h5_val is not None and all(
-      cfg.loss[k] == 0 for k in ("l1_weight", "ssim_weight", "mask_weight")):
+  # A real (nonempty, force_render=True) val_ds gets built either from
+  # data.photom_h5_val directly, or -- when that's unset -- as a fallback
+  # from data.gauss_h5's own embedded views (GaussH5ValDataset, see
+  # GSDataModule.setup). val/rec_loss is 0-by-construction when all
+  # photometric weights are 0 UNLESS it's the GaussH5ValDataset fallback AND
+  # a direct_*_weight is nonzero -- that val_ds's items carry "ground_truth"
+  # (unlike a photom_h5_val corpus, which never does), so compute_loss's
+  # direct-supervision terms fire during validation too and val/rec_loss
+  # picks those up instead of reading 0.
+  has_real_val_ds = cfg.data.photom_h5_val is not None or (
+    cfg.data.fixed_source_view is not None and cfg.data.gauss_h5 is not None)
+  uses_gauss_h5_val_fallback = (
+    cfg.data.photom_h5_val is None and cfg.data.fixed_source_view is not None
+    and cfg.data.gauss_h5 is not None)
+  photometric_off = all(cfg.loss[k] == 0 for k in ("l1_weight", "ssim_weight", "mask_weight"))
+  if has_real_val_ds and photometric_off and not (uses_gauss_h5_val_fallback and direct_enabled):
     log.warning(
       "val/rec_loss will read 0 by construction with all photometric weights "
       "at 0 -- check val/loss_l1 / val/loss_ssim / val/loss_mask instead.")

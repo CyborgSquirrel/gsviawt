@@ -27,7 +27,13 @@ data:
   # encoder on a different image, not a held-out subset of the training
   # corpus. Also usable (optionally) with ordinary multi-scene training,
   # replacing the photom_val_fraction mesh-holdout split with a wholly
-  # separate corpus. null (default): unchanged behavior.
+  # separate corpus. null (default): when fixed_source_view + gauss_h5 are
+  # set and this is left null, val_ds instead falls back to gauss_h5's OWN
+  # embedded secondary views (GaussH5ValDataset, gs_dataset.py) -- the exact
+  # views fit_gsplat.py fit its ground truth against, with scale/rotation
+  # etc. ground-truth-pinned for whichever fields aren't in
+  # model.predict_params. Set this explicitly to validate against a
+  # genuinely different corpus/image instead.
   photom_h5_val: null
   # fit_gsplat.py output .h5 (per-pixel ground-truth Gaussian params for ONE
   # view). Only used when set, and only together with fixed_source_view --
