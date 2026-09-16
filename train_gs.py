@@ -18,7 +18,7 @@ frame (see gs_dataset.relative_viewmats) -- no world coordinates involved.
 
 Usage:
     docker exec -w /app gsviawt-app-gpu-1 /home/user/venv/bin/python train_gs.py \\
-        data.h5_paths=/app/bla/lite_blackbg.h5 train.max_epochs=1000
+        data.photom_h5=/app/bla/lite_blackbg.h5 train.max_epochs=1000
 
 gsplat JIT-compiles CUDA kernels on first import; see _setup_cuda_toolchain
 (copied from fit_gsplat.py, which needs the same env setup).
@@ -421,14 +421,14 @@ def compute_loss(model, item, cfg, device, window, force_render=False):
   gt = item.get("ground_truth")
   if need_direct_cfg and gt is None and not force_render:
     # force_render is True exactly at validation/orbit-preview call sites --
-    # a GT-less item there (e.g. from an external data.val_h5_paths corpus,
+    # a GT-less item there (e.g. from an external data.photom_h5_val corpus,
     # which never carries "ground_truth") is expected and fine to silently
     # skip. A GT-less item during an actual training_step (force_render is
     # only ever False there) means something's wired wrong -- loud error.
     raise ValueError(
       "loss.direct_*_weight > 0 but a TRAINING item has no 'ground_truth' -- "
-      "set data.ground_truth_h5 (validation/orbit-preview items from an external "
-      "data.val_h5_paths corpus are expected to lack it and are fine)")
+      "set data.gauss_h5 (validation/orbit-preview items from an external "
+      "data.photom_h5_val corpus are expected to lack it and are fine)")
   need_direct = need_direct_cfg and gt is not None
 
   loss = torch.zeros((), device=device)
@@ -643,13 +643,13 @@ def log_orbit_video(wandb_run, step, tag, frames, fps, crf, workdir):
 
 def _external_val_dataset(cfg):
   """Builds val_ds as a standalone GSPairDataset over its OWN H5Catalog
-  (data.val_h5_paths), completely independent of whatever train_ds is doing
+  (data.photom_h5_val), completely independent of whatever train_ds is doing
   -- source AND target views are both drawn from this corpus itself
   (deterministic_targets=True, exactly like today's multi-scene val split),
-  not from data.h5_paths / data.fixed_source_view. See conf/train_gs.yaml's
-  data.val_h5_paths comment for why this is the deliberate design."""
+  not from data.photom_h5 / data.fixed_source_view. See conf/train_gs.yaml's
+  data.photom_h5_val comment for why this is the deliberate design."""
   catalog = H5Catalog(
-    cfg.data.val_h5_paths,
+    cfg.data.photom_h5_val,
     H5Catalog.path().alias("path"),
     H5Catalog.index().alias("view_idx"),
     H5Catalog.dataset("mesh_index").alias("mesh_id"),
@@ -687,26 +687,33 @@ class GSDataModule(pl.LightningDataModule):
     if cfg.data.fixed_source_view is not None:
       # Single-batch overfit mode (fit_gsplat.py's primary/secondary terms
       # applied here): the exact same source+target views every step, no
-      # resampling at all -- nothing to hold out, so val is empty.
-      h5_path = cfg.data.h5_paths if isinstance(cfg.data.h5_paths, str) else cfg.data.h5_paths[0]
+      # resampling at all -- nothing to hold out, so val is empty. photom_h5
+      # is optional here (mutually exclusive with gauss_h5, see main()'s
+      # config-validation block) -- when unset, GSFixedViewsDataset builds
+      # the source view straight from gauss_h5's own embedded primary view.
+      photom_h5 = None
+      if cfg.data.photom_h5 is not None:
+        photom_h5 = cfg.data.photom_h5 if isinstance(cfg.data.photom_h5, str) else cfg.data.photom_h5[0]
       self.train_ds = GSFixedViewsDataset(
-        h5_path, source_view=cfg.data.fixed_source_view,
-        target_views=list(cfg.data.fixed_target_views), num_layers=cfg.data.num_layers,
-        ground_truth_h5=cfg.data.ground_truth_h5,
+        source_view=cfg.data.fixed_source_view,
+        target_views=list(cfg.data.fixed_target_views) if cfg.data.fixed_target_views is not None else [],
+        num_layers=cfg.data.num_layers,
+        photom_h5=photom_h5, gauss_h5=cfg.data.gauss_h5,
       )
-      # data.val_h5_paths is orthogonal to this mode's own view selection --
+      # data.photom_h5_val is orthogonal to this mode's own view selection --
       # if set, val still comes from that wholly separate corpus (source AND
       # targets both drawn from it), not from fixed_source_view/targets.
       self.val_ds = (
-        _external_val_dataset(cfg) if cfg.data.val_h5_paths is not None else _EmptyDataset()
+        _external_val_dataset(cfg) if cfg.data.photom_h5_val is not None else _EmptyDataset()
       )
-    elif cfg.data.val_h5_paths is not None:
+    elif cfg.data.photom_h5_val is not None:
       # Multi-scene training with an external validation corpus: bypass
-      # split_by_mesh/val_fraction entirely and use the WHOLE h5_paths
-      # catalog for train_ds -- val_fraction becomes a no-op here (logged in
-      # main()'s config-validation block, not silently swallowed).
+      # split_by_mesh/photom_val_fraction entirely and use the WHOLE
+      # photom_h5 catalog for train_ds -- photom_val_fraction becomes a
+      # no-op here (logged in main()'s config-validation block, not
+      # silently swallowed).
       catalog = H5Catalog(
-        cfg.data.h5_paths,
+        cfg.data.photom_h5,
         H5Catalog.path().alias("path"),
         H5Catalog.index().alias("view_idx"),
         H5Catalog.dataset("mesh_index").alias("mesh_id"),
@@ -718,12 +725,13 @@ class GSDataModule(pl.LightningDataModule):
       self.val_ds = _external_val_dataset(cfg)
     else:
       catalog = H5Catalog(
-        cfg.data.h5_paths,
+        cfg.data.photom_h5,
         H5Catalog.path().alias("path"),
         H5Catalog.index().alias("view_idx"),
         H5Catalog.dataset("mesh_index").alias("mesh_id"),
       )
-      train_catalog, val_catalog = split_by_mesh(catalog, val_fraction=cfg.data.val_fraction, seed=cfg.train.seed)
+      train_catalog, val_catalog = split_by_mesh(
+        catalog, val_fraction=cfg.data.photom_val_fraction, seed=cfg.train.seed)
       self.train_ds = GSPairDataset(
         train_catalog, num_layers=cfg.data.num_layers, num_target_views=cfg.data.num_target_views,
         seed=cfg.train.seed, deterministic_targets=False,
@@ -733,7 +741,7 @@ class GSDataModule(pl.LightningDataModule):
         seed=cfg.train.seed, deterministic_targets=True,
       )
     if len(self.train_ds) == 0:
-      raise SystemExit("train split is empty -- check data.h5_paths / data.val_fraction")
+      raise SystemExit("train split is empty -- check data.photom_h5 / data.photom_val_fraction")
 
   def train_dataloader(self):
     return DataLoader(
@@ -1033,18 +1041,28 @@ def main(cfg: DictConfig) -> None:
   # ---- config validation (unchanged SystemExit checks, plus the new
   # grad_accum_steps==1 assertion for GSFixedViewsDataset -- see
   # train_gs_lightning_plan.md) ----
-  if cfg.data.ground_truth_h5 is not None and cfg.data.fixed_source_view is None:
-    raise SystemExit("data.ground_truth_h5 requires data.fixed_source_view (single-fixed-view scope only)")
+  if cfg.data.photom_h5 is not None and cfg.data.gauss_h5 is not None:
+    raise SystemExit(
+      "data.photom_h5 and data.gauss_h5 can't both be set (for now) -- gauss_h5 "
+      "is self-sufficient as a training source (it embeds its own primary "
+      "view's image/depth/pose, see gs_dataset._read_primary_from_gauss_h5), "
+      "so set data.photom_h5=null for direct-supervision-only training, or "
+      "data.gauss_h5=null for ordinary photometric training")
+  if cfg.data.gauss_h5 is not None and cfg.data.fixed_source_view is None:
+    raise SystemExit("data.gauss_h5 requires data.fixed_source_view (single-fixed-view scope only)")
+  if (cfg.data.fixed_source_view is not None and cfg.data.photom_h5 is None
+      and cfg.data.gauss_h5 is None):
+    raise SystemExit("data.fixed_source_view requires at least one of data.photom_h5/data.gauss_h5")
   direct_enabled = any(cfg.loss[k] > 0 for k in (
     "direct_opacity_weight", "direct_scale_weight", "direct_rotation_weight", "direct_color_weight"))
-  if direct_enabled and cfg.data.ground_truth_h5 is None:
-    raise SystemExit("loss.direct_*_weight > 0 requires data.ground_truth_h5 to be set")
+  if direct_enabled and cfg.data.gauss_h5 is None:
+    raise SystemExit("loss.direct_*_weight > 0 requires data.gauss_h5 to be set")
 
-  if cfg.data.val_h5_paths is not None and cfg.data.fixed_source_view is None:
+  if cfg.data.photom_h5_val is not None and cfg.data.fixed_source_view is None:
     log.info(
-      "data.val_h5_paths set -- data.val_fraction is ignored, the full "
+      "data.photom_h5_val set -- data.photom_val_fraction is ignored, the full "
       "training corpus is used for train_ds.")
-  if cfg.data.val_h5_paths is not None and all(
+  if cfg.data.photom_h5_val is not None and all(
       cfg.loss[k] == 0 for k in ("l1_weight", "ssim_weight", "mask_weight")):
     log.warning(
       "val/rec_loss will read 0 by construction with all photometric weights "
@@ -1056,10 +1074,10 @@ def main(cfg: DictConfig) -> None:
     raise SystemExit(
       f"model.predict_params has unknown entries {sorted(unknown)} -- "
       f"must be a subset of {PREDICTABLE_PARAMS}")
-  if predict_params != set(PREDICTABLE_PARAMS) and cfg.data.ground_truth_h5 is None:
+  if predict_params != set(PREDICTABLE_PARAMS) and cfg.data.gauss_h5 is None:
     raise SystemExit(
       "model.predict_params (restricting which fields the network predicts) "
-      "requires data.ground_truth_h5 to supply the rest")
+      "requires data.gauss_h5 to supply the rest")
   for field in PREDICTABLE_PARAMS:
     if field not in predict_params and cfg.loss[f"direct_{field}_weight"] > 0:
       log.warning(
@@ -1071,8 +1089,13 @@ def main(cfg: DictConfig) -> None:
     # Single-batch overfit mode (fit_gsplat.py's primary/secondary terms
     # applied here): the exact same source+target views every step, no
     # resampling at all -- nothing to hold out, so val is empty.
-    if cfg.data.fixed_target_views is None:
-      raise SystemExit("data.fixed_target_views must be set when data.fixed_source_view is set")
+    # fixed_target_views only matters when there's a photom_h5 to draw them
+    # from -- gauss_h5-only mode has no photom corpus, targets are forced
+    # empty (GSDataModule.setup / GSFixedViewsDataset).
+    if cfg.data.photom_h5 is not None and cfg.data.fixed_target_views is None:
+      raise SystemExit(
+        "data.fixed_target_views must be set when data.fixed_source_view + "
+        "data.photom_h5 are set")
     if int(cfg.train.grad_accum_steps) != 1:
       # Under Lightning, "epoch" == "optimizer step" for this length-1
       # dataset only when grad_accum_steps == 1 (otherwise it takes

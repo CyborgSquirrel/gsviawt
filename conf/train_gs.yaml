@@ -5,35 +5,41 @@
 torch_detect_anomaly: false
 
 data:
-  h5_paths: /app/bla/lite_blackbg.h5   # str, list, or glob(s)
+  photom_h5: /app/bla/lite_blackbg.h5   # str, list, or glob(s) -- render_objaverse.py-schema
   num_layers: 6                         # must match the file(s)' depth_peel layer count
   num_target_views: 3                   # extra supervision views per step, alongside self-render
-  val_fraction: 0.1                     # fraction of MESH GROUPS held out (0 = pure overfit)
+  photom_val_fraction: 0.1              # fraction of MESH GROUPS held out (0 = pure overfit)
   # Single-batch overfit mode (fit_gsplat.py's primary/secondary terms
   # applied here): if set, train on this EXACT source+target view set every
-  # step, no resampling at all (ignores num_target_views/val_fraction).
-  # fixed_target_views is required when fixed_source_view is set.
+  # step, no resampling at all (ignores num_target_views/photom_val_fraction).
+  # fixed_target_views is required when fixed_source_view + photom_h5 are
+  # both set (irrelevant/ignored in gauss_h5-only mode -- see gauss_h5 below).
   fixed_source_view: null    # int, e.g. 0
   fixed_target_views: null   # list of ints, e.g. [1, 2, 3]
+  # A SEPARATE render_objaverse.py-schema corpus (str/list/glob(s)) used
+  # EXCLUSIVELY for validation, decoupled from data.photom_h5 -- for the
+  # "train on direct Gaussian-parameter supervision, validate
+  # photometrically" mode: pair this with fixed_source_view + gauss_h5 +
+  # direct_*_weight training. Every val item's source AND target views are
+  # drawn from this corpus itself (a GSPairDataset over its own H5Catalog),
+  # independent of whatever view train.fixed_source_view points at --
+  # validation genuinely tests the trained network as a normal single-image
+  # encoder on a different image, not a held-out subset of the training
+  # corpus. Also usable (optionally) with ordinary multi-scene training,
+  # replacing the photom_val_fraction mesh-holdout split with a wholly
+  # separate corpus. null (default): unchanged behavior.
+  photom_h5_val: null
   # fit_gsplat.py output .h5 (per-pixel ground-truth Gaussian params for ONE
   # view). Only used when set, and only together with fixed_source_view --
   # its config_json "primary" must equal fixed_source_view (checked at
   # startup, see gs_dataset._check_ground_truth_consistency). Enables
-  # loss.direct_*_weight below.
-  ground_truth_h5: null
-  # A SEPARATE render_objaverse.py-schema corpus (str/list/glob(s)) used
-  # EXCLUSIVELY for validation, decoupled from data.h5_paths -- for the
-  # "train on direct Gaussian-parameter supervision, validate
-  # photometrically" mode: pair this with fixed_source_view +
-  # ground_truth_h5 + direct_*_weight training. Every val item's source AND
-  # target views are drawn from this corpus itself (a GSPairDataset over its
-  # own H5Catalog), independent of whatever view train.fixed_source_view
-  # points at -- validation genuinely tests the trained network as a normal
-  # single-image encoder on a different image, not a held-out subset of the
-  # training corpus. Also usable (optionally) with ordinary multi-scene
-  # training, replacing the val_fraction mesh-holdout split with a wholly
-  # separate corpus. null (default): unchanged behavior.
-  val_h5_paths: null
+  # loss.direct_*_weight below. Mutually exclusive with photom_h5 (for now):
+  # a gauss_h5 already embeds everything needed to rebuild its own primary
+  # view (image/depth/pose, see gs_dataset._read_primary_from_gauss_h5), so
+  # it's a fully self-sufficient training source on its own -- set
+  # photom_h5=null when using this. photom_h5_val may still be set alongside
+  # it to add photometric validation against a separate corpus.
+  gauss_h5: null
 
 model:
   backbone:
@@ -83,7 +89,7 @@ model:
   min_scale_mult: 1.0
   sh_scale: 1.0
   # Which Gaussian fields the network is trained/trusted to predict; the rest
-  # are overwritten with data.ground_truth_h5 values before
+  # are overwritten with data.gauss_h5 values before
   # flattening/rendering. E.g. [scale] isolates scale's own learning signal
   # and pins everything else to ground truth, so an unsupervised field can't
   # silently drift via the shared decoder trunk.
@@ -108,7 +114,7 @@ loss:
   color_reg_thresh: 2.0
 
   # Direct per-pixel supervision of the model's own predicted Gaussian
-  # params against a fit_gsplat.py ground-truth .h5 (data.ground_truth_h5),
+  # params against a fit_gsplat.py ground-truth .h5 (data.gauss_h5),
   # as an alternative/complement to the photometric losses above. All
   # default 0 (opt-in); when ALL of l1_weight/ssim_weight/mask_weight AND
   # these are left at their defaults, behavior is unchanged from today. When
