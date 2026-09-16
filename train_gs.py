@@ -753,20 +753,22 @@ class GSDataModule(pl.LightningDataModule):
 
   def train_dataloader(self):
     return DataLoader(
-      self.train_ds, batch_size=1, shuffle=True, num_workers=self.cfg.train.num_workers,
-      collate_fn=lambda batch: batch[0], persistent_workers=self.cfg.train.num_workers > 0,
+      self.train_ds,
+      batch_size=1,
+      shuffle=True,
+      num_workers=self.cfg.train.num_workers,
+      collate_fn=lambda batch: batch[0],
+      persistent_workers=self.cfg.train.num_workers > 0,
     )
 
   def val_dataloader(self):
-    # cfg.val.every<=0 (validation disabled entirely, independent of whether
-    # there's data to validate against) is handled by main()'s
-    # Trainer(limit_val_batches=...) -- this only covers "no data at all"
-    # (replaces today's _EmptyDataset-guarded skip in run_validation). Always
-    # a real DataLoader, even over a zero-length _EmptyDataset -- Lightning
-    # handles an empty DataLoader (0 batches) fine; it does NOT handle
-    # val_dataloader() itself returning None (see main()'s Trainer comment,
-    # this was tried first and crashed).
-    return DataLoader(self.val_ds, batch_size=1, shuffle=False, num_workers=0, collate_fn=lambda batch: batch[0])
+    return DataLoader(
+      self.val_ds,
+      batch_size=1,
+      shuffle=False,
+      num_workers=0,
+      collate_fn=lambda batch: batch[0],
+    )
 
 
 class GSLightningModule(pl.LightningModule):
