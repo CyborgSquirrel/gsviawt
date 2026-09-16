@@ -18,6 +18,10 @@ ipython
 # train_gs.py: experiment tracking
 wandb
 
+# train_gs.py: training loop (modern `lightning` package -- `import
+# lightning.pytorch as pl`, not the old standalone `pytorch-lightning` name)
+lightning
+
 # Hydra
 hydra-core
 hydra-joblib-launcher

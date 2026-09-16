@@ -2,6 +2,8 @@
 # Splatting prediction model (Flash3D-style encoder/decoder) on
 # render_objaverse.py-schema HDF5 files. See train_gs.py's module docstring.
 
+torch_detect_anomaly: false
+
 data:
   h5_paths: /app/bla/lite_blackbg.h5   # str, list, or glob(s)
   num_layers: 6                         # must match the file(s)' depth_peel layer count
@@ -57,6 +59,12 @@ model:
   scale_lambda: 1.0
   min_scale_mult: 1.0
   sh_scale: 1.0
+  # Which Gaussian fields the network is trained/trusted to predict; the rest
+  # are overwritten with data.ground_truth_h5 values before
+  # flattening/rendering. E.g. [scale] isolates scale's own learning signal
+  # and pins everything else to ground truth, so an unsupervised field can't
+  # silently drift via the shared decoder trunk.
+  predict_params: [opacity, scale, rotation, color]
   # z-score constants for the input point cloud's camera-space xyz channels
   # (WT's own training-distribution stats; derived from render_objaverse.py's
   # convention -- unit-cube-normalized objects, camera_distance~=1.9).
@@ -93,20 +101,20 @@ loss:
                                  # vs. gt's flat RGB) -- sh_rest has no GT signal
 
 train:
-  device: cuda
+  accelerator: auto        # auto (cuda if available else cpu) | cuda | cpu
   seed: 42
   num_workers: 4
   grad_accum_steps: 4        # effective batch size (batch_size is fixed at 1 scene/step)
-  max_steps: 20000
+  max_epochs: 20000
   lr: 1.0e-4
   min_lr: 1.0e-6            # cosine floor (never fully reaches 0, avoids a dead-flat tail)
-  warmup_steps: 200         # linear warmup 0 -> lr, then cosine decay lr -> min_lr over max_steps
+  warmup_steps: 200         # linear warmup 0 -> lr, then cosine decay lr -> min_lr over the
+                              # derived total step count (see max_epochs above)
   grad_clip_norm: 1.0
   log_every: 50
 
 val:
   every: 500                 # 0 disables
-  num_scenes: 8
 
 # Turntable orbit preview, rendered from a fixed train scene and (if the
 # corpus has one) a fixed val scene, logged as wandb.Video. Cheap: one

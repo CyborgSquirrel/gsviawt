@@ -103,7 +103,7 @@ class GaussianResnetDecoder(nn.Module):
     self.num_ch_dec = np.array(num_ch_dec)
     self.max_sh_degree = max_sh_degree
     self.num_layers = num_layers
-    self.scale_lambda = scale_lambda
+    # self.scale_lambda = scale_lambda
 
     per_layer_dims = gaussian_split_dims(max_sh_degree)
     per_layer_scales, per_layer_biases = gaussian_init_scales_biases(
@@ -165,9 +165,13 @@ class GaussianResnetDecoder(nn.Module):
       # tensors: num_layers entries, each (B,C,H,W) -> (B,L,C,H,W)
       return rearrange(tensors, "l b c h w -> b l c h w")
 
+    raw_scale = stack_layers(per_field["scale"])
+
     out = {
       "opacity": torch.sigmoid(stack_layers(per_field["opacity"])),
-      "scale": torch.exp(stack_layers(per_field["scale"])) * self.scale_lambda,
+      # "scale": torch.exp(stack_layers(per_field["scale"])) * self.scale_lambda,
+      "raw_scale": raw_scale,
+      "scale": torch.exp(raw_scale),
       "rotation": F.normalize(stack_layers(per_field["rotation"]), dim=2),
       "sh_dc": stack_layers(per_field["sh_dc"]),
     }
