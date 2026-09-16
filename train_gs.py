@@ -24,6 +24,7 @@ gsplat JIT-compiles CUDA kernels on first import; see _setup_cuda_toolchain
 (copied from fit_gsplat.py, which needs the same env setup).
 """
 
+import contextlib
 import logging
 import math
 import os
@@ -68,7 +69,7 @@ import torch.nn as nn  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 from einops import rearrange, repeat  # noqa: E402
 from lightning.pytorch.loggers import WandbLogger  # noqa: E402
-from omegaconf import DictConfig, OmegaConf  # noqa: E402
+from omegaconf import DictConfig, OmegaConf, open_dict  # noqa: E402
 from torch.utils.data import DataLoader  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
@@ -158,19 +159,6 @@ class GSModel(nn.Module):
     feats = self.encoder(x.unsqueeze(0))
     out = self.decoder(feats)
     out = {k: v[0, :, :, :dh, :dw] for k, v in out.items()}   # (L,C,H,W)
-
-    # Pixel-anchoring "scale" to each pixel's own real geometric footprint
-    # (depth/fx, with a min_scale_mult floor added to the multiplier) was
-    # considered here as a further fix for render_orbit's CUDA OOM (huge
-    # unconstrained absolute-unit scale blowing up gsplat's isect_tiles
-    # allocation -- see gs_decoder.py's scale_lambda for the fix that WAS
-    # kept). Deliberately NOT re-enabled: scale_lambda alone (damping
-    # exp(raw) toward Flash3D's own 0.01, still an absolute world-unit
-    # value, no per-pixel anchoring/floor) was chosen instead -- simpler,
-    # matches Flash3D's own parameterization, sufficient in practice. Revisit
-    # pixel-anchoring (multiplier = min_scale_mult + exp(raw)*scale_lambda;
-    # scale = multiplier * pixel_scale, pixel_scale = depth/fx) if
-    # scale_lambda alone turns out not to be enough.
     return out
 
 
@@ -584,25 +572,27 @@ def _orbit_c2w_gl(means, up, num_frames, elevation_deg):
   return np.stack(poses).astype(np.float32)
 
 
-def _guarded_render(fn, tag):
-  """Runs a zero-arg render callable, catching CUDA OOM so a single bad
-  preview/validation render can't crash the whole training run. gsplat has
-  no built-in memory-budget/OOM-catch mechanism of its own -- an outlier
-  Gaussian scale (e.g. from an undertrained network early in training) can
-  blow up isect_tiles' allocation regardless of what else is using the GPU
-  (confirmed against gsplat's own GitHub issues #464/#487: same failure
-  mode, same root cause -- excessive Gaussian volume -- no upstream fix).
-  Only used at preview/validation call sites (render_orbit, the orbit
-  panel log, validation_step) where skipping one frame is safe and
-  correct -- NOT in the main training step, where an OOM mid-step should
-  still surface loudly rather than silently dropping an optimizer step.
-  Returns fn()'s result, or None on OOM (after log.warning + empty_cache)."""
+@contextlib.contextmanager
+def _guarded_render(tag):
+  """Context manager: runs the wrapped block, catching CUDA OOM so a single
+  bad preview/validation render can't crash the whole training run. gsplat
+  has no built-in memory-budget/OOM-catch mechanism of its own -- an
+  outlier Gaussian scale (e.g. from an undertrained network early in
+  training) can blow up isect_tiles' allocation regardless of what else is
+  using the GPU (confirmed against gsplat's own GitHub issues #464/#487:
+  same failure mode, same root cause -- excessive Gaussian volume -- no
+  upstream fix). Only used at preview/validation call sites (render_orbit,
+  the orbit panel log, validation_step) where skipping one frame is safe
+  and correct -- NOT in the main training step, where an OOM mid-step
+  should still surface loudly rather than silently dropping an optimizer
+  step. Callers pre-initialize their result variable to a fallback (e.g.
+  None) BEFORE the `with` block and assign it from inside -- if a CUDA OOM
+  fires, that assignment is simply never reached and the fallback stands."""
   try:
-    return fn()
+    yield
   except torch.OutOfMemoryError as e:
     log.warning("%s: CUDA OOM during render, skipping this frame -- %s", tag, e)
     torch.cuda.empty_cache()
-    return None
 
 
 def render_orbit(model, item, cfg, device):
@@ -634,7 +624,8 @@ def render_orbit(model, item, cfg, device):
 
   import gsplat
 
-  def _do_render():
+  frames = None
+  with _guarded_render("orbit render"):
     with torch.no_grad():
       rgb_out, _, _ = gsplat.rasterization(
         means=flat["means"], quats=flat["quats"], scales=flat["scales"],
@@ -642,10 +633,9 @@ def render_orbit(model, item, cfg, device):
         viewmats=viewmats, Ks=ks, width=int(iw), height=int(ih),
         sh_degree=cfg.model.max_sh_degree, render_mode="RGB", packed=True,
       )
-    frames = (rgb_out.clamp(0.0, 1.0).cpu().numpy() * 255).astype(np.uint8)
-    return [frames[i] for i in range(frames.shape[0])]
-
-  return _guarded_render(_do_render, "orbit render")
+    rgb_np = (rgb_out.clamp(0.0, 1.0).cpu().numpy() * 255).astype(np.uint8)
+    frames = [rgb_np[i] for i in range(rgb_np.shape[0])]
+  return frames
 
 
 def log_orbit_video(wandb_run, step, tag, frames, fps, crf, workdir):
@@ -947,10 +937,10 @@ class GSLightningModule(pl.LightningModule):
       # numbers worth keeping.
       return
     item = batch
-    def _do_val():
+    result = None
+    with _guarded_render(f"validation batch {batch_idx}"):
       with torch.no_grad():
-        return compute_loss(self.model, item, self.cfg, self.device, self.window, force_render=True)
-    result = _guarded_render(_do_val, f"validation batch {batch_idx}")
+        result = compute_loss(self.model, item, self.cfg, self.device, self.window, force_render=True)
     if result is None:
       return   # CUDA OOM -- skip this batch rather than crash the whole validation pass
     _, metrics, extras = result
@@ -1038,10 +1028,10 @@ class OrbitCallback(pl.Callback):
         # real val split (e.g. single-batch overfit mode), where
         # validation_step never fires.
         if wandb_run is not None:
-          def _do_panel():
+          result = None
+          with _guarded_render(f"orbit/{tag} panel"):
             with torch.no_grad():
-              return compute_loss(model, item, cfg, device, pl_module.window, force_render=True)
-          result = _guarded_render(_do_panel, f"orbit/{tag} panel")
+              result = compute_loss(model, item, cfg, device, pl_module.window, force_render=True)
           if result is not None:
             _, _, extras = result
             pred_rgb, _, gt_rgb, _, gauss = extras
@@ -1147,12 +1137,11 @@ def main(cfg: DictConfig) -> None:
   # Stashed into cfg (not just logged) so it lands in wandb's persisted run
   # config below (OmegaConf.to_container(cfg, ...)) -- unlike the console-only
   # "Total params" line from Lightning's own ModelSummary table, this is
-  # queryable after the fact. set_struct(False) since Hydra's cfg is
-  # struct-locked by default (adding a key not in the yaml schema would
-  # otherwise raise ConfigAttributeError).
-  OmegaConf.set_struct(cfg, False)
-  cfg.model.num_params = sum(p.numel() for p in model.parameters())
-  OmegaConf.set_struct(cfg, True)
+  # queryable after the fact. open_dict since Hydra's cfg is struct-locked by
+  # default (adding a key not in the yaml schema would otherwise raise
+  # ConfigAttributeError).
+  with open_dict(cfg):
+    cfg.model.num_params = sum(p.numel() for p in model.parameters())
 
   log.info("train=%d val=%d views, accelerator=%s, output=%s, total_steps=%d, num_params=%d",
            len(datamodule.train_ds), len(datamodule.val_ds), accelerator, model.ckpt_path, total_steps,
