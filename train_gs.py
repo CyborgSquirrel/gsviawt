@@ -159,32 +159,18 @@ class GSModel(nn.Module):
     out = self.decoder(feats)
     out = {k: v[0, :, :, :dh, :dw] for k, v in out.items()}   # (L,C,H,W)
 
-    # Anchor "scale" to each pixel's own real geometric footprint (its
-    # inter-pixel spacing at its own depth, depth/fx for a fronto-parallel
-    # approximation) instead of an unconstrained absolute value, WITH A HARD
-    # FLOOR (min_scale_mult), not just a good initial value: gsplat's
-    # antialiasing eps2d floor (hard-coded minimum ~3px projected size, see
-    # gsplat.rendering docs) makes the photometric loss's gradient w.r.t.
-    # scale vanish once a Gaussian is already sub-floor -- so nothing during
-    # training actually stops `exp(raw)` from drifting back down there over
-    # enough steps even after starting at a sane value (confirmed: a 15-min
-    # run looked fine, a 65-min run on the same data drifted back into the
-    # grid artifact, with a few neighbors ballooning outward to compensate
-    # for the ones that collapsed). Adding a constant floor to the
-    # dimensionless multiplier -- not just to its initial value -- closes the
-    # loophole structurally: scale can never render below
-    # min_scale_mult * pixel_scale, regardless of what raw drifts to. This
-    # was previously disabled by accident (dead code, out["scale"] left as
-    # the decoder's raw unconstrained exp(raw)*scale_lambda in absolute
-    # world units) -- found while tracking down render_orbit's sporadic
-    # CUDA OOM: an un-anchored scale has no incentive to stay near object
-    # size, and an occasional outlier pixel's huge projected radius blows up
-    # gsplat's isect_tiles allocation (gsplat itself has no upper-bound
-    # safety valve -- radius_clip only skips gaussians BELOW a threshold).
-    pixel_scale = torch.nan_to_num(xyz_cam[..., 2], nan=1.0) / fx   # (L,H,W)
-    multiplier = self.min_scale_mult + out["scale"]                 # (L,3,H,W), floor + exp(raw)*scale_lambda
-    out["scale"] = multiplier * pixel_scale.unsqueeze(1)            # (L,3,H,W)
-
+    # Pixel-anchoring "scale" to each pixel's own real geometric footprint
+    # (depth/fx, with a min_scale_mult floor added to the multiplier) was
+    # considered here as a further fix for render_orbit's CUDA OOM (huge
+    # unconstrained absolute-unit scale blowing up gsplat's isect_tiles
+    # allocation -- see gs_decoder.py's scale_lambda for the fix that WAS
+    # kept). Deliberately NOT re-enabled: scale_lambda alone (damping
+    # exp(raw) toward Flash3D's own 0.01, still an absolute world-unit
+    # value, no per-pixel anchoring/floor) was chosen instead -- simpler,
+    # matches Flash3D's own parameterization, sufficient in practice. Revisit
+    # pixel-anchoring (multiplier = min_scale_mult + exp(raw)*scale_lambda;
+    # scale = multiplier * pixel_scale, pixel_scale = depth/fx) if
+    # scale_lambda alone turns out not to be enough.
     return out
 
 
