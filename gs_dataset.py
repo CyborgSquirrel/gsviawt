@@ -287,22 +287,39 @@ def _read_view(f, path, view_idx, k_depth_name, k_image_name):
   }
 
 
-def _build_item(f, path, source_view, target_views, num_layers, mesh_id):
+def _read_primary_from_gauss_h5(f):
+  """f: open h5py.File for a fit_gsplat.py-schema ground-truth .h5. Reads
+  the PRIMARY view's own image/depth/pose/intrinsics directly out of that
+  file's embedded '_used'/'_primary' arrays (index 0 -- fit_gsplat.py always
+  lists the primary view first, config_json["primary"] is its index in the
+  SOURCE render h5, not into these arrays). Same return shape as
+  _read_view. This makes a gauss_h5 fully self-sufficient as a training
+  source -- no separate photom_h5 render corpus needed -- since it already
+  carries everything used to fit it."""
+  depth_peel = np.asarray(f["depth_peel_primary"]).astype(np.float32)   # (H,W,L)
+  K_depth = np.asarray(f["depth_intrinsics_used"][0]).astype(np.float32)
+  K_image = np.asarray(f["image_intrinsics_used"][0]).astype(np.float32)
+  pose = np.asarray(f["camera_pose_used"][0]).astype(np.float32)
+  images = np.asarray(f["images_used"][0])   # (H,W,4) RGBA
+
+  return {
+    "rgb": images[..., :3].astype(np.float32) / 255.0,
+    "alpha": images[..., 3].astype(np.float32) / 255.0,
+    "pose": pose, "K_depth": K_depth, "K_image": K_image, "depth_peel": depth_peel,
+  }
+
+
+def _assemble_item(src, targets, num_layers, mesh_id, source_view, target_views):
   """Shared by GSPairDataset (sampled source/targets) and GSFixedViewsDataset
   (fixed source/targets, for single-batch overfit sanity checks): given a
-  DECIDED source view + target view list, reads them and builds the full
+  DECIDED source view + target view dicts (from _read_view or
+  _read_primary_from_gauss_h5 -- same shape either way), builds the full
   item dict train_gs.py's render_scene/render_orbit expect."""
-  k_depth_name = intrinsics_name(f, "depth")
-  k_image_name = intrinsics_name(f, "image", None)
-
-  src = _read_view(f, path, source_view, k_depth_name, k_image_name)
   xyz_cam, hit = dense_unproject_camera(src["depth_peel"], src["K_depth"])
   if hit.shape[-1] != num_layers:
     raise ValueError(
-      f"{path!r} view {source_view}: depth_peel has {hit.shape[-1]} "
+      f"source view {source_view}: depth_peel has {hit.shape[-1]} "
       f"layers, expected num_layers={num_layers}")
-
-  targets = [_read_view(f, path, v, k_depth_name, k_image_name) for v in target_views]
 
   poses = np.stack([src["pose"]] + [t["pose"] for t in targets], axis=0)
   viewmats = relative_viewmats(poses)   # (1+k, 4, 4), viewmats[0] == eye(4)
@@ -331,6 +348,16 @@ def _build_item(f, path, source_view, target_views, num_layers, mesh_id):
     "source_view": int(source_view),
     "target_views": [int(v) for v in target_views],
   }
+
+
+def _build_item(f, path, source_view, target_views, num_layers, mesh_id):
+  """_assemble_item, reading src/targets from an open render_objaverse.py-
+  schema h5py.File (f) at path -- see _assemble_item for the shared part."""
+  k_depth_name = intrinsics_name(f, "depth")
+  k_image_name = intrinsics_name(f, "image", None)
+  src = _read_view(f, path, source_view, k_depth_name, k_image_name)
+  targets = [_read_view(f, path, v, k_depth_name, k_image_name) for v in target_views]
+  return _assemble_item(src, targets, num_layers, mesh_id, source_view, target_views)
 
 
 class H5Catalog(Dataset):
@@ -519,70 +546,161 @@ class GSFixedViewsDataset(Dataset):
   for single-batch overfit sanity checks (does the whole pipeline converge
   on one fixed set of views before trusting it on anything harder). `source`
   and every entry of `targets` must share the same mesh_index, checked at
-  construction (mirrors fit_gsplat.py's own primary/secondary check)."""
+  construction (mirrors fit_gsplat.py's own primary/secondary check).
 
-  def __init__(self, h5_path, source_view, target_views, num_layers=6, ground_truth_h5=None):
-    self.path = h5_path
+  At least one of photom_h5/gauss_h5 must be set (never both -- see
+  train_gs.py's config-validation block). photom_h5 (a render_objaverse.py
+  h5) supplies the source+target views for photometric supervision, indexed
+  by source_view/target_views. gauss_h5 (a fit_gsplat.py h5) supplies direct
+  Gaussian-parameter ground truth for the source view -- AND, when photom_h5
+  is None, is used to build the source view ITSELF too, straight from its
+  own embedded primary-view arrays (see _read_primary_from_gauss_h5): it's
+  fully self-sufficient as a training source since it already carries
+  everything used to fit it, so no separate photom_h5 is needed. In that
+  mode there's no photom corpus to draw target views from, so target_views
+  is forced empty regardless of what's passed in."""
+
+  def __init__(self, source_view, target_views, num_layers=6, photom_h5=None, gauss_h5=None):
+    if photom_h5 is None and gauss_h5 is None:
+      raise ValueError("GSFixedViewsDataset needs at least one of photom_h5/gauss_h5 set")
+    self.photom_h5 = photom_h5
+    self.gauss_h5 = gauss_h5
     self.source_view = int(source_view)
-    self.target_views = [int(v) for v in target_views]
+    self.target_views = [int(v) for v in target_views] if photom_h5 is not None else []
     self.num_layers = num_layers
 
-    with h5py.File(h5_path, "r") as f:
-      if "mesh_index" in f:
-        mi = f["mesh_index"][:]
-        order = [self.source_view] + self.target_views
-        picked = {int(mi[i]) for i in order}
-        if len(picked) > 1:
-          raise ValueError(
-            f"{h5_path!r}: source view {self.source_view} and target views "
-            f"{self.target_views} span multiple mesh_index values {sorted(picked)} "
-            "-- they must all show the same object")
-        self.mesh_id = int(mi[self.source_view])
-      else:
-        self.mesh_id = -1
-
-    log.info(
-      "GSFixedViewsDataset: source=%d targets=%s mesh_id=%s",
-      self.source_view, self.target_views, self.mesh_id,
-    )
+    if photom_h5 is not None:
+      with h5py.File(photom_h5, "r") as f:
+        if "mesh_index" in f:
+          mi = f["mesh_index"][:]
+          order = [self.source_view] + self.target_views
+          picked = {int(mi[i]) for i in order}
+          if len(picked) > 1:
+            raise ValueError(
+              f"{photom_h5!r}: source view {self.source_view} and target views "
+              f"{self.target_views} span multiple mesh_index values {sorted(picked)} "
+              "-- they must all show the same object")
+          self.mesh_id = int(mi[self.source_view])
+        else:
+          self.mesh_id = -1
+    else:
+      self.mesh_id = None   # filled in below from gauss_h5's own ground-truth attrs
 
     self.ground_truth = None
-    if ground_truth_h5 is not None:
+    if gauss_h5 is not None:
       # Direct-parameter-supervision ground truth (fit_gsplat.py output) for
-      # the source view only. Re-reads/unprojects that one view independently
-      # of __getitem__'s own _build_item call below -- a duplicate I/O given
+      # the source view. Re-reads/unprojects that one view independently of
+      # __getitem__'s own item-building below -- a duplicate I/O given
       # __len__()==1 (this item never changes), not worth sharing state for.
-      with h5py.File(h5_path, "r") as f:
-        k_depth_name = intrinsics_name(f, "depth")
-        k_image_name = intrinsics_name(f, "image", None)
-        src = _read_view(f, h5_path, self.source_view, k_depth_name, k_image_name)
+      if photom_h5 is not None:
+        with h5py.File(photom_h5, "r") as f:
+          k_depth_name = intrinsics_name(f, "depth")
+          k_image_name = intrinsics_name(f, "image", None)
+          src = _read_view(f, photom_h5, self.source_view, k_depth_name, k_image_name)
+      else:
+        with h5py.File(gauss_h5, "r") as f:
+          src = _read_primary_from_gauss_h5(f)
       xyz_cam_np, hit_np = dense_unproject_camera(src["depth_peel"], src["K_depth"])
       xyz_cam = rearrange(torch.from_numpy(xyz_cam_np), "h w l c -> l h w c").contiguous()
       hit = rearrange(torch.from_numpy(hit_np), "h w l -> l h w").contiguous()
       pose_gl = torch.from_numpy(src["pose"])
 
-      gt_tensors, gt_attrs = _load_ground_truth(ground_truth_h5, pose_gl)
-      _check_ground_truth_consistency(
-        gt_attrs, gt_tensors, ground_truth_h5, h5_path, self.source_view,
-        self.mesh_id, xyz_cam, hit, pose_gl,
-      )
+      gt_tensors, gt_attrs = _load_ground_truth(gauss_h5, pose_gl)
+      if self.mesh_id is None:
+        self.mesh_id = gt_attrs["mesh_index"]
+
+      if photom_h5 is not None:
+        _check_ground_truth_consistency(
+          gt_attrs, gt_tensors, gauss_h5, photom_h5, self.source_view,
+          self.mesh_id, xyz_cam, hit, pose_gl,
+        )
+      else:
+        # No separate corpus to cross-check against -- the source view came
+        # from this same file, so it's self-consistent by construction.
+        log.info(
+          "ground truth OK (self-contained, no photom_h5): %r primary=%d mesh_index=%d valid_frac=%.4f",
+          gauss_h5, int(gt_attrs["config"].get("primary", -1)), gt_attrs["mesh_index"],
+          float(gt_tensors["valid"].float().mean()),
+        )
       gt_tensors.pop("means_world", None)
       self.ground_truth = gt_tensors
+
+    log.info(
+      "GSFixedViewsDataset: source=%d targets=%s mesh_id=%s photom_h5=%s gauss_h5=%s",
+      self.source_view, self.target_views, self.mesh_id, self.photom_h5, self.gauss_h5,
+    )
 
   def __len__(self):
     return 1
 
-  def _h5(self):
-    return _get_h5(self.path)
-
   def __getitem__(self, idx):
-    item = _build_item(
-      self._h5(), self.path, self.source_view, self.target_views,
-      self.num_layers, self.mesh_id,
-    )
+    if self.photom_h5 is not None:
+      item = _build_item(
+        _get_h5(self.photom_h5), self.photom_h5, self.source_view, self.target_views,
+        self.num_layers, self.mesh_id,
+      )
+    else:
+      src = _read_primary_from_gauss_h5(_get_h5(self.gauss_h5))
+      item = _assemble_item(src, [], self.num_layers, self.mesh_id, self.source_view, [])
     if self.ground_truth is not None:
       item["ground_truth"] = self.ground_truth
     return item
+
+
+class GaussH5ValDataset(Dataset):
+  """Single-item validation dataset built entirely from a fit_gsplat.py
+  ground-truth .h5's own embedded views: the primary view as source, every
+  one of its embedded secondary views (images_used[1:]/camera_pose_used[1:]/
+  image_intrinsics_used[1:] -- the exact views fit_gsplat.py itself fit
+  against) as photometric targets. ground_truth is attached too, so
+  apply_ground_truth_overrides pins whichever fields the model isn't
+  predicting to the real per-pixel fit instead of exposing untrained decoder
+  heads on render. Used as GSDataModule's val_ds whenever data.gauss_h5 is
+  set and there's no separate data.photom_h5_val corpus -- gives real
+  photometric val numbers (logged via the ordinary val/loss_l1 etc. path)
+  even for a direct-supervision-only training run, with no extra render
+  corpus needed on disk."""
+
+  def __init__(self, gauss_h5, num_layers=6):
+    self.gauss_h5 = gauss_h5
+    self.num_layers = num_layers
+    with h5py.File(gauss_h5, "r") as f:
+      images_used = np.asarray(f["images_used"])             # (V,H,W,4) uint8
+      poses_used = np.asarray(f["camera_pose_used"])          # (V,4,4)
+      k_image_used = np.asarray(f["image_intrinsics_used"])   # (V,3,3)
+      view_index_used = np.asarray(f["view_index_used"])      # (V,)
+      src = _read_primary_from_gauss_h5(f)
+
+    pose_gl = torch.from_numpy(src["pose"])
+    gt_tensors, gt_attrs = _load_ground_truth(gauss_h5, pose_gl)
+    gt_tensors.pop("means_world", None)
+
+    targets = [
+      {
+        "rgb": images_used[i, ..., :3].astype(np.float32) / 255.0,
+        "alpha": images_used[i, ..., 3].astype(np.float32) / 255.0,
+        "K_image": k_image_used[i].astype(np.float32),
+        "pose": poses_used[i].astype(np.float32),
+      }
+      for i in range(1, images_used.shape[0])
+    ]
+    self._item = _assemble_item(
+      src, targets, num_layers=num_layers, mesh_id=gt_attrs["mesh_index"],
+      source_view=int(view_index_used[0]), target_views=[int(v) for v in view_index_used[1:]],
+    )
+    self._item["ground_truth"] = gt_tensors
+
+    log.info(
+      "GaussH5ValDataset: %r source_view=%d, %d embedded target views (the real "
+      "fit_gsplat.py corpus, ground-truth-pinned)",
+      gauss_h5, self._item["source_view"], len(targets),
+    )
+
+  def __len__(self):
+    return 1
+
+  def __getitem__(self, idx):
+    return self._item
 
 
 class _EmptyDataset(Dataset):

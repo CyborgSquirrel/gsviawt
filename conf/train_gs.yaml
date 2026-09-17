@@ -5,22 +5,47 @@
 torch_detect_anomaly: false
 
 data:
-  h5_paths: /app/bla/lite_blackbg.h5   # str, list, or glob(s)
+  photom_h5: /app/bla/lite_blackbg.h5   # str, list, or glob(s) -- render_objaverse.py-schema
   num_layers: 6                         # must match the file(s)' depth_peel layer count
   num_target_views: 3                   # extra supervision views per step, alongside self-render
-  val_fraction: 0.1                     # fraction of MESH GROUPS held out (0 = pure overfit)
+  photom_val_fraction: 0.1              # fraction of MESH GROUPS held out (0 = pure overfit)
   # Single-batch overfit mode (fit_gsplat.py's primary/secondary terms
   # applied here): if set, train on this EXACT source+target view set every
-  # step, no resampling at all (ignores num_target_views/val_fraction).
-  # fixed_target_views is required when fixed_source_view is set.
+  # step, no resampling at all (ignores num_target_views/photom_val_fraction).
+  # fixed_target_views is required when fixed_source_view + photom_h5 are
+  # both set (irrelevant/ignored in gauss_h5-only mode -- see gauss_h5 below).
   fixed_source_view: null    # int, e.g. 0
   fixed_target_views: null   # list of ints, e.g. [1, 2, 3]
+  # A SEPARATE render_objaverse.py-schema corpus (str/list/glob(s)) used
+  # EXCLUSIVELY for validation, decoupled from data.photom_h5 -- for the
+  # "train on direct Gaussian-parameter supervision, validate
+  # photometrically" mode: pair this with fixed_source_view + gauss_h5 +
+  # direct_*_weight training. Every val item's source AND target views are
+  # drawn from this corpus itself (a GSPairDataset over its own H5Catalog),
+  # independent of whatever view train.fixed_source_view points at --
+  # validation genuinely tests the trained network as a normal single-image
+  # encoder on a different image, not a held-out subset of the training
+  # corpus. Also usable (optionally) with ordinary multi-scene training,
+  # replacing the photom_val_fraction mesh-holdout split with a wholly
+  # separate corpus. null (default): when fixed_source_view + gauss_h5 are
+  # set and this is left null, val_ds instead falls back to gauss_h5's OWN
+  # embedded secondary views (GaussH5ValDataset, gs_dataset.py) -- the exact
+  # views fit_gsplat.py fit its ground truth against, with scale/rotation
+  # etc. ground-truth-pinned for whichever fields aren't in
+  # model.predict_params. Set this explicitly to validate against a
+  # genuinely different corpus/image instead.
+  photom_h5_val: null
   # fit_gsplat.py output .h5 (per-pixel ground-truth Gaussian params for ONE
   # view). Only used when set, and only together with fixed_source_view --
   # its config_json "primary" must equal fixed_source_view (checked at
   # startup, see gs_dataset._check_ground_truth_consistency). Enables
-  # loss.direct_*_weight below.
-  ground_truth_h5: null
+  # loss.direct_*_weight below. Mutually exclusive with photom_h5 (for now):
+  # a gauss_h5 already embeds everything needed to rebuild its own primary
+  # view (image/depth/pose, see gs_dataset._read_primary_from_gauss_h5), so
+  # it's a fully self-sufficient training source on its own -- set
+  # photom_h5=null when using this. photom_h5_val may still be set alongside
+  # it to add photometric validation against a separate corpus.
+  gauss_h5: null
 
 model:
   backbone:
@@ -29,38 +54,54 @@ model:
     bn_order: pre_bn         # pre_bn | monodepth -- see gs_encoder.py
     num_ch_dec: [32, 32, 64, 128, 256]
     upsample_mode: nearest
-  max_sh_degree: 1           # 0 = plain RGB, 1 = DC + 1 SH band (9 extra channels)
+  max_sh_degree: 0           # 0 = plain RGB, 1 = DC + 1 SH band (9 extra channels).
+                              # Default 0 for now: fit_gsplat.py's ground truth is flat
+                              # RGB with no SH>0 at all, so direct_color_weight only ever
+                              # supervises sh_dc -- with sh_degree=1, sh_rest gets zero
+                              # gradient AND (if color_reg_weight=0, e.g. isolated
+                              # direct-color experiments) zero regularization, free to
+                              # drift arbitrarily via the shared decoder trunk. Since
+                              # it's genuinely view-dependent, that drift shows up as
+                              # flickering ("disco ball") on an orbiting camera. Revisit
+                              # once there's an actual view-dependent-shading signal to
+                              # train sh_rest against.
   one_gauss_decoder: false   # false: one decoder head per layer (Flash3D default).
                               # true: one decoder emits all layers via channel-slicing
                               # (cheaper once num_layers scales up, e.g. to 6).
   # Xavier-uniform init scale/bias per output group. opacity/rotation/sh are
-  # Flash3D's own values; scale_bias/scale_lambda are NOT (see below).
+  # Flash3D's own values; scale_bias is NOT (see below); scale_lambda IS
+  # (Flash3D's own 0.01) -- damps how far exp(raw) can push the multiplier
+  # away from the min_scale_mult floor, an extra safety margin on top of
+  # pixel-anchoring against scale blowing up (see min_scale_mult below and
+  # GSModel.forward -- an un-anchored, undamped scale sitting near
+  # object-size, not pixel-size, was confirmed to blow up gsplat's
+  # isect_tiles memory allocation).
   opacity_scale: 1.0e-3
   opacity_bias: 0.0
   scale_scale: 1.0e-1
   # "scale" is a MULTIPLIER on each pixel's own real geometric footprint
   # (depth/fx at that pixel -- see GSModel.forward), not an absolute
-  # world-unit value like Flash3D's own scale_bias=0.02/scale_lambda=0.01
-  # (tuned for their real-world-scale video scenes, meaningless for our
-  # unit-cube-normalized objects). bias=log(scale_bias) -> multiplier~1 at
-  # init, i.e. "start at one pixel of spacing". Un-anchored absolute scale
-  # let the network settle on sub-pixel Gaussians that only looked fine
-  # because gsplat's antialiasing eps2d floor (hard-coded ~3px minimum)
-  # papered over the gap -- visible the moment a render's true projected
-  # size (novel distance, etc.) exceeds that floor. A good INIT value alone
-  # isn't enough either: eps2d makes the loss gradient vanish once a
-  # Gaussian is already sub-floor, so exp(raw) can (and empirically does,
-  # given enough steps) drift back below the floor during training with
-  # nothing to stop it. min_scale_mult is a HARD floor added on top of the
-  # multiplier (final scale = (min_scale_mult + exp(raw)*scale_lambda) *
-  # pixel_scale) -- scale can never render below min_scale_mult pixels of
-  # spacing, regardless of what raw learns.
+  # world-unit value like Flash3D's own scale_bias=0.02 (tuned for their
+  # real-world-scale video scenes, meaningless for our unit-cube-normalized
+  # objects). bias=log(scale_bias) -> multiplier~1 at init, i.e. "start at
+  # one pixel of spacing". Un-anchored absolute scale let the network settle
+  # on sub-pixel Gaussians that only looked fine because gsplat's
+  # antialiasing eps2d floor (hard-coded ~3px minimum) papered over the gap
+  # -- visible the moment a render's true projected size (novel distance,
+  # etc.) exceeds that floor. A good INIT value alone isn't enough either:
+  # eps2d makes the loss gradient vanish once a Gaussian is already
+  # sub-floor, so exp(raw) can (and empirically does, given enough steps)
+  # drift back below the floor during training with nothing to stop it.
+  # min_scale_mult is a HARD floor added on top of the multiplier (final
+  # scale = (min_scale_mult + exp(raw)*scale_lambda) * pixel_scale) --
+  # scale can never render below min_scale_mult pixels of spacing,
+  # regardless of what raw learns.
   scale_bias: 1.0
-  scale_lambda: 1.0
+  scale_lambda: 0.01
   min_scale_mult: 1.0
   sh_scale: 1.0
   # Which Gaussian fields the network is trained/trusted to predict; the rest
-  # are overwritten with data.ground_truth_h5 values before
+  # are overwritten with data.gauss_h5 values before
   # flattening/rendering. E.g. [scale] isolates scale's own learning signal
   # and pins everything else to ground truth, so an unsupervised field can't
   # silently drift via the shared decoder trunk.
@@ -85,7 +126,7 @@ loss:
   color_reg_thresh: 2.0
 
   # Direct per-pixel supervision of the model's own predicted Gaussian
-  # params against a fit_gsplat.py ground-truth .h5 (data.ground_truth_h5),
+  # params against a fit_gsplat.py ground-truth .h5 (data.gauss_h5),
   # as an alternative/complement to the photometric losses above. All
   # default 0 (opt-in); when ALL of l1_weight/ssim_weight/mask_weight AND
   # these are left at their defaults, behavior is unchanged from today. When
@@ -99,6 +140,12 @@ loss:
   direct_rotation_weight: 0.0  # sign-invariant (1 - |dot(q_pred, q_gt)|)
   direct_color_weight: 0.0     # only touches sh_dc's gradient (SH_C0*sh_dc+0.5
                                  # vs. gt's flat RGB) -- sh_rest has no GT signal
+  # Restricts which depth-peel layers are actually modeled -- e.g. [0] for
+  # just the front/surface layer, [2, 3] for a couple of middle layers.
+  # null (default): all layers. With model.one_gauss_decoder=false
+  # (default), unlisted layers skip their own decoder head's
+  # forward+backward entirely, not just the loss mask.
+  supervised_layers: null   # e.g. [0], [1], [2, 3]
 
 train:
   accelerator: auto        # auto (cuda if available else cpu) | cuda | cpu
@@ -115,6 +162,9 @@ train:
 
 val:
   every: 500                 # 0 disables
+  # NOTE: when training is direct-loss-only (loss.{l1,ssim,mask}_weight all
+  # 0), val/rec_loss / val/loss_source / val/loss_targets_mean read 0 by
+  # construction -- see val/loss_l1 / val/loss_ssim / val/loss_mask instead.
 
 # Turntable orbit preview, rendered from a fixed train scene and (if the
 # corpus has one) a fixed val scene, logged as wandb.Video. Cheap: one
@@ -122,7 +172,7 @@ val:
 # views of the already-fixed Gaussian set -- see train_gs.py's render_orbit.
 orbit:
   enabled: true
-  every_n_epochs: 1          # one pass over the train DataLoader = one epoch
+  every_n_epochs: 1000       # one pass over the train DataLoader = one epoch
   num_frames: 24             # keep modest -- this runs frequently
   fps: 12
   crf: 28                    # x264 quality (higher = smaller/faster; fine for monitoring)
@@ -135,9 +185,20 @@ wandb:
   tags: [gs, flash3d-style]
   name: null
 
+# Directory for everything a single run produces (checkpoints, etc). null
+# (default): a fresh directory per run, named after the Unix timestamp at
+# startup, so back-to-back runs never collide.
+output_dir: null
+
 checkpoint:
-  dir: null                   # null -> cwd (hydra's per-run output dir)
-  every: 2000                 # 0 disables periodic checkpoints (a final one is always written)
+  # Step interval between periodic checkpoints. Default spreads 10 evenly
+  # over the run, however long train.max_epochs is. 0 disables periodic
+  # checkpoints (a final one is always still written).
+  every: ${div_floor:${train.max_epochs},10}
+  # Periodic saves are step-numbered files (train_gs.ckpt.step{N}.pt), never
+  # overwritten in place. null (default): keep every one forever. Set to an
+  # int to delete all but the N most recent.
+  keep_last: null
 
 hydra:
   job:

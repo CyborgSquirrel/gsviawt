@@ -496,8 +496,12 @@ def main(cfg: DictConfig) -> None:
     raise SystemExit("RGB-only file (no alpha) with images and depth_peel at "
                      "different resolutions is not supported -- the mask can't be "
                      "derived. Use an RGBA render or equal resolutions.")
-  log.info("primary=%d secondary=%s  %d views  RGB %dx%d  depth/grid %dx%d  %d peel layers  mesh=%s",
+  views_per_iter = cfg.get("views_per_iter", None)
+  views_per_iter = None if views_per_iter is None else min(int(views_per_iter), V)
+  log.info("primary=%d secondary=%s  %d views  RGB %dx%d  depth/grid %dx%d  %d peel layers  "
+           "views_per_iter=%s  mesh=%s",
            views["primary"], views["secondary"], V, IW, IH, DW, DH, L,
+           views_per_iter if views_per_iter is not None else "all",
            views["mesh_path"] or views["mesh_index"])
 
   with timed("init"):
@@ -555,14 +559,24 @@ def main(cfg: DictConfig) -> None:
   orbit_workdir = tempfile.mkdtemp(prefix="fit_gsplat_orbit_") if orbit_every else None
   K_orbit = views["image_K"][0]
 
+  # Separate RNG (seeded, but independent of torch's global state) for
+  # per-iteration view subsampling -- only used when views_per_iter is set.
+  view_rng = np.random.default_rng(int(cfg.seed))
+
   final_loss = float("nan")
   with timed("optimize"):
     for it in it_range:
-      rgb, alpha = render(params, viewmats, Ks, IW, IH)
+      if views_per_iter is None:
+        vm_it, ks_it, gt_rgb_it, gt_alpha_it = viewmats, Ks, gt_rgb, gt_alpha
+      else:
+        idx = torch.from_numpy(view_rng.choice(V, size=views_per_iter, replace=False)).to(device)
+        vm_it, ks_it, gt_rgb_it, gt_alpha_it = viewmats[idx], Ks[idx], gt_rgb[idx], gt_alpha[idx]
+
+      rgb, alpha = render(params, vm_it, ks_it, IW, IH)
       rgb_c = rgb * alpha  # premultiply so bg stays black on both sides
-      l1 = (rgb_c - gt_rgb).abs().mean()
-      dssim = 1.0 - ssim(rgb_c.permute(0, 3, 1, 2), gt_rgb.permute(0, 3, 1, 2), window)
-      mask = (alpha - gt_alpha).abs().mean()
+      l1 = (rgb_c - gt_rgb_it).abs().mean()
+      dssim = 1.0 - ssim(rgb_c.permute(0, 3, 1, 2), gt_rgb_it.permute(0, 3, 1, 2), window)
+      mask = (alpha - gt_alpha_it).abs().mean()
       loss = (1 - ls) * l1 + ls * dssim + lm * mask
 
       opt.zero_grad(set_to_none=True)
@@ -582,7 +596,16 @@ def main(cfg: DictConfig) -> None:
           "train/dssim": dssim.item(), "train/mask": mask.item(),
         }, step=it)
       if val_every and (it % val_every == 0 or last):
-        panel = _build_val_panel(gt_rgb, gt_alpha, rgb_c, alpha)
+        # Always panel against the FULL view set, independent of what this
+        # step happened to sample -- otherwise the panel's row count/pairing
+        # would silently depend on views_per_iter.
+        if views_per_iter is None:
+          full_rgb_c, full_alpha = rgb_c, alpha
+        else:
+          with torch.no_grad():
+            full_rgb, full_alpha = render(params, viewmats, Ks, IW, IH)
+            full_rgb_c = full_rgb * full_alpha
+        panel = _build_val_panel(gt_rgb, gt_alpha, full_rgb_c, full_alpha)
         dump_val(f"{stem}.val", it, panel)
         if wandb_run is not None:
           import wandb

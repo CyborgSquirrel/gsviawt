@@ -103,7 +103,7 @@ class GaussianResnetDecoder(nn.Module):
     self.num_ch_dec = np.array(num_ch_dec)
     self.max_sh_degree = max_sh_degree
     self.num_layers = num_layers
-    # self.scale_lambda = scale_lambda
+    self.scale_lambda = scale_lambda
 
     per_layer_dims = gaussian_split_dims(max_sh_degree)
     per_layer_scales, per_layer_biases = gaussian_init_scales_biases(
@@ -165,11 +165,17 @@ class GaussianResnetDecoder(nn.Module):
       # tensors: num_layers entries, each (B,C,H,W) -> (B,L,C,H,W)
       return rearrange(tensors, "l b c h w -> b l c h w")
 
-    raw_scale = stack_layers(per_field["scale"])
+    # scale_lambda folded in as an ADDITIVE log-space bias (log(exp(raw)*lambda)
+    # == raw + log(lambda)) rather than a separate post-exp multiply, so
+    # "raw_scale" stays log(the multiplier that "scale" actually uses) --
+    # matters for compute_direct_loss's direct_scale_weight term, which
+    # compares raw_scale directly against log(gt_scale) in log-space; without
+    # folding lambda in here that comparison would be off by a constant
+    # log(scale_lambda) offset.
+    raw_scale = stack_layers(per_field["scale"]) + float(np.log(self.scale_lambda))
 
     out = {
       "opacity": torch.sigmoid(stack_layers(per_field["opacity"])),
-      # "scale": torch.exp(stack_layers(per_field["scale"])) * self.scale_lambda,
       "raw_scale": raw_scale,
       "scale": torch.exp(raw_scale),
       "rotation": F.normalize(stack_layers(per_field["rotation"]), dim=2),
@@ -195,6 +201,20 @@ class GSDecoderStack(nn.Module):
       for _ in range(num_layers)
     ])
 
-  def forward(self, input_features):
-    outs = [head(input_features) for head in self.heads]
-    return {k: torch.cat([o[k] for o in outs], dim=1) for k in outs[0]}
+  def forward(self, input_features, active_layers=None):
+    """active_layers: optional iterable of layer indices to actually run
+    through their own decoder head -- each head is a FULL independent 5-level
+    U-Net (~9M params here, 68% of this model's total is spread across the 6
+    heads), so skipping inactive ones is a real forward+backward compute/VRAM
+    saving, not just cosmetic. Skipped layers get an all-zero placeholder
+    (torch.zeros_like off an actually-computed layer's own output -- same
+    shape/dtype/device, no grad_fn, so it costs nothing in the backward pass
+    either) instead of running their head at all. None (default): every
+    layer runs, identical to the pre-active_layers behavior."""
+    indices = range(len(self.heads)) if active_layers is None else sorted(set(active_layers))
+    computed = {i: self.heads[i](input_features) for i in indices}
+    ref = next(iter(computed.values()))
+    return {
+      k: torch.cat([computed[i][k] if i in computed else torch.zeros_like(ref[k]) for i in range(len(self.heads))], dim=1)
+      for k in ref
+    }
