@@ -15,12 +15,21 @@ per-point form of the symmetric Chamfer distance that plot_chamfer_box.py
 reduces to one number per view -- and mean(GT->WT) + mean(WT->GT) printed
 here should match that number.
 
-Raw, no alignment: a Z-only scale/shift isn't a valid 3-D transform, so
-(like every other Chamfer tool here) the clouds are compared as-is.
+Default is raw, no alignment: a Z-only *shift* isn't a valid 3-D transform
+((X, Y) would need to shift too, off the camera ray), so (like every other
+Chamfer tool here) the clouds are compared as-is by default.
+
+A pure uniform *scale*, though, is a valid 3-D transform: scaling every
+(X, Y, Z) of the WT cloud by one scalar just moves each point along its own
+camera ray, which is exactly the "unknown global scale" World Tracing is
+ambiguous about. --align median|scale fits that one scalar on layer 0's
+shared valid pixels (see compare_wt_depth._align) and applies it to every
+point in the WT cloud before comparing/exporting.
 
     python debug_cloud_disparity.py bla/obj_rand500.h5 bla/obj_rand500.h5.wt.h5 400
     python debug_cloud_disparity.py render.h5 render.h5.wt.h5 7 --layers 0 1
     python debug_cloud_disparity.py render.h5 render.h5.wt.h5 7 -e glb -o /tmp/v7
+    python debug_cloud_disparity.py render.h5 render.h5.wt.h5 7 --align median
 """
 
 from argparse import ArgumentParser
@@ -29,6 +38,7 @@ import h5py
 import numpy as np
 import trimesh
 
+from compare_wt_depth import _align
 from debug_pointcloud import extract_valid_points, unproject_depth_peel
 from util import intrinsics_name
 
@@ -77,6 +87,11 @@ def main():
   p.add_argument("--dist-range", type=float, nargs=2, metavar=("LO", "HI"), default=None,
                  help="pin the shared distance colour scale (default: LO=0, HI=99th "
                       "percentile of the pooled GT->WT and WT->GT distances)")
+  p.add_argument("--align", choices=["none", "median", "scale"], default="none",
+                 help="uniform-scale the WT cloud onto GT before comparing (scalar "
+                      "fit on layer 0's shared valid pixels, applied to all layers "
+                      "and coords -- a pure scale from the camera origin, unlike "
+                      "affine/mad, IS a valid point-cloud transform). Default none.")
   p.add_argument("-e", "--export-format", choices=["ply", "glb"], default="ply",
                  help="ply (default): two flat files <prefix>.gt.ply / <prefix>.wt.ply. "
                       "glb: one file with \"gt\" and \"wt\" nodes.")
@@ -113,6 +128,19 @@ def main():
   gt, _, _, gt_layer = unproject_depth_peel(depth_peel, K, None, "camera")
   wt, _, _, wt_layer = extract_valid_points(pts_grid)
 
+  scale = 1.0
+  if args.align != "none":
+    gt0 = depth_peel[..., 0].astype(np.float32)
+    gt0_valid = gt0 > 0.0
+    pr0_xyz = pts_grid[:, :, 0, :].astype(np.float32)
+    pr0_valid = ~np.isnan(pr0_xyz).any(axis=-1)
+    both0 = gt0_valid & pr0_valid
+    if not both0.any():
+      raise SystemExit(f"--align {args.align}: no shared valid layer-0 pixels to fit a scale")
+    scale, _ = _align(pr0_xyz[..., 2][both0], gt0[both0], args.align)
+    wt = wt * scale
+    print(f"  align={args.align}  scale={scale:.4g}  (fit on {int(both0.sum())} shared layer-0 px)")
+
   suffix = "" if args.layers is None else f" (layers {sel})"
   if args.layers is not None:
     gt, gt_layer = gt[np.isin(gt_layer, sel)], gt_layer[np.isin(gt_layer, sel)]
@@ -142,6 +170,8 @@ def main():
   head = f"view {args.index}"
   if mesh is not None:
     head += f"  mesh {mesh}"
+  if args.align != "none":
+    head += f"  [{args.align}-aligned, s={scale:.4g}]"
   print(f"{head}  GT {len(gt)} pts  WT {len(wt)} pts{suffix}")
   print(f"  distance colour scale (shared): [{lo:.4g}, {hi:.4g}]")
   m_gt = _stats("GT->WT", d_gt)
@@ -149,7 +179,8 @@ def main():
   print(f"  per-point Chamfer  mean(GT->WT) + mean(WT->GT) = {m_gt + m_wt:.4f}  "
         f"(cf. plot_chamfer_box; a few % off from its 40k/side subsampling)")
 
-  prefix = args.out or f"{args.wt_h5}.view{args.index}.disparity"
+  align_tag = "" if args.align == "none" else f".align-{args.align}"
+  prefix = args.out or f"{args.wt_h5}.view{args.index}{align_tag}.disparity"
   if args.export_format == "ply":
     for tag, xyz, col in (("gt", gt, gt_colors), ("wt", wt, wt_colors)):
       out = f"{prefix}.{tag}.ply"

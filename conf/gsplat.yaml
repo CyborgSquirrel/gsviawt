@@ -17,6 +17,17 @@ iters: 3000
 seed: 42
 device: cuda              # cuda | cpu
 
+# Number of views (sampled uniformly at random, without replacement, from the
+# full primary+secondary set) to render and supervise on each iteration.
+# null (the special "all views" value) renders every view every iteration --
+# full-batch gradient descent, this repo's original/default behaviour. Set an
+# int (e.g. 1) to instead do stochastic per-iteration view sampling, matching
+# the vanilla 3DGS paper's one-random-camera-per-step training loop -- each
+# iteration gets cheaper (~views_per_iter/num_views the cost) but noisier, so
+# more iterations are typically needed to reach the same quality. Values >=
+# the number of views behave identically to null.
+views_per_iter: null
+
 # Whether the optimizer may move Gaussian centers. false = centers stay locked
 # at their depth-peel back-projected seed positions; only scale / rotation /
 # opacity / colour are optimized (and lr.means is unused).

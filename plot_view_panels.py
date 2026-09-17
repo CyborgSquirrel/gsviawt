@@ -17,10 +17,14 @@ two validity masks disagree at that layer: red where WT predicts a surface
 the render doesn't have, blue where the render has one WT missed, white
 where they agree.
 
-The title also carries the symmetric Chamfer distance (raw, no alignment)
-between the render's unprojected depth-peel point cloud and WT's predicted
-XYZ -- overall, and per layer in each row's label. Below it, the mesh's path
-relative to the objaverse download root (shard dir + file).
+The title also carries the symmetric Chamfer distance between the render's
+unprojected depth-peel point cloud and WT's predicted XYZ -- overall, and per
+layer in each row's label. Raw by default; with --align on, it's computed on
+the WT cloud scaled by the fitted `s` (a uniform scale is a valid point-cloud
+transform, so this is a real post-align Chamfer -- the fitted shift `t` is
+not applied to the cloud, only to the 1-D depth values shown in the panels).
+Below the title, the mesh's path relative to the objaverse download root
+(shard dir + file).
 
     python plot_view_panels.py bla/obj_rand40.h5 bla/obj_rand40.h5.wt.h5 --views 1 8 12 24
 """
@@ -293,10 +297,14 @@ def main():
       both0 = gtv0 & prv0 & np.isfinite(pr0) & (gt0 > 0)
       s, t = _align(pr0[both0], gt0[both0], args.align)
 
-      # Chamfer distance is always on the RAW clouds (a Z-only scale/shift
-      # isn't a valid point-cloud transform), regardless of --align.
+      # Point-cloud Chamfer: when --align is on, computed on the WT cloud
+      # scaled by `s` -- a uniform scale is a valid 3-D transform (every
+      # point just slides along its own camera ray), unlike the shift `t`
+      # (only meaningful for the 1-D depth comparison below, since shifting
+      # just Z would pull a point off its ray -- see debug_cloud_disparity.py).
       K = K_ds[v] if K_ds is not None else None
-      wt_cloud_all = _xyz_cloud(pts) if K is not None else None
+      pts_cd = pts * s if args.align != "none" else pts
+      wt_cloud_all = _xyz_cloud(pts_cd) if K is not None else None
       cd_all = (_chamfer(np.concatenate([_unproject(dp[..., li], K)
                                          for li in range(n_layers)], axis=0),
                          wt_cloud_all)
@@ -311,7 +319,7 @@ def main():
         both = gtv & wtv & (gt > 0)
         absrel = (float(np.mean(np.abs(wt[both] - gt[both]) / gt[both]))
                   if both.any() else np.nan)
-        cd = (_chamfer(_unproject(dp[..., li], K), _xyz_cloud(pts[:, :, li, :]))
+        cd = (_chamfer(_unproject(dp[..., li], K), _xyz_cloud(pts_cd[:, :, li, :]))
               if K is not None else np.nan)
         layers.append(dict(idx=li, gt=gt, gtv=gtv, wt=wt, wtv=wtv, both=both,
                            absrel=absrel, n=int(both.sum()), cd=cd))
@@ -322,7 +330,10 @@ def main():
       if args.align != "none":
         tags.append(f"align={args.align} (s={s:.3g}, t={t:.3g})")
       if np.isfinite(cd_all):
-        tags.append(f"Chamfer(all) {cd_all:.4f}")
+        cd_tag = f"Chamfer(all) {cd_all:.4f}"
+        if args.align != "none":
+          cd_tag += " [s-aligned]"
+        tags.append(cd_tag)
       title = "    ".join(t for t in tags if t)
       wt_label = "depth WT (raw)" if args.align == "none" else f"depth WT ({args.align}-aligned)"
       subtitle = None
