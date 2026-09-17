@@ -53,6 +53,12 @@ imageio
 imageio-ffmpeg
 plyfile
 
+# clip_score.py: aesthetic-score filtering (CLIP embedding + the LAION
+# improved-aesthetic-predictor MLP head, see its docstring). open_clip_torch
+# ships OpenAI's original ViT-L/14 weights the aesthetic MLP was trained on;
+# torch/torchvision/Pillow already come from the deps above.
+open_clip_torch
+
 # unsorted
 objaverse
 trimesh

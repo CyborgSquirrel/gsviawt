@@ -8,6 +8,12 @@ wt_infer_layers.py + the compare_wt_depth.py tooling read directly.
 depth_intrinsics matches depth_peel, image_intrinsics matches images; both
 are always written and are identical when the two resolutions match.
 
+If compute_clip is enabled, clip_score.py runs as a second pass right after
+rendering (in the project's normal venv, not Blender's bundled Python) and
+adds a CLIP ViT-L/14 embedding per view (clip_embedding, N x 768 float32);
+compute_aesthetic additionally adds a LAION-Aesthetics V2 score per view
+(aesthetic_score, N float32). See clip_score.py's own docstring.
+
 Runs *inside* Blender (no rpyc server):
 
     /opt/blender/blender --background --python render_objaverse.py -- \\
@@ -405,6 +411,13 @@ def run(cfg):
   from omegaconf import OmegaConf
 
   logging.basicConfig(level=logging.INFO)
+  if bool(cfg.compute_aesthetic) and not bool(cfg.compute_clip):
+    raise ValueError("compute_aesthetic requires compute_clip: true -- the "
+                     "aesthetic score is predicted from the CLIP embedding")
+  if bool(cfg.compute_clip) and not bool(cfg.render):
+    raise ValueError("compute_clip requires render: true -- there's no RGB "
+                     "image to embed otherwise")
+
   scene = bpy.context.scene
   scene.render.engine = str(cfg.render_engine)
   scene.render.resolution_percentage = 100
@@ -459,6 +472,37 @@ def run(cfg):
       logger.warning("%d/%d meshes failed: %s", len(failed), len(meshes), failed)
 
   logger.info("wrote %s", cfg.output_path)
+
+  if cfg.compute_clip:
+    _run_clip_score(cfg)
+
+
+def _run_clip_score(cfg):
+  """Score the just-written h5 for CLIP embeddings (+ aesthetic score) as a
+  separate subprocess in the project's normal venv, not inside Blender's
+  bundled Python -- see this file's docstring for why that split exists.
+  Reuses the venv on $VIRTUAL_ENV/$PATH that the Dockerfile activates for
+  the whole container."""
+  import shutil
+  import subprocess
+
+  venv = os.environ.get("VIRTUAL_ENV")
+  python = os.path.join(venv, "bin", "python") if venv else (shutil.which("python3") or "python3")
+  script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clip_score.py")
+  overrides = [
+    f"output_path={cfg.output_path}",
+    f"compute_aesthetic={bool(cfg.compute_aesthetic)}",
+  ]
+  logger.info("running clip_score.py (%s) on %s", python, cfg.output_path)
+  try:
+    subprocess.run([python, script, *overrides], check=True)
+  except subprocess.CalledProcessError:
+    logger.error(
+      "clip_score.py failed -- %s was already written and closed "
+      "successfully (the render itself is fine); re-run scoring by hand "
+      "with: %s %s output_path=%s compute_aesthetic=%s",
+      cfg.output_path, python, script, cfg.output_path, bool(cfg.compute_aesthetic))
+    raise
 
 
 def _render_mesh(cfg, scene, mi, mesh_path, view_strategy, W, H, DW, DH, Lmax, tmp,

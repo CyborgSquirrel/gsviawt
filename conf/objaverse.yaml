@@ -60,6 +60,19 @@ lighting: objaverse
 # usually unnecessary.
 camera_depth_target: null
 
+# Compute a CLIP ViT-L/14 image embedding per rendered view and save it to
+# the "clip_embedding" dataset (N x 768 float32). This runs as a separate
+# pass (clip_score.py, see its own conf/clip_score.yaml -- e.g. its
+# `background` the transparent renders get composited onto before CLIP sees
+# them) after rendering finishes, in the project's normal venv -- not inside
+# Blender's bundled Python. Requires render: true (there's no RGB image to
+# embed otherwise).
+compute_clip: false
+
+# Also predict a LAION-Aesthetics V2 score per view from its CLIP embedding
+# and save it to "aesthetic_score" (N float32). Requires compute_clip: true.
+compute_aesthetic: false
+
 hydra:
   job:
     chdir: false
