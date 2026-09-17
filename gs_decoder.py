@@ -201,6 +201,20 @@ class GSDecoderStack(nn.Module):
       for _ in range(num_layers)
     ])
 
-  def forward(self, input_features):
-    outs = [head(input_features) for head in self.heads]
-    return {k: torch.cat([o[k] for o in outs], dim=1) for k in outs[0]}
+  def forward(self, input_features, active_layers=None):
+    """active_layers: optional iterable of layer indices to actually run
+    through their own decoder head -- each head is a FULL independent 5-level
+    U-Net (~9M params here, 68% of this model's total is spread across the 6
+    heads), so skipping inactive ones is a real forward+backward compute/VRAM
+    saving, not just cosmetic. Skipped layers get an all-zero placeholder
+    (torch.zeros_like off an actually-computed layer's own output -- same
+    shape/dtype/device, no grad_fn, so it costs nothing in the backward pass
+    either) instead of running their head at all. None (default): every
+    layer runs, identical to the pre-active_layers behavior."""
+    indices = range(len(self.heads)) if active_layers is None else sorted(set(active_layers))
+    computed = {i: self.heads[i](input_features) for i in indices}
+    ref = next(iter(computed.values()))
+    return {
+      k: torch.cat([computed[i][k] if i in computed else torch.zeros_like(ref[k]) for i in range(len(self.heads))], dim=1)
+      for k in ref
+    }

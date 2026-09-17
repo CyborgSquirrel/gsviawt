@@ -25,6 +25,7 @@ gsplat JIT-compiles CUDA kernels on first import; see _setup_cuda_toolchain
 """
 
 import contextlib
+import glob
 import logging
 import math
 import os
@@ -32,6 +33,7 @@ import shutil
 import sys
 import sysconfig
 import tempfile
+import time
 
 
 def _setup_cuda_toolchain() -> None:
@@ -102,6 +104,7 @@ class GSModel(nn.Module):
     self.num_layers = int(cfg.data.num_layers)
     self.max_sh_degree = int(cfg.model.max_sh_degree)
     self.min_scale_mult = float(cfg.model.min_scale_mult)
+    self.one_gauss_decoder = bool(cfg.model.one_gauss_decoder)
     in_channels = 3 + 4 * self.num_layers
 
     self.encoder = GSResnetEncoder(
@@ -143,7 +146,15 @@ class GSModel(nn.Module):
     per_layer = torch.cat([xyz_norm, valid], dim=1).reshape(-1, dh, dw)  # (4L,DH,DW)
     return torch.cat([rgb_norm, per_layer], dim=0)            # (3+4L,DH,DW)
 
-  def forward(self, rgb, xyz_cam, hit, fx):
+  def forward(self, rgb, xyz_cam, hit, fx, active_layers=None):
+    """active_layers: optional iterable of layer indices -- forwarded to
+    GSDecoderStack.forward to skip running the (independent, ~9M-param each)
+    decoder heads for every layer NOT in it, a real compute/VRAM saving, not
+    just a loss-masking one (see train_gs.yaml's loss.supervised_layers and
+    compute_direct_loss). Only meaningful with model.one_gauss_decoder=false
+    (the default) -- GaussianResnetDecoder's single shared conv can't skip a
+    channel slice's compute the same way, so this is ignored (every layer
+    still runs) when one_gauss_decoder=true."""
     x = self.build_input(rgb, xyz_cam, hit)
     dh, dw = x.shape[-2:]
     # The 5-level U-Net halves spatial dims 4x (conv1 + maxpool + 2 more
@@ -158,7 +169,10 @@ class GSModel(nn.Module):
     if pad_h or pad_w:
       x = F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")
     feats = self.encoder(x.unsqueeze(0))
-    out = self.decoder(feats)
+    if self.one_gauss_decoder:
+      out = self.decoder(feats)
+    else:
+      out = self.decoder(feats, active_layers=active_layers)
     out = {k: v[0, :, :, :dh, :dw] for k, v in out.items()}   # (L,C,H,W)
     return out
 
@@ -232,7 +246,7 @@ def apply_ground_truth_overrides(gauss, gt, hit, predict_params, device):
   return out
 
 
-def run_model_source(model, item, device, predict_params):
+def run_model_source(model, item, device, predict_params, active_layers=None):
   """Runs the model on `item`'s source view once. Returns (gauss, gauss_render,
   hit, flat): `gauss` is the raw (L,C,H,W) per-layer decoder output dict --
   always the network's own unmodified prediction, so compute_direct_loss's
@@ -243,14 +257,16 @@ def run_model_source(model, item, device, predict_params):
   `hit` is (L,H,W) bool. `flat` is flatten_gaussians' output built from
   `gauss_render` -- shared by both the photometric render path and the
   direct-parameter-loss path below (see compute_loss), computed exactly once
-  regardless of which (or both) are active this step."""
+  regardless of which (or both) are active this step. `active_layers`: see
+  GSModel.forward -- layers not in it get an all-zero decoder output (skips
+  that layer's own decoder head entirely) instead of a real prediction."""
   src = item["source"]
   rgb = src["rgb"].to(device)
   xyz_cam = src["xyz_cam"].to(device)
   hit = src["hit"].to(device)
   fx = src["K_depth"][0, 0].to(device)
 
-  gauss = model(rgb, xyz_cam, hit, fx)
+  gauss = model(rgb, xyz_cam, hit, fx, active_layers=active_layers)
   gauss_render = gauss
   gt = item.get("ground_truth")
   if gt is not None:
@@ -387,21 +403,20 @@ def compute_direct_loss(gauss, gt, hit, cfg_loss, device):
     # fit_gsplat.py has no SH>0 -- its ground truth is flat RGB, comparable
     # to our sh_dc via SH degree-0 evaluation. Only sh_dc gets a gradient
     # from this; sh_rest has no ground-truth signal in this source at all.
-    # nan_to_num guard: same reasoning as direct_scale_weight/direct_opacity_weight
-    # above -- gt["color"] is NaN-padded outside `mask`, and pow(2)'s backward
-    # (2*x) propagates that NaN through the unselected positions' local Jacobian
-    # even though their incoming gradient is zero (0*NaN=NaN).
+    # L1 (not L2, unlike opacity/scale above): abs()'s backward (sign(x))
+    # never propagates NaN through masked-out positions the way pow(2)'s
+    # backward (2*x) does, so no nan_to_num guard is needed here.
     shdc_pred = rearrange(gauss["sh_dc"], "l c h w -> l h w c")
     color_pred = SH_C0 * shdc_pred + 0.5
-    gt_color = torch.nan_to_num(gt["color"].to(device), nan=0.0)
-    parts["color"] = (color_pred - gt_color).pow(2)[mask].mean()
+    parts["color"] = (color_pred - gt["color"].to(device)).abs()[mask].mean()
     total = total + cfg_loss.direct_color_weight * parts["color"]
 
   return total, parts
 
 
 def compute_loss(model, item, cfg, device, window, force_render=False):
-  gauss, gauss_render, hit, flat = run_model_source(model, item, device, set(cfg.model.predict_params))
+  gauss, gauss_render, hit, flat = run_model_source(
+    model, item, device, set(cfg.model.predict_params), active_layers=cfg.loss.supervised_layers)
 
   need_photo = (force_render or cfg.loss.l1_weight > 0
                 or cfg.loss.ssim_weight > 0 or cfg.loss.mask_weight > 0)
@@ -616,7 +631,7 @@ def render_orbit(model, item, cfg, device):
 
   predict_params = set(cfg.model.predict_params)
   with torch.no_grad():
-    gauss = model(rgb, xyz_cam, hit, fx)
+    gauss = model(rgb, xyz_cam, hit, fx, active_layers=cfg.loss.supervised_layers)
     gt = item.get("ground_truth")
     if gt is not None:
       gauss = apply_ground_truth_overrides(gauss, gt, hit, predict_params, device)
@@ -821,9 +836,18 @@ class GSLightningModule(pl.LightningModule):
     self._accum_metrics = {}
     self.global_train_step = 0
 
-    ckpt_dir = cfg.checkpoint.dir or os.getcwd()
-    os.makedirs(ckpt_dir, exist_ok=True)
-    self.ckpt_path = os.path.join(ckpt_dir, "train_gs.ckpt.pt")
+    # One directory for everything this run produces (currently just
+    # checkpoints, but named generically for whatever else lands here later
+    # -- orbit videos/panels are wandb-only right now, see orbit_workdir).
+    # Defaults to the Unix timestamp at startup, so back-to-back runs never
+    # share a directory unless cfg.output_dir is set explicitly.
+    self.output_dir = cfg.output_dir or str(int(time.time()))
+    os.makedirs(self.output_dir, exist_ok=True)
+    # Final checkpoint only -- periodic in-training saves get their own
+    # step-numbered filename (see training_step) so a NaN/corrupted run
+    # doesn't clobber the last known-good snapshot the way a single
+    # always-overwritten file did (lost an entire overnight run to this).
+    self.ckpt_path = os.path.join(self.output_dir, "train_gs.ckpt.pt")
 
   def configure_optimizers(self):
     opt = torch.optim.AdamW(self.model.parameters(), lr=float(self.cfg.train.lr))
@@ -875,10 +899,25 @@ class GSLightningModule(pl.LightningModule):
         self._log_train_wandb(step, accum_loss, accum_metrics, grad_norm, sched)
 
     if self.cfg.checkpoint.every > 0 and step > 0 and step % self.cfg.checkpoint.every == 0:
-      self.trainer.save_checkpoint(self.ckpt_path)
-      log.info("checkpoint -> %s", self.ckpt_path)
+      step_ckpt_path = os.path.join(self.output_dir, f"train_gs.ckpt.step{step:07d}.pt")
+      self.trainer.save_checkpoint(step_ckpt_path)
+      log.info("checkpoint -> %s", step_ckpt_path)
+      self._prune_old_checkpoints()
 
     self.global_train_step += 1
+
+  def _prune_old_checkpoints(self):
+    """checkpoint.keep_last: null (default) keeps every periodic snapshot
+    forever; set to an int to delete all but the N most recent
+    train_gs.ckpt.step*.pt files (oldest-first by step number), bounding
+    disk usage on very long runs without reintroducing the
+    single-overwritten-file failure mode this replaced."""
+    keep_last = self.cfg.checkpoint.keep_last
+    if keep_last is None:
+      return
+    paths = sorted(glob.glob(os.path.join(self.output_dir, "train_gs.ckpt.step*.pt")))
+    for old_path in paths[:-int(keep_last)] if keep_last > 0 else paths:
+      os.remove(old_path)
 
   def _log_train_console(self, step, accum_loss, accum_metrics, grad_norm):
     if "l1" in accum_metrics:
@@ -1060,6 +1099,15 @@ class OrbitCallback(pl.Callback):
     if self.orbit_workdir is not None:
       shutil.rmtree(self.orbit_workdir, ignore_errors=True)
       self.orbit_workdir = None
+
+
+# Lets conf/train_gs.yaml derive checkpoint.every from train.max_epochs (e.g.
+# "${div_floor:${train.max_epochs},10}" -- 10 checkpoints spread evenly over
+# a run by default) instead of a fixed step count that's wrong for any
+# max_epochs other than whatever it was tuned for. Registered at import time
+# (before hydra.main composes the config below) since OmegaConf needs the
+# resolver in place before it can evaluate the interpolation.
+OmegaConf.register_new_resolver("div_floor", lambda total, n: max(1, int(total) // int(n)))
 
 
 @hydra.main(version_base=None, config_path="conf", config_name="train_gs")
