@@ -140,23 +140,11 @@ loss:
   direct_rotation_weight: 0.0  # sign-invariant (1 - |dot(q_pred, q_gt)|)
   direct_color_weight: 0.0     # only touches sh_dc's gradient (SH_C0*sh_dc+0.5
                                  # vs. gt's flat RGB) -- sh_rest has no GT signal
-  # Restricts which depth-peel layers are actually modeled at all -- e.g.
-  # [0] to only supervise the front/surface layer, or [2, 3] for a couple of
-  # middle layers. null (default): all layers, i.e. unchanged behavior. This
-  # is a genuine compute/VRAM saving, not just a loss mask: with
-  # model.one_gauss_decoder=false (the default), each layer has its OWN
-  # independent decoder head (~9M params each, 68% of this model's total
-  # params combined across all 6) -- layers not in this list skip their
-  # head's forward+backward entirely (GSModel.forward -> GSDecoderStack.forward)
-  # and get an all-zero placeholder output instead, in addition to being
-  # masked out of compute_direct_loss's own metric. Input point cloud
-  # (still needs every layer for context) and predict_params (which FIELDS
-  # get predicted, orthogonal to which LAYERS do) are untouched. No effect
-  # on the photometric losses (l1/ssim/mask above), which have no
-  # per-layer concept -- they compare full rendered images. With
-  # model.one_gauss_decoder=true, there's no independent per-layer head to
-  # skip (a single shared conv emits every layer via channel-slicing), so
-  # this only narrows the loss mask there, same as before.
+  # Restricts which depth-peel layers are actually modeled -- e.g. [0] for
+  # just the front/surface layer, [2, 3] for a couple of middle layers.
+  # null (default): all layers. With model.one_gauss_decoder=false
+  # (default), unlisted layers skip their own decoder head's
+  # forward+backward entirely, not just the loss mask.
   supervised_layers: null   # e.g. [0], [1], [2, 3]
 
 train:
@@ -197,29 +185,19 @@ wandb:
   tags: [gs, flash3d-style]
   name: null
 
-# Directory for everything a single run produces -- currently just
-# checkpoints, named generically since anything else added later (dumped
-# panels, etc.) belongs alongside them rather than scattered elsewhere.
-# null (default): a fresh directory per run, named after the Unix timestamp
-# at startup (e.g. "1758086746"), so back-to-back runs never collide or
-# share a directory unless this is set explicitly.
+# Directory for everything a single run produces (checkpoints, etc). null
+# (default): a fresh directory per run, named after the Unix timestamp at
+# startup, so back-to-back runs never collide.
 output_dir: null
 
 checkpoint:
-  # 10 checkpoints spread evenly over the run by default, however long
-  # train.max_epochs is (see train_gs.py's div_floor resolver) -- override
-  # with a literal step count to pin an exact cadence instead; 0 disables
-  # periodic checkpoints entirely (a final one is always still written).
+  # Step interval between periodic checkpoints. Default spreads 10 evenly
+  # over the run, however long train.max_epochs is. 0 disables periodic
+  # checkpoints (a final one is always still written).
   every: ${div_floor:${train.max_epochs},10}
   # Periodic saves are step-numbered files (train_gs.ckpt.step{N}.pt), never
-  # overwritten in place -- a run that goes NaN/corrupts partway through no
-  # longer destroys the last known-good snapshot (previously all periodic
-  # saves clobbered a single train_gs.ckpt.pt, and a run that NaN'd shortly
-  # after a checkpoint interval overwrote the last good one with garbage on
-  # its very next save). null (default): keep every one forever. Set to an
-  # int to delete all but the N most recent, bounding disk use on long runs
-  # (each checkpoint is close to the full model+optimizer state -- ~900MB
-  # for this model's 79.8M params).
+  # overwritten in place. null (default): keep every one forever. Set to an
+  # int to delete all but the N most recent.
   keep_last: null
 
 hydra:
