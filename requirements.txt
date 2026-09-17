@@ -55,6 +55,7 @@ plyfile
 
 # unsorted
 objaverse
+requests  # download_objaverse_sketchfab.py: fetch the TRELLIS-500K CSV (already an objaverse transitive dep, listed since we import it directly)
 trimesh
 # bpy
 
