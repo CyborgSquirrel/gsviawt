@@ -1,0 +1,32 @@
+# Config for clip_score.py -- CLIP ViT-L/14 image embeddings + the LAION
+# improved-aesthetic-predictor MLP head, computed per view of an existing
+# render_objaverse.py h5 and written back into it in place.
+#
+# Run in the container venv:
+#
+#     docker exec -w /app gsviawt-app-gpu-1 /home/user/venv/bin/python \
+#         clip_score.py output_path=/app/bla/objaverse_renders.h5
+
+output_path: ???       # required -- h5 written by render_objaverse.py (needs an "images" dataset)
+
+# Also run the LAION-Aesthetics V2 MLP head on the CLIP embeddings and write
+# an "aesthetic_score" (N,) float32 dataset.
+compute_aesthetic: true
+
+# Renders are RGBA with a transparent background (render_objaverse's
+# film_transparent: true). CLIP was never shown transparency, so each frame
+# is alpha-composited onto this background first -- RGB in [0, 1]. This
+# measurably shifts both the embedding and the aesthetic score, so pick the
+# background your renders should be judged against and keep it consistent
+# across any corpus you intend to compare scores within.
+background: [1.0, 1.0, 1.0]
+
+batch_size: 64
+device: auto            # auto (cuda if available else cpu) | cuda | cpu
+
+hydra:
+  job:
+    chdir: false
+  output_subdir: null
+  run:
+    dir: .
