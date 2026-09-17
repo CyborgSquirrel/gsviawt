@@ -142,7 +142,13 @@ ENV PATH="/home/user/venv/lib/python3.13/site-packages/nvidia/cu13/bin:$PATH"
 # compiled .so lands in ~/.cache/torch_extensions and is loaded as-is at
 # runtime. This layer only rebuilds when requirements.txt changes.
 ENV TORCH_CUDA_ARCH_LIST="8.6;8.9+PTX"
-RUN python -c "import gsplat; print('gsplat', gsplat.__version__, '- CUDA kernels prebuilt')"
+# `import gsplat` alone verifies nothing: gsplat.cuda._backend sets _C to
+# None (and just prints a warning) whenever it decides the CUDA toolkit
+# isn't usable, and import succeeds either way -- a build can "pass" this
+# step in ~3s having compiled nothing, silently pushing the ~5min JIT cost
+# onto every container's first render instead. Assert _C is real so a
+# build that can't actually precompile fails loudly here instead.
+RUN python -c "from gsplat.cuda._backend import _C; assert _C is not None, 'gsplat CUDA extension not built'; import gsplat; print('gsplat', gsplat.__version__, 'prebuilt at', _C.__file__)"
 
 # Copy everything (this is the only place world-tracing's actual source
 # lands in the image)
