@@ -5,11 +5,17 @@ computed over the "images" dataset of an existing render_objaverse.py h5 and
 written back into it as "clip_embedding" (N x 768 float32) and, optionally,
 "aesthetic_score" (N float32).
 
-Runs as a separate pass after rendering, in the project's normal venv --
-*not* inside Blender's bundled Python, which only has h5py/hydra-core
-installed (see render_objaverse.py's docstring). render_objaverse.py invokes
-this script automatically when its own `compute_clip` config is enabled; run
-it by hand against an existing h5:
+Runs in the project's normal venv -- *not* inside Blender's bundled Python,
+which only has h5py/hydra-core installed (see render_objaverse.py's
+docstring). render_objaverse.py's own `compute_clip`/`compute_aesthetic`
+toggles no longer call this script: they spawn clip_worker.py/
+aesthetic_worker.py as long-lived workers instead and score views live,
+during the render (see ipc.py, clip_worker.py). This script remains a
+standalone batch tool for scoring an h5 that was rendered without
+compute_clip, or re-scoring one with a different background; `load_clip_model`/
+`embed_batch`/`aesthetic_scores` below are the same functions the live
+workers use, so both paths score identically. Run by hand against an
+existing h5:
 
     docker exec -w /app gsviawt-app-gpu-1 /home/user/venv/bin/python \\
         clip_score.py output_path=/app/bla/objaverse_renders.h5
@@ -97,6 +103,43 @@ def resolve_device(device_cfg):
   return device_cfg
 
 
+def load_clip_model(device):
+  """OpenAI's ViT-L/14 CLIP weights via open_clip's QuickGELU tag (see
+  module docstring for why not the plain "ViT-L-14" tag). Shared by the
+  standalone batch path below and clip_worker.py. Returns (model, preprocess)."""
+  import open_clip
+
+  with timed("load CLIP ViT-L/14 (openai)"):
+    model, _, preprocess = open_clip.create_model_and_transforms(
+      "ViT-L-14-quickgelu", pretrained="openai", device=device)
+    model.eval()
+  return model, preprocess
+
+
+@torch.no_grad()
+def embed_batch(model, preprocess, rgb_uint8, device):
+  """(N, H, W, 3) uint8 RGB -> (N, 768) float32 CLIP embeddings,
+  un-normalized (L2-normalize before feeding the aesthetic MLP -- see
+  aesthetic_scores)."""
+  from PIL import Image
+
+  batch = torch.stack(
+    [preprocess(Image.fromarray(im, mode="RGB")) for im in rgb_uint8]
+  ).to(device)
+  return model.encode_image(batch).float().cpu().numpy()
+
+
+@torch.no_grad()
+def aesthetic_scores(mlp, emb):
+  """(N, 768) float32 CLIP embeddings -> (N,) float32 LAION-Aesthetics V2
+  scores. L2-normalizes internally (the MLP was trained on normalized
+  embeddings)."""
+  device = next(mlp.parameters()).device
+  t = torch.from_numpy(emb).to(device)
+  normed = t / t.norm(dim=-1, keepdim=True)
+  return mlp(normed).squeeze(-1).cpu().numpy()
+
+
 def composite(images, background):
   """(N, H, W, 4) uint8 RGBA -> (N, H, W, 3) uint8 RGB, alpha-composited onto
   `background` (an RGB triple in [0, 1]) -- Blender's PNG output uses
@@ -127,17 +170,11 @@ def ensure_dataset(hf, name, n, item_shape, dtype):
 @hydra.main(version_base=None, config_path="conf", config_name="clip_score")
 def main(cfg: DictConfig) -> None:
   logging.basicConfig(level=logging.INFO)
-  import open_clip
-  from PIL import Image
 
   device = resolve_device(str(cfg.device))
   log.info("device: %s", device)
 
-  with timed("load CLIP ViT-L/14 (openai)"):
-    model, _, preprocess = open_clip.create_model_and_transforms(
-      "ViT-L-14-quickgelu", pretrained="openai", device=device)
-    model.eval()
-
+  model, preprocess = load_clip_model(device)
   aesthetic_mlp = load_aesthetic_mlp(device) if cfg.compute_aesthetic else None
 
   with h5py.File(cfg.output_path, "a") as hf:
@@ -153,19 +190,15 @@ def main(cfg: DictConfig) -> None:
               if aesthetic_mlp is not None else None)
 
     batch_size = int(cfg.batch_size)
-    with timed(f"score {n} views"), torch.no_grad():
+    with timed(f"score {n} views"):
       for start in range(0, n, batch_size):
         end = min(start + batch_size, n)
         rgb = composite(images[start:end], cfg.background)
-        batch = torch.stack(
-          [preprocess(Image.fromarray(im, mode="RGB")) for im in rgb]
-        ).to(device)
-        emb = model.encode_image(batch).float()
-        ds_emb[start:end] = emb.cpu().numpy()
+        emb = embed_batch(model, preprocess, rgb, device)
+        ds_emb[start:end] = emb
 
         if aesthetic_mlp is not None:
-          normed = emb / emb.norm(dim=-1, keepdim=True)
-          ds_aes[start:end] = aesthetic_mlp(normed).squeeze(-1).cpu().numpy()
+          ds_aes[start:end] = aesthetic_scores(aesthetic_mlp, emb)
 
         log.info("scored %d/%d", end, n)
 

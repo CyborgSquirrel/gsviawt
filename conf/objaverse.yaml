@@ -61,17 +61,26 @@ lighting: objaverse
 camera_depth_target: null
 
 # Compute a CLIP ViT-L/14 image embedding per rendered view and save it to
-# the "clip_embedding" dataset (N x 768 float32). This runs as a separate
-# pass (clip_score.py, see its own conf/clip_score.yaml -- e.g. its
-# `background` the transparent renders get composited onto before CLIP sees
-# them) after rendering finishes, in the project's normal venv -- not inside
-# Blender's bundled Python. Requires render: true (there's no RGB image to
-# embed otherwise).
+# the "clip_embedding" dataset (N x 768 float32). clip_worker.py is spawned
+# once (in the project's normal venv, not Blender's bundled Python -- see
+# ipc.py) before rendering starts and scores each view live as it's
+# rendered -- there's no separate pass to run afterward. Requires
+# render: true (there's no RGB image to embed otherwise).
 compute_clip: false
 
 # Also predict a LAION-Aesthetics V2 score per view from its CLIP embedding
-# and save it to "aesthetic_score" (N float32). Requires compute_clip: true.
+# (via aesthetic_worker.py, spawned alongside clip_worker.py) and save it to
+# "aesthetic_score" (N float32). Requires compute_clip: true.
 compute_aesthetic: false
+
+# Renders are RGBA with a transparent background (film_transparent: true
+# above). CLIP was never shown transparency, so each frame is
+# alpha-composited onto this background before clip_worker.py scores it --
+# RGB in [0, 1]. This measurably shifts both the embedding and the
+# aesthetic score, so pick the background your renders should be judged
+# against and keep it consistent across any corpus you intend to compare
+# scores within. Only used when compute_clip: true.
+clip_background: [1.0, 1.0, 1.0]
 
 hydra:
   job:

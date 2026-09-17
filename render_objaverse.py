@@ -8,11 +8,16 @@ wt_infer_layers.py + the compare_wt_depth.py tooling read directly.
 depth_intrinsics matches depth_peel, image_intrinsics matches images; both
 are always written and are identical when the two resolutions match.
 
-If compute_clip is enabled, clip_score.py runs as a second pass right after
-rendering (in the project's normal venv, not Blender's bundled Python) and
-adds a CLIP ViT-L/14 embedding per view (clip_embedding, N x 768 float32);
-compute_aesthetic additionally adds a LAION-Aesthetics V2 score per view
-(aesthetic_score, N float32). See clip_score.py's own docstring.
+If compute_clip is enabled, clip_worker.py is spawned once (in the
+project's normal venv, not Blender's bundled Python -- see ipc.py) before
+the render loop starts, and scores each rendered view live: a CLIP ViT-L/14
+embedding per view (clip_embedding, N x 768 float32) via a Unix-socket
+request/response per view (the frame itself passed through shared memory,
+not the socket -- see ipc.shared_frame_buffer). compute_aesthetic similarly
+spawns aesthetic_worker.py and adds a LAION-Aesthetics V2 score per view
+(aesthetic_score, N float32), predicted from clip_worker's embedding. See
+ipc.py, clip_worker.py, aesthetic_worker.py. clip_score.py remains a
+separate standalone tool for scoring an h5 after the fact.
 
 Runs *inside* Blender (no rpyc server):
 
@@ -407,6 +412,7 @@ def configure_device(device):
 def run(cfg):
   import hydra
   import h5py
+  import ipc
   from util import LazyDataset, timed
   from omegaconf import OmegaConf
 
@@ -443,6 +449,25 @@ def run(cfg):
 
   with ctl.ExitStack() as stack:
     tmp = stack.enter_context(TemporaryDirectory())
+
+    clip_conn = aesthetic_conn = shm_view = None
+    if cfg.compute_clip:
+      python = _venv_python()
+      scripts_dir = os.path.dirname(os.path.abspath(__file__))
+      # shm entered *before* clip_conn so ExitStack's LIFO unwind closes and
+      # unlinks it *after* clip_conn's own cleanup has already terminated
+      # the worker -- unlinking first would be a use-after-free.
+      shm = stack.enter_context(ipc.shared_frame_buffer(H * W * 4))
+      shm_view = np.ndarray((H, W, 4), dtype=np.uint8, buffer=shm.buf)
+      clip_conn = stack.enter_context(ipc.worker_connection(
+        python, os.path.join(scripts_dir, "clip_worker.py"),
+        os.path.join(tmp, "clip.sock"), shm.name, str(W), str(H),
+        *[str(c) for c in cfg.clip_background]))
+      if cfg.compute_aesthetic:
+        aesthetic_conn = stack.enter_context(ipc.worker_connection(
+          python, os.path.join(scripts_dir, "aesthetic_worker.py"),
+          os.path.join(tmp, "aesthetic.sock")))
+
     hf = stack.enter_context(h5py.File(cfg.output_path, "w"))
     hf.attrs["config_json"] = json.dumps(OmegaConf.to_container(cfg, resolve=True))
     hf.create_dataset("mesh_paths", data=meshes, dtype=h5py.string_dtype("utf-8"))
@@ -457,12 +482,20 @@ def run(cfg):
     ds_depth = stack.enter_context(LazyDataset(hf, "depth_peel", dataset_kwargs=depth_kw))
     ds_mesh = stack.enter_context(LazyDataset(hf, "mesh_index"))
     ds_scale = stack.enter_context(LazyDataset(hf, "depth_scale"))
+    ds_clip = stack.enter_context(LazyDataset(hf, "clip_embedding")) if clip_conn is not None else None
+    ds_aes = stack.enter_context(LazyDataset(hf, "aesthetic_score")) if aesthetic_conn is not None else None
 
     failed = []
     for mi, mesh_path in enumerate(meshes):
       try:
         _render_mesh(cfg, scene, mi, mesh_path, view_strategy, W, H, DW, DH, Lmax, tmp,
-                     ds_img, ds_pose, ds_depth_intr, ds_img_intr, ds_depth, ds_mesh, ds_scale)
+                     ds_img, ds_pose, ds_depth_intr, ds_img_intr, ds_depth, ds_mesh, ds_scale,
+                     clip_conn, aesthetic_conn, shm_view, ds_clip, ds_aes)
+      except ipc.WorkerDiedError:
+        # A dead scoring worker never recovers -- every remaining mesh would
+        # fail the same way, one at a time. Abort the whole render instead
+        # of thrashing through failed.append(mi) for every mesh left.
+        raise
       except Exception:
         logger.exception("mesh %d (%s) failed -- skipping", mi, mesh_path)
         failed.append(mi)
@@ -473,46 +506,31 @@ def run(cfg):
 
   logger.info("wrote %s", cfg.output_path)
 
-  if cfg.compute_clip:
-    _run_clip_score(cfg)
 
-
-def _run_clip_score(cfg):
-  """Score the just-written h5 for CLIP embeddings (+ aesthetic score) as a
-  separate subprocess in the project's normal venv, not inside Blender's
-  bundled Python -- see this file's docstring for why that split exists.
+def _venv_python():
+  """Path to the project's normal venv python (not Blender's bundled one --
+  see this file's docstring), used to run clip_worker.py/aesthetic_worker.py.
   Reuses the venv on $VIRTUAL_ENV/$PATH that the Dockerfile activates for
   the whole container."""
   import shutil
-  import subprocess
 
   venv = os.environ.get("VIRTUAL_ENV")
-  python = os.path.join(venv, "bin", "python") if venv else (shutil.which("python3") or "python3")
-  script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clip_score.py")
-  overrides = [
-    f"output_path={cfg.output_path}",
-    f"compute_aesthetic={bool(cfg.compute_aesthetic)}",
-  ]
-  logger.info("running clip_score.py (%s) on %s", python, cfg.output_path)
-  try:
-    subprocess.run([python, script, *overrides], check=True)
-  except subprocess.CalledProcessError:
-    logger.error(
-      "clip_score.py failed -- %s was already written and closed "
-      "successfully (the render itself is fine); re-run scoring by hand "
-      "with: %s %s output_path=%s compute_aesthetic=%s",
-      cfg.output_path, python, script, cfg.output_path, bool(cfg.compute_aesthetic))
-    raise
+  return os.path.join(venv, "bin", "python") if venv else (shutil.which("python3") or "python3")
 
 
 def _render_mesh(cfg, scene, mi, mesh_path, view_strategy, W, H, DW, DH, Lmax, tmp,
-                 ds_img, ds_pose, ds_depth_intr, ds_img_intr, ds_depth, ds_mesh, ds_scale):
+                 ds_img, ds_pose, ds_depth_intr, ds_img_intr, ds_depth, ds_mesh, ds_scale,
+                 clip_conn, aesthetic_conn, shm_view, ds_clip, ds_aes):
   """Load, normalize and render one mesh for every view the strategy yields,
   appending a row per view to the open datasets. Raises on any Blender
-  failure (bad glb, degenerate bbox, ...) so run() can skip the mesh.
+  failure (bad glb, degenerate bbox, ...) so run() can skip the mesh; raises
+  ipc.WorkerDiedError if clip_conn/aesthetic_conn dies mid-request, which
+  run() re-raises rather than skipping (a dead worker never recovers).
 
   W,H is the RGB resolution; DW,DH the depth-peel resolution (equal unless
-  cfg.depth_width/height override)."""
+  cfg.depth_width/height override). clip_conn/aesthetic_conn/shm_view/
+  ds_clip/ds_aes are all None unless cfg.compute_clip/compute_aesthetic."""
+  import ipc
   from util import timed
 
   reset_scene()  # purges bpy.data objects/materials/images -> rebuild the rig
@@ -555,6 +573,25 @@ def _render_mesh(cfg, scene, mi, mesh_path, view_strategy, W, H, DW, DH, Lmax, t
         depth_vol = depth_vol * depth_scale  # NaN * s = NaN, so no-hit stays no-hit
         pose[:3, 3] *= depth_scale
 
+    # Score this view live (after depth_peel has already succeeded, so a
+    # failure anywhere above still leaves every dataset row-aligned -- no
+    # row gets appended at all for a view that failed partway through).
+    embedding = aes_score = None
+    if clip_conn is not None:
+      with timed(f"{label} clip"):
+        shm_view[:] = rgba
+        try:
+          clip_conn.send(None)
+          embedding = np.frombuffer(clip_conn.recv(), dtype="<f4")
+        except (EOFError, BrokenPipeError, ConnectionResetError) as e:
+          raise ipc.WorkerDiedError(f"clip_worker died mid-request ({label})") from e
+      if aesthetic_conn is not None:
+        try:
+          aesthetic_conn.send(embedding.astype("<f4").tobytes())
+          aes_score = aesthetic_conn.recv()
+        except (EOFError, BrokenPipeError, ConnectionResetError) as e:
+          raise ipc.WorkerDiedError(f"aesthetic_worker died mid-request ({label})") from e
+
     if ds_img is not None:
       ds_img.append(rgba)
     if ds_img_intr is not None:
@@ -564,6 +601,10 @@ def _render_mesh(cfg, scene, mi, mesh_path, view_strategy, W, H, DW, DH, Lmax, t
     ds_depth.append(depth_vol.astype(np.float32))
     ds_mesh.append(np.int64(mi))
     ds_scale.append(np.float32(depth_scale))
+    if ds_clip is not None:
+      ds_clip.append(embedding)
+    if ds_aes is not None:
+      ds_aes.append(np.float32(aes_score))
 
 
 def main():
