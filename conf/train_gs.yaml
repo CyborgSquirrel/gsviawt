@@ -61,17 +61,7 @@ model:
     bn_order: pre_bn         # pre_bn | monodepth -- see gs_encoder.py
     num_ch_dec: [32, 32, 64, 128, 256]
     upsample_mode: nearest
-  max_sh_degree: 0           # 0 = plain RGB, 1 = DC + 1 SH band (9 extra channels).
-                              # Default 0 for now: fit_gsplat.py's ground truth is flat
-                              # RGB with no SH>0 at all, so direct_color_weight only ever
-                              # supervises sh_dc -- with sh_degree=1, sh_rest gets zero
-                              # gradient AND (if color_reg_weight=0, e.g. isolated
-                              # direct-color experiments) zero regularization, free to
-                              # drift arbitrarily via the shared decoder trunk. Since
-                              # it's genuinely view-dependent, that drift shows up as
-                              # flickering ("disco ball") on an orbiting camera. Revisit
-                              # once there's an actual view-dependent-shading signal to
-                              # train sh_rest against.
+  max_sh_degree: 0
   one_gauss_decoder: false   # false: one decoder head per layer (Flash3D default).
                               # true: one decoder emits all layers via channel-slicing
                               # (cheaper once num_layers scales up, e.g. to 6).
@@ -86,23 +76,6 @@ model:
   opacity_scale: 1.0e-3
   opacity_bias: 0.0
   scale_scale: 1.0e-1
-  # "scale" is a MULTIPLIER on each pixel's own real geometric footprint
-  # (depth/fx at that pixel -- see GSModel.forward), not an absolute
-  # world-unit value like Flash3D's own scale_bias=0.02 (tuned for their
-  # real-world-scale video scenes, meaningless for our unit-cube-normalized
-  # objects). bias=log(scale_bias) -> multiplier~1 at init, i.e. "start at
-  # one pixel of spacing". Un-anchored absolute scale let the network settle
-  # on sub-pixel Gaussians that only looked fine because gsplat's
-  # antialiasing eps2d floor (hard-coded ~3px minimum) papered over the gap
-  # -- visible the moment a render's true projected size (novel distance,
-  # etc.) exceeds that floor. A good INIT value alone isn't enough either:
-  # eps2d makes the loss gradient vanish once a Gaussian is already
-  # sub-floor, so exp(raw) can (and empirically does, given enough steps)
-  # drift back below the floor during training with nothing to stop it.
-  # min_scale_mult is a HARD floor added on top of the multiplier (final
-  # scale = (min_scale_mult + exp(raw)*scale_lambda) * pixel_scale) --
-  # scale can never render below min_scale_mult pixels of spacing,
-  # regardless of what raw learns.
   scale_bias: 1.0
   scale_lambda: 0.01
   min_scale_mult: 1.0
@@ -126,21 +99,12 @@ loss:
   scale_reg_weight: 0.001    # 0 disables; penalizes scale > scale_reg_thresh
   scale_reg_thresh: 0.05     # ~5% of a unit-cube object -- already a big single Gaussian.
                               # (2.0, Flash3D's own value, was 2x the whole object -- inert here.)
-  # SH color coefficients are unconstrained; without this, degree>=1 SH is
-  # prone to runaway blowup on off-training-direction views (see train_gs.py's
-  # compute_loss). |dc| > ~2 already saturates degree-0 color via SH_C0*dc+0.5.
   color_reg_weight: 1.0e-3
   color_reg_thresh: 2.0
 
   # Direct per-pixel supervision of the model's own predicted Gaussian
   # params against a fit_gsplat.py ground-truth .h5 (data.gauss_h5),
-  # as an alternative/complement to the photometric losses above. All
-  # default 0 (opt-in); when ALL of l1_weight/ssim_weight/mask_weight AND
-  # these are left at their defaults, behavior is unchanged from today. When
-  # all photometric weights are 0 and at least one of these is nonzero, the
-  # per-step gsplat rasterization call is skipped entirely (see
-  # train_gs.compute_loss); render panels/orbit videos still work regardless
-  # (force_render=True at those call sites).
+  # as an alternative/complement to the photometric losses above.
   direct_opacity_weight: 0.0
   direct_scale_weight: 0.0     # compared in log-space (both sides are
                                  # already absolute world-unit sizes)
@@ -158,17 +122,8 @@ train:
   accelerator: auto        # auto (cuda if available else cpu) | cuda | cpu
   seed: 42
   num_workers: 4
-  # REAL batch size: this many scenes go through one encoder/decoder forward
-  # pass together (shared BatchNorm2d statistics in the pretrained ResNet
-  # trunk), then one combined backward pass. NOT the same as grad_accum_steps
-  # below (sequential single-item forward+backward calls, gradients summed
-  # before one optimizer step -- each microbatch normalizes independently).
-  # Must be 1 when data.fixed_source_view is set (single-batch overfit mode,
-  # dataset length 1) and must not exceed len(train_ds).
   batch_size: 1
-  # Gradient-accumulation multiplier ON TOP OF batch_size -- effective batch
-  # size = batch_size * grad_accum_steps.
-  grad_accum_steps: 4
+  grad_accum_steps: 1
   max_epochs: 20000
   lr: 1.0e-4
   min_lr: 1.0e-6            # cosine floor (never fully reaches 0, avoids a dead-flat tail)
