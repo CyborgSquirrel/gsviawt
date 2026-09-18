@@ -354,12 +354,16 @@ def compute_direct_loss(gauss, gt, hit, cfg_loss, device):
   (None or a list of layer indices), when set, restricts which depth-peel
   layers actually contribute to this loss -- everything else about the
   model (input point cloud, predicted/rendered layers) is unchanged, only
-  which layers get gradient from THIS loss."""
+  which layers get gradient from THIS loss. Exception: direct_scale_weight's
+  term supervises every pixel of an active layer, not just hit & gt.valid
+  ones -- see its own comment below."""
   mask = hit & gt["valid"].to(device)
+  scale_mask = None   # None means "every pixel of every active layer" -- see direct_scale_weight below
   if cfg_loss.supervised_layers is not None:
     layer_mask = torch.zeros(hit.shape[0], dtype=torch.bool, device=device)
     layer_mask[list(cfg_loss.supervised_layers)] = True
     mask = mask & layer_mask[:, None, None]
+    scale_mask = layer_mask[:, None, None].expand_as(hit)
   parts = {}
   total = torch.zeros((), device=device)
   if not mask.any():
@@ -382,13 +386,24 @@ def compute_direct_loss(gauss, gt, hit, cfg_loss, device):
     # Log-space L2 against gauss["raw_scale"] (pre-floor/pixel_scale logit,
     # not the activated "scale" -- units must match gt after log()). L2 over
     # L1 concentrates gradient on the worst-residual pixels instead of
-    # applying equal pressure everywhere. gt_scale is NaN-padded outside
-    # `mask`; nan_to_num guards pow(2)'s backward (2*x) from propagating
-    # that NaN even though the incoming gradient there is zero.
+    # applying equal pressure everywhere.
+    #
+    # Unlike opacity/rotation/color above, this is NOT restricted to `mask`
+    # (hit & gt.valid) -- only to supervised_layers, via scale_mask. gt_scale
+    # is NaN-padded outside the ground truth's own valid region, filled here
+    # with eps (a real target: "no surface here, predict a tiny Gaussian")
+    # instead of being excluded. Reason: flatten_gaussians/gsplat already
+    # discard non-hit pixels downstream, so raw_scale there gets zero
+    # gradient from every OTHER loss term -- nothing constrains it, and it
+    # was confirmed (via a live checkpoint dump) to drift past exp()'s ~88
+    # float32 overflow point in exactly these never-supervised pixels well
+    # before the loss showed any symptom. Supervising the full grid toward
+    # eps removes that blind spot.
     scale_pred = rearrange(gauss["raw_scale"], "l c h w -> l h w c")
     gt_scale = torch.nan_to_num(gt["scale"].to(device), nan=eps).clamp(min=eps)
     log_diff = scale_pred - torch.log(gt_scale)
-    parts["scale"] = log_diff.pow(2)[mask].mean()
+    sq = log_diff.pow(2)
+    parts["scale"] = sq.mean() if scale_mask is None else sq[scale_mask].mean()
     total = total + cfg_loss.direct_scale_weight * parts["scale"]
 
   if cfg_loss.direct_rotation_weight > 0:
