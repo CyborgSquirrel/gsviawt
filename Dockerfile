@@ -7,31 +7,44 @@ SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
 ARG XUID
 ARG XGID
 
-RUN --mount=type=bind,src=container/build/check-build-args.sh,dst=/tmp/check-build-args.sh \
-  bash -eo pipefail /tmp/check-build-args.sh
+RUN <<check-build-args
+  test -n "$XUID" || (echo "XUID build arg is required" && exit 1)
+  test -n "$XGID" || (echo "XGID build arg is required" && exit 1)
+check-build-args
 
 ############################################################
 #                           User                           #
 ############################################################
 
-RUN --mount=type=bind,src=container/build/create-user.sh,dst=/tmp/create-user.sh \
-  bash -eo pipefail /tmp/create-user.sh
+RUN <<create-user
+  # Free up UID 1000
+  userdel -r ubuntu 2>/dev/null || true
+
+  # Create user matching host group and user
+  groupadd -f -g "$XGID" user
+  useradd -m -u "$XUID" -g "$XGID" -s /bin/bash user
+  # chown user:user /app
+create-user
 
 USER user
 
 # Setup env
 ENV HOME="/home/user"
 ENV PATH="/home/user/.local/bin:$PATH"
-RUN --mount=type=bind,src=container/build/user-dirs.sh,dst=/tmp/user-dirs.sh \
-  bash -eo pipefail /tmp/user-dirs.sh
+RUN <<user-dirs
+  mkdir -p /home/user/.cache
+  mkdir -p /home/user/.local
+user-dirs
 
 # Point HISTFILE at a symlink into a directory instead of bind-mounting the
 # file directly: if a bind-mounted file's host source doesn't exist yet,
 # Docker creates it as a directory (root-owned) instead, silently breaking
 # history. A directory target has no such ambiguity, and bash creates the
 # history file inside it on first write.
-RUN --mount=type=bind,src=container/build/bash-history.sh,dst=/tmp/bash-history.sh \
-  bash -eo pipefail /tmp/bash-history.sh
+RUN <<bash-history
+  mkdir -p /home/user/.bash_history_dir
+  ln -s /home/user/.bash_history_dir/history /home/user/.bash_history
+bash-history
 
 # Flush bash history after every command instead of only on clean shell
 # exit: the entrypoint execs bash as PID 1, so a SIGTERM (e.g. `docker
@@ -55,8 +68,30 @@ RUN \
 RUN \
   --mount=type=cache,dst=/var/cache/apt,sharing=locked,id=apt-cache \
   --mount=type=cache,dst=/var/lib/apt,sharing=locked,id=apt-lib \
-  --mount=type=bind,src=container/build/apt-system-deps.sh,dst=/tmp/apt-system-deps.sh \
-  bash -eo pipefail /tmp/apt-system-deps.sh
+<<apt-system-deps
+  pkgs=(
+    # Misc
+      build-essential
+      python3-dev
+      git
+      swig
+      curl
+      neovim
+    # Graphics
+      # libgl1-mesa-glx
+      libglib2.0-0
+      libsm6
+      libxext6
+      libxrender1
+      libgomp1
+    # Wayland support
+      libwayland-client0
+      libwayland-egl1
+      qtwayland5
+      libqt5waylandclient5
+  )
+  apt-get install -y "${pkgs[@]}"
+apt-system-deps
 
 ############################################################
 #                         Blender                          #
@@ -74,21 +109,70 @@ ARG BLENDER_VERSION=4.2.3
 RUN \
   --mount=type=cache,dst=/var/cache/apt,sharing=locked,id=apt-cache \
   --mount=type=cache,dst=/var/lib/apt,sharing=locked,id=apt-lib \
-  --mount=type=bind,src=container/build/apt-blender-deps.sh,dst=/tmp/apt-blender-deps.sh \
-  bash -eo pipefail /tmp/apt-blender-deps.sh
+<<apt-blender-deps
+  pkgs=(
+    wget xz-utils ca-certificates
+    libgl1 libegl1 libglvnd0 libglx0
+    libxi6 libxrender1 libxfixes3 libxkbcommon0 libsm6 libxext6 libxrandr2
+    libxinerama1 libxcursor1
+    libsndfile1
+    libopenexr-dev
+    fonts-dejavu-core
+  )
+  apt-get install -y --no-install-recommends "${pkgs[@]}"
+apt-blender-deps
 
 # Official tarball, not apt's `blender` package: apt's build is stale and
 # frequently lacks CUDA/OptiX device support and a working EGL path.
 RUN \
   --mount=type=cache,target=/var/cache/blender-dl,id=blender-dl \
-  --mount=type=bind,src=container/build/install-blender.sh,dst=/tmp/install-blender.sh \
-  bash -eo pipefail /tmp/install-blender.sh
+<<install-blender
+  BLENDER_MAJOR="${BLENDER_VERSION%.*}"
+  BLENDER_TAR="/var/cache/blender-dl/blender-${BLENDER_VERSION}-linux-x64.tar.xz"
+  if [ ! -f "$BLENDER_TAR" ]; then
+    wget \
+      "https://download.blender.org/release/Blender${BLENDER_MAJOR}/blender-${BLENDER_VERSION}-linux-x64.tar.xz" \
+      -O /tmp/blender.tar.xz
+    mv /tmp/blender.tar.xz "$BLENDER_TAR"
+  fi
+  mkdir -p /opt/blender
+  tar -xf "$BLENDER_TAR" -C /opt/blender --strip-components=1
+install-blender
 
 # Install packages for Blender's Python.
 RUN \
   --mount=type=cache,target=/home/user/.cache/pip,id=pip \
-  --mount=type=bind,src=container/build/install-blender-python-pkgs.sh,dst=/tmp/install-blender-python-pkgs.sh \
-  bash -eo pipefail /tmp/install-blender-python-pkgs.sh
+<<install-blender-python-pkgs
+  pkgs=(
+    # render_objaverse.py runs the whole render inside Blender and reads
+    # our Hydra config + writes the h5 from there.
+    h5py
+    hydra-core
+  )
+  BLENDER_MAJOR="${BLENDER_VERSION%.*}"
+  "/opt/blender/$BLENDER_MAJOR/python/bin/python3.11" \
+    -m pip install \
+    --target=$BLENDER_USER_PYTHON \
+    "${pkgs[@]}"
+  # h5py pulls in numpy; Blender ships its own and sitecustomize.py (below)
+  # appends BLENDER_USER_PYTHON *after* Blender's site-packages so Blender's
+  # numpy wins -- but drop the duplicate so it can't shadow anything.
+  rm -rf "$BLENDER_USER_PYTHON"/numpy "$BLENDER_USER_PYTHON"/numpy-*.dist-info
+
+  # Patch Blender's bundled Python itself so BLENDER_USER_PYTHON lands on
+  # sys.path for every script it runs, not just ones that remember to do it:
+  # sitecustomize.py is auto-imported by the `site` module on interpreter
+  # startup whenever it's importable, which it is once dropped into Blender's
+  # own site-packages.
+  cat > "/opt/blender/$BLENDER_MAJOR/python/lib/python3.11/site-packages/sitecustomize.py" <<'PYEOF'
+import os
+import sys
+
+_extra = os.environ.get("BLENDER_USER_PYTHON", "")
+if _extra.strip():
+  sys.path.append(_extra)  # append: Blender's own numpy still wins
+PYEOF
+install-blender-python-pkgs
 
 ############################################################
 #                            uv                            #
@@ -120,15 +204,25 @@ ENV PATH="/home/user/venv/bin:$PATH"
 COPY --chown=$XUID:$XGID world-tracing/pyproject.toml world-tracing/pyproject.toml
 RUN \
   --mount=type=cache,uid=$XUID,gid=$XGID,dst=$UV_PYTHON_CACHE_DIR,id=uv \
-  --mount=type=bind,src=container/build/uv-sync-wt-deps.sh,dst=/tmp/uv-sync-wt-deps.sh \
-  bash -eo pipefail /tmp/uv-sync-wt-deps.sh
+<<uv-sync-wt-deps
+  cd world-tracing
+  uv lock
+  uv sync --inexact --extra viz --no-install-project
+uv-sync-wt-deps
 
 # Install other packages
 COPY --chown=$XUID:$XGID requirements.txt requirements.txt
 RUN \
   --mount=type=cache,uid=$XUID,gid=$XGID,dst=$UV_PYTHON_CACHE_DIR,id=uv \
-  --mount=type=bind,src=container/build/uv-install-requirements.sh,dst=/tmp/uv-install-requirements.sh \
-  bash -eo pipefail /tmp/uv-install-requirements.sh
+<<uv-install-requirements
+  uv pip compile requirements.txt -o requirements.lock
+  uv pip install -r requirements.lock
+  # gsplat's JIT link step passes -lcudart; the pip CUDA wheel ships only the
+  # versioned libcudart.so.13, so add the dev symlink it expects. (fit_gsplat
+  # also does this at runtime, for anyone who pip-installs into an existing env.)
+  cudalib="/home/user/venv/lib/python${PYTHON_VERSION}/site-packages/nvidia/cu13/lib"
+  [ -e "$cudalib/libcudart.so.13" ] && ln -sf libcudart.so.13 "$cudalib/libcudart.so"
+uv-install-requirements
 
 # gsplat: point torch.utils.cpp_extension at the pip CUDA toolchain.
 ENV CUDA_HOME="/home/user/venv/lib/python3.13/site-packages/nvidia/cu13"
@@ -162,8 +256,10 @@ COPY --chown=$XUID:$XGID . .
 # as installed.
 RUN \
   --mount=type=cache,uid=$XUID,gid=$XGID,dst=$UV_PYTHON_CACHE_DIR,id=uv \
-  --mount=type=bind,src=container/build/uv-register-wt.sh,dst=/tmp/uv-register-wt.sh \
-  bash -eo pipefail /tmp/uv-register-wt.sh
+<<uv-register-wt
+  cd world-tracing
+  uv sync --inexact --extra viz
+uv-register-wt
 
 # Set entrypoint
 ENTRYPOINT ["/app/container/entrypoint.sh"]

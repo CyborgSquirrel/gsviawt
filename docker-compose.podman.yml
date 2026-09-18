@@ -1,0 +1,16 @@
+# Podman-only override, merged in by container/podman.py via `-f`.
+#
+# docker-compose.yml's app-cpu/app-gpu build from the heredoc-based
+# `Dockerfile` via `extends: service: app-base` -- fine for Docker, but
+# buildah (podman's builder) can't parse RUN heredocs. Override the
+# dockerfile directly on app-cpu/app-gpu (not app-base) so it applies
+# regardless of when `extends` gets resolved relative to this file's merge;
+# `Dockerfile.podman` is generated from `Dockerfile` by
+# container/gen_podman_dockerfile.py on every container/podman.py invocation.
+services:
+  app-cpu:
+    build:
+      dockerfile: Dockerfile.podman
+  app-gpu:
+    build:
+      dockerfile: Dockerfile.podman

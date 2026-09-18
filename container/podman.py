@@ -28,12 +28,21 @@ Usage: identical to podman-compose, e.g.
 podman-compose 1.0.6 doesn't support compose `profiles:`, so (unlike
 `docker compose`) you always need to name the service explicitly -- there
 is no `--profile gpu` equivalent.
+
+Every invocation first regenerates Dockerfile.podman + container/build/*.sh
+from the heredoc-based Dockerfile (see gen_podman_dockerfile.py) -- cheap pure
+text processing, run unconditionally rather than trying to guess which
+subcommands (build/up/run/create) might trigger an implicit build.
 """
 
 import os
 import shutil
 import subprocess
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import gen_podman_dockerfile  # noqa: E402
 
 NVIDIA_RUNTIME = "/usr/bin/nvidia-container-runtime"
 
@@ -56,6 +65,8 @@ def main() -> None:
         print("podman.py: podman-compose not found on PATH", file=sys.stderr)
         sys.exit(1)
 
+    gen_podman_dockerfile.generate()
+
     env = os.environ.copy()
     env.setdefault("XUID", str(os.getuid()))
     env.setdefault("XGID", str(os.getgid()))
@@ -67,10 +78,14 @@ def main() -> None:
     else:
         print("podman.py: no GPU detected, running without --runtime", file=sys.stderr)
 
+    # -f docker-compose.podman.yml overrides build.dockerfile to point at the
+    # generated Dockerfile.podman instead of the heredoc-based Dockerfile
+    # Docker itself builds from -- see docker-compose.podman.yml.
+    cmd = ["podman-compose", "-f", "docker-compose.yml", "-f", "docker-compose.podman.yml"]
+
     # Values start with "--" themselves, so argparse needs the `=` form
     # (`--podman-run-args value` as two argv tokens makes argparse treat the
     # value as another flag and reject it with "expected one argument").
-    cmd = ["podman-compose"]
     for arg in podman_run_args:
         cmd.append(f"--podman-run-args={arg}")
     cmd += sys.argv[1:]
