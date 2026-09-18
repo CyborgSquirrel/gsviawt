@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.4
 
-FROM nvidia/cuda:13.1.1-cudnn-runtime-ubuntu24.04
+FROM docker.io/nvidia/cuda:13.1.1-cudnn-runtime-ubuntu24.04
 
 SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
 
@@ -8,6 +8,7 @@ ARG XUID
 ARG XGID
 
 RUN <<EOF
+  # name: check-build-args.sh
   test -n "$XUID" || (echo "XUID build arg is required" && exit 1)
   test -n "$XGID" || (echo "XGID build arg is required" && exit 1)
 EOF
@@ -17,6 +18,7 @@ EOF
 ############################################################
 
 RUN <<EOF
+  # name: create-user.sh
   # Free up UID 1000
   userdel -r ubuntu 2>/dev/null || true
 
@@ -32,6 +34,7 @@ USER user
 ENV HOME="/home/user"
 ENV PATH="/home/user/.local/bin:$PATH"
 RUN <<EOF
+  # name: user-dirs.sh
   mkdir -p /home/user/.cache
   mkdir -p /home/user/.local
 EOF
@@ -42,6 +45,7 @@ EOF
 # history. A directory target has no such ambiguity, and bash creates the
 # history file inside it on first write.
 RUN <<EOF
+  # name: bash-history.sh
   mkdir -p /home/user/.bash_history_dir
   ln -s /home/user/.bash_history_dir/history /home/user/.bash_history
 EOF
@@ -69,6 +73,7 @@ RUN \
   --mount=type=cache,dst=/var/cache/apt,sharing=locked,id=apt-cache \
   --mount=type=cache,dst=/var/lib/apt,sharing=locked,id=apt-lib \
 <<EOF
+  # name: apt-system-deps.sh
   pkgs=(
     # Misc
       build-essential
@@ -110,6 +115,7 @@ RUN \
   --mount=type=cache,dst=/var/cache/apt,sharing=locked,id=apt-cache \
   --mount=type=cache,dst=/var/lib/apt,sharing=locked,id=apt-lib \
 <<EOF
+  # name: apt-blender-deps.sh
   pkgs=(
     wget xz-utils ca-certificates
     libgl1 libegl1 libglvnd0 libglx0
@@ -127,6 +133,7 @@ EOF
 RUN \
   --mount=type=cache,target=/var/cache/blender-dl,id=blender-dl \
 <<EOF
+  # name: install-blender.sh
   BLENDER_MAJOR="${BLENDER_VERSION%.*}"
   BLENDER_TAR="/var/cache/blender-dl/blender-${BLENDER_VERSION}-linux-x64.tar.xz"
   if [ ! -f "$BLENDER_TAR" ]; then
@@ -143,6 +150,7 @@ EOF
 RUN \
   --mount=type=cache,target=/home/user/.cache/pip,id=pip \
 <<EOF
+  # name: install-blender-python-pkgs.sh
   pkgs=(
     # render_objaverse.py runs the whole render inside Blender and reads
     # our Hydra config + writes the h5 from there.
@@ -205,6 +213,7 @@ COPY --chown=$XUID:$XGID world-tracing/pyproject.toml world-tracing/pyproject.to
 RUN \
   --mount=type=cache,uid=$XUID,gid=$XGID,dst=$UV_PYTHON_CACHE_DIR,id=uv \
 <<EOF
+  # name: uv-sync-wt-deps.sh
   cd world-tracing
   uv lock
   uv sync --inexact --extra viz --no-install-project
@@ -215,6 +224,7 @@ COPY --chown=$XUID:$XGID requirements.txt requirements.txt
 RUN \
   --mount=type=cache,uid=$XUID,gid=$XGID,dst=$UV_PYTHON_CACHE_DIR,id=uv \
 <<EOF
+  # name: uv-install-requirements.sh
   uv pip compile requirements.txt -o requirements.lock
   uv pip install -r requirements.lock
   # gsplat's JIT link step passes -lcudart; the pip CUDA wheel ships only the
@@ -236,7 +246,13 @@ ENV PATH="/home/user/venv/lib/python3.13/site-packages/nvidia/cu13/bin:$PATH"
 # compiled .so lands in ~/.cache/torch_extensions and is loaded as-is at
 # runtime. This layer only rebuilds when requirements.txt changes.
 ENV TORCH_CUDA_ARCH_LIST="8.6;8.9+PTX"
-RUN python -c "import gsplat; print('gsplat', gsplat.__version__, '- CUDA kernels prebuilt')"
+# `import gsplat` alone verifies nothing: gsplat.cuda._backend sets _C to
+# None (and just prints a warning) whenever it decides the CUDA toolkit
+# isn't usable, and import succeeds either way -- a build can "pass" this
+# step in ~3s having compiled nothing, silently pushing the ~5min JIT cost
+# onto every container's first render instead. Assert _C is real so a
+# build that can't actually precompile fails loudly here instead.
+RUN python -c "from gsplat.cuda._backend import _C; assert _C is not None, 'gsplat CUDA extension not built'; import gsplat; print('gsplat', gsplat.__version__, 'prebuilt at', _C.__file__)"
 
 # Copy everything (this is the only place world-tracing's actual source
 # lands in the image)
@@ -251,6 +267,7 @@ COPY --chown=$XUID:$XGID . .
 RUN \
   --mount=type=cache,uid=$XUID,gid=$XGID,dst=$UV_PYTHON_CACHE_DIR,id=uv \
 <<EOF
+  # name: uv-register-wt.sh
   cd world-tracing
   uv sync --inexact --extra viz
 EOF
@@ -260,4 +277,3 @@ ENTRYPOINT ["/app/container/entrypoint.sh"]
 
 # Default command
 CMD ["/bin/bash"]
-
