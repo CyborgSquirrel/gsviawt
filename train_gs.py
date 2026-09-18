@@ -906,6 +906,14 @@ class GSLightningModule(pl.LightningModule):
 
     self.global_train_step += 1
 
+  def on_save_checkpoint(self, checkpoint):
+    checkpoint["global_train_step"] = self.global_train_step
+
+  def on_load_checkpoint(self, checkpoint):
+    # .get with a 0 fallback: checkpoints saved before this hook existed
+    # have no such key.
+    self.global_train_step = checkpoint.get("global_train_step", 0)
+
   def _prune_old_checkpoints(self):
     """checkpoint.keep_last: null (default) keeps every periodic snapshot
     forever; set to an int to delete all but the N most recent
@@ -1271,7 +1279,7 @@ def main(cfg: DictConfig) -> None:
     default_root_dir=os.getcwd(),
   )
   with timed("train"):
-    trainer.fit(model, datamodule=datamodule)
+    trainer.fit(model, datamodule=datamodule, ckpt_path=cfg.resume_from_checkpoint)
 
 
 if __name__ == "__main__":

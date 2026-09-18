@@ -4,6 +4,8 @@
 
 torch_detect_anomaly: false
 
+resume_from_checkpoint: null   # path to a train_gs.ckpt*.pt to resume full trainer state from
+
 data:
   photom_h5: /app/bla/lite_blackbg.h5   # str, list, or glob(s) -- render_objaverse.py-schema
   num_layers: 6                         # must match the file(s)' depth_peel layer count
