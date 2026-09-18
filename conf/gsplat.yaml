@@ -26,7 +26,7 @@ device: cuda              # cuda | cpu
 # iteration gets cheaper (~views_per_iter/num_views the cost) but noisier, so
 # more iterations are typically needed to reach the same quality. Values >=
 # the number of views behave identically to null.
-views_per_iter: null
+views_per_iter: 1
 
 # Whether the optimizer may move Gaussian centers. false = centers stay locked
 # at their depth-peel back-projected seed positions; only scale / rotation /
