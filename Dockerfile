@@ -7,16 +7,18 @@ SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
 ARG XUID
 ARG XGID
 
-RUN <<check-build-args
+RUN <<EOF
+  # name: check-build-args.sh
   test -n "$XUID" || (echo "XUID build arg is required" && exit 1)
   test -n "$XGID" || (echo "XGID build arg is required" && exit 1)
-check-build-args
+EOF
 
 ############################################################
 #                           User                           #
 ############################################################
 
-RUN <<create-user
+RUN <<EOF
+  # name: create-user.sh
   # Free up UID 1000
   userdel -r ubuntu 2>/dev/null || true
 
@@ -24,27 +26,29 @@ RUN <<create-user
   groupadd -f -g "$XGID" user
   useradd -m -u "$XUID" -g "$XGID" -s /bin/bash user
   # chown user:user /app
-create-user
+EOF
 
 USER user
 
 # Setup env
 ENV HOME="/home/user"
 ENV PATH="/home/user/.local/bin:$PATH"
-RUN <<user-dirs
+RUN <<EOF
+  # name: user-dirs.sh
   mkdir -p /home/user/.cache
   mkdir -p /home/user/.local
-user-dirs
+EOF
 
 # Point HISTFILE at a symlink into a directory instead of bind-mounting the
 # file directly: if a bind-mounted file's host source doesn't exist yet,
 # Docker creates it as a directory (root-owned) instead, silently breaking
 # history. A directory target has no such ambiguity, and bash creates the
 # history file inside it on first write.
-RUN <<bash-history
+RUN <<EOF
+  # name: bash-history.sh
   mkdir -p /home/user/.bash_history_dir
   ln -s /home/user/.bash_history_dir/history /home/user/.bash_history
-bash-history
+EOF
 
 # Flush bash history after every command instead of only on clean shell
 # exit: the entrypoint execs bash as PID 1, so a SIGTERM (e.g. `docker
@@ -68,7 +72,8 @@ RUN \
 RUN \
   --mount=type=cache,dst=/var/cache/apt,sharing=locked,id=apt-cache \
   --mount=type=cache,dst=/var/lib/apt,sharing=locked,id=apt-lib \
-<<apt-system-deps
+<<EOF
+  # name: apt-system-deps.sh
   pkgs=(
     # Misc
       build-essential
@@ -91,7 +96,7 @@ RUN \
       libqt5waylandclient5
   )
   apt-get install -y "${pkgs[@]}"
-apt-system-deps
+EOF
 
 ############################################################
 #                         Blender                          #
@@ -109,7 +114,8 @@ ARG BLENDER_VERSION=4.2.3
 RUN \
   --mount=type=cache,dst=/var/cache/apt,sharing=locked,id=apt-cache \
   --mount=type=cache,dst=/var/lib/apt,sharing=locked,id=apt-lib \
-<<apt-blender-deps
+<<EOF
+  # name: apt-blender-deps.sh
   pkgs=(
     wget xz-utils ca-certificates
     libgl1 libegl1 libglvnd0 libglx0
@@ -120,13 +126,14 @@ RUN \
     fonts-dejavu-core
   )
   apt-get install -y --no-install-recommends "${pkgs[@]}"
-apt-blender-deps
+EOF
 
 # Official tarball, not apt's `blender` package: apt's build is stale and
 # frequently lacks CUDA/OptiX device support and a working EGL path.
 RUN \
   --mount=type=cache,target=/var/cache/blender-dl,id=blender-dl \
-<<install-blender
+<<EOF
+  # name: install-blender.sh
   BLENDER_MAJOR="${BLENDER_VERSION%.*}"
   BLENDER_TAR="/var/cache/blender-dl/blender-${BLENDER_VERSION}-linux-x64.tar.xz"
   if [ ! -f "$BLENDER_TAR" ]; then
@@ -137,12 +144,13 @@ RUN \
   fi
   mkdir -p /opt/blender
   tar -xf "$BLENDER_TAR" -C /opt/blender --strip-components=1
-install-blender
+EOF
 
 # Install packages for Blender's Python.
 RUN \
   --mount=type=cache,target=/home/user/.cache/pip,id=pip \
-<<install-blender-python-pkgs
+<<EOF
+  # name: install-blender-python-pkgs.sh
   pkgs=(
     # render_objaverse.py runs the whole render inside Blender and reads
     # our Hydra config + writes the h5 from there.
@@ -172,7 +180,7 @@ _extra = os.environ.get("BLENDER_USER_PYTHON", "")
 if _extra.strip():
   sys.path.append(_extra)  # append: Blender's own numpy still wins
 PYEOF
-install-blender-python-pkgs
+EOF
 
 ############################################################
 #                            uv                            #
@@ -204,17 +212,19 @@ ENV PATH="/home/user/venv/bin:$PATH"
 COPY --chown=$XUID:$XGID world-tracing/pyproject.toml world-tracing/pyproject.toml
 RUN \
   --mount=type=cache,uid=$XUID,gid=$XGID,dst=$UV_PYTHON_CACHE_DIR,id=uv \
-<<uv-sync-wt-deps
+<<EOF
+  # name: uv-sync-wt-deps.sh
   cd world-tracing
   uv lock
   uv sync --inexact --extra viz --no-install-project
-uv-sync-wt-deps
+EOF
 
 # Install other packages
 COPY --chown=$XUID:$XGID requirements.txt requirements.txt
 RUN \
   --mount=type=cache,uid=$XUID,gid=$XGID,dst=$UV_PYTHON_CACHE_DIR,id=uv \
-<<uv-install-requirements
+<<EOF
+  # name: uv-install-requirements.sh
   uv pip compile requirements.txt -o requirements.lock
   uv pip install -r requirements.lock
   # gsplat's JIT link step passes -lcudart; the pip CUDA wheel ships only the
@@ -222,7 +232,7 @@ RUN \
   # also does this at runtime, for anyone who pip-installs into an existing env.)
   cudalib="/home/user/venv/lib/python${PYTHON_VERSION}/site-packages/nvidia/cu13/lib"
   [ -e "$cudalib/libcudart.so.13" ] && ln -sf libcudart.so.13 "$cudalib/libcudart.so"
-uv-install-requirements
+EOF
 
 # gsplat: point torch.utils.cpp_extension at the pip CUDA toolchain.
 ENV CUDA_HOME="/home/user/venv/lib/python3.13/site-packages/nvidia/cu13"
@@ -256,10 +266,11 @@ COPY --chown=$XUID:$XGID . .
 # as installed.
 RUN \
   --mount=type=cache,uid=$XUID,gid=$XGID,dst=$UV_PYTHON_CACHE_DIR,id=uv \
-<<uv-register-wt
+<<EOF
+  # name: uv-register-wt.sh
   cd world-tracing
   uv sync --inexact --extra viz
-uv-register-wt
+EOF
 
 # Set entrypoint
 ENTRYPOINT ["/app/container/entrypoint.sh"]
