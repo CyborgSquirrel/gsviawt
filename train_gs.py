@@ -71,6 +71,7 @@ import torch.nn as nn  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 from einops import rearrange, repeat  # noqa: E402
 from lightning.pytorch.loggers import WandbLogger  # noqa: E402
+import polars as plr  # noqa: E402 -- `pl` is taken by lightning.pytorch below
 from omegaconf import DictConfig, OmegaConf, open_dict  # noqa: E402
 from torch.utils.data import DataLoader  # noqa: E402
 
@@ -146,16 +147,15 @@ class GSModel(nn.Module):
     per_layer = torch.cat([xyz_norm, valid], dim=1).reshape(-1, dh, dw)  # (4L,DH,DW)
     return torch.cat([rgb_norm, per_layer], dim=0)            # (3+4L,DH,DW)
 
-  def forward(self, rgb, xyz_cam, hit, fx, active_layers=None):
-    """active_layers: optional iterable of layer indices -- forwarded to
-    GSDecoderStack.forward to skip running the (independent, ~9M-param each)
-    decoder heads for every layer NOT in it, a real compute/VRAM saving, not
-    just a loss-masking one (see train_gs.yaml's loss.supervised_layers and
-    compute_direct_loss). Only meaningful with model.one_gauss_decoder=false
-    (the default) -- GaussianResnetDecoder's single shared conv can't skip a
-    channel slice's compute the same way, so this is ignored (every layer
-    still runs) when one_gauss_decoder=true."""
-    x = self.build_input(rgb, xyz_cam, hit)
+  def _forward_batch_core(self, x, active_layers=None):
+    """x: (B,3+4L,dh,dw), any real batch size B >= 1. Runs the encoder +
+    decoder ONCE across the whole batch -- the point of this being a single
+    call rather than a Python loop over B single-item forwards is that
+    BatchNorm2d layers in the (pretrained) encoder pool their statistics
+    across all B items in this one forward pass, which is the actual
+    semantic difference a real batch is supposed to have over
+    grad-accumulated microbatches (see train_gs.yaml's train.batch_size vs
+    train.grad_accum_steps). Returns the cropped (B,L,C,H,W) output dict."""
     dh, dw = x.shape[-2:]
     # The 5-level U-Net halves spatial dims 4x (conv1 + maxpool + 2 more
     # strided stages) then doubles back up 5x via nearest-neighbor upsample;
@@ -168,13 +168,38 @@ class GSModel(nn.Module):
     pad_h, pad_w = (-dh) % 32, (-dw) % 32
     if pad_h or pad_w:
       x = F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")
-    feats = self.encoder(x.unsqueeze(0))
+    feats = self.encoder(x)
     if self.one_gauss_decoder:
       out = self.decoder(feats)
     else:
       out = self.decoder(feats, active_layers=active_layers)
-    out = {k: v[0, :, :, :dh, :dw] for k, v in out.items()}   # (L,C,H,W)
-    return out
+    return {k: v[:, :, :, :dh, :dw] for k, v in out.items()}   # (B,L,C,H,W)
+
+  def forward(self, rgb, xyz_cam, hit, fx, active_layers=None):
+    """Single-item convenience wrapper around forward_batch (batch of 1) --
+    active_layers: see forward_batch."""
+    return self.forward_batch([rgb], [xyz_cam], [hit], active_layers=active_layers)[0]
+
+  def forward_batch(self, rgbs, xyz_cams, hits, active_layers=None):
+    """rgbs/xyz_cams/hits: lists of B same-shape per-item tensors (one
+    scene's source view each -- see build_input for individual shapes).
+    Runs the encoder/decoder ONCE across a real batch dimension B (see
+    _forward_batch_core's docstring for why that's not the same as calling
+    forward() B times), then immediately unbundles the result back into a
+    list of B (L,C,H,W) dicts -- one per item, in input order -- so every
+    downstream function (flatten_gaussians, apply_ground_truth_overrides,
+    compute_direct_loss, render_photometric, ...) keeps operating on a
+    single item's own tensors, completely unchanged, whether B is 1 or
+    many. active_layers: see the (identical) docstring this carried on
+    forward() before this split -- forwarded to GSDecoderStack.forward to
+    skip running the (independent, ~9M-param each) decoder heads for every
+    layer NOT in it, a real compute/VRAM saving, not just a loss-masking
+    one. Only meaningful with model.one_gauss_decoder=false (the default)."""
+    x = torch.stack(
+      [self.build_input(rgb, xyz_cam, hit) for rgb, xyz_cam, hit in zip(rgbs, xyz_cams, hits)], dim=0)
+    out = self._forward_batch_core(x, active_layers=active_layers)
+    b = x.shape[0]
+    return [{k: v[i] for k, v in out.items()} for i in range(b)]
 
 
 def flatten_gaussians(xyz_cam, hit, gauss):
@@ -267,12 +292,22 @@ def run_model_source(model, item, device, predict_params, active_layers=None):
   fx = src["K_depth"][0, 0].to(device)
 
   gauss = model(rgb, xyz_cam, hit, fx, active_layers=active_layers)
+  gauss_render, flat = _finish_model_source(gauss, xyz_cam, hit, item, device, predict_params)
+  return gauss, gauss_render, hit, flat
+
+
+def _finish_model_source(gauss, xyz_cam, hit, item, device, predict_params):
+  """The second half of run_model_source (ground-truth overrides + flatten),
+  factored out so the real-batch training path (GSLightningModule.training_step)
+  can reuse it per-item after a single batched model.forward_batch call,
+  instead of duplicating this logic. See run_model_source's docstring for
+  what gauss_render/flat mean."""
   gauss_render = gauss
   gt = item.get("ground_truth")
   if gt is not None:
     gauss_render = apply_ground_truth_overrides(gauss, gt, hit, predict_params, device)
   flat = flatten_gaussians(xyz_cam, hit, gauss_render)
-  return gauss, gauss_render, hit, flat
+  return gauss_render, flat
 
 
 def render_photometric(item, flat, sh_degree, device):
@@ -432,7 +467,15 @@ def compute_direct_loss(gauss, gt, hit, cfg_loss, device):
 def compute_loss(model, item, cfg, device, window, force_render=False):
   gauss, gauss_render, hit, flat = run_model_source(
     model, item, device, set(cfg.model.predict_params), active_layers=cfg.loss.supervised_layers)
+  return _compute_loss_core(gauss, gauss_render, hit, flat, item, cfg, device, window, force_render=force_render)
 
+
+def _compute_loss_core(gauss, gauss_render, hit, flat, item, cfg, device, window, force_render=False):
+  """Everything compute_loss does after obtaining (gauss, gauss_render, hit,
+  flat) -- factored out so the real-batch training path
+  (GSLightningModule.training_step) can reuse it per-item after a single
+  batched model.forward_batch call (see _finish_model_source), instead of
+  duplicating the render/loss-term logic below."""
   need_photo = (force_render or cfg.loss.l1_weight > 0
                 or cfg.loss.ssim_weight > 0 or cfg.loss.mask_weight > 0)
   need_direct_cfg = (cfg.loss.direct_opacity_weight > 0 or cfg.loss.direct_scale_weight > 0
@@ -707,6 +750,19 @@ def _external_val_dataset(cfg):
   )
 
 
+def _subset_catalog(catalog, view_indices):
+  """Restricts `catalog` to only rows whose view_idx is in `view_indices`
+  (data.view_indices config, e.g. [0, 5, 12]) -- None (default) leaves it
+  untouched. Applied to data.photom_h5's own catalog BEFORE any train/val
+  split (split_by_mesh), so a subset run's train/val corpora are drawn only
+  from the kept views, not the full corpus's leftovers. Does NOT apply to
+  data.photom_h5_val's catalog (_external_val_dataset) -- that's already a
+  deliberately separate corpus, an independent knob from this one."""
+  if view_indices is None:
+    return catalog
+  return catalog.filter(plr.col("view_idx").is_in(list(view_indices)))
+
+
 class GSDataModule(pl.LightningDataModule):
   """Mechanical extraction of the dataset-construction branch that used to
   live at the top of main(): single-batch overfit mode (GSFixedViewsDataset)
@@ -772,6 +828,7 @@ class GSDataModule(pl.LightningDataModule):
         H5Catalog.index().alias("view_idx"),
         H5Catalog.dataset("mesh_index").alias("mesh_id"),
       )
+      catalog = _subset_catalog(catalog, cfg.data.view_indices)
       self.train_ds = GSPairDataset(
         catalog, num_layers=cfg.data.num_layers, num_target_views=cfg.data.num_target_views,
         seed=cfg.train.seed, deterministic_targets=False,
@@ -784,6 +841,7 @@ class GSDataModule(pl.LightningDataModule):
         H5Catalog.index().alias("view_idx"),
         H5Catalog.dataset("mesh_index").alias("mesh_id"),
       )
+      catalog = _subset_catalog(catalog, cfg.data.view_indices)
       train_catalog, val_catalog = split_by_mesh(
         catalog, val_fraction=cfg.data.photom_val_fraction, seed=cfg.train.seed)
       self.train_ds = GSPairDataset(
@@ -795,16 +853,29 @@ class GSDataModule(pl.LightningDataModule):
         seed=cfg.train.seed, deterministic_targets=True,
       )
     if len(self.train_ds) == 0:
-      raise SystemExit("train split is empty -- check data.photom_h5 / data.photom_val_fraction")
+      raise SystemExit("train split is empty -- check data.photom_h5 / data.photom_val_fraction "
+                        "/ data.view_indices")
+    batch_size = int(self.cfg.train.batch_size)
+    if batch_size > len(self.train_ds):
+      raise SystemExit(
+        f"train.batch_size={batch_size} > len(train_ds)={len(self.train_ds)} -- the train "
+        "DataLoader (drop_last=True) would yield zero batches per epoch")
 
   def train_dataloader(self):
+    # collate_fn keeps the raw list of train.batch_size scene dicts (no
+    # stacking here -- GSLightningModule.training_step batches the encoder
+    # input itself via GSModel.forward_batch, since each scene's own
+    # Gaussian count/camera set can't be torch.stack'd like a normal tensor
+    # batch). drop_last=True: a short final batch would silently be a
+    # smaller real batch size than configured.
     return DataLoader(
       self.train_ds,
-      batch_size=1,
+      batch_size=int(self.cfg.train.batch_size),
       shuffle=True,
       num_workers=self.cfg.train.num_workers,
-      collate_fn=lambda batch: batch[0],
+      collate_fn=lambda batch: batch,
       persistent_workers=self.cfg.train.num_workers > 0,
+      drop_last=True,
     )
 
   def val_dataloader(self):
@@ -884,8 +955,38 @@ class GSLightningModule(pl.LightningModule):
     return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "step"}}
 
   def training_step(self, batch, batch_idx):
-    item = batch
-    loss, metrics, _ = compute_loss(self.model, item, self.cfg, self.device, self.window)
+    # batch: a list of train.batch_size scene dicts (see GSDataModule.
+    # train_dataloader) -- run the encoder/decoder ONCE across all of them as
+    # a real batch (shared BatchNorm statistics; see GSModel.forward_batch),
+    # then loop per-item for flatten/render/loss since each scene has its own
+    # Gaussian count and camera set, and combine into ONE loss tensor so
+    # there's a single backward pass through the shared batched forward graph
+    # -- this is what makes train.batch_size genuinely different from
+    # train.grad_accum_steps (whose microbatches each get their own separate
+    # forward AND backward call). With batch_size=1 this reduces to exactly
+    # the old single-item behavior (a batch of 1 is numerically identical to
+    # the previous unsqueeze(0) path).
+    items = batch
+    device = self.device
+    predict_params = set(self.cfg.model.predict_params)
+    gauss_list = self.model.forward_batch(
+      [it["source"]["rgb"].to(device) for it in items],
+      [it["source"]["xyz_cam"].to(device) for it in items],
+      [it["source"]["hit"].to(device) for it in items],
+      active_layers=self.cfg.loss.supervised_layers,
+    )
+    losses, metrics_list = [], []
+    for it, gauss in zip(items, gauss_list):
+      xyz_cam = it["source"]["xyz_cam"].to(device)
+      hit = it["source"]["hit"].to(device)
+      gauss_render, flat = _finish_model_source(gauss, xyz_cam, hit, it, device, predict_params)
+      item_loss, item_metrics, _ = _compute_loss_core(
+        gauss, gauss_render, hit, flat, it, self.cfg, device, self.window)
+      losses.append(item_loss)
+      metrics_list.append(item_metrics)
+    loss = torch.stack(losses).mean()
+    metric_keys = {k for m in metrics_list for k in m}
+    metrics = {k: torch.stack([m[k] for m in metrics_list if k in m]).mean() for k in metric_keys}
     self.manual_backward(loss / self._grad_accum_steps)
     self._micro_step += 1
     self._accum_loss += loss.item() / self._grad_accum_steps
@@ -1239,6 +1340,14 @@ def main(cfg: DictConfig) -> None:
       raise SystemExit(
         "data.fixed_source_view (GSFixedViewsDataset) requires "
         "train.grad_accum_steps == 1 -- see train_gs_lightning_plan.md")
+    if int(cfg.train.batch_size) != 1:
+      # GSFixedViewsDataset has length 1 (the same exact scene every step) --
+      # a real batch > 1 would mean stacking that identical scene with
+      # itself, which is pointless (BatchNorm pooling stats from B copies of
+      # the same item is a no-op over B=1) and DataLoader(drop_last=True)
+      # would yield zero batches per epoch anyway once batch_size > len(ds).
+      raise SystemExit(
+        "data.fixed_source_view (GSFixedViewsDataset) requires train.batch_size == 1")
 
   datamodule = GSDataModule(cfg)
   datamodule.setup()

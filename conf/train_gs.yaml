@@ -11,6 +11,11 @@ data:
   num_layers: 6                         # must match the file(s)' depth_peel layer count
   num_target_views: 3                   # extra supervision views per step, alongside self-render
   photom_val_fraction: 0.1              # fraction of MESH GROUPS held out (0 = pure overfit)
+  # Restricts data.photom_h5's own catalog to only these view_idx values,
+  # applied BEFORE photom_val_fraction's train/val split -- e.g. [0, 5, 12]
+  # to train on just those 3 views instead of the whole file. null (default):
+  # every view. Does not apply to photom_h5_val (already a separate corpus).
+  view_indices: null
   # Single-batch overfit mode (fit_gsplat.py's primary/secondary terms
   # applied here): if set, train on this EXACT source+target view set every
   # step, no resampling at all (ignores num_target_views/photom_val_fraction).
@@ -153,7 +158,17 @@ train:
   accelerator: auto        # auto (cuda if available else cpu) | cuda | cpu
   seed: 42
   num_workers: 4
-  grad_accum_steps: 4        # effective batch size (batch_size is fixed at 1 scene/step)
+  # REAL batch size: this many scenes go through one encoder/decoder forward
+  # pass together (shared BatchNorm2d statistics in the pretrained ResNet
+  # trunk), then one combined backward pass. NOT the same as grad_accum_steps
+  # below (sequential single-item forward+backward calls, gradients summed
+  # before one optimizer step -- each microbatch normalizes independently).
+  # Must be 1 when data.fixed_source_view is set (single-batch overfit mode,
+  # dataset length 1) and must not exceed len(train_ds).
+  batch_size: 1
+  # Gradient-accumulation multiplier ON TOP OF batch_size -- effective batch
+  # size = batch_size * grad_accum_steps.
+  grad_accum_steps: 4
   max_epochs: 20000
   lr: 1.0e-4
   min_lr: 1.0e-6            # cosine floor (never fully reaches 0, avoids a dead-flat tail)
