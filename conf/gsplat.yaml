@@ -1,7 +1,7 @@
 # Config for fit_gsplat.py -- optimize a 3D Gaussian Splatting model from one
 # render HDF5 (render_objaverse.py / capture_turntable.py schema), seeded from
 # the PRIMARY view's 6-layer depth peel and supervised by every view in the
-# train split. See fit_gsplat.py's module docstring, and GSFitSceneDataset's
+# train split. See fit_gsplat.py's module docstring, and load_catalog_views'
 # docstring for what "primary" means now (no longer its own config field).
 
 defaults:
@@ -11,7 +11,7 @@ defaults:
   # train_gs.py's, e.g. data/split_fn=by_indices
   # data.split_fn.train_idx='[0,1,2]' data.split_fn.val_idx='[3,4]' (the
   # first entry of train_idx is the seeding "primary" view -- see
-  # GSFitSceneDataset). by_view (not train_gs.yaml's by_mesh default):
+  # load_catalog_views). by_view (not train_gs.yaml's by_mesh default):
   # fit_gsplat.py fits ONE scene at a time, so a corpus is typically
   # single-mesh already, where by_mesh degenerates to "everything train,
   # nothing val" (see its own docstring) -- by_view actually does
@@ -22,24 +22,23 @@ defaults:
 # --- input ---
 hdf5_path: /app/bla/objaverse_renders.h5   # str, list, or glob(s)
 
-# null -> "<hdf5_path>.gsplat.view<primary>.h5" (+ .ply, + .val/ alongside)
+# null -> "<hdf5_path>.gsplat.view<primary>.h5" (+ .ply)
 output_path: null
 
 # --- optimization ---
-iters: 10000                # trainer.max_epochs -- one Lightning "epoch" == one
-                             # optimizer step here (see GSFitDataModule)
+iters: 10000                # trainer.max_epochs -- one Lightning "epoch" is a
+                             # full pass over the train split's views now (see
+                             # GSFitDataModule), not a single optimizer step.
 seed: 42
 
-# Number of views (sampled uniformly at random, without replacement, from the
-# full primary+secondary set) to render and supervise on each iteration.
-# null (the special "all views" value) renders every view every iteration --
-# full-batch gradient descent, this repo's original/default behaviour. Set an
-# int (e.g. 1) to instead do stochastic per-iteration view sampling, matching
-# the vanilla 3DGS paper's one-random-camera-per-step training loop -- each
-# iteration gets cheaper (~views_per_iter/num_views the cost) but noisier, so
-# more iterations are typically needed to reach the same quality. Values >=
-# the number of views behave identically to null.
-views_per_iter: null
+# Views per training step, rendered+compared together in one batch (a plain
+# DataLoader(shuffle=True, batch_size=...) over the train split -- see
+# GSFitDataModule). 1 matches the vanilla 3DGS paper's one-random-camera-
+# per-step training loop; set it to the number of train views for full-batch
+# gradient descent instead (this repo's original/default behaviour).
+loader:
+  batch_size: 1
+  num_workers: 0
 
 # Whether the optimizer may move Gaussian centers. false = centers stay locked
 # at their depth-peel back-projected seed positions; only scale / rotation /
@@ -63,12 +62,6 @@ init_opacity: 0.1         # starting opacity for every seeded Gaussian
 knn_k: 4                  # neighbours used to size each Gaussian's initial scale
 
 # --- validation / output ---
-# Cadence (in iters) for BOTH: the gt|render PNG panel dump below (always
-# against the train split, regardless of whether split_fn produced a val
-# split) AND, when it did, the held-out val/loss* metrics (Lightning's
-# check_val_every_n_epoch). 0 disables the panel dump; the val/loss* metrics
-# just don't log if the val split is empty, independent of this.
-val_every: 500
 write_ply: true           # also write a standard 3DGS .ply next to the .h5
 # .ply pruning -- all off by default (the .h5 always keeps every Gaussian).
 # Set a value to enable that check.
@@ -93,41 +86,37 @@ wandb:
 # Same wandb train/panel [GT | render | |diff|] comparison train_gs.py logs,
 # and (orbit) the same turntable preview video train_gs.py logs -- both
 # module.{Panel,Orbit}Callback, shared -- see their own docstrings; each
-# pulls straight from GSFitLightningModule.get_preview_source()/
-# get_orbit_source(), no other callback needed. panel is separate from the
-# val_every gt|render PNG dump above -- that compares against the FULL
-# supervision set and writes to disk regardless of wandb; this is
-# wandb-only and reuses the same cadence. To disable either one (e.g. no
-# wandb.mode -> both no-op already, but to drop one specifically), remove
-# it on the CLI: ~callbacks.orbit.
+# pulls straight from GSFitLightningModule.get_preview_source(), no other
+# callback needed. To disable either one (e.g. no wandb.mode -> both no-op
+# already, but to drop one specifically), remove it on the CLI:
+# ~callbacks.orbit.
 callbacks:
   panel:
     _target_: module.PanelCallback
-    every_n_epochs: ${val_every}
+    every_n_epochs: ${eval:'${iters} // 50'}
 
   orbit:
     _target_: module.OrbitCallback
-    every_n_epochs: 500        # iterations between orbit renders
+    every_n_epochs: ${eval:'${iters} // 50'}
     num_frames: 24
     fps: 12
     crf: 28
     elevation_deg: 20.0        # camera distance = the primary view's own actual capture
                                 # distance (scene_scale), not a re-fit bounding-sphere
-                                # framing -- see GSFitLightningModule.get_orbit_source
+                                # framing -- see GSFitLightningModule.get_preview_source
 
 # pl.Trainer kwargs -- everything except `logger` (built in code from the
-# wandb run, or False when wandb is disabled). `has_val` isn't a field you
-# set: main() injects it (== whether split_fn produced a non-empty val
-# split for this mesh) before the trainer is built, same trick
-# train_gs.yaml's sched.total_steps uses.
+# wandb run, or False when wandb is disabled). No has_val bookkeeping needed:
+# when split_fn produces an empty val split, GSFitDataModule.val_dataloader
+# hands Lightning a gs_dataset._EmptyDataset and it skips validation on its
+# own, same as train_gs.py.
 trainer:
   max_epochs: ${iters}
   accelerator: auto
   devices: 1
   enable_checkpointing: false
-  num_sanity_val_steps: ${eval:'2 if ${has_val} else 0'}
-  check_val_every_n_epoch: ${eval:'max(1, ${val_every})'}
-  limit_val_batches: ${eval:'1.0 if ${has_val} else 0.0'}
+  num_sanity_val_steps: 2
+  check_val_every_n_epoch: 1
   log_every_n_steps: 10      # matches the original loop's wandb logging cadence (it % 10 == 0)
   # Unset/null by default -- this optimization's lr/loss weights above were
   # tuned without gradient clipping; set this to experiment with it rather
