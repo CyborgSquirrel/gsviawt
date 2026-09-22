@@ -539,9 +539,11 @@ class GSFitLightningModule(pl.LightningModule):
       _log(f"loss/photom_{k}", v.detach())
 
     if stage == "train":
-      self.views_seen += B
       self.final_loss = loss.item()  # plain float: fed to log.info/%f, save_output, wandb.summary
-      self.log("views_seen", self.views_seen, reduce_fx="max", batch_size=B)
+
+    if stage == "train":
+      self.views_seen += B
+    self.log("views_seen", self.views_seen, reduce_fx="max", batch_size=B)
 
     return loss
 
