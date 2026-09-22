@@ -22,7 +22,6 @@ output_path: null
 iters: 10000                # trainer.max_epochs -- one Lightning "epoch" == one
                              # optimizer step here (see GSFitDataModule)
 seed: 42
-device: cuda              # cuda | cpu
 
 # Number of views (sampled uniformly at random, without replacement, from the
 # full primary+secondary set) to render and supervise on each iteration.
@@ -98,12 +97,22 @@ orbit:
   crf: 28
   elevation_deg: 20.0
 
-# pl.Trainer kwargs not already covered above (max_epochs=iters, logger,
-# check_val_every_n_epoch=val_every, limit_val_batches are all set in code).
-# Unset/null by default -- this optimization's lr/loss weights above were
-# tuned without gradient clipping; add gradient_clip_val here to experiment
-# with it rather than changing the default.
+# pl.Trainer kwargs -- everything except `logger` (built in code from the
+# wandb run, or False when wandb is disabled). `has_val` isn't a field you
+# set: main() injects it (== bool(len(cfg.val))) before the trainer is built,
+# same trick train_gs.yaml's sched.total_steps uses.
 trainer:
+  max_epochs: ${iters}
+  accelerator: auto
+  devices: 1
+  enable_checkpointing: false
+  num_sanity_val_steps: ${eval:'2 if ${has_val} else 0'}
+  check_val_every_n_epoch: ${eval:'max(1, ${val_every})'}
+  limit_val_batches: ${eval:'1.0 if ${has_val} else 0.0'}
+  log_every_n_steps: 10      # matches the original loop's wandb logging cadence (it % 10 == 0)
+  # Unset/null by default -- this optimization's lr/loss weights above were
+  # tuned without gradient clipping; set this to experiment with it rather
+  # than changing the default.
   gradient_clip_val: null
   gradient_clip_algorithm: norm
 

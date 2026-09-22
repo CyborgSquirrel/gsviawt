@@ -192,7 +192,7 @@ optim:
   lr: 1e-4
 
 sched:
-  _target_: gs_lightning.WarmupCosineAnnealingLR
+  _target_: module.WarmupCosineAnnealingLR
   _partial_: true
   total_steps: ${total_steps}
   warmup_steps: ${eval:'int(${total_steps} * 0.05)'}

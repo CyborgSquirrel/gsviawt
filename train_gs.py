@@ -53,7 +53,7 @@ from gs_dataset import (OPENGL_TO_OPENCV, GaussH5ValDataset,  # noqa: E402
                         _EmptyDataset, split_by_mesh, split_by_view)
 from gs_decoder import GaussianResnetDecoder, GSDecoderStack  # noqa: E402
 from gs_encoder import GSResnetEncoder  # noqa: E402
-from gs_lightning import WarmupCosineAnnealingLR, gaussian_window, guarded_render, ssim_map  # noqa: E402
+from module import DSSIMLoss, WarmupCosineAnnealingLR, guarded_render  # noqa: E402
 from orbit_video import look_at_c2w, write_mp4  # noqa: E402
 from util import collate_with_batch_size, pipe, set_mode, timed  # noqa: E402
 
@@ -309,23 +309,23 @@ def apply_ground_truth_overrides(gauss, gt, hit, predict_params, device):
 
 
 # ---------------------------------------------------------------------------
-# losses (gaussian_window/ssim_map now live in gs_lightning.py, shared with
-# fit_gsplat.py)
+# losses (DSSIMLoss now lives in module.py, shared with fit_gsplat.py)
 # ---------------------------------------------------------------------------
 
-def per_view_losses(pred_rgb, pred_alpha, gt_rgb, gt_alpha, window, cfg_loss):
-  """pred/gt _rgb: (V,H,W,3), _alpha: (V,H,W,1). Returns (per_view (V,) total
-  weighted loss, parts dict of (V,) component losses), all premultiplied by
-  alpha (matches fit_gsplat.py's convention: bg stays black on both sides)."""
+def per_view_losses(pred_rgb, pred_alpha, gt_rgb, gt_alpha, dssim, cfg_loss):
+  """pred/gt _rgb: (V,H,W,3), _alpha: (V,H,W,1). `dssim`: a DSSIMLoss(reduction=
+  "none") instance. Returns (per_view (V,) total weighted loss, parts dict of
+  (V,) component losses), all premultiplied by alpha (matches fit_gsplat.py's
+  convention: bg stays black on both sides)."""
   pred_c = rearrange(pred_rgb * pred_alpha, "v h w c -> v c h w")
   gt_c = rearrange(gt_rgb * gt_alpha, "v h w c -> v c h w")
   l1 = (pred_c - gt_c).abs().mean(dim=(1, 2, 3))
-  dssim = 1.0 - ssim_map(pred_c, gt_c, window).mean(dim=(1, 2, 3))
+  dssim_per_view = dssim(pred_c, gt_c).mean(dim=(1, 2, 3))
   mask_l1 = (pred_alpha - gt_alpha).abs().mean(dim=(1, 2, 3))
   per_view = (
-    cfg_loss.l1_weight * l1 + cfg_loss.ssim_weight * dssim + cfg_loss.mask_weight * mask_l1
+    cfg_loss.l1_weight * l1 + cfg_loss.ssim_weight * dssim_per_view + cfg_loss.mask_weight * mask_l1
   )
-  return per_view, {"l1": l1, "ssim": dssim, "mask": mask_l1}
+  return per_view, {"l1": l1, "ssim": dssim_per_view, "mask": mask_l1}
 
 
 def compute_direct_loss(gauss, gt, hit, cfg_loss, device):
@@ -612,7 +612,7 @@ class GSLightningModule(pl.LightningModule):
 
     with timed("build_model"):
       self.model = GSModel(cfg)
-    self.register_buffer("window", gaussian_window(), persistent=False)
+    self.dssim = DSSIMLoss(reduction="none")
 
     # One directory for everything this run produces (currently just
     # checkpoints, but named generically for whatever else lands here later
@@ -700,7 +700,7 @@ class GSLightningModule(pl.LightningModule):
 
     ## D-SSIM Loss
     if cfg.loss.photom.dssim_weight > 0:
-      _photom_dssim = 1.0 - g(ssim_map(f(pred_rgb), f(gt_rgb), self.window)) # (B,V,C,H,W)
+      _photom_dssim = g(self.dssim(f(pred_rgb), f(gt_rgb))) # (B,V,C,H,W)
       _splatter_metric("loss/photom_dssim", _photom_dssim)
       loss = loss + cfg.loss.photom.dssim_weight * _photom_dssim.mean()
 
@@ -776,7 +776,7 @@ class OrbitCallback(pl.Callback):
     """Renders a turntable orbit of `item`'s source-view Gaussians. Returns a
     generator of (H,W,3) uint8 frames, or None if the source view seeded zero
     Gaussians (nothing to show) or the render hit a CUDA OOM (see
-    gs_lightning.guarded_render)."""
+    module.guarded_render)."""
 
     B = batch["batch_size"]
 
@@ -956,9 +956,6 @@ class ViewPanelCallback(pl.Callback):
           caption="GT | render | |diff|, one row per view (source first, then targets)",
         ),
       })
-
-
-OmegaConf.register_new_resolver("eval", eval)
 
 
 @hydra.main(version_base=None, config_path="conf", config_name="train_gs")

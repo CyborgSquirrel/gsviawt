@@ -40,7 +40,7 @@ Output is written next to the input as:
 
 Trained as a `pl.LightningModule` (GSFitLightningModule) under a plain
 `pl.Trainer`, sharing its loss/schedule/OOM-handling building blocks with
-train_gs.py via gs_lightning.py -- see that module's docstring for what's
+train_gs.py via module.py -- see that module's docstring for what's
 actually shared vs. deliberately not. There's no dataset in the usual sense
 (one fixed scene is optimized every step, no batching/epochs over examples),
 so GSFitDataModule's loader is a length-1 dummy: one Lightning "epoch" is
@@ -79,7 +79,7 @@ import wandb
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from debug_pointcloud import unproject_depth_peel  # noqa: E402
-from gs_lightning import gaussian_window, ssim_map  # noqa: E402
+from module import DSSIMLoss  # noqa: E402
 from util import intrinsics_name, timed  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -394,7 +394,7 @@ def dump_val(val_dir, it, panel):
 # distance the model was actually supervised at avoids manufacturing that
 # confusion here.
 #
-# NOTE: kept as plain functions here, not moved to gs_lightning.py or shared
+# NOTE: kept as plain functions here, not moved to module.py or shared
 # with orbit_video.py/train_gs.py's own orbit callbacks -- deliberately out
 # of scope for this pass, see the PR description.
 # ---------------------------------------------------------------------------
@@ -513,7 +513,7 @@ class GSFitLightningModule(pl.LightningModule):
       k: nn.Parameter(torch.from_numpy(v), requires_grad=(k != "means" or self.optimize_means))
       for k, v in g.items()
     })
-    self.register_buffer("window", gaussian_window(), persistent=False)
+    self.dssim = DSSIMLoss()
     self._register_view_buffers("", views)
 
     self.has_val = val_views is not None
@@ -558,52 +558,57 @@ class GSFitLightningModule(pl.LightningModule):
   def _photom_loss(self, rgb, alpha, gt_rgb, gt_alpha):
     rgb_c = rgb * alpha  # premultiply so bg stays black on both sides
     l1 = (rgb_c - gt_rgb).abs().mean()
-    dssim = 1.0 - ssim_map(
-      rgb_c.permute(0, 3, 1, 2), gt_rgb.permute(0, 3, 1, 2), self.window).mean()
+    dssim = self.dssim(rgb_c.permute(0, 3, 1, 2), gt_rgb.permute(0, 3, 1, 2))
     mask = (alpha - gt_alpha).abs().mean()
     ls, lm = float(self.cfg.lambda_ssim), float(self.cfg.lambda_mask)
     loss = (1 - ls) * l1 + ls * dssim + lm * mask
     return loss, rgb_c, {"l1": l1, "dssim": dssim, "mask": mask}
 
   def training_step(self, batch, batch_idx):
-    it = self.current_epoch
-    V = self.viewmats.shape[0]
-    if self.views_per_iter >= V:
-      vm, ks, gt_rgb, gt_alpha = self.viewmats, self.Ks, self.gt_rgb, self.gt_alpha
-    else:
-      idx = torch.from_numpy(
-        self.view_rng.choice(V, size=self.views_per_iter, replace=False)).to(self.device)
-      vm, ks, gt_rgb, gt_alpha = self.viewmats[idx], self.Ks[idx], self.gt_rgb[idx], self.gt_alpha[idx]
-
-    IH, IW = gt_rgb.shape[1:3]
-    rgb, alpha = render(self.params, vm, ks, IW, IH)
-    loss, rgb_c, parts = self._photom_loss(rgb, alpha, gt_rgb, gt_alpha)
-    self._last_rgb_c, self._last_alpha = rgb_c.detach(), alpha.detach()
-
-    self.views_seen += self.views_per_iter
-    self.final_loss = loss.item()  # plain float: fed to log.info/%f, save_output, wandb.summary
-    self.log("train/loss", loss, prog_bar=True, batch_size=1)
-    for k, v in parts.items():
-      self.log(f"train/loss/photom_{k}", v.detach(), batch_size=1)
-    self.log("views_seen", self.views_seen, reduce_fx="max", batch_size=1)
-
-    last = it == self.iters - 1
-    if it % self.log_every == 0 or last:
-      log.info("iter %d/%d  loss %.5f  (l1 %.5f  dssim %.5f  mask %.5f)",
-               it, self.iters, loss.item(), parts["l1"].item(), parts["dssim"].item(),
-               parts["mask"].item())
-    return loss
+    return self._step("train", batch, batch_idx)
 
   def validation_step(self, batch, batch_idx):
-    if not self.has_val:
-      return
-    IH, IW = self.val_gt_rgb.shape[1:3]
-    with torch.no_grad():
-      rgb, alpha = render(self.params, self.val_viewmats, self.val_Ks, IW, IH)
-      loss, _, parts = self._photom_loss(rgb, alpha, self.val_gt_rgb, self.val_gt_alpha)
-    self.log("val/loss", loss, batch_size=1)
+    return self._step("val", batch, batch_idx)
+
+  def _step(self, stage, batch, batch_idx):
+    if stage == "val":
+      if not self.has_val:
+        return None
+      vm, ks, gt_rgb, gt_alpha = self.val_viewmats, self.val_Ks, self.val_gt_rgb, self.val_gt_alpha
+    else:
+      V = self.viewmats.shape[0]
+      if self.views_per_iter >= V:
+        vm, ks, gt_rgb, gt_alpha = self.viewmats, self.Ks, self.gt_rgb, self.gt_alpha
+      else:
+        idx = torch.from_numpy(
+          self.view_rng.choice(V, size=self.views_per_iter, replace=False)).to(self.device)
+        vm, ks, gt_rgb, gt_alpha = self.viewmats[idx], self.Ks[idx], self.gt_rgb[idx], self.gt_alpha[idx]
+
+    IH, IW = gt_rgb.shape[1:3]
+    with torch.set_grad_enabled(stage == "train"):
+      rgb, alpha = render(self.params, vm, ks, IW, IH)
+      loss, rgb_c, parts = self._photom_loss(rgb, alpha, gt_rgb, gt_alpha)
+
+    def _log(key, *args, **kwargs):
+      self.log(f"{stage}/{key}", *args, **kwargs, batch_size=1)
+
+    _log("loss", loss, prog_bar=(stage == "train"))
     for k, v in parts.items():
-      self.log(f"val/loss/photom_{k}", v, batch_size=1)
+      _log(f"loss/photom_{k}", v.detach())
+
+    if stage == "train":
+      self._last_rgb_c, self._last_alpha = rgb_c.detach(), alpha.detach()
+      self.views_seen += self.views_per_iter
+      self.final_loss = loss.item()  # plain float: fed to log.info/%f, save_output, wandb.summary
+      self.log("views_seen", self.views_seen, reduce_fx="max", batch_size=1)
+
+      it = self.current_epoch
+      last = it == self.iters - 1
+      if it % self.log_every == 0 or last:
+        log.info("iter %d/%d  loss %.5f  (l1 %.5f  dssim %.5f  mask %.5f)",
+                 it, self.iters, loss.item(), parts["l1"].item(), parts["dssim"].item(),
+                 parts["mask"].item())
+    return loss
 
   def params_np(self):
     return {k: v.detach().cpu().numpy() for k, v in self.params.items()}
@@ -675,14 +680,9 @@ class GSFitLightningModule(pl.LightningModule):
 def main(cfg: DictConfig) -> None:
   logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
   torch.manual_seed(int(cfg.seed))
-  device = cfg.device if (cfg.device != "cuda" or torch.cuda.is_available()) else "cpu"
-  if device != cfg.device:
-    log.warning("cuda not available, falling back to cpu")
 
   out_h5 = cfg.output_path or f"{cfg.hdf5_path}.gsplat.view{int(cfg.primary)}.h5"
   stem = out_h5[:-3] if out_h5.endswith(".h5") else out_h5
-  with open_dict(cfg):
-    cfg.output_stem = stem  # stashed so GSFitLightningModule can find the .val/ dir
 
   wandb_run, logger = None, False
   if cfg.wandb.mode != "disabled":
@@ -698,6 +698,9 @@ def main(cfg: DictConfig) -> None:
   with timed("load"):
     views = load_views(cfg)
     val_views = load_val_views(cfg)
+  with open_dict(cfg):
+    cfg.output_stem = stem              # so GSFitLightningModule can find the .val/ dir
+    cfg.has_val = val_views is not None  # read by conf/gsplat.yaml's trainer.* interpolations
   V = views["images"].shape[0]
   IH, IW = views["images"].shape[1:3]      # RGB render / supervision resolution
   DH, DW, L = views["depth"].shape[1:]     # depth-peel = seed + output-grid resolution
@@ -728,18 +731,7 @@ def main(cfg: DictConfig) -> None:
 
   model = GSFitLightningModule(cfg, g, uvl, views, val_views, scene_scale, views["image_K"][0])
 
-  trainer = pl.Trainer(
-    max_epochs=int(cfg.iters),
-    accelerator=("gpu" if device == "cuda" else "cpu"),
-    devices=1,
-    logger=logger,
-    enable_checkpointing=False,
-    num_sanity_val_steps=(2 if model.has_val else 0),
-    check_val_every_n_epoch=max(1, int(cfg.val_every)),
-    limit_val_batches=(1.0 if model.has_val else 0.0),
-    log_every_n_steps=10,  # matches the original loop's wandb logging cadence (it % 10 == 0)
-    **OmegaConf.to_container(cfg.trainer, resolve=True),
-  )
+  trainer = pl.Trainer(logger=logger, **OmegaConf.to_container(cfg.trainer, resolve=True))
   with timed("optimize"):
     trainer.fit(model, datamodule=GSFitDataModule())
 
