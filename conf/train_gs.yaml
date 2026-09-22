@@ -14,6 +14,12 @@ seed: 42
 
 torch_detect_anomaly: false
 
+# Path to a Lightning checkpoint (e.g. an earlier run's
+# ${output_dir}/last.ckpt or model-{epoch}-{step}.ckpt) to resume from --
+# restores model/optimizer/scheduler state and the trainer's epoch/step
+# counters, then continues training into a fresh output_dir. null: fresh run.
+ckpt_path: null
+
 data:
   photom_h5: /app/bla/lite_blackbg.h5   # str, list, or glob(s) -- render_objaverse.py-schema
   num_layers: 6                         # must match the file(s)' depth_peel layer count

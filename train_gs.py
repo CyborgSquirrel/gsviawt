@@ -20,6 +20,11 @@ Usage:
     docker exec -w /app gsviawt-app-gpu-1 /home/user/venv/bin/python train_gs.py \\
         data.photom_h5=/app/bla/lite_blackbg.h5 train.max_epochs=1000
 
+    # Resume from an earlier run's checkpoint (model/optimizer/scheduler +
+    # epoch/step state; continues into a fresh output_dir):
+    docker exec -w /app gsviawt-app-gpu-1 /home/user/venv/bin/python train_gs.py \\
+        ckpt_path=/app/outputs/3dgs-model-2026-09-01_12-00-00/last.ckpt
+
 gsplat JIT-compiles CUDA kernels on first import; see _setup_cuda_toolchain
 (copied from fit_gsplat.py, which needs the same env setup).
 """
@@ -531,6 +536,15 @@ class GSLightningModule(pl.LightningModule):
 
     return out
 
+  def on_save_checkpoint(self, checkpoint):
+    # views_seen is a plain Python int, not part of state_dict() -- persist
+    # it explicitly so it keeps climbing (not resetting to 0) across resume.
+    checkpoint["views_seen"] = self.views_seen
+
+  def on_load_checkpoint(self, checkpoint):
+    # .get: checkpoints written before this hook existed have no such key.
+    self.views_seen = checkpoint.get("views_seen", 0)
+
   def training_step(self, batch, batch_idx):
     return self._step("train", batch, batch_idx)
 
@@ -875,7 +889,7 @@ def main(cfg: DictConfig) -> None:
     callbacks=callbacks,
   )
   with timed("train"):
-    trainer.fit(model, datamodule=datamodule)
+    trainer.fit(model, datamodule=datamodule, ckpt_path=cfg.ckpt_path)
 
 
 if __name__ == "__main__":
