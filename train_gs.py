@@ -50,7 +50,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
 from fit_gsplat import SH_C0  # noqa: E402
 from gs_dataset import (OPENGL_TO_OPENCV, GaussH5ValDataset,  # noqa: E402
                         GSFixedViewsDataset, GSPairDataset, H5Catalog,
-                        _EmptyDataset, split_by_mesh, split_by_view)
+                        _EmptyDataset)
 from gs_decoder import GaussianResnetDecoder, GSDecoderStack  # noqa: E402
 from gs_encoder import GSResnetEncoder  # noqa: E402
 from module import DSSIMLoss, WarmupCosineAnnealingLR, guarded_render  # noqa: E402
@@ -518,10 +518,9 @@ class GSDataModule(pl.LightningDataModule):
         self.val_ds = _EmptyDataset()
     elif cfg.data.photom_h5_val is not None:
       # Multi-scene training with an external validation corpus: bypass
-      # split_by_mesh/photom_val_fraction entirely and use the WHOLE
-      # photom_h5 catalog for train_ds -- photom_val_fraction becomes a
-      # no-op here (logged in main()'s config-validation block, not
-      # silently swallowed).
+      # data.split_fn entirely and use the WHOLE photom_h5 catalog for
+      # train_ds -- data.split_fn becomes a no-op here (logged in main()'s
+      # config-validation block, not silently swallowed).
       catalog = H5Catalog(
         cfg.data.photom_h5,
         H5Catalog.path().alias("path"),
@@ -541,24 +540,8 @@ class GSDataModule(pl.LightningDataModule):
         H5Catalog.dataset("mesh_index").alias("mesh_id"),
       )
 
-      if (
-          int(cfg.data.photom_val_fraction_mesh is not None)
-        + int(cfg.data.photom_val_fraction_view is not None)
-      ) != 1:
-        raise RuntimeError()
-
-      if cfg.data.photom_val_fraction_mesh is not None:
-        train_catalog, val_catalog = split_by_mesh(
-          catalog,
-          val_fraction=cfg.data.photom_val_fraction_mesh,
-          seed=cfg.seed,
-        )
-      if cfg.data.photom_val_fraction_view is not None:
-        train_catalog, val_catalog = split_by_view(
-          catalog,
-          val_fraction=cfg.data.photom_val_fraction_view,
-          seed=cfg.seed,
-        )
+      split_fn = hydra.utils.instantiate(cfg.data.split_fn)
+      train_catalog, val_catalog = split_fn(catalog, seed=cfg.seed)
 
       self.train_ds = GSPairDataset(
         train_catalog, num_layers=cfg.data.num_layers, num_target_views=cfg.data.num_target_views,
@@ -569,7 +552,7 @@ class GSDataModule(pl.LightningDataModule):
         seed=cfg.seed, deterministic_targets=True,
       )
     if len(self.train_ds) == 0:
-      raise SystemExit("train split is empty -- check data.photom_h5 / data.photom_val_fraction")
+      raise SystemExit("train split is empty -- check data.photom_h5 / data.split_fn")
 
   def train_dataloader(self):
     return DataLoader(
@@ -971,7 +954,7 @@ def main(cfg: DictConfig) -> None:
 
   if cfg.data.photom_h5_val is not None and cfg.data.fixed_source_view is None:
     log.info(
-      "data.photom_h5_val set -- data.photom_val_fraction is ignored, the full "
+      "data.photom_h5_val set -- data.split_fn is ignored, the full "
       "training corpus is used for train_ds.")
   # A real (nonempty, force_render=True) val_ds gets built either from
   # data.photom_h5_val directly, or -- when that's unset -- as a fallback

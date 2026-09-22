@@ -14,12 +14,24 @@ data:
   photom_h5: /app/bla/lite_blackbg.h5   # str, list, or glob(s) -- render_objaverse.py-schema
   num_layers: 6                         # must match the file(s)' depth_peel layer count
   num_target_views: 3                   # extra supervision views per step, alongside self-render
-  photom_val_fraction_mesh: null
-  photom_val_fraction_view: null
+
+  # Train/val split for ordinary multi-scene training (ignored when
+  # fixed_source_view or photom_h5_val is set -- see their own comments
+  # below). _target_ picks the split granularity: gs_dataset.split_by_mesh
+  # (default -- never splits a single mesh's views across train/val) or
+  # gs_dataset.split_by_view (splits individual views; the same mesh can
+  # land in both). _partial_: true bakes val_fraction in now, so
+  # GSDataModule.setup() just calls split_fn(catalog, seed=cfg.seed).
+  # val_fraction: 0 disables the split (train_ds gets everything, val_ds
+  # empty) -- see split_by_mesh/split_by_view's own docstrings.
+  split_fn:
+    _target_: gs_dataset.split_by_mesh
+    _partial_: true
+    val_fraction: 0.1
 
   # Single-batch overfit mode (fit_gsplat.py's primary/secondary terms
   # applied here): if set, train on this EXACT source+target view set every
-  # step, no resampling at all (ignores num_target_views/photom_val_fraction).
+  # step, no resampling at all (ignores num_target_views/split_fn).
   # fixed_target_views is required when fixed_source_view + photom_h5 are
   # both set (irrelevant/ignored in gauss_h5-only mode -- see gauss_h5 below).
   fixed_source_view: null    # int, e.g. 0
@@ -34,7 +46,7 @@ data:
   # validation genuinely tests the trained network as a normal single-image
   # encoder on a different image, not a held-out subset of the training
   # corpus. Also usable (optionally) with ordinary multi-scene training,
-  # replacing the photom_val_fraction mesh-holdout split with a wholly
+  # replacing the split_fn mesh-holdout split with a wholly
   # separate corpus. null (default): when fixed_source_view + gauss_h5 are
   # set and this is left null, val_ds instead falls back to gauss_h5's OWN
   # embedded secondary views (GaussH5ValDataset, gs_dataset.py) -- the exact

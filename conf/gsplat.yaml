@@ -12,7 +12,7 @@ secondary: []             # extra view indices for supervision, e.g. [1,2,3]
 # Held-out view indices used ONLY for the val/* photometric metrics below --
 # never seed Gaussians, never supervise (must be disjoint from primary/secondary,
 # checked at startup). [] -> no validation split (val/* metrics just don't log,
-# same as today). Comparable in spirit to train_gs.py's data.photom_val_fraction*.
+# same as today). Comparable in spirit to train_gs.py's data.split_fn.
 val: []
 
 # null -> "<hdf5_path>.gsplat.view<primary>.h5" (+ .ply, + .val/ alongside)
