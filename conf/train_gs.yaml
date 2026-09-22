@@ -2,6 +2,10 @@
 # Splatting prediction model (Flash3D-style encoder/decoder) on
 # render_objaverse.py-schema HDF5 files. See train_gs.py's module docstring.
 
+defaults:
+  - data/split_fn: by_mesh
+  - _self_
+
 # Directory for everything a single run produces.
 output_dirname: 3dgs-model-${now:%Y-%m-%d_%H-%M-%S}
 output_dir: outputs/${output_dirname}
@@ -10,16 +14,29 @@ seed: 42
 
 torch_detect_anomaly: false
 
+# Path to a Lightning checkpoint (e.g. an earlier run's
+# ${output_dir}/last.ckpt or model-{epoch}-{step}.ckpt) to resume from --
+# restores model/optimizer/scheduler state and the trainer's epoch/step
+# counters, then continues training into a fresh output_dir. null: fresh run.
+ckpt_path: null
+
 data:
   photom_h5: /app/bla/lite_blackbg.h5   # str, list, or glob(s) -- render_objaverse.py-schema
   num_layers: 6                         # must match the file(s)' depth_peel layer count
   num_target_views: 3                   # extra supervision views per step, alongside self-render
-  photom_val_fraction_mesh: null
-  photom_val_fraction_view: null
+
+  # Train/val split for ordinary multi-scene training (ignored when
+  # fixed_source_view or photom_h5_val is set -- see their own comments
+  # below). A config group (conf/data/split_fn/*.yaml, picked via the
+  # `defaults:` list up top) rather than inline here, so the strategy is a
+  # one-token CLI override instead of rewriting _target_ by hand, e.g.:
+  #   data/split_fn=by_view data.split_fn.val_fraction=0.2
+  #   data/split_fn=by_indices data.split_fn.train_idx='[0,1,2]' data.split_fn.val_idx='[3,4]'
+  # See conf/data/split_fn/*.yaml for what each option takes.
 
   # Single-batch overfit mode (fit_gsplat.py's primary/secondary terms
   # applied here): if set, train on this EXACT source+target view set every
-  # step, no resampling at all (ignores num_target_views/photom_val_fraction).
+  # step, no resampling at all (ignores num_target_views/split_fn).
   # fixed_target_views is required when fixed_source_view + photom_h5 are
   # both set (irrelevant/ignored in gauss_h5-only mode -- see gauss_h5 below).
   fixed_source_view: null    # int, e.g. 0
@@ -34,7 +51,7 @@ data:
   # validation genuinely tests the trained network as a normal single-image
   # encoder on a different image, not a held-out subset of the training
   # corpus. Also usable (optionally) with ordinary multi-scene training,
-  # replacing the photom_val_fraction mesh-holdout split with a wholly
+  # replacing the split_fn mesh-holdout split with a wholly
   # separate corpus. null (default): when fixed_source_view + gauss_h5 are
   # set and this is left null, val_ds instead falls back to gauss_h5's OWN
   # embedded secondary views (GaussH5ValDataset, gs_dataset.py) -- the exact
@@ -158,16 +175,16 @@ callbacks:
     save_weights_only: false
 
   orbit:
-    _target_: __main__.OrbitCallback
+    _target_: module.OrbitCallback
     every_n_epochs: ${eval:'${trainer.max_epochs} // 50'}
     num_frames: 24
     fps: 12
     crf: 28                    # x264 quality (higher = smaller/faster; fine for monitoring)
     elevation_deg: 20.0        # camera distance = the actual source view's own capture distance,
-                                # not a re-fit bounding-sphere framing -- see train_gs._orbit_c2w_gl
+                                # not a re-fit bounding-sphere framing -- see GSLightningModule.get_preview_source
 
-  view_panel:
-    _target_: __main__.ViewPanelCallback
+  panel:
+    _target_: module.PanelCallback
     every_n_epochs: ${eval:'${trainer.max_epochs} // 50'}
 
 loader:
@@ -192,7 +209,7 @@ optim:
   lr: 1e-4
 
 sched:
-  _target_: __main__.WarmupCosineAnnealingLR
+  _target_: module.WarmupCosineAnnealingLR
   _partial_: true
   total_steps: ${total_steps}
   warmup_steps: ${eval:'int(${total_steps} * 0.05)'}

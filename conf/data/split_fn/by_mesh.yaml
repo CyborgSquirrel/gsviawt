@@ -1,0 +1,7 @@
+# Default train/val split strategy: random, at the MESH-GROUP level --
+# never splits a single mesh's views across train/val. See
+# gs_dataset.split_by_mesh's own docstring. val_fraction: 0 disables the
+# split (train_ds gets everything, val_ds empty).
+_target_: gs_dataset.split_by_mesh
+_partial_: true
+val_fraction: 0.1

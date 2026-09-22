@@ -89,12 +89,15 @@ def xyz_to_x0(xyz):
   return (xyz - XYZ_MEAN) / XYZ_STD
 
 
-def _rotate_quats_wxyz(q_wxyz, R_transform):
+def rotate_quats_wxyz(q_wxyz, R_transform):
   """q_wxyz: (...,4) numpy wxyz unit quaternions. R_transform: (3,3) rotation
   matrix applied on the left (R_out = R_transform @ R_in). Returns (...,4)
   wxyz, same shape. Uses scipy.spatial.transform.Rotation (already a project
   dependency -- fit_gsplat.py uses it too) rather than hand-rolled quaternion
-  composition, which is an easy place to get sign/order conventions wrong."""
+  composition, which is an easy place to get sign/order conventions wrong.
+  Public (not _-prefixed): train_gs.py's get_preview_source() also uses this,
+  the opposite direction (camera-to-world instead of world-to-camera), to
+  transform its preview Gaussians into world space for module.OrbitCallback."""
   from scipy.spatial.transform import Rotation
   shape = q_wxyz.shape
   flat = q_wxyz.reshape(-1, 4)
@@ -150,7 +153,7 @@ def _load_ground_truth(gt_h5_path, source_pose_gl):
   quat_cam_lhwc = np.zeros_like(quat_world_lhwc)
   quat_cam_lhwc[..., 0] = 1.0
   if valid_lhw.any():
-    quat_cam_lhwc[valid_lhw] = _rotate_quats_wxyz(quat_world_lhwc[valid_lhw], r_w2c)
+    quat_cam_lhwc[valid_lhw] = rotate_quats_wxyz(quat_world_lhwc[valid_lhw], r_w2c)
 
   tensors = {
     "opacity": rearrange(torch.from_numpy(opacity), "h w l -> l h w").contiguous().float(),
@@ -495,6 +498,34 @@ def split_by_view(catalog: H5Catalog, val_fraction=0.1, seed=42):
     print("Train idx", list(train_idx))
     print("Val idx", list(val_idx))
 
+  return H5Catalog._from_df(catalog.df[train_idx]), H5Catalog._from_df(catalog.df[val_idx])
+
+
+def split_by_indices(catalog: H5Catalog, train_idx, val_idx, seed=42, strict=True):
+  """Splits `catalog` at caller-given row positions (into catalog.df, the
+  same index space split_by_view's own random split operates in) instead of
+  a random val_fraction -- for reproducing one specific split (e.g. matching
+  an earlier run, or hand-picking which scenes are held out) rather than
+  reseeding a random one. `seed` is accepted only so GSDataModule.setup()
+  can call every data.split_fn the same way (split_fn(catalog,
+  seed=cfg.seed)); unused here.
+
+  `strict` (default True) requires train_idx/val_idx to exactly partition
+  catalog: (1) no index in both, and (2) together they cover every row
+  0..len(catalog)-1 -- a typo'd or stale index list fails loudly instead of
+  silently training/validating on the wrong rows. Set False to allow a
+  deliberate partial split (rows in neither list are just dropped) or an
+  intentional overlap."""
+  train_idx, val_idx = list(train_idx), list(val_idx)
+  if strict:
+    overlap = sorted(set(train_idx) & set(val_idx))
+    if overlap:
+      raise ValueError(f"split_by_indices: {overlap} appear in both train_idx and val_idx")
+    missing = sorted(set(range(len(catalog))) - set(train_idx) - set(val_idx))
+    if missing:
+      raise ValueError(
+        f"split_by_indices: strict=True requires train_idx+val_idx to cover every row "
+        f"in [0, {len(catalog)}) -- missing {missing}")
   return H5Catalog._from_df(catalog.df[train_idx]), H5Catalog._from_df(catalog.df[val_idx])
 
 

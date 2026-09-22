@@ -20,16 +20,20 @@ Usage:
     docker exec -w /app gsviawt-app-gpu-1 /home/user/venv/bin/python train_gs.py \\
         data.photom_h5=/app/bla/lite_blackbg.h5 train.max_epochs=1000
 
+    # Resume from an earlier run's checkpoint (model/optimizer/scheduler +
+    # epoch/step state; continues into a fresh output_dir):
+    docker exec -w /app gsviawt-app-gpu-1 /home/user/venv/bin/python train_gs.py \\
+        ckpt_path=/app/outputs/3dgs-model-2026-09-01_12-00-00/last.ckpt
+
 gsplat JIT-compiles CUDA kernels on first import; see _setup_cuda_toolchain
 (copied from fit_gsplat.py, which needs the same env setup).
 """
 
 import contextlib as ctl
+import functools as ft
 import logging
 import os
-import shutil
 import sys
-import tempfile
 
 import gsplat
 import hydra
@@ -41,7 +45,6 @@ import torch.nn.functional as F
 from einops import pack, rearrange, repeat
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import DictConfig, OmegaConf, open_dict
-from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 
 import wandb
@@ -50,43 +53,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
 from fit_gsplat import SH_C0  # noqa: E402
 from gs_dataset import (OPENGL_TO_OPENCV, GaussH5ValDataset,  # noqa: E402
                         GSFixedViewsDataset, GSPairDataset, H5Catalog,
-                        _EmptyDataset, split_by_mesh, split_by_view)
+                        _EmptyDataset, rotate_quats_wxyz)
 from gs_decoder import GaussianResnetDecoder, GSDecoderStack  # noqa: E402
 from gs_encoder import GSResnetEncoder  # noqa: E402
-from orbit_video import look_at_c2w, write_mp4  # noqa: E402
+from module import DSSIMLoss, WarmupCosineAnnealingLR  # noqa: E402
 from util import collate_with_batch_size, pipe, set_mode, timed  # noqa: E402
 
 log = logging.getLogger(__name__)
-
-
-class WarmupCosineAnnealingLR(torch.optim.lr_scheduler.SequentialLR):
-  def __init__(
-    self,
-    optimizer: Optimizer,
-    total_steps: int,
-    warmup_steps: int,
-    min_lr: float = 0.0,
-  ) -> None:
-    self.total_steps = int(total_steps)
-    self.warmup_steps = max(1, int(warmup_steps))
-    self.min_lr = float(min_lr)
-
-    warmup = torch.optim.lr_scheduler.LinearLR(
-      optimizer,
-      start_factor=1.0 / self.warmup_steps,
-      end_factor=1.0,
-      total_iters=self.warmup_steps,
-    )
-    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-      optimizer,
-      T_max=max(1, self.total_steps - self.warmup_steps),
-      eta_min=self.min_lr,
-    )
-    super().__init__(
-      optimizer,
-      schedulers=[warmup, cosine],
-      milestones=[self.warmup_steps],
-    )
 
 # ---------------------------------------------------------------------------
 # model
@@ -338,46 +311,8 @@ def apply_ground_truth_overrides(gauss, gt, hit, predict_params, device):
 
 
 # ---------------------------------------------------------------------------
-# losses (SSIM ported from fit_gsplat.py's hand-rolled version, kept
-# unreduced over the view axis so source/target losses can be split out)
+# losses (DSSIMLoss now lives in module.py, shared with fit_gsplat.py)
 # ---------------------------------------------------------------------------
-
-def _gaussian_window(size=11, sigma=1.5, device="cpu"):
-  coords = torch.arange(size, dtype=torch.float32, device=device) - (size - 1) / 2
-  g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
-  g = g / g.sum()
-  return (g[:, None] * g[None, :])[None, None]
-
-
-def ssim_map(x, y, window):
-  """x, y: (V,C,H,W) in [0,1]. Standard 11x11 Gaussian-window SSIM, returned
-  unreduced (per-pixel) so callers can average per-view instead of globally."""
-  c = x.shape[1]
-  w = window.expand(c, 1, -1, -1)
-  pad = w.shape[-1] // 2
-  mu_x = F.conv2d(x, w, padding=pad, groups=c)
-  mu_y = F.conv2d(y, w, padding=pad, groups=c)
-  mu_x2, mu_y2, mu_xy = mu_x ** 2, mu_y ** 2, mu_x * mu_y
-  sig_x = F.conv2d(x * x, w, padding=pad, groups=c) - mu_x2
-  sig_y = F.conv2d(y * y, w, padding=pad, groups=c) - mu_y2
-  sig_xy = F.conv2d(x * y, w, padding=pad, groups=c) - mu_xy
-  c1, c2 = 0.01 ** 2, 0.03 ** 2
-  return ((2 * mu_xy + c1) * (2 * sig_xy + c2)) / ((mu_x2 + mu_y2 + c1) * (sig_x + sig_y + c2))
-
-
-def per_view_losses(pred_rgb, pred_alpha, gt_rgb, gt_alpha, window, cfg_loss):
-  """pred/gt _rgb: (V,H,W,3), _alpha: (V,H,W,1). Returns (per_view (V,) total
-  weighted loss, parts dict of (V,) component losses), all premultiplied by
-  alpha (matches fit_gsplat.py's convention: bg stays black on both sides)."""
-  pred_c = rearrange(pred_rgb * pred_alpha, "v h w c -> v c h w")
-  gt_c = rearrange(gt_rgb * gt_alpha, "v h w c -> v c h w")
-  l1 = (pred_c - gt_c).abs().mean(dim=(1, 2, 3))
-  dssim = 1.0 - ssim_map(pred_c, gt_c, window).mean(dim=(1, 2, 3))
-  mask_l1 = (pred_alpha - gt_alpha).abs().mean(dim=(1, 2, 3))
-  per_view = (
-    cfg_loss.l1_weight * l1 + cfg_loss.ssim_weight * dssim + cfg_loss.mask_weight * mask_l1
-  )
-  return per_view, {"l1": l1, "ssim": dssim, "mask": mask_l1}
 
 
 def compute_direct_loss(gauss, gt, hit, cfg_loss, device):
@@ -453,97 +388,6 @@ def compute_direct_loss(gauss, gt, hit, cfg_loss, device):
 
 
 # ---------------------------------------------------------------------------
-# orbit previews
-#
-# The model's Gaussians live entirely in the source view's own camera frame
-# (see gs_dataset.py's module docstring) -- there's no Blender world frame
-# available to orbit around. To still get a non-tumbling turntable, we derive
-# a stable "up" direction by taking Blender's world +Z and expressing it in
-# that same source-camera frame via the view's own (otherwise-unused) raw
-# pose, then build the orbit entirely within that frame using the same
-# look_at_c2w/OPENGL_TO_OPENCV convention as the rest of the render path.
-# ---------------------------------------------------------------------------
-
-def _up_in_source_frame(pose_gl):
-  """pose_gl: (4,4) camera-to-world, Blender/OpenGL axes (a view's raw,
-  un-transformed pose). Returns Blender's world +Z direction expressed in
-  this camera's own OpenCV frame (the frame flatten_gaussians' `means` live
-  in), via the same axis flip debug_pointcloud.py/gs_dataset.py use
-  elsewhere (self-inverse, so it applies the same in either direction)."""
-  r_gl = pose_gl[:3, :3]
-  up_gl = r_gl.T @ np.array([0.0, 0.0, 1.0], dtype=np.float32)
-  up_cv = up_gl * np.array([1.0, -1.0, -1.0], dtype=np.float32)
-  return up_cv / (np.linalg.norm(up_cv) + 1e-8)
-
-
-def _orbit_c2w_gl(means, up, num_frames, elevation_deg):
-  """Closed circular orbit (OpenGL local axes, matching look_at_c2w) around
-  `means`'s centroid, entirely within `means`'s own frame, at the SAME
-  distance the real source camera was from the object.
-
-  This deliberately does not fit a "nicely framed" distance to the means'
-  bounding sphere (orbit_video.py's approach, meant for arbitrary/unknown-
-  scale 3DGS models): our Gaussians are anchored one-per-source-pixel, so
-  their scale only covers the point spacing produced at that original
-  capture distance/resolution. A tighter-fit orbit camera zooms in past that
-  native density and exposes the gaps between neighboring Gaussians as a
-  fine grid/moire artifact -- confirmed by comparing against a render at the
-  actual capture distance, which shows no such pattern. The real camera sat
-  at this frame's own origin (see gs_dataset.py), so the distance is just
-  the centroid's norm -- no separate bookkeeping needed."""
-  center = means.mean(axis=0)
-  up = up / (np.linalg.norm(up) + 1e-8)
-
-  # azimuth=0 reference: from the object back toward where the real camera
-  # was (its own frame's origin), projected off the up axis -- an arbitrary
-  # but recognizable, non-degenerate starting angle.
-  ref = -center
-  ref = ref - np.dot(ref, up) * up
-  if np.linalg.norm(ref) < 1e-6:
-    arbitrary = np.array([1.0, 0.0, 0.0], np.float32)
-    if abs(np.dot(arbitrary, up)) > 0.99:
-      arbitrary = np.array([0.0, 1.0, 0.0], np.float32)
-    ref = arbitrary - np.dot(arbitrary, up) * up
-  ref = ref / np.linalg.norm(ref)
-  right = np.cross(up, ref)
-
-  dist = max(float(np.linalg.norm(center)), 1e-3)
-  elev = np.radians(float(elevation_deg))
-  azimuths = np.linspace(0.0, 2 * np.pi, int(num_frames), endpoint=False)
-
-  poses = []
-  for az in azimuths:
-    eq_dir = ref * np.cos(az) + right * np.sin(az)
-    direction = eq_dir * np.cos(elev) + up * np.sin(elev)
-    eye = center + dist * direction
-    poses.append(look_at_c2w(eye, center, up=up))
-  return np.stack(poses).astype(np.float32)
-
-
-@ctl.contextmanager
-def _guarded_render(tag):
-  """Context manager: runs the wrapped block, catching CUDA OOM so a single
-  bad preview/validation render can't crash the whole training run. gsplat
-  has no built-in memory-budget/OOM-catch mechanism of its own -- an
-  outlier Gaussian scale (e.g. from an undertrained network early in
-  training) can blow up isect_tiles' allocation regardless of what else is
-  using the GPU (confirmed against gsplat's own GitHub issues #464/#487:
-  same failure mode, same root cause -- excessive Gaussian volume -- no
-  upstream fix). Only used at preview/validation call sites (render_orbit,
-  the orbit panel log, validation_step) where skipping one frame is safe
-  and correct -- NOT in the main training step, where an OOM mid-step
-  should still surface loudly rather than silently dropping an optimizer
-  step. Callers pre-initialize their result variable to a fallback (e.g.
-  None) BEFORE the `with` block and assign it from inside -- if a CUDA OOM
-  fires, that assignment is simply never reached and the fallback stands."""
-  try:
-    yield
-  except torch.OutOfMemoryError as e:
-    log.warning("%s: CUDA OOM during render, skipping this frame -- %s", tag, e)
-    torch.cuda.empty_cache()
-
-
-# ---------------------------------------------------------------------------
 # training loop
 # ---------------------------------------------------------------------------
 
@@ -608,10 +452,9 @@ class GSDataModule(pl.LightningDataModule):
         self.val_ds = _EmptyDataset()
     elif cfg.data.photom_h5_val is not None:
       # Multi-scene training with an external validation corpus: bypass
-      # split_by_mesh/photom_val_fraction entirely and use the WHOLE
-      # photom_h5 catalog for train_ds -- photom_val_fraction becomes a
-      # no-op here (logged in main()'s config-validation block, not
-      # silently swallowed).
+      # data.split_fn entirely and use the WHOLE photom_h5 catalog for
+      # train_ds -- data.split_fn becomes a no-op here (logged in main()'s
+      # config-validation block, not silently swallowed).
       catalog = H5Catalog(
         cfg.data.photom_h5,
         H5Catalog.path().alias("path"),
@@ -631,24 +474,8 @@ class GSDataModule(pl.LightningDataModule):
         H5Catalog.dataset("mesh_index").alias("mesh_id"),
       )
 
-      if (
-          int(cfg.data.photom_val_fraction_mesh is not None)
-        + int(cfg.data.photom_val_fraction_view is not None)
-      ) != 1:
-        raise RuntimeError()
-
-      if cfg.data.photom_val_fraction_mesh is not None:
-        train_catalog, val_catalog = split_by_mesh(
-          catalog,
-          val_fraction=cfg.data.photom_val_fraction_mesh,
-          seed=cfg.seed,
-        )
-      if cfg.data.photom_val_fraction_view is not None:
-        train_catalog, val_catalog = split_by_view(
-          catalog,
-          val_fraction=cfg.data.photom_val_fraction_view,
-          seed=cfg.seed,
-        )
+      split_fn = hydra.utils.instantiate(cfg.data.split_fn)
+      train_catalog, val_catalog = split_fn(catalog, seed=cfg.seed)
 
       self.train_ds = GSPairDataset(
         train_catalog, num_layers=cfg.data.num_layers, num_target_views=cfg.data.num_target_views,
@@ -659,7 +486,7 @@ class GSDataModule(pl.LightningDataModule):
         seed=cfg.seed, deterministic_targets=True,
       )
     if len(self.train_ds) == 0:
-      raise SystemExit("train split is empty -- check data.photom_h5 / data.photom_val_fraction")
+      raise SystemExit("train split is empty -- check data.photom_h5 / data.split_fn")
 
   def train_dataloader(self):
     return DataLoader(
@@ -683,10 +510,11 @@ class GSLightningModule(pl.LightningModule):
   def __init__(self, cfg):
     super().__init__()
     self.cfg = cfg
+    self.views_seen = 0
 
     with timed("build_model"):
       self.model = GSModel(cfg)
-    self.register_buffer("window", _gaussian_window(), persistent=False)
+    self.dssim = DSSIMLoss(reduction="none")
 
     # One directory for everything this run produces (currently just
     # checkpoints, but named generically for whatever else lands here later
@@ -697,15 +525,25 @@ class GSLightningModule(pl.LightningModule):
     os.makedirs(self.output_dir, exist_ok=True)
 
   def configure_optimizers(self):
-    optim = hydra.utils.instantiate(self.cfg.optim)(self.model.parameters())
-    sched = hydra.utils.instantiate(self.cfg.sched)(optim)
-    return {
-      "optimizer": optim,
-      "lr_scheduler": {
-        "scheduler": sched,
+    out = {}
+
+    out["optimizer"] = hydra.utils.instantiate(self.cfg.optim)(self.model.parameters())
+    if OmegaConf.select(self.cfg, "sched") is not None:
+      out["lr_scheduler"] = {
+        "scheduler": hydra.utils.instantiate(self.cfg.sched)(out["optimizer"]),
         "interval": "step",
       }
-    }
+
+    return out
+
+  def on_save_checkpoint(self, checkpoint):
+    # views_seen is a plain Python int, not part of state_dict() -- persist
+    # it explicitly so it keeps climbing (not resetting to 0) across resume.
+    checkpoint["views_seen"] = self.views_seen
+
+  def on_load_checkpoint(self, checkpoint):
+    # .get: checkpoints written before this hook existed have no such key.
+    self.views_seen = checkpoint.get("views_seen", 0)
 
   def training_step(self, batch, batch_idx):
     return self._step("train", batch, batch_idx)
@@ -717,6 +555,7 @@ class GSLightningModule(pl.LightningModule):
     B = batch["batch_size"]
     _, V, *_ = batch["views"]["rgb"].shape
 
+    @ft.wraps(self.log)
     def _log(key, *args, **kwargs):
       self.log(f"{stage}/{key}", *args, **kwargs, batch_size=B)
 
@@ -728,6 +567,10 @@ class GSLightningModule(pl.LightningModule):
       or cfg.loss.photom.ssim_weight > 0
       or cfg.loss.photom.mask_weight > 0
     )
+
+    if stage == "train":
+      self.views_seen += B * V
+    self.log("views_seen", self.views_seen, reduce_fx="max")
 
     # forward pass
     model_pred = model_forward(self.model, batch, need_render=need_render, device=device)
@@ -769,7 +612,7 @@ class GSLightningModule(pl.LightningModule):
 
     ## D-SSIM Loss
     if cfg.loss.photom.dssim_weight > 0:
-      _photom_dssim = 1.0 - g(ssim_map(f(pred_rgb), f(gt_rgb), self.window)) # (B,V,C,H,W)
+      _photom_dssim = g(self.dssim(f(pred_rgb), f(gt_rgb))) # (B,V,C,H,W)
       _splatter_metric("loss/photom_dssim", _photom_dssim)
       loss = loss + cfg.loss.photom.dssim_weight * _photom_dssim.mean()
 
@@ -808,226 +651,110 @@ class GSLightningModule(pl.LightningModule):
 
     return out
 
+  def _preview_entry(self, item):
+    """One stage's {"gauss","scene_scale","views"} entry for
+    get_preview_source() below, computed from a SINGLE fixed dataset item
+    (train_ds[0], or val_ds[0] for the "val" stage) via this model's own
+    forward pass -- in true WORLD space, for module.PanelCallback's
+    [GT | render | |diff|] panel and module.OrbitCallback's turntable
+    video.
 
-class OrbitCallback(pl.Callback):
-  def __init__(
-    self,
-    *,
-    every_n_epochs: int,
-    num_frames: int,
-    fps: int,
-    crf: int,
-    elevation_deg: float,
-  ):
-    self.every_n_epochs = every_n_epochs
-    self.num_frames = num_frames
-    self.fps = fps
-    self.crf = crf
-    self.elevation_deg = elevation_deg
+    The model's own Gaussians are natively predicted in the source view's
+    own camera frame (see gs_dataset.py's module docstring -- there's no
+    Blender world frame available to the model itself, by design, since it
+    has to work from a single image with no other scene context). But THIS
+    item is a real dataset row with a real recorded camera pose
+    (source.pose_gl), so -- purely for this preview/orbit purpose, not
+    anything the model itself relies on -- everything below is transformed
+    into true Blender world space using that one known pose:
+      - Gaussian means: gs_dataset._check_ground_truth_consistency's own
+        reprojection formula (already proven there against real ground
+        truth, ~1e-5 error).
+      - Gaussian quats: gs_dataset.rotate_quats_wxyz, the inverse direction
+        of what _load_ground_truth uses (that rotates world->camera; this
+        is camera->world).
+      - The whole supervision-set viewmats: recovered algebraically from
+        that same pose and the existing source-relative viewmats
+        (gs_dataset.relative_viewmats) -- world_viewmat[i] == viewmat[i] @
+        inv(source_c2w_cv) -- no change to gs_dataset.py needed, target
+        views' raw poses were never stored and don't need to be.
+    This is what lets module.OrbitCallback stay fully generic: it never
+    has to know this source-camera-frame-vs-world distinction exists.
 
-    self.train_batch = None
-    self.val_batch = None
-    self.workdir = None
+    NOTE(andrei): Not sure if setting model to eval is the right move here,
+    but gonna do it for now."""
+    batch = collate_with_batch_size([item])
+    device = self.device
+    with set_mode(self.model, "eval"), torch.no_grad():
+      gauss = self.model(
+        batch["views"]["rgb"][:, 0].to(device),
+        batch["source"]["xyz_cam"].to(device),
+      )
+      flat = next(flatten_gaussians(
+        batch["batch_size"], gauss,
+        batch["source"]["xyz_cam"].to(device), batch["source"]["hit"].to(device),
+      ))
+    flat["sh_degree"] = self.model.max_sh_degree
 
-  def on_fit_start(self, trainer, pl_module):
-    dm = trainer.datamodule
-    self.train_batch = collate_with_batch_size([dm.train_ds[0]])
-    self.val_batch = collate_with_batch_size([dm.val_ds[0]]) if len(dm.val_ds) > 0 else None
-    self.workdir = tempfile.mkdtemp(prefix="gs_orbit_")
+    # world <- source-camera-frame, from this item's own known real pose.
+    pose_gl_np = batch["source"]["pose_gl"][0].numpy()
+    c2w_cv = pose_gl_np @ OPENGL_TO_OPENCV
 
-  def on_train_epoch_end(self, trainer, pl_module):
-    return self._on_epoch_end("train", trainer, pl_module)
+    means_np = flat["means"].detach().cpu().numpy()
+    means_h = np.concatenate([means_np, np.ones((len(means_np), 1), np.float32)], axis=-1)
+    flat["means"] = torch.from_numpy((means_h @ c2w_cv.T)[:, :3].astype(np.float32)).to(device)
 
-  def on_validation_epoch_end(self, trainer, pl_module):
-    return self._on_epoch_end("val", trainer, pl_module)
+    quats_np = flat["quats"].detach().cpu().numpy()
+    quats_world = rotate_quats_wxyz(quats_np, c2w_cv[:3, :3])
+    flat["quats"] = torch.from_numpy(quats_world.astype(np.float32)).to(device)
 
-  def _render_orbit(self, model, batch, device):
-    """Renders a turntable orbit of `item`'s source-view Gaussians. Returns a
-    generator of (H,W,3) uint8 frames, or None if the source view seeded zero
-    Gaussians (nothing to show) or the render hit a CUDA OOM (see
-    _guarded_render)."""
+    v = batch["views"]
+    viewmat_np = v["viewmat"][0].numpy()               # (V,4,4), source-relative
+    world_viewmat = viewmat_np @ np.linalg.inv(c2w_cv)  # (V,4,4), true world-to-camera
 
-    B = batch["batch_size"]
+    return {
+      "gauss": flat,
+      # scene_scale: the source camera's own real distance from the world
+      # origin -- module.OrbitCallback's orbit radius (matches
+      # fit_gsplat.py's own scene_scale: norm of a capture camera's own
+      # world position).
+      "scene_scale": float(np.linalg.norm(pose_gl_np[:3, 3])) or 1.0,
+      "views": {
+        "viewmat": torch.from_numpy(world_viewmat.astype(np.float32)).to(device),
+        "K": v["K_image"][0].to(device),
+        "width": v["rgb"].shape[-1],
+        "height": v["rgb"].shape[-2],
+        "gt_rgb": v["rgb"][0].to(device),
+      },
+    }
 
-    model_pred = model_forward(model, batch, device=device)
-    _b, _v, _c, ih, iw = batch["views"]["rgb"].shape
+  def get_preview_source(self, mode):
+    """{"train": entry, "val": entry-or-None} for module.PanelCallback/
+    OrbitCallback -- see module.py's own comment block for the full
+    contract. Unlike fit_gsplat.py's version, train and val here are NOT
+    the same Gaussians rendered against different views -- the model
+    predicts an entirely different Gaussian set per forward-passed item,
+    so each stage gets its own full _preview_entry() call (own gauss, own
+    scene_scale, own views), from a fixed dataset item (train_ds[0], or
+    val_ds[0] for "val").
 
-    # TODO: Ground truth override
-    # gauss = apply_ground_truth_overrides(gauss, gt, hit, predict_params, device)
+    mode picks both the cache granularity (epoch: once per
+    self.current_epoch; step: once per self.trainer.global_step) and
+    whether "val" is computed at all -- skipped (left None) in epoch mode
+    even when a val split exists, since nothing pulls it there (see
+    module.PanelCallback._step) -- this avoids the extra forward pass on
+    every epoch-cadence tick when it's not needed."""
+    key = (mode, self.current_epoch if mode == "epoch" else self.trainer.global_step)
+    if getattr(self, "_preview_cache_key", None) == key:
+      return self._preview_cache
 
-    frames = None
-    with _guarded_render("orbit render"), torch.no_grad():
-      # TODO: Actually properly support batch size > 1
-      for (
-        x_gauss_flat,
-        x_pose_gl,
-        x_K_image,
-      ) in zip(
-        flatten_gaussians(
-          B,
-          model_pred["gauss"],
-          batch["source"]["xyz_cam"].to(device),
-          batch["source"]["hit"].to(device),
-        ),
-        batch["source"]["pose_gl"],
-        batch["views"]["K_image"][:,0],
-      ):
-        means_np = x_gauss_flat["means"].detach().cpu().numpy()
-        up = _up_in_source_frame(x_pose_gl.numpy())
-        poses_gl = _orbit_c2w_gl(means_np, up, self.num_frames, self.elevation_deg)
-        c2w_cv = poses_gl @ OPENGL_TO_OPENCV
-        viewmats = torch.from_numpy(np.linalg.inv(c2w_cv).astype(np.float32)).to(device)
-        # ks = src["K_image"].to(device)[None].expand(len(poses_gl), -1, -1)
-        ks = repeat(x_K_image.to(device), "... -> b ...", b=len(poses_gl))
-
-        rgb_out, _, _ = gsplat.rasterization(
-          means=x_gauss_flat["means"],
-          quats=x_gauss_flat["quats"],
-          scales=x_gauss_flat["scales"],
-          opacities=x_gauss_flat["opacities"],
-          colors=x_gauss_flat["colors"],
-          viewmats=viewmats,
-          Ks=ks,
-          width=int(iw),
-          height=int(ih),
-          sh_degree=model.max_sh_degree,
-          render_mode="RGB",
-          packed=True,
-        )
-        rgb_np = (rgb_out.clamp(0.0, 1.0).cpu().numpy() * 255).astype(np.uint8)
-    frames = [rgb_np[i] for i in range(rgb_np.shape[0])]
-    return frames
-
-  def _on_epoch_end(self, stage, trainer, pl_module):
-    # Count of COMPLETED epochs (Lightning hasn't bumped trainer.current_epoch
-    # yet at this point in the hook) -- "every_n_epochs=1" means "every
-    # epoch", matching conf/train_gs.yaml's comment on that field.
-    epoch = trainer.current_epoch + 1
-    if epoch % self.every_n_epochs != 0:
-      return
-    model = pl_module.model
-    device = pl_module.device
-
-    wandb_run = pl_module.logger.experiment if pl_module.logger is not None else None
-    if wandb_run is None:
-      return
-
-    # NOTE(andrei): Not sure if setting model to eval is the right move here,
-    # but gonna do it for now.
-    with set_mode(model, "eval"), timed(f"orbit@epoch{epoch}"):
-      match stage:
-        case "train":
-          batch = self.train_batch
-        case "val":
-          batch = self.val_batch
-        case _:
-          raise RuntimeError(f"Unexpected {stage=}")
-
-      if batch is None:
-        return
-
-      frames = self._render_orbit(model, batch, device)
-
-      if frames is None:
-        return
-
-      # NOMERGE: ideally the rendering would be the same as orbit_video.py
-      tag = f"{stage}/orbit"
-      path = os.path.join(self.workdir, f"{tag.replace('/', '_')}.mp4")
-      write_mp4(frames, path, self.fps, self.crf)
-      wandb_run.log({tag: wandb.Video(path, caption=tag, format="mp4")})
-
-  def on_fit_end(self, trainer, pl_module):
-    if self.workdir is not None:
-      shutil.rmtree(self.workdir, ignore_errors=True)
-      self.workdir = None
-
-
-# ---------------------------------------------------------------------------
-# wandb image panels
-# ---------------------------------------------------------------------------
-
-def _val_panel(gt_rgb, pred_rgb):
-  """
-  gt_rgb/pred_rgb: (N,3,H,W) in [0,1].
-  Returns one uint8 (H, V*3*W, 3) image: for each view, [GT | render | |diff|] side by side.
-  """
-  n = gt_rgb.shape[0]
-  rows = []
-  for i in range(n):
-    g = (gt_rgb[i].detach().cpu() * 255).to(torch.uint8)
-    r = (pred_rgb[i].detach().cpu() * 255).to(torch.uint8)
-    d = ((gt_rgb[i] - pred_rgb[i].detach().cpu()).abs() * 255).to(torch.uint8)
-    rows.append(pack([g, r, d], "c * w")[0])
-  return pack(rows, "c h *")[0]
-
-
-class ViewPanelCallback(pl.Callback):
-  def __init__(
-    self,
-    *,
-    every_n_epochs: int,
-  ):
-    self.every_n_epochs = every_n_epochs
-
-    self.train_batch = None
-    self.val_batch = None
-
-  def on_fit_start(self, trainer, pl_module):
-    dm = trainer.datamodule
-    self.train_batch = collate_with_batch_size([dm.train_ds[0]])
-    self.val_batch = collate_with_batch_size([dm.val_ds[0]]) if len(dm.val_ds) > 0 else None
-
-  def on_train_epoch_end(self, trainer, pl_module):
-    return self._on_epoch_end("train", trainer, pl_module)
-
-  def on_validation_epoch_end(self, trainer, pl_module):
-    return self._on_epoch_end("val", trainer, pl_module)
-
-  def _on_epoch_end(self, stage, trainer, pl_module):
-    # Count of COMPLETED epochs (Lightning hasn't bumped trainer.current_epoch
-    # yet at this point in the hook) -- "every_n_epochs=1" means "every
-    # epoch", matching conf/train_gs.yaml's comment on that field.
-    epoch = trainer.current_epoch + 1
-    if epoch % self.every_n_epochs != 0:
-      return
-    model = pl_module.model
-    device = pl_module.device
-
-    wandb_run = pl_module.logger.experiment if pl_module.logger is not None else None
-    if wandb_run is None:
-      return
-
-    # NOTE(andrei): Not sure if setting model to eval is the right move here,
-    # but gonna do it for now.
-    with set_mode(model, "eval"), timed(f"view_panel@epoch{epoch}"):
-      match stage:
-        case "train":
-          batch = self.train_batch
-        case "val":
-          batch = self.val_batch
-        case _:
-          raise RuntimeError(f"Unexpected {stage=}")
-
-      if batch is None:
-        return
-
-      model_pred = None
-      with _guarded_render(f"{stage}/orbit panel"), torch.no_grad():
-        model_pred = model_forward(model, batch, need_render=True, device=device)
-
-      pred_rgb = rearrange(model_pred["rgb"]    , "b v ... -> (b v) ...")
-      gt_rgb   = rearrange(batch["views"]["rgb"], "b v ... -> (b v) ...")
-
-      wandb_run.log({
-        f"{stage}/panel": wandb.Image(
-          _val_panel(gt_rgb, pred_rgb),
-          caption="GT | render | |diff|, one row per view (source first, then targets)",
-        ),
-      })
-
-
-OmegaConf.register_new_resolver("eval", eval)
+    val_ds = self.trainer.datamodule.val_ds
+    source = {
+      "train": self._preview_entry(self.trainer.datamodule.train_ds[0]),
+      "val": self._preview_entry(val_ds[0]) if mode == "step" and len(val_ds) > 0 else None,
+    }
+    self._preview_cache_key, self._preview_cache = key, source
+    return source
 
 
 @hydra.main(version_base=None, config_path="conf", config_name="train_gs")
@@ -1058,7 +785,7 @@ def main(cfg: DictConfig) -> None:
 
   if cfg.data.photom_h5_val is not None and cfg.data.fixed_source_view is None:
     log.info(
-      "data.photom_h5_val set -- data.photom_val_fraction is ignored, the full "
+      "data.photom_h5_val set -- data.split_fn is ignored, the full "
       "training corpus is used for train_ds.")
   # A real (nonempty, force_render=True) val_ds gets built either from
   # data.photom_h5_val directly, or -- when that's unset -- as a fallback
@@ -1162,7 +889,7 @@ def main(cfg: DictConfig) -> None:
     callbacks=callbacks,
   )
   with timed("train"):
-    trainer.fit(model, datamodule=datamodule)
+    trainer.fit(model, datamodule=datamodule, ckpt_path=cfg.ckpt_path)
 
 
 if __name__ == "__main__":

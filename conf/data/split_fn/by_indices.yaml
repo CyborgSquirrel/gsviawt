@@ -1,0 +1,14 @@
+# Explicit train/val row indices instead of a random fraction -- e.g. to
+# reproduce one specific split, or hand-pick which scenes are held out. No
+# defaults for train_idx/val_idx (??? -- Hydra silently drops an unset ???
+# from this _partial_, so it doesn't error at instantiate() time, but the
+# resulting partial then raises a plain TypeError ("missing 2 required
+# positional arguments") the moment GSDataModule.setup() calls it -- still
+# fails loudly, just one call later. Set both explicitly, e.g.
+# data.split_fn.train_idx='[0,1,2]' data.split_fn.val_idx='[3,4]'). See
+# gs_dataset.split_by_indices's own docstring, including what `strict` checks.
+_target_: gs_dataset.split_by_indices
+_partial_: true
+train_idx: ???
+val_idx: ???
+strict: true
