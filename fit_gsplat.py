@@ -52,41 +52,13 @@ import sys
 import sysconfig
 import tempfile
 
-
-def _setup_cuda_toolchain() -> None:
-  """Make the pip-installed CUDA toolkit (`nvidia-cuda-nvcc` etc.) usable by
-  gsplat's `torch.utils.cpp_extension` JIT build: export CUDA_HOME / PATH and
-  add the `libcudart.so` dev symlink the linker's `-lcudart` needs (the wheel
-  ships only `libcudart.so.13`). No-ops cleanly if the layout isn't there or a
-  system CUDA is already configured."""
-  if os.environ.get("CUDA_HOME") and os.path.exists(
-      os.path.join(os.environ["CUDA_HOME"], "bin", "nvcc")):
-    return
-  for libdir in {sysconfig.get_paths()["purelib"], sysconfig.get_paths()["platlib"]}:
-    cuda_home = os.path.join(libdir, "nvidia", "cu13")
-    if not os.path.exists(os.path.join(cuda_home, "bin", "nvcc")):
-      continue
-    os.environ["CUDA_HOME"] = cuda_home
-    os.environ["PATH"] = os.path.join(cuda_home, "bin") + os.pathsep + os.environ.get("PATH", "")
-    lib = os.path.join(cuda_home, "lib")
-    link, real = os.path.join(lib, "libcudart.so"), os.path.join(lib, "libcudart.so.13")
-    if os.path.exists(real) and not os.path.exists(link):
-      try:
-        os.symlink("libcudart.so.13", link)
-      except OSError:
-        pass
-    return
-
-
-_setup_cuda_toolchain()
-
-import h5py  # noqa: E402
-import hydra  # noqa: E402
-import numpy as np  # noqa: E402
-from einops import rearrange, reduce, repeat  # noqa: E402
-import torch  # noqa: E402
-import torch.nn.functional as F  # noqa: E402
-from omegaconf import DictConfig, OmegaConf  # noqa: E402
+import h5py
+import hydra
+import numpy as np
+import torch
+import torch.nn.functional as F
+from einops import rearrange, reduce, repeat
+from omegaconf import DictConfig, OmegaConf
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from debug_pointcloud import unproject_depth_peel  # noqa: E402

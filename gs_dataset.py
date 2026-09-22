@@ -282,8 +282,12 @@ def _read_view(f, path, view_idx, k_depth_name, k_image_name):
     alpha = (depth_peel[..., 0] > 0).astype(np.float32)
 
   return {
-    "rgb": rgb, "alpha": alpha, "pose": pose,
-    "K_depth": K_depth, "K_image": K_image, "depth_peel": depth_peel,
+    "rgb": rgb,
+    "alpha": alpha,
+    "pose": pose,
+    "K_depth": K_depth,
+    "K_image": K_image,
+    "depth_peel": depth_peel,
   }
 
 
@@ -321,20 +325,23 @@ def _assemble_item(src, targets, num_layers, mesh_id, source_view, target_views)
       f"source view {source_view}: depth_peel has {hit.shape[-1]} "
       f"layers, expected num_layers={num_layers}")
 
-  poses = np.stack([src["pose"]] + [t["pose"] for t in targets], axis=0)
+  poses = np.stack([src["pose"], *(t["pose"] for t in targets)], axis=0)
   viewmats = relative_viewmats(poses)   # (1+k, 4, 4), viewmats[0] == eye(4)
 
   def to_view_dict(v, viewmat):
     return {
-      "rgb": rearrange(torch.from_numpy(v["rgb"]), "h w c -> c h w").contiguous(),  # (3,H,W)
-      "alpha": torch.from_numpy(v["alpha"])[None],                       # (1,H,W)
-      "K_image": torch.from_numpy(v["K_image"]),                        # (3,3)
-      "viewmat": torch.from_numpy(viewmat),                             # (4,4)
+      "rgb": rearrange(torch.from_numpy(v["rgb"]), "h w c -> c h w").contiguous(),
+      "alpha": rearrange(torch.from_numpy(v["alpha"]), "h w -> 1 h w"),
+      "K_image": torch.from_numpy(v["K_image"]),    # (3,3)
+      "viewmat": torch.from_numpy(viewmat),         # (4,4)
     }
 
   return {
+    "views": torch.utils.data.default_collate([
+      to_view_dict(v, viewmat)
+      for v, viewmat in zip([src, *targets], viewmats)
+    ]),
     "source": {
-      **to_view_dict(src, viewmats[0]),
       "xyz_cam": rearrange(torch.from_numpy(xyz_cam), "h w l c -> l h w c").contiguous(),  # (L,H,W,3)
       "hit": rearrange(torch.from_numpy(hit), "h w l -> l h w").contiguous(),              # (L,H,W)
       "K_depth": torch.from_numpy(src["K_depth"]),
@@ -343,7 +350,6 @@ def _assemble_item(src, targets, num_layers, mesh_id, source_view, target_views)
                                                            # "up" direction for orbit previews
                                                            # (train_gs.py); not used in training.
     },
-    "targets": [to_view_dict(t, viewmats[1 + i]) for i, t in enumerate(targets)],
     "mesh_index": mesh_id,
     "source_view": int(source_view),
     "target_views": [int(v) for v in target_views],
@@ -494,6 +500,9 @@ class GSPairDataset(Dataset):
 
   def __init__(self, catalog: H5Catalog, num_layers=6, num_target_views=3, seed=42,
               deterministic_targets=False):
+    self.source_view = 0
+    self.target_views = tuple(range(1, num_target_views+1))
+
     self.catalog = catalog
     self.num_layers = num_layers
     self.num_target_views = num_target_views
@@ -531,11 +540,11 @@ class GSPairDataset(Dataset):
     # sample instead of first filtering it out of the whole (possibly much
     # larger) views list -- avoids an O(len(views)) scan every call.
     k = min(self.num_target_views, len(views) - 1)
-    if k > 0:
+    if k <= 0:
+      target_views = []
+    else:
       sampled = rng.sample(views, k + 1)
       target_views = [v for v in sampled if v != source_view][:k]
-    else:
-      target_views = []
 
     return _build_item(f, path, source_view, target_views, self.num_layers, mesh_id)
 
