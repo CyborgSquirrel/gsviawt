@@ -3,7 +3,8 @@
 # render_objaverse.py-schema HDF5 files. See train_gs.py's module docstring.
 
 # Directory for everything a single run produces.
-output_dir: 3dgs-model-${now:%s}
+output_dirname: 3dgs-model-${now:%Y-%m-%d_%H-%M-%S}
+output_dir: outputs/${output_dirname}
 
 seed: 42
 
@@ -13,7 +14,9 @@ data:
   photom_h5: /app/bla/lite_blackbg.h5   # str, list, or glob(s) -- render_objaverse.py-schema
   num_layers: 6                         # must match the file(s)' depth_peel layer count
   num_target_views: 3                   # extra supervision views per step, alongside self-render
-  photom_val_fraction: 0.1              # fraction of MESH GROUPS held out (0 = pure overfit)
+  photom_val_fraction_mesh: null
+  photom_val_fraction_view: null
+
   # Single-batch overfit mode (fit_gsplat.py's primary/secondary terms
   # applied here): if set, train on this EXACT source+target view set every
   # step, no resampling at all (ignores num_target_views/photom_val_fraction).
@@ -141,27 +144,31 @@ loss:
 
 callbacks:
   # https://pytorch-lightning.readthedocs.io/en/2.6.1/pytorch/api/lightning.pytorch.callbacks.LearningRateMonitor.html
-  - _target_: lightning.pytorch.callbacks.LearningRateMonitor
+  lr_monitor:
+    _target_: lightning.pytorch.callbacks.LearningRateMonitor
 
   # https://lightning.ai/docs/pytorch/stable/optional-api/api/lightning.pytorch.callbacks.ModelCheckpoint
-  - _target_: lightning.pytorch.callbacks.ModelCheckpoint
+  checkpoint:
+    _target_: lightning.pytorch.callbacks.ModelCheckpoint
     dirpath: ${output_dir}
     filename: "model-{epoch}-{step}"
-    every_n_epochs: ${div_floor:${trainer.max_epochs},10}
+    every_n_epochs: ${eval:'${trainer.max_epochs} // 10'}
     save_last: true
     save_on_exception: true
     save_weights_only: false
 
-  - _target_: __main__.OrbitCallback
-    every_n_epochs: ${div_floor:${trainer.max_epochs},50}
+  orbit:
+    _target_: __main__.OrbitCallback
+    every_n_epochs: ${eval:'${trainer.max_epochs} // 50'}
     num_frames: 24
     fps: 12
     crf: 28                    # x264 quality (higher = smaller/faster; fine for monitoring)
     elevation_deg: 20.0        # camera distance = the actual source view's own capture distance,
                                 # not a re-fit bounding-sphere framing -- see train_gs._orbit_c2w_gl
 
-  - _target_: __main__.ViewPanelCallback
-    every_n_epochs: ${div_floor:${trainer.max_epochs},50}
+  view_panel:
+    _target_: __main__.ViewPanelCallback
+    every_n_epochs: ${eval:'${trainer.max_epochs} // 50'}
 
 loader:
   batch_size: 1
@@ -185,19 +192,20 @@ optim:
   lr: 1e-4
 
 sched:
-  min_lr: 1.0e-6            # cosine floor (never fully reaches 0, avoids a dead-flat tail)
-  warmup_steps: 200         # linear warmup 0 -> lr, then cosine decay lr -> min_lr over the
-                              # derived total step count (see max_epochs above)
-  grad_clip_norm: 1.0
+  _target_: __main__.WarmupCosineAnnealingLR
+  _partial_: true
+  total_steps: ${total_steps}
+  warmup_steps: ${eval:'int(${total_steps} * 0.05)'}
+  min_lr: 1.0e-6
 
 wandb:
   project: gsviawt
   mode: online                # online | offline | disabled
   tags: []
-  name: ${output_dir}
+  name: ${output_dirname}
 
 hydra:
   job:
     chdir: false
   run:
-    dir: outputs/train_gs/${now:%Y-%m-%d_%H-%M-%S}
+    dir: ${output_dirname}

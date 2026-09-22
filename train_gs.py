@@ -25,15 +25,11 @@ gsplat JIT-compiles CUDA kernels on first import; see _setup_cuda_toolchain
 """
 
 import contextlib as ctl
-import itertools as itt
 import logging
-import math
 import os
 import shutil
 import sys
-import sysconfig
 import tempfile
-import time
 
 import gsplat
 import hydra
@@ -42,9 +38,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import pack, rearrange, reduce, repeat
+from einops import pack, rearrange, repeat
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import DictConfig, OmegaConf, open_dict
+from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 
 import wandb
@@ -53,14 +50,43 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
 from fit_gsplat import SH_C0  # noqa: E402
 from gs_dataset import (OPENGL_TO_OPENCV, GaussH5ValDataset,  # noqa: E402
                         GSFixedViewsDataset, GSPairDataset, H5Catalog,
-                        _EmptyDataset, split_by_mesh)
+                        _EmptyDataset, split_by_mesh, split_by_view)
 from gs_decoder import GaussianResnetDecoder, GSDecoderStack  # noqa: E402
 from gs_encoder import GSResnetEncoder  # noqa: E402
 from orbit_video import look_at_c2w, write_mp4  # noqa: E402
 from util import collate_with_batch_size, pipe, set_mode, timed  # noqa: E402
 
-log = logging.getLogger("train_gs")
+log = logging.getLogger(__name__)
 
+
+class WarmupCosineAnnealingLR(torch.optim.lr_scheduler.SequentialLR):
+  def __init__(
+    self,
+    optimizer: Optimizer,
+    total_steps: int,
+    warmup_steps: int,
+    min_lr: float = 0.0,
+  ) -> None:
+    self.total_steps = int(total_steps)
+    self.warmup_steps = max(1, int(warmup_steps))
+    self.min_lr = float(min_lr)
+
+    warmup = torch.optim.lr_scheduler.LinearLR(
+      optimizer,
+      start_factor=1.0 / self.warmup_steps,
+      end_factor=1.0,
+      total_iters=self.warmup_steps,
+    )
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+      optimizer,
+      T_max=max(1, self.total_steps - self.warmup_steps),
+      eta_min=self.min_lr,
+    )
+    super().__init__(
+      optimizer,
+      schedulers=[warmup, cosine],
+      milestones=[self.warmup_steps],
+    )
 
 # ---------------------------------------------------------------------------
 # model
@@ -187,11 +213,11 @@ def model_forward(
       flatten_gaussians(
         B,
         out["gauss"],
-        batch["source"]["xyz_cam"],
-        batch["source"]["hit"],
+        batch["source"]["xyz_cam"].to(device),
+        batch["source"]["hit"].to(device),
       ),
     ):
-      _, _, ih, iw, *_ = batch["views"]["rgb"].shape
+      _b, _v, _c, ih, iw = batch["views"]["rgb"].shape
 
       x_pred_rgb, x_pred_alpha, _ = gsplat.rasterization(
         means=x_gauss_flat["means"],
@@ -207,6 +233,9 @@ def model_forward(
         render_mode="RGB",
         packed=True,
       )
+
+      x_pred_rgb   = rearrange(x_pred_rgb, "v h w c -> v c h w")
+      x_pred_alpha = rearrange(x_pred_rgb, "v h w c -> v c h w")
 
       pred_rgb.append(x_pred_rgb)
       pred_alpha.append(x_pred_alpha)
@@ -424,31 +453,6 @@ def compute_direct_loss(gauss, gt, hit, cfg_loss, device):
 
 
 # ---------------------------------------------------------------------------
-# wandb image panels
-# ---------------------------------------------------------------------------
-
-def _val_panel(gt_rgb, pred_rgb):
-  """gt_rgb/pred_rgb: (V,H,W,3) in [0,1]. Returns one uint8 (H, V*3*W, 3)
-  image: for each view, [GT | render | |diff|] side by side."""
-  v = gt_rgb.shape[0]
-  rows = []
-  for i in range(v):
-    g = (gt_rgb[i].detach().cpu().numpy() * 255).astype(np.uint8)
-    r = (pred_rgb[i].detach().cpu().numpy() * 255).astype(np.uint8)
-    d = ((gt_rgb[i] - pred_rgb[i]).abs().detach().cpu().numpy() * 255).astype(np.uint8)
-    rows.append(pack([g, r, d], "h * 3"))
-  return pack(rows, "* w 3")
-
-
-def _layer_opacity_panel(gauss):
-  """gauss["opacity"]: (L,1,H,W). Returns one uint8 (H, L*W) grayscale image,
-  one column per layer's mean opacity."""
-  op = gauss["opacity"][:, 0].detach().cpu().numpy()   # (L,H,W)
-  cols = [(op[l] * 255).astype(np.uint8) for l in range(op.shape[0])]
-  return np.concatenate(cols, axis=1)
-
-
-# ---------------------------------------------------------------------------
 # orbit previews
 #
 # The model's Gaussians live entirely in the source view's own camera frame
@@ -563,19 +567,6 @@ def _external_val_dataset(cfg):
 
 
 class GSDataModule(pl.LightningDataModule):
-  """Mechanical extraction of the dataset-construction branch that used to
-  live at the top of main(): single-batch overfit mode (GSFixedViewsDataset)
-  vs. multi-scene mode (H5Catalog + split_by_mesh + GSPairDataset). See this
-  module's docstring / gs_dataset.py for what each dataset type means. The
-  data.fixed_target_views / train.grad_accum_steps==1 SystemExit checks live
-  in main()'s config-validation block, not here -- see
-  train_gs_lightning_plan.md.
-
-  setup() is idempotent (guarded on self.train_ds): main() calls it once
-  explicitly, before GSLightningModule exists, to get len(train_ds) for the
-  derived LR-schedule step count (see main()); Lightning's own fit() flow
-  calls it again regardless, so it must be a no-op the second time."""
-
   def __init__(self, cfg):
     super().__init__()
     self.cfg = cfg
@@ -639,8 +630,26 @@ class GSDataModule(pl.LightningDataModule):
         H5Catalog.index().alias("view_idx"),
         H5Catalog.dataset("mesh_index").alias("mesh_id"),
       )
-      train_catalog, val_catalog = split_by_mesh(
-        catalog, val_fraction=cfg.data.photom_val_fraction, seed=cfg.seed)
+
+      if (
+          int(cfg.data.photom_val_fraction_mesh is not None)
+        + int(cfg.data.photom_val_fraction_view is not None)
+      ) != 1:
+        raise RuntimeError()
+
+      if cfg.data.photom_val_fraction_mesh is not None:
+        train_catalog, val_catalog = split_by_mesh(
+          catalog,
+          val_fraction=cfg.data.photom_val_fraction_mesh,
+          seed=cfg.seed,
+        )
+      if cfg.data.photom_val_fraction_view is not None:
+        train_catalog, val_catalog = split_by_view(
+          catalog,
+          val_fraction=cfg.data.photom_val_fraction_view,
+          seed=cfg.seed,
+        )
+
       self.train_ds = GSPairDataset(
         train_catalog, num_layers=cfg.data.num_layers, num_target_views=cfg.data.num_target_views,
         seed=cfg.seed, deterministic_targets=False,
@@ -689,21 +698,7 @@ class GSLightningModule(pl.LightningModule):
 
   def configure_optimizers(self):
     optim = hydra.utils.instantiate(self.cfg.optim)(self.model.parameters())
-
-    # Linear warmup -> cosine decay to min_lr, built from torch's own
-    # scheduler classes (LinearLR + CosineAnnealingLR chained via
-    # SequentialLR) rather than a hand-rolled LambdaLR closure.
-    warmup_steps = max(1, int(self.cfg.sched.warmup_steps))
-    warmup = torch.optim.lr_scheduler.LinearLR(
-      optim, start_factor=1.0 / warmup_steps, end_factor=1.0, total_iters=warmup_steps)
-    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-      optim, T_max=max(1, self.cfg.total_steps - warmup_steps), eta_min=float(self.cfg.sched.min_lr))
-    sched = torch.optim.lr_scheduler.SequentialLR(
-      optim, schedulers=[warmup, cosine], milestones=[warmup_steps])
-    # "interval"/"frequency" are automatic-optimization-only metadata -- under
-    # automatic_optimization=False we step `sched` ourselves (training_step),
-    # but returning it this way still lets Lightning checkpoint its
-    # state_dict alongside the optimizer's.
+    sched = hydra.utils.instantiate(self.cfg.sched)(optim)
     return {
       "optimizer": optim,
       "lr_scheduler": {
@@ -713,13 +708,14 @@ class GSLightningModule(pl.LightningModule):
     }
 
   def training_step(self, batch, batch_idx):
-    self._step("train", batch, batch_idx)
+    return self._step("train", batch, batch_idx)
 
   def validation_step(self, batch, batch_idx):
-    self._step("val", batch, batch_idx)
+    return self._step("val", batch, batch_idx)
 
   def _step(self, stage, batch, batch_idx):
     B = batch["batch_size"]
+    _, V, *_ = batch["views"]["rgb"].shape
 
     def _log(key, *args, **kwargs):
       self.log(f"{stage}/{key}", *args, **kwargs, batch_size=B)
@@ -735,7 +731,7 @@ class GSLightningModule(pl.LightningModule):
 
     # forward pass
     model_pred = model_forward(self.model, batch, need_render=need_render, device=device)
-    pred_rgb = model_pred["rgb"], 
+    pred_rgb = model_pred["rgb"]
     pred_alpha = model_pred["alpha"]
 
     # loss
@@ -754,7 +750,12 @@ class GSLightningModule(pl.LightningModule):
       _log(f"{metric_name}/source", metric_full[:,0].mean().detach())
       _log(f"{metric_name}/targets", metric_full[:,1:].mean().detach())
 
-    # NOPUSH: Composite GT RGB onto white background
+    def f(a):
+      return rearrange(a, "b v ... -> (b v) ...")
+    def g(a):
+      return rearrange(a, "(b v) ... -> b v ...", b=B, v=V)
+
+    # NOMERGE: Composite GT RGB onto white background
 
     # TODO: Maybe integrate alpha into the loss function somehow? Maybe not?
 
@@ -762,13 +763,13 @@ class GSLightningModule(pl.LightningModule):
 
     ## L1 loss
     if cfg.loss.photom.l1_weight > 0:
-      _photom_l1 = (pred_rgb - gt_rgb).abs() # (B,V,C,H,W)
+      _photom_l1 = g((f(pred_rgb) - f(gt_rgb)).abs()) # (B,V,C,H,W)
       _splatter_metric("loss/photom_l1", _photom_l1)
       loss = loss + cfg.loss.photom.l1_weight * _photom_l1.mean()
 
     ## D-SSIM Loss
     if cfg.loss.photom.dssim_weight > 0:
-      _photom_dssim = 1.0 - ssim_map(pred_c, gt_c, window) # (B,V,C,H,W)
+      _photom_dssim = 1.0 - g(ssim_map(f(pred_rgb), f(gt_rgb), self.window)) # (B,V,C,H,W)
       _splatter_metric("loss/photom_dssim", _photom_dssim)
       loss = loss + cfg.loss.photom.dssim_weight * _photom_dssim.mean()
 
@@ -778,26 +779,26 @@ class GSLightningModule(pl.LightningModule):
     scale_reg = torch.zeros((), device=device)
     if cfg.loss.scale_reg_weight > 0:
       scale_reg = pipe(
-        gauss_pred["scales"],
+        model_pred["gauss"]["scale"],
         lambda a: rearrange(a, "b ... -> b (...)"),
         lambda a: a[a > cfg.loss.scale_reg_thresh],
         lambda a: a.mean() if a.numel() > 0 else torch.zeros((), device=device),
       )
 
       loss = loss + cfg.loss.scale_reg_weight * scale_reg
-      self.log("loss/scale_reg", scale_reg.detach())
+      _log("loss/scale_reg", scale_reg.detach())
 
     # TODO: skim through this code, fix it up
-    if need_direct:
-      raise NotImplementedError()
+    # if need_direct:
+    #   raise NotImplementedError()
     # if need_direct:
     #   direct_total, direct_parts = compute_direct_loss(gauss, gt, hit, cfg.loss, device)
     #   loss = loss + direct_total
     #   for k, v in direct_parts.items():
     #     metrics[f"direct_{k}"] = v.detach()
 
-    self.log("loss", loss.detach())
-    out["loss"] = loss.detach()
+    _log("loss", loss.detach())
+    out["loss"] = loss
 
     # TODO: Are any of these metrics actually needed?
     # metrics["mean_opacity"] = flat["opacities"].mean().detach() if flat["opacities"].numel() else torch.zeros((), device=device)
@@ -835,10 +836,10 @@ class OrbitCallback(pl.Callback):
     self.workdir = tempfile.mkdtemp(prefix="gs_orbit_")
 
   def on_train_epoch_end(self, trainer, pl_module):
-    self._on_epoch_end("train", trainer, pl_module)
+    return self._on_epoch_end("train", trainer, pl_module)
 
   def on_validation_epoch_end(self, trainer, pl_module):
-    self._on_epoch_end("val", trainer, pl_module)
+    return self._on_epoch_end("val", trainer, pl_module)
 
   def _render_orbit(self, model, batch, device):
     """Renders a turntable orbit of `item`'s source-view Gaussians. Returns a
@@ -848,50 +849,43 @@ class OrbitCallback(pl.Callback):
 
     B = batch["batch_size"]
 
-    out = model_forward(model, batch, device=device)
+    model_pred = model_forward(model, batch, device=device)
+    _b, _v, _c, ih, iw = batch["views"]["rgb"].shape
 
-    src = item["source"]
-    rgb, xyz_cam, hit = src["rgb"].to(device), src["xyz_cam"].to(device), src["hit"].to(device)
-    fx = src["K_depth"][0, 0].to(device)
-    ih, iw = src["rgb"].shape[-2:]
-
-    # TODO: Better implementation for this
-    # predict_params = set(model.predict_params)
-    # with torch.no_grad():
-    #   gauss = model(rgb, xyz_cam)
-    #   gt = item.get("ground_truth")
-    #   if gt is not None:
-    #     gauss = apply_ground_truth_overrides(gauss, gt, hit, predict_params, device)
-    #   flat = flatten_gaussians(gauss, xyz_cam, hit)
-    # if flat["means"].shape[0] == 0:
-    #   return None
-
-    means_np = flat["means"].detach().cpu().numpy()
-    up = _up_in_source_frame(src["pose_gl"].numpy())
-    poses_gl = _orbit_c2w_gl(means_np, up, self.num_frames, self.elevation_deg)
-    c2w_cv = poses_gl @ OPENGL_TO_OPENCV
-    viewmats = torch.from_numpy(np.linalg.inv(c2w_cv).astype(np.float32)).to(device)
-    ks = src["K_image"].to(device)[None].expand(len(poses_gl), -1, -1)
+    # TODO: Ground truth override
+    # gauss = apply_ground_truth_overrides(gauss, gt, hit, predict_params, device)
 
     frames = None
     with _guarded_render("orbit render"), torch.no_grad():
       # TODO: Actually properly support batch size > 1
       for (
         x_gauss_flat,
+        x_pose_gl,
+        x_K_image,
       ) in zip(
         flatten_gaussians(
           B,
           model_pred["gauss"],
-          batch["source"]["xyz_cam"],
-          batch["source"]["hit"],
+          batch["source"]["xyz_cam"].to(device),
+          batch["source"]["hit"].to(device),
         ),
+        batch["source"]["pose_gl"],
+        batch["views"]["K_image"][:,0],
       ):
+        means_np = x_gauss_flat["means"].detach().cpu().numpy()
+        up = _up_in_source_frame(x_pose_gl.numpy())
+        poses_gl = _orbit_c2w_gl(means_np, up, self.num_frames, self.elevation_deg)
+        c2w_cv = poses_gl @ OPENGL_TO_OPENCV
+        viewmats = torch.from_numpy(np.linalg.inv(c2w_cv).astype(np.float32)).to(device)
+        # ks = src["K_image"].to(device)[None].expand(len(poses_gl), -1, -1)
+        ks = repeat(x_K_image.to(device), "... -> b ...", b=len(poses_gl))
+
         rgb_out, _, _ = gsplat.rasterization(
-          means=flat["means"],
-          quats=flat["quats"],
-          scales=flat["scales"],
-          opacities=flat["opacities"],
-          colors=flat["colors"],
+          means=x_gauss_flat["means"],
+          quats=x_gauss_flat["quats"],
+          scales=x_gauss_flat["scales"],
+          opacities=x_gauss_flat["opacities"],
+          colors=x_gauss_flat["colors"],
           viewmats=viewmats,
           Ks=ks,
           width=int(iw),
@@ -937,16 +931,35 @@ class OrbitCallback(pl.Callback):
       if frames is None:
         return
 
-      # NOPUSH: ideally the rendering would be the same as orbit_video.py
+      # NOMERGE: ideally the rendering would be the same as orbit_video.py
       tag = f"{stage}/orbit"
       path = os.path.join(self.workdir, f"{tag.replace('/', '_')}.mp4")
-      write_mp4(frames, path, fps, crf)
-      wandb_run.log({tag: wandb.Video(path, caption=tag, format="mp4")}, step=self.global_step)
+      write_mp4(frames, path, self.fps, self.crf)
+      wandb_run.log({tag: wandb.Video(path, caption=tag, format="mp4")})
 
   def on_fit_end(self, trainer, pl_module):
     if self.workdir is not None:
       shutil.rmtree(self.workdir, ignore_errors=True)
       self.workdir = None
+
+
+# ---------------------------------------------------------------------------
+# wandb image panels
+# ---------------------------------------------------------------------------
+
+def _val_panel(gt_rgb, pred_rgb):
+  """
+  gt_rgb/pred_rgb: (N,3,H,W) in [0,1].
+  Returns one uint8 (H, V*3*W, 3) image: for each view, [GT | render | |diff|] side by side.
+  """
+  n = gt_rgb.shape[0]
+  rows = []
+  for i in range(n):
+    g = (gt_rgb[i].detach().cpu() * 255).to(torch.uint8)
+    r = (pred_rgb[i].detach().cpu() * 255).to(torch.uint8)
+    d = ((gt_rgb[i] - pred_rgb[i].detach().cpu()).abs() * 255).to(torch.uint8)
+    rows.append(pack([g, r, d], "c * w")[0])
+  return pack(rows, "c h *")[0]
 
 
 class ViewPanelCallback(pl.Callback):
@@ -966,10 +979,10 @@ class ViewPanelCallback(pl.Callback):
     self.val_batch = collate_with_batch_size([dm.val_ds[0]]) if len(dm.val_ds) > 0 else None
 
   def on_train_epoch_end(self, trainer, pl_module):
-    self._on_epoch_end("train", trainer, pl_module)
+    return self._on_epoch_end("train", trainer, pl_module)
 
   def on_validation_epoch_end(self, trainer, pl_module):
-    self._on_epoch_end("val", trainer, pl_module)
+    return self._on_epoch_end("val", trainer, pl_module)
 
   def _on_epoch_end(self, stage, trainer, pl_module):
     # Count of COMPLETED epochs (Lightning hasn't bumped trainer.current_epoch
@@ -990,37 +1003,31 @@ class ViewPanelCallback(pl.Callback):
     with set_mode(model, "eval"), timed(f"view_panel@epoch{epoch}"):
       match stage:
         case "train":
-          item = self.train_batch
+          batch = self.train_batch
         case "val":
-          item = self.val_batch
+          batch = self.val_batch
         case _:
           raise RuntimeError(f"Unexpected {stage=}")
 
-      if item is None:
+      if batch is None:
         return
 
       model_pred = None
       with _guarded_render(f"{stage}/orbit panel"), torch.no_grad():
-        model_pred = model_forward(self.model, batch, need_render=True, device=device)
+        model_pred = model_forward(model, batch, need_render=True, device=device)
 
-      pred_rgb = model_pred["rgb"]
-      gt_rgb = batch["views"]["rgb"]
+      pred_rgb = rearrange(model_pred["rgb"]    , "b v ... -> (b v) ...")
+      gt_rgb   = rearrange(batch["views"]["rgb"], "b v ... -> (b v) ...")
 
       wandb_run.log({
         f"{stage}/panel": wandb.Image(
           _val_panel(gt_rgb, pred_rgb),
           caption="GT | render | |diff|, one row per view (source first, then targets)",
         ),
-      }, step=self.global_step)
+      })
 
 
-# Lets conf/train_gs.yaml derive checkpoint.every from train.max_epochs (e.g.
-# "${div_floor:${train.max_epochs},10}" -- 10 checkpoints spread evenly over
-# a run by default) instead of a fixed step count that's wrong for any
-# max_epochs other than whatever it was tuned for. Registered at import time
-# (before hydra.main composes the config below) since OmegaConf needs the
-# resolver in place before it can evaluate the interpolation.
-OmegaConf.register_new_resolver("div_floor", lambda total, n: max(1, int(total) // int(n)))
+OmegaConf.register_new_resolver("eval", eval)
 
 
 @hydra.main(version_base=None, config_path="conf", config_name="train_gs")
@@ -1147,7 +1154,7 @@ def main(cfg: DictConfig) -> None:
     logger = WandbLogger(experiment=wandb_run)
 
   callbacks = []
-  callbacks += hydra.utils.instantiate(cfg.callbacks)
+  callbacks += list(hydra.utils.instantiate(cfg.callbacks).values())
 
   trainer = pl.Trainer(
     **OmegaConf.to_container(cfg.trainer, resolve=True),

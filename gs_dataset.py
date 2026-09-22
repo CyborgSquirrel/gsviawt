@@ -481,6 +481,23 @@ def split_by_mesh(catalog: H5Catalog, val_fraction=0.1, seed=42):
   return H5Catalog._from_df(train_df), H5Catalog._from_df(val_df)
 
 
+def split_by_view(catalog: H5Catalog, val_fraction=0.1, seed=42):
+  gen = torch.Generator().manual_seed(seed)
+
+  n_total = len(catalog)
+  n_val = max(1, round(n_total * val_fraction)) if val_fraction > 0 else 0
+  n_train = n_total - n_val
+  idx = np.arange(n_total)
+  train_idx, val_idx = random_split(idx, [n_train, n_val], generator=gen)
+  train_idx, val_idx = train_idx.indices, val_idx.indices
+
+  if n_total <= 1000:
+    print("Train idx", list(train_idx))
+    print("Val idx", list(val_idx))
+
+  return H5Catalog._from_df(catalog.df[train_idx]), H5Catalog._from_df(catalog.df[val_idx])
+
+
 class GSPairDataset(Dataset):
   """Wraps an H5Catalog with "path", "mesh_id", "view_idx" columns (e.g. one
   half of a split_by_mesh result -- this class doesn't split anything

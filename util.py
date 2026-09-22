@@ -2,10 +2,8 @@ import contextlib as ctl
 import logging
 import time
 
-import einops
 import h5py
 import numpy as np
-import torch
 
 log = logging.getLogger(__name__)
 
@@ -121,10 +119,12 @@ class LazyDataset:
 
 def check_shape(x, pattern):
   """Validate x's shape against `pattern` (fixed axes raise on mismatch), return x."""
+  import einops
   einops.parse_shape(x, pattern)
   return x
 
 def collate_with_batch_size(features):
+  import torch
   batch = torch.utils.data.default_collate(features)
   batch["batch_size"] = len(features)
   return batch
@@ -132,6 +132,7 @@ def collate_with_batch_size(features):
 def pipe(a, *fns):
   for fn in fns:
     a = fn(a)
+  return a
 
 @ctl.contextmanager
 def set_mode(model, mode):
