@@ -30,7 +30,7 @@ Thumbs.db
 
 secret.env
 
-data/
+/data/
 
 # Hydra
 outputs/

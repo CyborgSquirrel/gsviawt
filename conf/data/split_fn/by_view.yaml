@@ -1,0 +1,7 @@
+# Random train/val split at the individual-VIEW level -- the same mesh can
+# land in both train and val (contrast by_mesh.yaml). See
+# gs_dataset.split_by_view's own docstring. val_fraction: 0 disables the
+# split (train_ds gets everything, val_ds empty).
+_target_: gs_dataset.split_by_view
+_partial_: true
+val_fraction: 0.1
