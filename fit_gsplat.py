@@ -6,11 +6,11 @@ Input is an `.h5` (or glob/list of them) in the `render_objaverse.py` schema
 `mesh_index`; legacy `camera_intrinsics` is also accepted), read via
 `gs_dataset.H5Catalog` and split into train/val view sets with `data.split_fn`
 (a Hydra config group at `conf/data/split_fn/*.yaml`, the exact same one
-train_gs.py uses -- see `conf/gsplat.yaml`'s `defaults:`). fit_gsplat.py fits
-ONE scene at a time: it currently only ever uses train/val item 0
-(GSFitSceneDataset's docstring covers the multi-mesh caveat -- not handled
-yet). All of a scene's views must share the same `mesh_index`, checked at
-load time.
+train_gs.py uses -- see `conf/gsplat.yaml`'s `defaults:`). No mesh grouping:
+each split's catalog ROW ORDER is taken directly as the view order (see
+load_catalog_views) -- fit_gsplat.py fits ONE scene, from ONE object, at a
+time; a corpus spanning multiple meshes isn't handled (produces garbage or
+a clean mesh_index-mismatch error, deliberately not engineered around yet).
 
 Within that scene's TRAIN split, the **primary** view -- whichever one
 sorts first in the (already-split) catalog -- seeds the Gaussians; the
@@ -80,14 +80,13 @@ import h5py
 import hydra
 import lightning.pytorch as pl
 import numpy as np
-import polars as pl_
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, reduce, repeat
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import DictConfig, OmegaConf, open_dict
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 
 import wandb
 
@@ -112,8 +111,8 @@ SH_C0 = 0.28209479177387814  # SH band-0 constant, for RGB <-> sh0 in the .ply
 def _load_view_set(hdf5_path, ds, order):
   """Read exactly the given view indices (order matters -- index 0 is treated
   as "primary" for the mesh_index consistency check). Returns a dict of
-  stacked arrays; called once per GSFitSceneDataset item (one mesh's train
-  or val view set)."""
+  stacked arrays; called once per load_catalog_views call (once for the
+  train split, once for the val split)."""
   with h5py.File(hdf5_path, "r") as f:
     n = f[ds.pose].shape[0]
     for i in order:
@@ -156,49 +155,30 @@ def _load_view_set(hdf5_path, ds, order):
   }
 
 
-class GSFitSceneDataset(Dataset):
-  """Wraps an H5Catalog (e.g. one half of a split_fn result), grouped by
-  mesh -- one item = one mesh's ENTIRE view set (all of that mesh's rows in
-  the catalog), read as flat world-space arrays via _load_view_set.
+def load_catalog_views(catalog: H5Catalog, ds_names):
+  """catalog row order IS the view order -- row 0 ("primary") seeds the
+  Gaussians, the rest ("secondary") are supervision-only. No mesh grouping,
+  no multi-file handling: reads every row against the FIRST row's path,
+  assuming (not checking) the whole catalog is one file/one object. With
+  split_fn=gs_dataset.split_by_indices, "primary" is exactly the first
+  entry of train_idx/val_idx -- put the view you want to seed from there
+  for explicit control.
 
-  Deliberately NOT gs_dataset.GSPairDataset's per-view item shape:
-  GSPairDataset unprojects into the SOURCE CAMERA's own frame, built for
-  train_gs.py's Flash3D-style network (see gs_dataset.py's module
-  docstring). fit_gsplat.py needs true world-space Gaussians -- portable to
-  a .ply, an orbit video, any external 3DGS viewer (see render_orbit_frames'
-  docstring below) -- so seeding stays on
-  debug_pointcloud.unproject_depth_peel(space="world") via init_gaussians,
-  entirely unaffected by this class.
+  Multi-mesh corpora are NOT handled -- deliberately out of scope for now.
+  A catalog spanning more than one mesh either produces garbage (if it
+  happens to share depth-peel layer counts etc.) or a clean SystemExit from
+  _load_view_set's own mesh_index check below; both are acceptable until
+  multi-mesh fitting is actually built.
 
-  Within a mesh's view set, `order[0]` (that group's first row, in catalog
-  order) is the "primary" view that seeds Gaussians; the rest are
-  supervision-only "secondary" views -- fit_gsplat.py's own primary/
-  secondary terminology, just no longer separate config fields: it's now
-  "whichever view sorts first for that mesh in the (already-split)
-  catalog." With split_fn=gs_dataset.split_by_indices, that's exactly the
-  first entry of train_idx/val_idx -- put the view you want to seed from
-  first there for explicit control.
-
-  len(dataset) == number of distinct meshes in the catalog. main() only
-  ever fits dataset[0] for now (single-scene) -- a later multi-scene
-  fit_gsplat.py would loop over every item instead, but that's not
-  implemented here."""
-
-  def __init__(self, catalog: H5Catalog, ds_names):
-    self.ds_names = ds_names
-    groups_df = catalog.df.group_by(["path", "mesh_id"], maintain_order=True).agg(pl_.col("view_idx"))
-    self.groups = list(groups_df.iter_rows(named=True))
-
-  def __len__(self):
-    return len(self.groups)
-
-  def __getitem__(self, idx):
-    g = self.groups[idx]
-    order = [int(v) for v in g["view_idx"]]
-    out = _load_view_set(g["path"], self.ds_names, order)
-    out["primary"] = order[0]
-    out["secondary"] = order[1:]
-    return out
+  Returns None if `catalog` is empty (e.g. an empty val split)."""
+  rows = list(catalog.df.iter_rows(named=True))
+  if not rows:
+    return None
+  order = [int(r["view_idx"]) for r in rows]
+  out = _load_view_set(rows[0]["path"], ds_names, order)
+  out["primary"] = order[0]
+  out["secondary"] = order[1:]
+  return out
 
 
 # ---------------------------------------------------------------------------
@@ -717,14 +697,10 @@ def main(cfg: DictConfig) -> None:
     )
     split_fn = hydra.utils.instantiate(cfg.data.split_fn)
     train_catalog, val_catalog = split_fn(catalog, seed=cfg.seed)
-    train_ds = GSFitSceneDataset(train_catalog, cfg.datasets)
-    val_ds = GSFitSceneDataset(val_catalog, cfg.datasets)
-    if len(train_ds) == 0:
-      raise SystemExit("train split is empty -- check hdf5_path / split_fn")
-    # main() only ever fits item 0 (single-scene) -- see GSFitSceneDataset's
-    # own docstring for the multi-mesh caveat.
-    views = train_ds[0]
-    val_views = val_ds[0] if len(val_ds) > 0 else None
+    views = load_catalog_views(train_catalog, cfg.datasets)
+    if views is None:
+      raise SystemExit("train split is empty -- check hdf5_path / data.split_fn")
+    val_views = load_catalog_views(val_catalog, cfg.datasets)
 
   out_h5 = cfg.output_path or f"{views['path']}.gsplat.view{views['primary']}.h5"
   stem = out_h5[:-3] if out_h5.endswith(".h5") else out_h5
