@@ -56,7 +56,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # fit_gsplat wires up the pip CUDA toolchain for gsplat's JIT build on import,
 # and gives us the camera-convention helper, SSIM, and the SH constant.
 from fit_gsplat import make_viewmats, SH_C0  # noqa: E402
-from module import DSSIMLoss  # noqa: E402
+from module import DSSIMLoss, write_mp4  # noqa: E402
 
 import h5py  # noqa: E402
 import hydra  # noqa: E402
@@ -414,24 +414,6 @@ def write_frames_dir(frames, out_dir):
   for i, fr in enumerate(frames):
     Image.fromarray(fr).save(os.path.join(out_dir, f"frame_{i:06d}.png"))
   return out_dir
-
-
-def write_mp4(frames, path, fps, crf):
-  """H.264 .mp4 via imageio's ffmpeg backend. `imageio-ffmpeg` ships a static
-  ffmpeg binary, so this needs nothing on the system PATH."""
-  import imageio.v2 as imageio
-  writer = imageio.get_writer(
-    path, format="FFMPEG", mode="I", fps=float(fps),
-    codec="libx264", macro_block_size=1,        # don't silently resize our frames
-    pixelformat="yuv420p",                      # broad player compatibility
-    ffmpeg_params=["-crf", str(int(crf)), "-preset", "medium"],
-  )
-  try:
-    for fr in frames:
-      writer.append_data(np.ascontiguousarray(fr))
-  finally:
-    writer.close()
-  return path
 
 
 def resolve_output(cfg, comparing):

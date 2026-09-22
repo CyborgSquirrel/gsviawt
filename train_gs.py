@@ -28,9 +28,7 @@ import contextlib as ctl
 import functools as ft
 import logging
 import os
-import shutil
 import sys
-import tempfile
 
 import gsplat
 import hydra
@@ -53,8 +51,8 @@ from gs_dataset import (OPENGL_TO_OPENCV, GaussH5ValDataset,  # noqa: E402
                         _EmptyDataset)
 from gs_decoder import GaussianResnetDecoder, GSDecoderStack  # noqa: E402
 from gs_encoder import GSResnetEncoder  # noqa: E402
-from module import DSSIMLoss, WarmupCosineAnnealingLR, guarded_render  # noqa: E402
-from orbit_video import look_at_c2w, write_mp4  # noqa: E402
+from module import DSSIMLoss, WarmupCosineAnnealingLR  # noqa: E402
+from orbit_video import look_at_c2w  # noqa: E402
 from util import collate_with_batch_size, pipe, set_mode, timed  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -749,139 +747,39 @@ class GSLightningModule(pl.LightningModule):
     self._preview_cache_epoch, self._preview_cache = epoch, source
     return source
 
+  def get_orbit_source(self, num_frames, elevation_deg):
+    """Orbit camera poses + this module's current Gaussians, for
+    module.OrbitCallback's turntable preview video. The model's Gaussians
+    live entirely in the source view's own camera frame (see gs_dataset.py's
+    module docstring) -- there's no Blender world frame available to orbit
+    around. To still get a non-tumbling turntable, derive a stable "up"
+    direction by taking Blender's world +Z and expressing it in that same
+    source-camera frame via the view's own (otherwise-unused) raw pose,
+    then build the orbit entirely within that frame (_orbit_c2w_gl).
+    Distance is fixed to the real source camera's own capture distance --
+    NOT an auto-fit/bounding-sphere framing like orbit_video.py's default
+    -- see _orbit_c2w_gl's own docstring for why (exposes the per-pixel
+    Gaussian spacing as a moire pattern otherwise).
 
-class OrbitCallback(pl.Callback):
-  def __init__(
-    self,
-    *,
-    every_n_epochs: int,
-    num_frames: int,
-    fps: int,
-    crf: int,
-    elevation_deg: float,
-  ):
-    self.every_n_epochs = every_n_epochs
-    self.num_frames = num_frames
-    self.fps = fps
-    self.crf = crf
-    self.elevation_deg = elevation_deg
+    Reuses get_preview_source()'s cached gauss (same Gaussians, same
+    epoch) -- this only computes the extra orbit-specific camera poses."""
+    preview = self.get_preview_source()
+    gauss, views = preview["gauss"], preview["views"]
 
-    self.train_batch = None
-    self.val_batch = None
-    self.workdir = None
+    means_np = gauss["means"].detach().cpu().numpy()
+    pose_gl = self.trainer.datamodule.train_ds[0]["source"]["pose_gl"].numpy()
+    up = _up_in_source_frame(pose_gl)
+    poses_gl = _orbit_c2w_gl(means_np, up, num_frames, elevation_deg)
+    c2w_cv = poses_gl @ OPENGL_TO_OPENCV
+    viewmats = torch.from_numpy(np.linalg.inv(c2w_cv).astype(np.float32)).to(self.device)
 
-  def on_fit_start(self, trainer, pl_module):
-    dm = trainer.datamodule
-    self.train_batch = collate_with_batch_size([dm.train_ds[0]])
-    self.val_batch = collate_with_batch_size([dm.val_ds[0]]) if len(dm.val_ds) > 0 else None
-    self.workdir = tempfile.mkdtemp(prefix="gs_orbit_")
-
-  def on_train_epoch_end(self, trainer, pl_module):
-    return self._on_epoch_end("train", trainer, pl_module)
-
-  def on_validation_epoch_end(self, trainer, pl_module):
-    return self._on_epoch_end("val", trainer, pl_module)
-
-  def _render_orbit(self, model, batch, device):
-    """Renders a turntable orbit of `item`'s source-view Gaussians. Returns a
-    generator of (H,W,3) uint8 frames, or None if the source view seeded zero
-    Gaussians (nothing to show) or the render hit a CUDA OOM (see
-    module.guarded_render)."""
-
-    B = batch["batch_size"]
-
-    model_pred = model_forward(model, batch, device=device)
-    _b, _v, _c, ih, iw = batch["views"]["rgb"].shape
-
-    # TODO: Ground truth override
-    # gauss = apply_ground_truth_overrides(gauss, gt, hit, predict_params, device)
-
-    frames = None
-    with guarded_render("orbit render"), torch.no_grad():
-      # TODO: Actually properly support batch size > 1
-      for (
-        x_gauss_flat,
-        x_pose_gl,
-        x_K_image,
-      ) in zip(
-        flatten_gaussians(
-          B,
-          model_pred["gauss"],
-          batch["source"]["xyz_cam"].to(device),
-          batch["source"]["hit"].to(device),
-        ),
-        batch["source"]["pose_gl"],
-        batch["views"]["K_image"][:,0],
-      ):
-        means_np = x_gauss_flat["means"].detach().cpu().numpy()
-        up = _up_in_source_frame(x_pose_gl.numpy())
-        poses_gl = _orbit_c2w_gl(means_np, up, self.num_frames, self.elevation_deg)
-        c2w_cv = poses_gl @ OPENGL_TO_OPENCV
-        viewmats = torch.from_numpy(np.linalg.inv(c2w_cv).astype(np.float32)).to(device)
-        # ks = src["K_image"].to(device)[None].expand(len(poses_gl), -1, -1)
-        ks = repeat(x_K_image.to(device), "... -> b ...", b=len(poses_gl))
-
-        rgb_out, _, _ = gsplat.rasterization(
-          means=x_gauss_flat["means"],
-          quats=x_gauss_flat["quats"],
-          scales=x_gauss_flat["scales"],
-          opacities=x_gauss_flat["opacities"],
-          colors=x_gauss_flat["colors"],
-          viewmats=viewmats,
-          Ks=ks,
-          width=int(iw),
-          height=int(ih),
-          sh_degree=model.max_sh_degree,
-          render_mode="RGB",
-          packed=True,
-        )
-        rgb_np = (rgb_out.clamp(0.0, 1.0).cpu().numpy() * 255).astype(np.uint8)
-        frames = [rgb_np[i] for i in range(rgb_np.shape[0])]
-    return frames
-
-  def _on_epoch_end(self, stage, trainer, pl_module):
-    # Count of COMPLETED epochs (Lightning hasn't bumped trainer.current_epoch
-    # yet at this point in the hook) -- "every_n_epochs=1" means "every
-    # epoch", matching conf/train_gs.yaml's comment on that field.
-    epoch = trainer.current_epoch + 1
-    if epoch % self.every_n_epochs != 0:
-      return
-    model = pl_module.model
-    device = pl_module.device
-
-    wandb_run = pl_module.logger.experiment if pl_module.logger is not None else None
-    if wandb_run is None:
-      return
-
-    # NOTE(andrei): Not sure if setting model to eval is the right move here,
-    # but gonna do it for now.
-    with set_mode(model, "eval"), timed(f"orbit@epoch{epoch}"):
-      match stage:
-        case "train":
-          batch = self.train_batch
-        case "val":
-          batch = self.val_batch
-        case _:
-          raise RuntimeError(f"Unexpected {stage=}")
-
-      if batch is None:
-        return
-
-      frames = self._render_orbit(model, batch, device)
-
-      if frames is None:
-        return
-
-      # NOMERGE: ideally the rendering would be the same as orbit_video.py
-      tag = f"{stage}/orbit"
-      path = os.path.join(self.workdir, f"{tag.replace('/', '_')}.mp4")
-      write_mp4(frames, path, self.fps, self.crf)
-      wandb_run.log({tag: wandb.Video(path, caption=tag, format="mp4")})
-
-  def on_fit_end(self, trainer, pl_module):
-    if self.workdir is not None:
-      shutil.rmtree(self.workdir, ignore_errors=True)
-      self.workdir = None
+    return {
+      "gauss": gauss,
+      "viewmats": viewmats,
+      "K": views["K"][0],  # views["K"] is (V,3,3) for the whole supervision set; orbit uses only the source view's own K
+      "width": views["width"],
+      "height": views["height"],
+    }
 
 
 @hydra.main(version_base=None, config_path="conf", config_name="train_gs")

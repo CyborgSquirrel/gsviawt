@@ -169,7 +169,7 @@ callbacks:
     save_weights_only: false
 
   orbit:
-    _target_: __main__.OrbitCallback
+    _target_: module.OrbitCallback
     every_n_epochs: ${eval:'${trainer.max_epochs} // 50'}
     num_frames: 24
     fps: 12

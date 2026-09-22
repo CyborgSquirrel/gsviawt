@@ -4,17 +4,26 @@
 Both scripts optimize Gaussian-splat parameters against gsplat photometric
 renders under a `pl.Trainer` (train_gs.py: a network's predicted Gaussians
 over a dataset; fit_gsplat.py: one scene's own Gaussians, directly). That's
-where the overlap actually is -- the loss/schedule/OOM-handling plumbing
-below -- not the render loop or orbit-preview code itself, which differ per
-script for reasons documented at their own call sites (Gaussian
-representation, SH vs. flat colour, world- vs. source-camera frame, batched
-vs. per-frame rasterization).
+where the overlap actually is -- the loss/schedule/OOM-handling plumbing,
+plus the PanelCallback/OrbitCallback pair below, which each PULL a
+normalized {"gauss", ...} snapshot from the LightningModule (via
+get_preview_source()/get_orbit_source(), one implementation per script) and
+do the actual gsplat.rasterization()+encode+wandb-log call once, here.
+What's NOT shared -- deliberately -- is how each script gets from "current
+state" to that normalized snapshot: Gaussian representation, SH vs. flat
+colour, world- vs. source-camera frame, and (for orbit) camera-distance
+policy all differ per script for reasons documented at each
+get_preview_source()/get_orbit_source() implementation.
 """
 
 import contextlib as ctl
 import logging
+import os
+import shutil
+import tempfile
 
 import lightning.pytorch as pl
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -240,4 +249,96 @@ class PanelCallback(pl.Callback):
     wandb_run.log({
       f"{stage}/panel": wandb.Image(
         panel, caption="GT | render | |diff|, one row per view"),
+    })
+
+
+def write_mp4(frames, path, fps, crf):
+  """H.264 .mp4 via imageio's ffmpeg backend (imageio-ffmpeg ships a static
+  binary -- nothing needed on the system PATH). Canonical copy -- orbit_video.py
+  and fit_gsplat.py both used to define their own identical version of this;
+  they now import it from here."""
+  import imageio.v2 as imageio
+  writer = imageio.get_writer(
+    path, format="FFMPEG", mode="I", fps=float(fps),
+    codec="libx264", macro_block_size=1, pixelformat="yuv420p",
+    ffmpeg_params=["-crf", str(int(crf))],
+  )
+  try:
+    for fr in frames:
+      writer.append_data(np.ascontiguousarray(fr))
+  finally:
+    writer.close()
+  return path
+
+
+class OrbitCallback(pl.Callback):
+  """Shared consumer half of the same pull pattern PanelCallback uses.
+  Pulls pl_module.get_orbit_source(num_frames, elevation_deg) --
+  {"gauss": {means,quats,scales,opacities,colors,sh_degree}, "viewmats":
+  (N,4,4), "K": (3,3), "width", "height"} -- expands K to (N,3,3), renders
+  all N orbit frames in ONE batched gsplat.rasterization() call, writes an
+  mp4, and logs wandb.Video.
+
+  Train-stage only for now -- see PanelCallback's own note on why val is
+  deferred; same reasoning applies here.
+
+  Camera-pose generation (world-frame vs. source-camera-frame, fixed-at-
+  capture-distance vs. auto-fit) stays entirely inside each script's own
+  get_orbit_source() -- see train_gs.py's / fit_gsplat.py's own
+  implementations for why those genuinely differ and aren't unified here."""
+
+  def __init__(self, *, every_n_epochs: int, num_frames: int = 24,
+              fps: int = 12, crf: int = 28, elevation_deg: float = 20.0):
+    self.every_n_epochs = every_n_epochs
+    self.num_frames = num_frames
+    self.fps = fps
+    self.crf = crf
+    self.elevation_deg = elevation_deg
+    self.workdir = None
+
+  def on_fit_start(self, trainer, pl_module):
+    self.workdir = tempfile.mkdtemp(prefix="orbit_")
+
+  def on_fit_end(self, trainer, pl_module):
+    if self.workdir is not None:
+      shutil.rmtree(self.workdir, ignore_errors=True)
+      self.workdir = None
+
+  def on_train_epoch_end(self, trainer, pl_module):
+    self._on_epoch_end("train", trainer, pl_module)
+
+  # Deliberately not implemented -- see PanelCallback.
+  # def on_validation_epoch_end(self, trainer, pl_module):
+  #   self._on_epoch_end("val", trainer, pl_module)
+
+  def _on_epoch_end(self, stage, trainer, pl_module):
+    epoch = trainer.current_epoch + 1
+    if epoch % self.every_n_epochs != 0:
+      return
+    wandb_run = pl_module.logger.experiment if pl_module.logger is not None else None
+    if wandb_run is None:
+      return
+
+    frames = None
+    with guarded_render(f"{stage}/orbit"), torch.no_grad():
+      import gsplat
+      source = pl_module.get_orbit_source(self.num_frames, self.elevation_deg)
+      gauss, viewmats = source["gauss"], source["viewmats"]
+      Ks = source["K"][None].expand(viewmats.shape[0], -1, -1)
+      rgb, _, _ = gsplat.rasterization(
+        means=gauss["means"], quats=gauss["quats"], scales=gauss["scales"],
+        opacities=gauss["opacities"], colors=gauss["colors"],
+        viewmats=viewmats, Ks=Ks,
+        width=int(source["width"]), height=int(source["height"]),
+        sh_degree=gauss["sh_degree"], render_mode="RGB", packed=True,
+      )
+      rgb_np = (rgb.clamp(0.0, 1.0).cpu().numpy() * 255).astype("uint8")
+      frames = [rgb_np[i] for i in range(rgb_np.shape[0])]
+    if frames is None:
+      return
+
+    path = os.path.join(self.workdir, f"{stage}_orbit_{trainer.current_epoch}.mp4")
+    write_mp4(frames, path, self.fps, self.crf)
+    wandb_run.log({
+      f"{stage}/orbit": wandb.Video(path, caption=f"epoch {epoch}", format="mp4"),
     })

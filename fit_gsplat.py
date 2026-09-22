@@ -72,9 +72,7 @@ pip `nvidia-cuda-nvcc` toolchain (the base image has no system `nvcc`).
 import json
 import logging
 import os
-import shutil
 import sys
-import tempfile
 
 import h5py
 import hydra
@@ -412,9 +410,11 @@ def dump_val(val_dir, it, panel):
 # distance the model was actually supervised at avoids manufacturing that
 # confusion here.
 #
-# NOTE: kept as plain functions here, not moved to module.py or shared
-# with orbit_video.py/train_gs.py's own orbit callbacks -- deliberately out
-# of scope for this pass, see the PR description.
+# look_at_c2w stays a plain function here (kept local rather than moved to
+# module.py -- world-frame pose generation is genuinely specific to this
+# script, see GSFitLightningModule.get_orbit_source below). The actual
+# render+encode+wandb-log path is shared now: module.OrbitCallback pulls
+# get_orbit_source()'s output and does that part once, for both scripts.
 # ---------------------------------------------------------------------------
 
 WORLD_UP = np.array([0.0, 0.0, 1.0], np.float32)  # Blender / render_objaverse is Z-up
@@ -432,48 +432,6 @@ def look_at_c2w(eye, target, up=WORLD_UP):
   c2w = np.eye(4, dtype=np.float32)
   c2w[:3, 0], c2w[:3, 1], c2w[:3, 2], c2w[:3, 3] = x, y, z, eye
   return c2w
-
-
-def write_mp4(frames, path, fps, crf):
-  """H.264 .mp4 via imageio's ffmpeg backend (imageio-ffmpeg ships a static
-  binary -- nothing needed on the system PATH). Same as orbit_video.py's."""
-  import imageio.v2 as imageio
-  writer = imageio.get_writer(
-    path, format="FFMPEG", mode="I", fps=float(fps),
-    codec="libx264", macro_block_size=1, pixelformat="yuv420p",
-    ffmpeg_params=["-crf", str(int(crf))],
-  )
-  try:
-    for fr in frames:
-      writer.append_data(np.ascontiguousarray(fr))
-  finally:
-    writer.close()
-  return path
-
-
-def render_orbit_frames(params, K_ref, dist, width, height, device, num_frames=24, elevation_deg=20.0):
-  """Renders a turntable orbit around the world origin at radius `dist`
-  (the primary view's own capture distance), reusing this module's own
-  `render()`. Yields (H,W,3) uint8 frames one at a time (one gsplat call per
-  frame, rather than batching all num_frames cameras into one call) to keep
-  peak memory bounded regardless of num_frames -- write_mp4 consumes frames
-  one at a time anyway, so nothing needs the full orbit in memory at once."""
-  elev = np.radians(float(elevation_deg))
-  azimuths = np.linspace(0.0, 2 * np.pi, int(num_frames), endpoint=False)
-  K_t = torch.from_numpy(K_ref[None]).to(device)
-  for az in azimuths:
-    d = np.array([np.cos(elev) * np.cos(az), np.cos(elev) * np.sin(az), np.sin(elev)], np.float32)
-    pose = look_at_c2w(d * dist, np.zeros(3, np.float32))
-    viewmat = torch.from_numpy(make_viewmats(pose[None])).to(device)
-    with torch.no_grad():
-      rgb, _ = render(params, viewmat, K_t, width, height)
-    yield (rgb[0].clamp(0.0, 1.0).cpu().numpy() * 255).astype(np.uint8)
-
-
-def log_orbit_video(wandb_run, step, frames, fps, crf, workdir):
-  path = os.path.join(workdir, f"orbit_{step}.mp4")
-  write_mp4(frames, path, fps, crf)
-  wandb_run.log({"orbit": wandb.Video(path, caption=f"iter {step}", format="mp4")}, step=step)
 
 
 # ---------------------------------------------------------------------------
@@ -521,7 +479,6 @@ class GSFitLightningModule(pl.LightningModule):
     self.scene_scale = scene_scale
     self.optimize_means = bool(cfg.optimize_means)
     self.K_orbit = K_orbit
-    self.orbit_workdir = None
     self.views_seen = 0
     self.final_loss = float("nan")
     self.iters = int(cfg.iters)
@@ -659,24 +616,48 @@ class GSFitLightningModule(pl.LightningModule):
     self._preview_cache_epoch, self._preview_cache = epoch, source
     return source
 
+  def get_orbit_source(self, num_frames, elevation_deg):
+    """Orbit camera poses + this optimization's current Gaussians, for
+    module.OrbitCallback's turntable preview video. Unlike train_gs.py's
+    Gaussians (anchored in an arbitrary source camera's own frame), these
+    are seeded in true Blender WORLD coordinates (object recentred near
+    the origin by render_objaverse.py's normalize_object) -- so the orbit
+    can use a plain world-frame look_at_c2w directly, no per-scene "up"
+    derivation needed. Distance is fixed to the primary view's own actual
+    capture distance (scene_scale), NOT an auto-fit/bounding-sphere
+    framing -- see this module's own orbit-preview comment block above for
+    why.
+
+    Reuses get_preview_source()'s cached gauss (same Gaussians, same
+    "epoch" == optimizer step here) -- this only computes the extra
+    orbit-specific camera poses."""
+    gauss = self.get_preview_source()["gauss"]
+    elev = np.radians(float(elevation_deg))
+    azimuths = np.linspace(0.0, 2 * np.pi, int(num_frames), endpoint=False)
+    poses = np.stack([
+      look_at_c2w(
+        np.array([np.cos(elev) * np.cos(az), np.cos(elev) * np.sin(az), np.sin(elev)], np.float32)
+        * self.scene_scale,
+        np.zeros(3, np.float32),
+      )
+      for az in azimuths
+    ])
+    viewmats = torch.from_numpy(make_viewmats(poses)).to(self.device)
+    return {
+      "gauss": gauss,
+      "viewmats": viewmats,
+      "K": torch.from_numpy(self.K_orbit).to(self.device),
+      "width": self.gt_rgb.shape[2],
+      "height": self.gt_rgb.shape[1],
+    }
+
   def _wandb_run(self):
     return self.logger.experiment if self.logger is not None else None
-
-  def on_fit_start(self):
-    if bool(self.cfg.orbit.enabled):
-      self.orbit_workdir = tempfile.mkdtemp(prefix="fit_gsplat_orbit_")
-
-  def on_fit_end(self):
-    if self.orbit_workdir is not None:
-      shutil.rmtree(self.orbit_workdir, ignore_errors=True)
-      self.orbit_workdir = None
 
   def on_train_epoch_end(self):
     # `self.current_epoch` here is still the just-finished 0-indexed
     # iteration (Lightning bumps it after this hook), matching the original
-    # hand-rolled loop's post-step `it` exactly -- no +1 correction needed
-    # (contrast train_gs.py's OrbitCallback, a separate pl.Callback where the
-    # bump has already happened by the time it runs).
+    # hand-rolled loop's post-step `it` exactly.
     it = self.current_epoch
     last = it == self.iters - 1
     cfg = self.cfg
@@ -684,16 +665,6 @@ class GSFitLightningModule(pl.LightningModule):
     val_every = int(cfg.val_every)
     if val_every and (it % val_every == 0 or last):
       self._dump_val_panel(it)
-
-    orbit_every = int(cfg.orbit.every) if cfg.orbit.enabled else 0
-    wandb_run = self._wandb_run()
-    if orbit_every and wandb_run is not None and (it % orbit_every == 0 or last):
-      IH, IW = self.gt_rgb.shape[1:3]
-      frames = render_orbit_frames(
-        self.params, self.K_orbit, self.scene_scale, IW, IH, self.device,
-        num_frames=cfg.orbit.num_frames, elevation_deg=cfg.orbit.elevation_deg,
-      )
-      log_orbit_video(wandb_run, it, frames, cfg.orbit.fps, cfg.orbit.crf, self.orbit_workdir)
 
   def _dump_val_panel(self, it):
     # Always panels against the FULL supervision view set, independent of
