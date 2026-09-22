@@ -2,8 +2,8 @@ import contextlib as ctl
 import logging
 import time
 
-import numpy as np
 import h5py
+import numpy as np
 
 log = logging.getLogger(__name__)
 
@@ -116,3 +116,40 @@ class LazyDataset:
     self.dataset[self.idx] = item
     self.idx += 1
 
+
+def check_shape(x, pattern):
+  """Validate x's shape against `pattern` (fixed axes raise on mismatch), return x."""
+  import einops
+  einops.parse_shape(x, pattern)
+  return x
+
+def collate_with_batch_size(features):
+  import torch
+  batch = torch.utils.data.default_collate(features)
+  batch["batch_size"] = len(features)
+  return batch
+
+def pipe(a, *fns):
+  for fn in fns:
+    a = fn(a)
+  return a
+
+@ctl.contextmanager
+def set_mode(model, mode):
+  """
+  Temporarily set a model to "train" or "eval" mode, restoring its
+  original training/eval state on exit (even if an exception occurs).
+
+  Usage:
+    with set_mode(model, "eval"):
+      output = model(x)
+  """
+  if mode not in ("train", "eval"):
+    raise ValueError(f"Mode must be 'train' or 'eval', got {mode!r}")
+
+  was_training = model.training
+  model.train(mode == "train")
+  try:
+    yield
+  finally:
+    model.train(was_training)

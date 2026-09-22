@@ -2,16 +2,41 @@
 # Splatting prediction model (Flash3D-style encoder/decoder) on
 # render_objaverse.py-schema HDF5 files. See train_gs.py's module docstring.
 
+defaults:
+  - data/split_fn: by_mesh
+  - _self_
+
+# Directory for everything a single run produces.
+output_dirname: 3dgs-model-${now:%Y-%m-%d_%H-%M-%S}
+output_dir: outputs/${output_dirname}
+
+seed: 42
+
 torch_detect_anomaly: false
+
+# Path to a Lightning checkpoint (e.g. an earlier run's
+# ${output_dir}/last.ckpt or model-{epoch}-{step}.ckpt) to resume from --
+# restores model/optimizer/scheduler state and the trainer's epoch/step
+# counters, then continues training into a fresh output_dir. null: fresh run.
+ckpt_path: null
 
 data:
   photom_h5: /app/bla/lite_blackbg.h5   # str, list, or glob(s) -- render_objaverse.py-schema
   num_layers: 6                         # must match the file(s)' depth_peel layer count
   num_target_views: 3                   # extra supervision views per step, alongside self-render
-  photom_val_fraction: 0.1              # fraction of MESH GROUPS held out (0 = pure overfit)
+
+  # Train/val split for ordinary multi-scene training (ignored when
+  # fixed_source_view or photom_h5_val is set -- see their own comments
+  # below). A config group (conf/data/split_fn/*.yaml, picked via the
+  # `defaults:` list up top) rather than inline here, so the strategy is a
+  # one-token CLI override instead of rewriting _target_ by hand, e.g.:
+  #   data/split_fn=by_view data.split_fn.val_fraction=0.2
+  #   data/split_fn=by_indices data.split_fn.train_idx='[0,1,2]' data.split_fn.val_idx='[3,4]'
+  # See conf/data/split_fn/*.yaml for what each option takes.
+
   # Single-batch overfit mode (fit_gsplat.py's primary/secondary terms
   # applied here): if set, train on this EXACT source+target view set every
-  # step, no resampling at all (ignores num_target_views/photom_val_fraction).
+  # step, no resampling at all (ignores num_target_views/split_fn).
   # fixed_target_views is required when fixed_source_view + photom_h5 are
   # both set (irrelevant/ignored in gauss_h5-only mode -- see gauss_h5 below).
   fixed_source_view: null    # int, e.g. 0
@@ -26,7 +51,7 @@ data:
   # validation genuinely tests the trained network as a normal single-image
   # encoder on a different image, not a held-out subset of the training
   # corpus. Also usable (optionally) with ordinary multi-scene training,
-  # replacing the photom_val_fraction mesh-holdout split with a wholly
+  # replacing the split_fn mesh-holdout split with a wholly
   # separate corpus. null (default): when fixed_source_view + gauss_h5 are
   # set and this is left null, val_ds instead falls back to gauss_h5's OWN
   # embedded secondary views (GaussH5ValDataset, gs_dataset.py) -- the exact
@@ -65,9 +90,6 @@ model:
                               # flickering ("disco ball") on an orbiting camera. Revisit
                               # once there's an actual view-dependent-shading signal to
                               # train sh_rest against.
-  one_gauss_decoder: false   # false: one decoder head per layer (Flash3D default).
-                              # true: one decoder emits all layers via channel-slicing
-                              # (cheaper once num_layers scales up, e.g. to 6).
   # Xavier-uniform init scale/bias per output group. opacity/rotation/sh are
   # Flash3D's own values; scale_bias is NOT (see below); scale_lambda IS
   # (Flash3D's own 0.01) -- damps how far exp(raw) can push the multiplier
@@ -113,17 +135,13 @@ model:
   xyz_std: [0.281, 0.316, 0.706]
 
 loss:
-  l1_weight: 1.0
-  ssim_weight: 0.85
-  mask_weight: 1.0
+  photom:
+    l1_weight: 1.0
+    dssim_weight: 0.85
+
   scale_reg_weight: 0.001    # 0 disables; penalizes scale > scale_reg_thresh
   scale_reg_thresh: 0.05     # ~5% of a unit-cube object -- already a big single Gaussian.
                               # (2.0, Flash3D's own value, was 2x the whole object -- inert here.)
-  # SH color coefficients are unconstrained; without this, degree>=1 SH is
-  # prone to runaway blowup on off-training-direction views (see train_gs.py's
-  # compute_loss). |dc| > ~2 already saturates degree-0 color via SH_C0*dc+0.5.
-  color_reg_weight: 1.0e-3
-  color_reg_thresh: 2.0
 
   # Direct per-pixel supervision of the model's own predicted Gaussian
   # params against a fit_gsplat.py ground-truth .h5 (data.gauss_h5),
@@ -140,68 +158,71 @@ loss:
   direct_rotation_weight: 0.0  # sign-invariant (1 - |dot(q_pred, q_gt)|)
   direct_color_weight: 0.0     # only touches sh_dc's gradient (SH_C0*sh_dc+0.5
                                  # vs. gt's flat RGB) -- sh_rest has no GT signal
-  # Restricts which depth-peel layers are actually modeled -- e.g. [0] for
-  # just the front/surface layer, [2, 3] for a couple of middle layers.
-  # null (default): all layers. With model.one_gauss_decoder=false
-  # (default), unlisted layers skip their own decoder head's
-  # forward+backward entirely, not just the loss mask.
-  supervised_layers: null   # e.g. [0], [1], [2, 3]
 
-train:
-  accelerator: auto        # auto (cuda if available else cpu) | cuda | cpu
-  seed: 42
+callbacks:
+  # https://pytorch-lightning.readthedocs.io/en/2.6.1/pytorch/api/lightning.pytorch.callbacks.LearningRateMonitor.html
+  lr_monitor:
+    _target_: lightning.pytorch.callbacks.LearningRateMonitor
+
+  # https://lightning.ai/docs/pytorch/stable/optional-api/api/lightning.pytorch.callbacks.ModelCheckpoint
+  checkpoint:
+    _target_: lightning.pytorch.callbacks.ModelCheckpoint
+    dirpath: ${output_dir}
+    filename: "model-{epoch}-{step}"
+    every_n_epochs: ${eval:'${trainer.max_epochs} // 10'}
+    save_last: true
+    save_on_exception: true
+    save_weights_only: false
+
+  orbit:
+    _target_: module.OrbitCallback
+    every_n_epochs: ${eval:'${trainer.max_epochs} // 50'}
+    num_frames: 24
+    fps: 12
+    crf: 28                    # x264 quality (higher = smaller/faster; fine for monitoring)
+    elevation_deg: 20.0        # camera distance = the actual source view's own capture distance,
+                                # not a re-fit bounding-sphere framing -- see GSLightningModule.get_preview_source
+
+  panel:
+    _target_: module.PanelCallback
+    every_n_epochs: ${eval:'${trainer.max_epochs} // 50'}
+
+loader:
+  batch_size: 1
   num_workers: 4
-  grad_accum_steps: 4        # effective batch size (batch_size is fixed at 1 scene/step)
+  persistent_workers: true
+
+trainer:
   max_epochs: 20000
-  lr: 1.0e-4
-  min_lr: 1.0e-6            # cosine floor (never fully reaches 0, avoids a dead-flat tail)
-  warmup_steps: 200         # linear warmup 0 -> lr, then cosine decay lr -> min_lr over the
-                              # derived total step count (see max_epochs above)
-  grad_clip_norm: 1.0
-  log_every: 50
+  accelerator: auto
+  devices: 1
+  # enable_checkpointing: false
+  check_val_every_n_epoch: 1
+  log_every_n_steps: 50
+  default_root_dir: ${output_dir}
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
 
-val:
-  every: 500                 # 0 disables
-  # NOTE: when training is direct-loss-only (loss.{l1,ssim,mask}_weight all
-  # 0), val/rec_loss / val/loss_source / val/loss_targets_mean read 0 by
-  # construction -- see val/loss_l1 / val/loss_ssim / val/loss_mask instead.
+optim:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: 1e-4
 
-# Turntable orbit preview, rendered from a fixed train scene and (if the
-# corpus has one) a fixed val scene, logged as wandb.Video. Cheap: one
-# forward pass (no backward) + a batched no-grad gsplat call over num_frames
-# views of the already-fixed Gaussian set -- see train_gs.py's render_orbit.
-orbit:
-  enabled: true
-  every_n_epochs: 1000       # one pass over the train DataLoader = one epoch
-  num_frames: 24             # keep modest -- this runs frequently
-  fps: 12
-  crf: 28                    # x264 quality (higher = smaller/faster; fine for monitoring)
-  elevation_deg: 20.0        # camera distance = the actual source view's own capture distance,
-                              # not a re-fit bounding-sphere framing -- see train_gs._orbit_c2w_gl
+sched:
+  _target_: module.WarmupCosineAnnealingLR
+  _partial_: true
+  total_steps: ${total_steps}
+  warmup_steps: ${eval:'int(${total_steps} * 0.05)'}
+  min_lr: 1.0e-6
 
 wandb:
   project: gsviawt
   mode: online                # online | offline | disabled
-  tags: [gs, flash3d-style]
-  name: null
-
-# Directory for everything a single run produces (checkpoints, etc). null
-# (default): a fresh directory per run, named after the Unix timestamp at
-# startup, so back-to-back runs never collide.
-output_dir: null
-
-checkpoint:
-  # Step interval between periodic checkpoints. Default spreads 10 evenly
-  # over the run, however long train.max_epochs is. 0 disables periodic
-  # checkpoints (a final one is always still written).
-  every: ${div_floor:${train.max_epochs},10}
-  # Periodic saves are step-numbered files (train_gs.ckpt.step{N}.pt), never
-  # overwritten in place. null (default): keep every one forever. Set to an
-  # int to delete all but the N most recent.
-  keep_last: null
+  tags: []
+  name: ${output_dirname}
 
 hydra:
   job:
     chdir: false
   run:
-    dir: outputs/train_gs/${now:%Y-%m-%d_%H-%M-%S}
+    dir: ${output_dirname}

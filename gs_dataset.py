@@ -89,12 +89,15 @@ def xyz_to_x0(xyz):
   return (xyz - XYZ_MEAN) / XYZ_STD
 
 
-def _rotate_quats_wxyz(q_wxyz, R_transform):
+def rotate_quats_wxyz(q_wxyz, R_transform):
   """q_wxyz: (...,4) numpy wxyz unit quaternions. R_transform: (3,3) rotation
   matrix applied on the left (R_out = R_transform @ R_in). Returns (...,4)
   wxyz, same shape. Uses scipy.spatial.transform.Rotation (already a project
   dependency -- fit_gsplat.py uses it too) rather than hand-rolled quaternion
-  composition, which is an easy place to get sign/order conventions wrong."""
+  composition, which is an easy place to get sign/order conventions wrong.
+  Public (not _-prefixed): train_gs.py's get_preview_source() also uses this,
+  the opposite direction (camera-to-world instead of world-to-camera), to
+  transform its preview Gaussians into world space for module.OrbitCallback."""
   from scipy.spatial.transform import Rotation
   shape = q_wxyz.shape
   flat = q_wxyz.reshape(-1, 4)
@@ -150,7 +153,7 @@ def _load_ground_truth(gt_h5_path, source_pose_gl):
   quat_cam_lhwc = np.zeros_like(quat_world_lhwc)
   quat_cam_lhwc[..., 0] = 1.0
   if valid_lhw.any():
-    quat_cam_lhwc[valid_lhw] = _rotate_quats_wxyz(quat_world_lhwc[valid_lhw], r_w2c)
+    quat_cam_lhwc[valid_lhw] = rotate_quats_wxyz(quat_world_lhwc[valid_lhw], r_w2c)
 
   tensors = {
     "opacity": rearrange(torch.from_numpy(opacity), "h w l -> l h w").contiguous().float(),
@@ -282,8 +285,12 @@ def _read_view(f, path, view_idx, k_depth_name, k_image_name):
     alpha = (depth_peel[..., 0] > 0).astype(np.float32)
 
   return {
-    "rgb": rgb, "alpha": alpha, "pose": pose,
-    "K_depth": K_depth, "K_image": K_image, "depth_peel": depth_peel,
+    "rgb": rgb,
+    "alpha": alpha,
+    "pose": pose,
+    "K_depth": K_depth,
+    "K_image": K_image,
+    "depth_peel": depth_peel,
   }
 
 
@@ -321,20 +328,23 @@ def _assemble_item(src, targets, num_layers, mesh_id, source_view, target_views)
       f"source view {source_view}: depth_peel has {hit.shape[-1]} "
       f"layers, expected num_layers={num_layers}")
 
-  poses = np.stack([src["pose"]] + [t["pose"] for t in targets], axis=0)
+  poses = np.stack([src["pose"], *(t["pose"] for t in targets)], axis=0)
   viewmats = relative_viewmats(poses)   # (1+k, 4, 4), viewmats[0] == eye(4)
 
   def to_view_dict(v, viewmat):
     return {
-      "rgb": rearrange(torch.from_numpy(v["rgb"]), "h w c -> c h w").contiguous(),  # (3,H,W)
-      "alpha": torch.from_numpy(v["alpha"])[None],                       # (1,H,W)
-      "K_image": torch.from_numpy(v["K_image"]),                        # (3,3)
-      "viewmat": torch.from_numpy(viewmat),                             # (4,4)
+      "rgb": rearrange(torch.from_numpy(v["rgb"]), "h w c -> c h w").contiguous(),
+      "alpha": rearrange(torch.from_numpy(v["alpha"]), "h w -> 1 h w"),
+      "K_image": torch.from_numpy(v["K_image"]),    # (3,3)
+      "viewmat": torch.from_numpy(viewmat),         # (4,4)
     }
 
   return {
+    "views": torch.utils.data.default_collate([
+      to_view_dict(v, viewmat)
+      for v, viewmat in zip([src, *targets], viewmats)
+    ]),
     "source": {
-      **to_view_dict(src, viewmats[0]),
       "xyz_cam": rearrange(torch.from_numpy(xyz_cam), "h w l c -> l h w c").contiguous(),  # (L,H,W,3)
       "hit": rearrange(torch.from_numpy(hit), "h w l -> l h w").contiguous(),              # (L,H,W)
       "K_depth": torch.from_numpy(src["K_depth"]),
@@ -343,7 +353,6 @@ def _assemble_item(src, targets, num_layers, mesh_id, source_view, target_views)
                                                            # "up" direction for orbit previews
                                                            # (train_gs.py); not used in training.
     },
-    "targets": [to_view_dict(t, viewmats[1 + i]) for i, t in enumerate(targets)],
     "mesh_index": mesh_id,
     "source_view": int(source_view),
     "target_views": [int(v) for v in target_views],
@@ -475,6 +484,51 @@ def split_by_mesh(catalog: H5Catalog, val_fraction=0.1, seed=42):
   return H5Catalog._from_df(train_df), H5Catalog._from_df(val_df)
 
 
+def split_by_view(catalog: H5Catalog, val_fraction=0.1, seed=42):
+  gen = torch.Generator().manual_seed(seed)
+
+  n_total = len(catalog)
+  n_val = max(1, round(n_total * val_fraction)) if val_fraction > 0 else 0
+  n_train = n_total - n_val
+  idx = np.arange(n_total)
+  train_idx, val_idx = random_split(idx, [n_train, n_val], generator=gen)
+  train_idx, val_idx = train_idx.indices, val_idx.indices
+
+  if n_total <= 1000:
+    print("Train idx", list(train_idx))
+    print("Val idx", list(val_idx))
+
+  return H5Catalog._from_df(catalog.df[train_idx]), H5Catalog._from_df(catalog.df[val_idx])
+
+
+def split_by_indices(catalog: H5Catalog, train_idx, val_idx, seed=42, strict=True):
+  """Splits `catalog` at caller-given row positions (into catalog.df, the
+  same index space split_by_view's own random split operates in) instead of
+  a random val_fraction -- for reproducing one specific split (e.g. matching
+  an earlier run, or hand-picking which scenes are held out) rather than
+  reseeding a random one. `seed` is accepted only so GSDataModule.setup()
+  can call every data.split_fn the same way (split_fn(catalog,
+  seed=cfg.seed)); unused here.
+
+  `strict` (default True) requires train_idx/val_idx to exactly partition
+  catalog: (1) no index in both, and (2) together they cover every row
+  0..len(catalog)-1 -- a typo'd or stale index list fails loudly instead of
+  silently training/validating on the wrong rows. Set False to allow a
+  deliberate partial split (rows in neither list are just dropped) or an
+  intentional overlap."""
+  train_idx, val_idx = list(train_idx), list(val_idx)
+  if strict:
+    overlap = sorted(set(train_idx) & set(val_idx))
+    if overlap:
+      raise ValueError(f"split_by_indices: {overlap} appear in both train_idx and val_idx")
+    missing = sorted(set(range(len(catalog))) - set(train_idx) - set(val_idx))
+    if missing:
+      raise ValueError(
+        f"split_by_indices: strict=True requires train_idx+val_idx to cover every row "
+        f"in [0, {len(catalog)}) -- missing {missing}")
+  return H5Catalog._from_df(catalog.df[train_idx]), H5Catalog._from_df(catalog.df[val_idx])
+
+
 class GSPairDataset(Dataset):
   """Wraps an H5Catalog with "path", "mesh_id", "view_idx" columns (e.g. one
   half of a split_by_mesh result -- this class doesn't split anything
@@ -494,6 +548,9 @@ class GSPairDataset(Dataset):
 
   def __init__(self, catalog: H5Catalog, num_layers=6, num_target_views=3, seed=42,
               deterministic_targets=False):
+    self.source_view = 0
+    self.target_views = tuple(range(1, num_target_views+1))
+
     self.catalog = catalog
     self.num_layers = num_layers
     self.num_target_views = num_target_views
@@ -531,11 +588,11 @@ class GSPairDataset(Dataset):
     # sample instead of first filtering it out of the whole (possibly much
     # larger) views list -- avoids an O(len(views)) scan every call.
     k = min(self.num_target_views, len(views) - 1)
-    if k > 0:
+    if k <= 0:
+      target_views = []
+    else:
       sampled = rng.sample(views, k + 1)
       target_views = [v for v in sampled if v != source_view][:k]
-    else:
-      target_views = []
 
     return _build_item(f, path, source_view, target_views, self.num_layers, mesh_id)
 

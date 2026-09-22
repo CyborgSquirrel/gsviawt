@@ -1,32 +1,47 @@
 # Config for fit_gsplat.py -- optimize a 3D Gaussian Splatting model from one
 # render HDF5 (render_objaverse.py / capture_turntable.py schema), seeded from
-# the primary view's 6-layer depth peel and supervised by primary + secondary
-# views. See fit_gsplat.py's module docstring.
+# the PRIMARY view's 6-layer depth peel and supervised by every view in the
+# train split. See fit_gsplat.py's module docstring, and load_catalog_views'
+# docstring for what "primary" means now (no longer its own config field).
+
+defaults:
+  # Reuses train_gs.py's own conf/data/split_fn/*.yaml option files verbatim
+  # (lands at data.split_fn here too, even though nothing else in this
+  # config lives under data: -- keeps the override syntax identical to
+  # train_gs.py's, e.g. data/split_fn=by_indices
+  # data.split_fn.train_idx='[0,1,2]' data.split_fn.val_idx='[3,4]' (the
+  # first entry of train_idx is the seeding "primary" view -- see
+  # load_catalog_views). by_view (not train_gs.yaml's by_mesh default):
+  # fit_gsplat.py fits ONE scene at a time, so a corpus is typically
+  # single-mesh already, where by_mesh degenerates to "everything train,
+  # nothing val" (see its own docstring) -- by_view actually does
+  # something useful here.
+  - data/split_fn: by_view
+  - _self_
 
 # --- input ---
-hdf5_path: /app/bla/objaverse_renders.h5
-primary: 0                 # primary view index (seeds the Gaussians)
-secondary: []             # extra view indices for supervision, e.g. [1,2,3]
-                          # (primary + secondary must all be the same mesh_index)
+hdf5_path: /app/bla/objaverse_renders.h5   # str, list, or glob(s)
 
-# null -> "<hdf5_path>.gsplat.view<primary>.h5" (+ .ply, + .val/ alongside)
+# null -> "<hdf5_path>.gsplat.view<primary>.h5" (+ .ply)
 output_path: null
 
 # --- optimization ---
-iters: 3000
+iters: 10000                # trainer.max_steps -- a raw optimizer-step count,
+                             # independent of train split size / loader.
+                             # batch_size below (an "epoch" -- one full pass
+                             # over the train split -- still exists and drives
+                             # check_val_every_n_epoch, but doesn't bound
+                             # training length; trainer.max_epochs is -1).
 seed: 42
-device: cuda              # cuda | cpu
 
-# Number of views (sampled uniformly at random, without replacement, from the
-# full primary+secondary set) to render and supervise on each iteration.
-# null (the special "all views" value) renders every view every iteration --
-# full-batch gradient descent, this repo's original/default behaviour. Set an
-# int (e.g. 1) to instead do stochastic per-iteration view sampling, matching
-# the vanilla 3DGS paper's one-random-camera-per-step training loop -- each
-# iteration gets cheaper (~views_per_iter/num_views the cost) but noisier, so
-# more iterations are typically needed to reach the same quality. Values >=
-# the number of views behave identically to null.
-views_per_iter: null
+# Views per training step, rendered+compared together in one batch (a plain
+# DataLoader(shuffle=True, batch_size=...) over the train split -- see
+# GSFitDataModule). 1 matches the vanilla 3DGS paper's one-random-camera-
+# per-step training loop; set it to the number of train views for full-batch
+# gradient descent instead (this repo's original/default behaviour).
+loader:
+  batch_size: 1
+  num_workers: 0
 
 # Whether the optimizer may move Gaussian centers. false = centers stay locked
 # at their depth-peel back-projected seed positions; only scale / rotation /
@@ -50,7 +65,6 @@ init_opacity: 0.1         # starting opacity for every seeded Gaussian
 knn_k: 4                  # neighbours used to size each Gaussian's initial scale
 
 # --- validation / output ---
-val_every: 500            # dump gt|render PNGs every N iters (0 disables)
 write_ply: true           # also write a standard 3DGS .ply next to the .h5
 # .ply pruning -- all off by default (the .h5 always keeps every Gaussian).
 # Set a value to enable that check.
@@ -69,22 +83,53 @@ datasets:
 wandb:
   project: gsviawt
   mode: disabled              # online | offline | disabled
-  tags: [fit-gsplat]
+  tags: [3dgs-optim]
   name: null
 
-# Turntable orbit preview, logged as wandb.Video (needs wandb.mode != disabled).
-# Anchored to the primary view's own actual capture distance (scene_scale),
-# NOT an auto-fit/bounding-sphere distance -- this optimization has no floor
-# forcing Gaussian scale to stay above ~1 pixel of spacing, so a
-# tighter-than-capture orbit can expose a false "gaps" artifact. See
-# fit_gsplat.py's render_orbit_frames docstring.
-orbit:
-  enabled: true
-  every: 500                 # iterations between orbit renders (0 effectively via enabled=false)
-  num_frames: 24
-  fps: 12
-  crf: 28
-  elevation_deg: 20.0
+# Same wandb train/panel [GT | render | |diff|] comparison train_gs.py logs,
+# and (orbit) the same turntable preview video train_gs.py logs -- both
+# module.{Panel,Orbit}Callback, shared -- see their own docstrings; each
+# pulls straight from GSFitLightningModule.get_preview_source(), no other
+# callback needed. To disable either one (e.g. no wandb.mode -> both no-op
+# already, but to drop one specifically), remove it on the CLI:
+# ~callbacks.orbit.
+callbacks:
+  panel:
+    _target_: module.PanelCallback
+    every_n_steps: ${eval:'${iters} // 50'}
+
+  orbit:
+    _target_: module.OrbitCallback
+    every_n_steps: ${eval:'${iters} // 50'}
+    num_frames: 24
+    fps: 12
+    crf: 28
+    elevation_deg: 20.0        # camera distance = the primary view's own actual capture
+                                # distance (scene_scale), not a re-fit bounding-sphere
+                                # framing -- see GSFitLightningModule.get_preview_source
+
+# pl.Trainer kwargs -- everything except `logger` (built in code from the
+# wandb run, or False when wandb is disabled). No has_val bookkeeping needed:
+# when split_fn produces an empty val split, GSFitDataModule.val_dataloader
+# hands Lightning a gs_dataset._EmptyDataset and it skips validation on its
+# own, same as train_gs.py.
+trainer:
+  max_steps: ${iters}
+  max_epochs: -1             # unbounded -- max_steps alone ends training;
+                              # epochs still happen (and still drive
+                              # check_val_every_n_epoch below), just aren't
+                              # what training length is measured in.
+  accelerator: auto
+  devices: 1
+  enable_checkpointing: false
+  num_sanity_val_steps: 2
+  check_val_every_n_epoch: 1
+  log_every_n_steps: 10      # matches the original loop's wandb logging cadence (it % 10 == 0)
+  # Unset/null by default -- this optimization's lr/loss weights above were
+  # tuned without gradient clipping; set this to experiment with it rather
+  # than changing the default.
+  gradient_clip_val: null
+  gradient_clip_algorithm: norm
 
 hydra:
   job:
