@@ -312,21 +312,6 @@ def apply_ground_truth_overrides(gauss, gt, hit, predict_params, device):
 # losses (DSSIMLoss now lives in module.py, shared with fit_gsplat.py)
 # ---------------------------------------------------------------------------
 
-def per_view_losses(pred_rgb, pred_alpha, gt_rgb, gt_alpha, dssim, cfg_loss):
-  """pred/gt _rgb: (V,H,W,3), _alpha: (V,H,W,1). `dssim`: a DSSIMLoss(reduction=
-  "none") instance. Returns (per_view (V,) total weighted loss, parts dict of
-  (V,) component losses), all premultiplied by alpha (matches fit_gsplat.py's
-  convention: bg stays black on both sides)."""
-  pred_c = rearrange(pred_rgb * pred_alpha, "v h w c -> v c h w")
-  gt_c = rearrange(gt_rgb * gt_alpha, "v h w c -> v c h w")
-  l1 = (pred_c - gt_c).abs().mean(dim=(1, 2, 3))
-  dssim_per_view = dssim(pred_c, gt_c).mean(dim=(1, 2, 3))
-  mask_l1 = (pred_alpha - gt_alpha).abs().mean(dim=(1, 2, 3))
-  per_view = (
-    cfg_loss.l1_weight * l1 + cfg_loss.ssim_weight * dssim_per_view + cfg_loss.mask_weight * mask_l1
-  )
-  return per_view, {"l1": l1, "ssim": dssim_per_view, "mask": mask_l1}
-
 
 def compute_direct_loss(gauss, gt, hit, cfg_loss, device):
   """Direct per-pixel supervision of the model's own predicted Gaussian
