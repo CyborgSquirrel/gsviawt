@@ -237,14 +237,25 @@ def make_viewmats(poses):
   return np.linalg.inv(c2w_cv).astype(np.float32)
 
 
+def activate_gaussians(params):
+  """params: the raw optimizer dict (means/scales_log/quats/opac_logit/
+  colors_logit). Returns gsplat.rasterization-ready values (means passed
+  through as-is; everything else activated): {"means","quats","scales",
+  "opacities","colors"}. Split out of render() so PreviewSourceCallback can
+  reuse just the activation, without also rasterizing."""
+  return {
+    "means": params["means"],
+    "quats": F.normalize(params["quats"], dim=-1),
+    "scales": torch.exp(params["scales_log"]),
+    "opacities": torch.sigmoid(params["opac_logit"]),
+    "colors": torch.sigmoid(params["colors_logit"]),
+  }
+
+
 def render(params, viewmats, Ks, width, height):
   import gsplat
   rgb, alpha, _ = gsplat.rasterization(
-    means=params["means"],
-    quats=F.normalize(params["quats"], dim=-1),
-    scales=torch.exp(params["scales_log"]),
-    opacities=torch.sigmoid(params["opac_logit"]),
-    colors=torch.sigmoid(params["colors_logit"]),
+    **activate_gaussians(params),
     viewmats=viewmats, Ks=Ks, width=width, height=height,
     sh_degree=None, render_mode="RGB", packed=True,
   )
@@ -515,6 +526,7 @@ class GSFitLightningModule(pl.LightningModule):
     self.final_loss = float("nan")
     self.iters = int(cfg.iters)
     self.log_every = max(1, self.iters // 10)
+    self.preview_source = None  # stashed by PreviewSourceCallback, read by module.PanelCallback
 
     self.params = nn.ParameterDict({
       k: nn.Parameter(torch.from_numpy(v), requires_grad=(k != "means" or self.optimize_means))
@@ -679,6 +691,31 @@ class GSFitLightningModule(pl.LightningModule):
       wandb_run.log({"val/panel": wandb.Image(panel, caption=f"iter {it}")}, step=it)
 
 
+class PreviewSourceCallback(pl.Callback):
+  """Producer half of module.PanelCallback's preview_source hand-off (see
+  that module's own comment block for the full contract). Unlike
+  train_gs.py's version, there's no model and no dataset batch to run here
+  -- the 3DGS IS pl_module.params, this optimization's own live state --
+  so this just activates it (activate_gaussians, the same helper render()
+  uses) and packages it with the fixed supervision view set.
+
+  Train-stage only for now -- see module.PanelCallback."""
+
+  def on_train_epoch_end(self, trainer, pl_module):
+    gauss = activate_gaussians(pl_module.params)
+    gauss["sh_degree"] = None
+    pl_module.preview_source = {
+      "gauss": gauss,
+      "views": {
+        "viewmat": pl_module.viewmats,
+        "K": pl_module.Ks,
+        "width": pl_module.gt_rgb.shape[2],
+        "height": pl_module.gt_rgb.shape[1],
+        "gt_rgb": rearrange(pl_module.gt_rgb, "v h w c -> v c h w"),
+      },
+    }
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -705,6 +742,14 @@ def main(cfg: DictConfig) -> None:
   out_h5 = cfg.output_path or f"{views['path']}.gsplat.view{views['primary']}.h5"
   stem = out_h5[:-3] if out_h5.endswith(".h5") else out_h5
 
+  with open_dict(cfg):
+    cfg.output_stem = stem              # so GSFitLightningModule can find the .val/ dir
+    cfg.has_val = val_views is not None  # read by conf/gsplat.yaml's trainer.* interpolations
+
+  # Stashed above BEFORE this: OmegaConf.to_container(cfg, resolve=True)
+  # below (for wandb's own config snapshot) resolves the whole tree,
+  # including trainer.num_sanity_val_steps's ${has_val} interpolation --
+  # has_val must already exist on cfg by the time that call runs.
   wandb_run, logger = None, False
   if cfg.wandb.mode != "disabled":
     wandb_run = wandb.init(
@@ -716,9 +761,6 @@ def main(cfg: DictConfig) -> None:
     )
     logger = WandbLogger(experiment=wandb_run)
 
-  with open_dict(cfg):
-    cfg.output_stem = stem              # so GSFitLightningModule can find the .val/ dir
-    cfg.has_val = val_views is not None  # read by conf/gsplat.yaml's trainer.* interpolations
   V = views["images"].shape[0]
   IH, IW = views["images"].shape[1:3]      # RGB render / supervision resolution
   DH, DW, L = views["depth"].shape[1:]     # depth-peel = seed + output-grid resolution
@@ -749,7 +791,9 @@ def main(cfg: DictConfig) -> None:
 
   model = GSFitLightningModule(cfg, g, uvl, views, val_views, scene_scale, views["image_K"][0])
 
-  trainer = pl.Trainer(logger=logger, **OmegaConf.to_container(cfg.trainer, resolve=True))
+  callbacks = list(hydra.utils.instantiate(cfg.callbacks).values())
+  trainer = pl.Trainer(
+    logger=logger, callbacks=callbacks, **OmegaConf.to_container(cfg.trainer, resolve=True))
   with timed("optimize"):
     trainer.fit(model, datamodule=GSFitDataModule())
 

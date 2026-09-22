@@ -14,11 +14,15 @@ vs. per-frame rasterization).
 import contextlib as ctl
 import logging
 
+import lightning.pytorch as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import pack, rearrange
 from omegaconf import OmegaConf
 from torch.optim import Optimizer
+
+import wandb
 
 log = logging.getLogger(__name__)
 
@@ -137,3 +141,106 @@ def guarded_render(tag):
   except torch.OutOfMemoryError as e:
     log.warning("%s: CUDA OOM during render, skipping this frame -- %s", tag, e)
     torch.cuda.empty_cache()
+
+
+# ---------------------------------------------------------------------------
+# preview_source / PanelCallback
+#
+# Both scripts periodically render their CURRENT Gaussians against a fixed
+# handful of views and log a [GT | render | |diff|] comparison to wandb.
+# What differs per script is how you get from "current state" to actual
+# gsplat.rasterization()-ready Gaussian arrays: train_gs.py runs its model
+# forward + flatten_gaussians on a batch item; fit_gsplat.py just activates
+# its own live optimizer params (no model, no batch). What's identical once
+# you have those arrays -- the render call, building the panel image, and
+# logging it -- lives here.
+#
+# The hand-off: each script defines its OWN `PreviewSourceCallback`
+# (`__main__.PreviewSourceCallback` in both conf/train_gs.yaml and
+# conf/gsplat.yaml -- same name, different file-local class, same convention
+# OrbitCallback/ViewPanelCallback already used), which on_train_epoch_end
+# stashes
+#   pl_module.preview_source = {
+#     "gauss": {"means","quats","scales","opacities","colors","sh_degree"},
+#     "views": {"viewmat","K","width","height","gt_rgb"},
+#   }
+# (gauss arrays already flattened/activated -- exactly what render()
+# already needs in fit_gsplat.py, or one flatten_gaussians() yield in
+# train_gs.py; gt_rgb: (V,C,H,W) in [0,1]; sh_degree: None or an int).
+# PanelCallback below just reads that dict -- it has no idea which script
+# produced it. Hydra callback order matters: PreviewSourceCallback must be
+# listed before PanelCallback in conf/*.yaml's `callbacks:` (Lightning
+# calls callbacks in list order), so the stash is fresh before this reads
+# it, not one epoch stale.
+#
+# Train-stage only for now: on_validation_epoch_end is commented out below
+# rather than implemented, since it's not yet clear what fit_gsplat.py
+# would put in preview_source for "val" that's comparable to train_gs.py's
+# val split -- revisit once that's settled instead of guessing now.
+# ---------------------------------------------------------------------------
+
+def _build_panel(gt_rgb, pred_rgb):
+  """gt_rgb/pred_rgb: (N,C,H,W) in [0,1]. Returns one uint8 (H, N*3*W, 3)
+  image: for each view, [GT | render | |diff|] side by side."""
+  n = gt_rgb.shape[0]
+  rows = []
+  for i in range(n):
+    gc = gt_rgb[i].detach().cpu()
+    pc = pred_rgb[i].detach().cpu()
+    g = (gc * 255).to(torch.uint8)
+    r = (pc * 255).to(torch.uint8)
+    d = ((gc - pc).abs() * 255).to(torch.uint8)
+    rows.append(pack([g, r, d], "c * w")[0])
+  return pack(rows, "c h *")[0]
+
+
+class PanelCallback(pl.Callback):
+  """Shared consumer half of the preview_source hand-off -- see this
+  module's own comment block above for the full contract. Renders
+  pl_module.preview_source's Gaussians into its views in ONE
+  gsplat.rasterization() call and logs a [GT | render | |diff|] panel."""
+
+  def __init__(self, *, every_n_epochs: int):
+    self.every_n_epochs = every_n_epochs
+
+  def on_train_epoch_end(self, trainer, pl_module):
+    self._on_epoch_end("train", trainer, pl_module)
+
+  # Deliberately not implemented -- see this module's comment block above.
+  # def on_validation_epoch_end(self, trainer, pl_module):
+  #   self._on_epoch_end("val", trainer, pl_module)
+
+  def _on_epoch_end(self, stage, trainer, pl_module):
+    # Count of COMPLETED epochs (Lightning hasn't bumped trainer.current_epoch
+    # yet at this point in the hook) -- "every_n_epochs=1" means "every
+    # epoch", matching conf/*.yaml's comment on that field elsewhere.
+    epoch = trainer.current_epoch + 1
+    if epoch % self.every_n_epochs != 0:
+      return
+    wandb_run = pl_module.logger.experiment if pl_module.logger is not None else None
+    if wandb_run is None:
+      return
+    source = pl_module.preview_source
+    if source is None:
+      return
+    gauss, views = source["gauss"], source["views"]
+
+    panel = None
+    with guarded_render(f"{stage}/panel"), torch.no_grad():
+      import gsplat
+      rgb, _, _ = gsplat.rasterization(
+        means=gauss["means"], quats=gauss["quats"], scales=gauss["scales"],
+        opacities=gauss["opacities"], colors=gauss["colors"],
+        viewmats=views["viewmat"], Ks=views["K"],
+        width=int(views["width"]), height=int(views["height"]),
+        sh_degree=gauss["sh_degree"], render_mode="RGB", packed=True,
+      )
+      pred_rgb = rearrange(rgb.clamp(0.0, 1.0), "v h w c -> v c h w")
+      panel = _build_panel(views["gt_rgb"], pred_rgb)
+    if panel is None:
+      return
+
+    wandb_run.log({
+      f"{stage}/panel": wandb.Image(
+        panel, caption="GT | render | |diff|, one row per view"),
+    })

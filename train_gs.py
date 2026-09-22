@@ -577,6 +577,7 @@ class GSLightningModule(pl.LightningModule):
     super().__init__()
     self.cfg = cfg
     self.views_seen = 0
+    self.preview_source = None  # stashed by PreviewSourceCallback, read by module.PanelCallback
 
     with timed("build_model"):
       self.model = GSModel(cfg)
@@ -846,84 +847,57 @@ class OrbitCallback(pl.Callback):
 # wandb image panels
 # ---------------------------------------------------------------------------
 
-def _val_panel(gt_rgb, pred_rgb):
-  """
-  gt_rgb/pred_rgb: (N,3,H,W) in [0,1].
-  Returns one uint8 (H, V*3*W, 3) image: for each view, [GT | render | |diff|] side by side.
-  """
-  n = gt_rgb.shape[0]
-  rows = []
-  for i in range(n):
-    g = (gt_rgb[i].detach().cpu() * 255).to(torch.uint8)
-    r = (pred_rgb[i].detach().cpu() * 255).to(torch.uint8)
-    d = ((gt_rgb[i] - pred_rgb[i].detach().cpu()).abs() * 255).to(torch.uint8)
-    rows.append(pack([g, r, d], "c * w")[0])
-  return pack(rows, "c h *")[0]
+class PreviewSourceCallback(pl.Callback):
+  """Producer half of module.PanelCallback's preview_source hand-off (see
+  that module's own comment block for the full contract and why this is a
+  separate callback). Runs the model on a fixed train item, flattens its
+  predicted Gaussians into gsplat.rasterization-ready arrays via the
+  existing model()/flatten_gaussians() pieces, and stashes
+  pl_module.preview_source. No cadence gating of its own -- cheap next to a
+  real training epoch (one forward pass on one fixed item), so it just
+  refreshes every epoch; module.PanelCallback alone decides when to
+  actually render+log from it.
 
+  Train-stage only for now -- see module.PanelCallback."""
 
-class ViewPanelCallback(pl.Callback):
-  def __init__(
-    self,
-    *,
-    every_n_epochs: int,
-  ):
-    self.every_n_epochs = every_n_epochs
-
+  def __init__(self):
     self.train_batch = None
-    self.val_batch = None
 
   def on_fit_start(self, trainer, pl_module):
     dm = trainer.datamodule
     self.train_batch = collate_with_batch_size([dm.train_ds[0]])
-    self.val_batch = collate_with_batch_size([dm.val_ds[0]]) if len(dm.val_ds) > 0 else None
 
   def on_train_epoch_end(self, trainer, pl_module):
-    return self._on_epoch_end("train", trainer, pl_module)
-
-  def on_validation_epoch_end(self, trainer, pl_module):
-    return self._on_epoch_end("val", trainer, pl_module)
-
-  def _on_epoch_end(self, stage, trainer, pl_module):
-    # Count of COMPLETED epochs (Lightning hasn't bumped trainer.current_epoch
-    # yet at this point in the hook) -- "every_n_epochs=1" means "every
-    # epoch", matching conf/train_gs.yaml's comment on that field.
-    epoch = trainer.current_epoch + 1
-    if epoch % self.every_n_epochs != 0:
+    if self.train_batch is None:
       return
     model = pl_module.model
     device = pl_module.device
-
-    wandb_run = pl_module.logger.experiment if pl_module.logger is not None else None
-    if wandb_run is None:
-      return
+    batch = self.train_batch
 
     # NOTE(andrei): Not sure if setting model to eval is the right move here,
     # but gonna do it for now.
-    with set_mode(model, "eval"), timed(f"view_panel@epoch{epoch}"):
-      match stage:
-        case "train":
-          batch = self.train_batch
-        case "val":
-          batch = self.val_batch
-        case _:
-          raise RuntimeError(f"Unexpected {stage=}")
+    with set_mode(model, "eval"), torch.no_grad():
+      gauss = model(
+        batch["views"]["rgb"][:, 0].to(device),
+        batch["source"]["xyz_cam"].to(device),
+      )
+      flat = next(flatten_gaussians(
+        batch["batch_size"], gauss,
+        batch["source"]["xyz_cam"].to(device), batch["source"]["hit"].to(device),
+      ))
+    flat["sh_degree"] = model.max_sh_degree
 
-      if batch is None:
-        return
-
-      model_pred = None
-      with guarded_render(f"{stage}/orbit panel"), torch.no_grad():
-        model_pred = model_forward(model, batch, need_render=True, device=device)
-
-      pred_rgb = rearrange(model_pred["rgb"]    , "b v ... -> (b v) ...")
-      gt_rgb   = rearrange(batch["views"]["rgb"], "b v ... -> (b v) ...")
-
-      wandb_run.log({
-        f"{stage}/panel": wandb.Image(
-          _val_panel(gt_rgb, pred_rgb),
-          caption="GT | render | |diff|, one row per view (source first, then targets)",
-        ),
-      })
+    v = batch["views"]
+    pl_module.preview_source = {
+      "gauss": flat,
+      "views": {
+        "viewmat": v["viewmat"][0].to(device),
+        "K": v["K_image"][0].to(device),
+        "width": v["rgb"].shape[-1],
+        "height": v["rgb"].shape[-2],
+        "gt_rgb": v["rgb"][0].to(device),
+      },
+    }
 
 
 @hydra.main(version_base=None, config_path="conf", config_name="train_gs")

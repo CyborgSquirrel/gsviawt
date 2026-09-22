@@ -104,6 +104,21 @@ orbit:
   crf: 28
   elevation_deg: 20.0
 
+# preview_source must come before panel -- Lightning calls callbacks in
+# this list's order, and panel reads what preview_source just stashed.
+# Same wandb train/panel [GT | render | |diff|] comparison train_gs.py logs
+# (module.PanelCallback, shared -- see its own docstring), now available
+# for fit_gsplat.py too. Separate from the val_every gt|render PNG dump
+# above -- that compares against the FULL supervision set and writes to
+# disk regardless of wandb; this is wandb-only and reuses the same cadence.
+callbacks:
+  preview_source:
+    _target_: __main__.PreviewSourceCallback
+
+  panel:
+    _target_: module.PanelCallback
+    every_n_epochs: ${val_every}
+
 # pl.Trainer kwargs -- everything except `logger` (built in code from the
 # wandb run, or False when wandb is disabled). `has_val` isn't a field you
 # set: main() injects it (== whether split_fn produced a non-empty val
