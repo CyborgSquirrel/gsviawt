@@ -89,12 +89,15 @@ def xyz_to_x0(xyz):
   return (xyz - XYZ_MEAN) / XYZ_STD
 
 
-def _rotate_quats_wxyz(q_wxyz, R_transform):
+def rotate_quats_wxyz(q_wxyz, R_transform):
   """q_wxyz: (...,4) numpy wxyz unit quaternions. R_transform: (3,3) rotation
   matrix applied on the left (R_out = R_transform @ R_in). Returns (...,4)
   wxyz, same shape. Uses scipy.spatial.transform.Rotation (already a project
   dependency -- fit_gsplat.py uses it too) rather than hand-rolled quaternion
-  composition, which is an easy place to get sign/order conventions wrong."""
+  composition, which is an easy place to get sign/order conventions wrong.
+  Public (not _-prefixed): train_gs.py's get_preview_source() also uses this,
+  the opposite direction (camera-to-world instead of world-to-camera), to
+  transform its preview Gaussians into world space for module.OrbitCallback."""
   from scipy.spatial.transform import Rotation
   shape = q_wxyz.shape
   flat = q_wxyz.reshape(-1, 4)
@@ -150,7 +153,7 @@ def _load_ground_truth(gt_h5_path, source_pose_gl):
   quat_cam_lhwc = np.zeros_like(quat_world_lhwc)
   quat_cam_lhwc[..., 0] = 1.0
   if valid_lhw.any():
-    quat_cam_lhwc[valid_lhw] = _rotate_quats_wxyz(quat_world_lhwc[valid_lhw], r_w2c)
+    quat_cam_lhwc[valid_lhw] = rotate_quats_wxyz(quat_world_lhwc[valid_lhw], r_w2c)
 
   tensors = {
     "opacity": rearrange(torch.from_numpy(opacity), "h w l -> l h w").contiguous().float(),

@@ -48,11 +48,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
 from fit_gsplat import SH_C0  # noqa: E402
 from gs_dataset import (OPENGL_TO_OPENCV, GaussH5ValDataset,  # noqa: E402
                         GSFixedViewsDataset, GSPairDataset, H5Catalog,
-                        _EmptyDataset)
+                        _EmptyDataset, rotate_quats_wxyz)
 from gs_decoder import GaussianResnetDecoder, GSDecoderStack  # noqa: E402
 from gs_encoder import GSResnetEncoder  # noqa: E402
 from module import DSSIMLoss, WarmupCosineAnnealingLR  # noqa: E402
-from orbit_video import look_at_c2w  # noqa: E402
 from util import collate_with_batch_size, pipe, set_mode, timed  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -384,74 +383,6 @@ def compute_direct_loss(gauss, gt, hit, cfg_loss, device):
 
 
 # ---------------------------------------------------------------------------
-# orbit previews
-#
-# The model's Gaussians live entirely in the source view's own camera frame
-# (see gs_dataset.py's module docstring) -- there's no Blender world frame
-# available to orbit around. To still get a non-tumbling turntable, we derive
-# a stable "up" direction by taking Blender's world +Z and expressing it in
-# that same source-camera frame via the view's own (otherwise-unused) raw
-# pose, then build the orbit entirely within that frame using the same
-# look_at_c2w/OPENGL_TO_OPENCV convention as the rest of the render path.
-# ---------------------------------------------------------------------------
-
-def _up_in_source_frame(pose_gl):
-  """pose_gl: (4,4) camera-to-world, Blender/OpenGL axes (a view's raw,
-  un-transformed pose). Returns Blender's world +Z direction expressed in
-  this camera's own OpenCV frame (the frame flatten_gaussians' `means` live
-  in), via the same axis flip debug_pointcloud.py/gs_dataset.py use
-  elsewhere (self-inverse, so it applies the same in either direction)."""
-  r_gl = pose_gl[:3, :3]
-  up_gl = r_gl.T @ np.array([0.0, 0.0, 1.0], dtype=np.float32)
-  up_cv = up_gl * np.array([1.0, -1.0, -1.0], dtype=np.float32)
-  return up_cv / (np.linalg.norm(up_cv) + 1e-8)
-
-
-def _orbit_c2w_gl(means, up, num_frames, elevation_deg):
-  """Closed circular orbit (OpenGL local axes, matching look_at_c2w) around
-  `means`'s centroid, entirely within `means`'s own frame, at the SAME
-  distance the real source camera was from the object.
-
-  This deliberately does not fit a "nicely framed" distance to the means'
-  bounding sphere (orbit_video.py's approach, meant for arbitrary/unknown-
-  scale 3DGS models): our Gaussians are anchored one-per-source-pixel, so
-  their scale only covers the point spacing produced at that original
-  capture distance/resolution. A tighter-fit orbit camera zooms in past that
-  native density and exposes the gaps between neighboring Gaussians as a
-  fine grid/moire artifact -- confirmed by comparing against a render at the
-  actual capture distance, which shows no such pattern. The real camera sat
-  at this frame's own origin (see gs_dataset.py), so the distance is just
-  the centroid's norm -- no separate bookkeeping needed."""
-  center = means.mean(axis=0)
-  up = up / (np.linalg.norm(up) + 1e-8)
-
-  # azimuth=0 reference: from the object back toward where the real camera
-  # was (its own frame's origin), projected off the up axis -- an arbitrary
-  # but recognizable, non-degenerate starting angle.
-  ref = -center
-  ref = ref - np.dot(ref, up) * up
-  if np.linalg.norm(ref) < 1e-6:
-    arbitrary = np.array([1.0, 0.0, 0.0], np.float32)
-    if abs(np.dot(arbitrary, up)) > 0.99:
-      arbitrary = np.array([0.0, 1.0, 0.0], np.float32)
-    ref = arbitrary - np.dot(arbitrary, up) * up
-  ref = ref / np.linalg.norm(ref)
-  right = np.cross(up, ref)
-
-  dist = max(float(np.linalg.norm(center)), 1e-3)
-  elev = np.radians(float(elevation_deg))
-  azimuths = np.linspace(0.0, 2 * np.pi, int(num_frames), endpoint=False)
-
-  poses = []
-  for az in azimuths:
-    eq_dir = ref * np.cos(az) + right * np.sin(az)
-    direction = eq_dir * np.cos(elev) + up * np.sin(elev)
-    eye = center + dist * direction
-    poses.append(look_at_c2w(eye, center, up=up))
-  return np.stack(poses).astype(np.float32)
-
-
-# ---------------------------------------------------------------------------
 # training loop
 # ---------------------------------------------------------------------------
 
@@ -589,15 +520,16 @@ class GSLightningModule(pl.LightningModule):
     os.makedirs(self.output_dir, exist_ok=True)
 
   def configure_optimizers(self):
-    optim = hydra.utils.instantiate(self.cfg.optim)(self.model.parameters())
-    sched = hydra.utils.instantiate(self.cfg.sched)(optim)
-    return {
-      "optimizer": optim,
-      "lr_scheduler": {
-        "scheduler": sched,
+    out = {}
+
+    out["optimizer"] = hydra.utils.instantiate(self.cfg.optim)(self.model.parameters())
+    if OmegaConf.select(self.cfg, "sched") is not None:
+      out["lr_scheduler"] = {
+        "scheduler": hydra.utils.instantiate(self.cfg.sched)(out["optimizer"]),
         "interval": "step",
       }
-    }
+
+    return out
 
   def training_step(self, batch, batch_idx):
     return self._step("train", batch, batch_idx)
@@ -706,13 +638,33 @@ class GSLightningModule(pl.LightningModule):
     return out
 
   def get_preview_source(self):
-    """Gaussians + views for module.PanelCallback's [GT | render | |diff|]
-    panel, computed from a fixed train item (self.trainer.datamodule's
-    train_ds[0]) via this model's own forward pass. Cached per-epoch
-    (lazily -- no __init__ changes needed for this, it's this method's own
-    bookkeeping) so a second call in the same epoch doesn't redundantly
-    redo the forward pass; called on-demand by PanelCallback, only on
-    epochs it's actually about to log, not every epoch.
+    """Gaussians + views, in true WORLD space, for module.PanelCallback's
+    [GT | render | |diff|] panel AND module.OrbitCallback's turntable video
+    -- both pull this same method, same per-epoch cache. Computed from a
+    fixed train item (self.trainer.datamodule's train_ds[0]) via this
+    model's own forward pass.
+
+    The model's own Gaussians are natively predicted in the source view's
+    own camera frame (see gs_dataset.py's module docstring -- there's no
+    Blender world frame available to the model itself, by design, since it
+    has to work from a single image with no other scene context). But THIS
+    item is a real dataset row with a real recorded camera pose
+    (source.pose_gl), so -- purely for this preview/orbit purpose, not
+    anything the model itself relies on -- everything below is transformed
+    into true Blender world space using that one known pose:
+      - Gaussian means: gs_dataset._check_ground_truth_consistency's own
+        reprojection formula (already proven there against real ground
+        truth, ~1e-5 error).
+      - Gaussian quats: gs_dataset.rotate_quats_wxyz, the inverse direction
+        of what _load_ground_truth uses (that rotates world->camera; this
+        is camera->world).
+      - The whole supervision-set viewmats: recovered algebraically from
+        that same pose and the existing source-relative viewmats
+        (gs_dataset.relative_viewmats) -- world_viewmat[i] == viewmat[i] @
+        inv(source_c2w_cv) -- no change to gs_dataset.py needed, target
+        views' raw poses were never stored and don't need to be.
+    This is what lets module.OrbitCallback stay fully generic: it never
+    has to know this source-camera-frame-vs-world distinction exists.
 
     NOTE(andrei): Not sure if setting model to eval is the right move here,
     but gonna do it for now."""
@@ -733,11 +685,31 @@ class GSLightningModule(pl.LightningModule):
       ))
     flat["sh_degree"] = self.model.max_sh_degree
 
+    # world <- source-camera-frame, from this item's own known real pose.
+    pose_gl_np = batch["source"]["pose_gl"][0].numpy()
+    c2w_cv = pose_gl_np @ OPENGL_TO_OPENCV
+
+    means_np = flat["means"].detach().cpu().numpy()
+    means_h = np.concatenate([means_np, np.ones((len(means_np), 1), np.float32)], axis=-1)
+    flat["means"] = torch.from_numpy((means_h @ c2w_cv.T)[:, :3].astype(np.float32)).to(device)
+
+    quats_np = flat["quats"].detach().cpu().numpy()
+    quats_world = rotate_quats_wxyz(quats_np, c2w_cv[:3, :3])
+    flat["quats"] = torch.from_numpy(quats_world.astype(np.float32)).to(device)
+
     v = batch["views"]
+    viewmat_np = v["viewmat"][0].numpy()               # (V,4,4), source-relative
+    world_viewmat = viewmat_np @ np.linalg.inv(c2w_cv)  # (V,4,4), true world-to-camera
+
     source = {
       "gauss": flat,
+      # scene_scale: the source camera's own real distance from the world
+      # origin -- module.OrbitCallback's orbit radius (matches
+      # fit_gsplat.py's own scene_scale: norm of a capture camera's own
+      # world position).
+      "scene_scale": float(np.linalg.norm(pose_gl_np[:3, 3])) or 1.0,
       "views": {
-        "viewmat": v["viewmat"][0].to(device),
+        "viewmat": torch.from_numpy(world_viewmat.astype(np.float32)).to(device),
         "K": v["K_image"][0].to(device),
         "width": v["rgb"].shape[-1],
         "height": v["rgb"].shape[-2],
@@ -746,40 +718,6 @@ class GSLightningModule(pl.LightningModule):
     }
     self._preview_cache_epoch, self._preview_cache = epoch, source
     return source
-
-  def get_orbit_source(self, num_frames, elevation_deg):
-    """Orbit camera poses + this module's current Gaussians, for
-    module.OrbitCallback's turntable preview video. The model's Gaussians
-    live entirely in the source view's own camera frame (see gs_dataset.py's
-    module docstring) -- there's no Blender world frame available to orbit
-    around. To still get a non-tumbling turntable, derive a stable "up"
-    direction by taking Blender's world +Z and expressing it in that same
-    source-camera frame via the view's own (otherwise-unused) raw pose,
-    then build the orbit entirely within that frame (_orbit_c2w_gl).
-    Distance is fixed to the real source camera's own capture distance --
-    NOT an auto-fit/bounding-sphere framing like orbit_video.py's default
-    -- see _orbit_c2w_gl's own docstring for why (exposes the per-pixel
-    Gaussian spacing as a moire pattern otherwise).
-
-    Reuses get_preview_source()'s cached gauss (same Gaussians, same
-    epoch) -- this only computes the extra orbit-specific camera poses."""
-    preview = self.get_preview_source()
-    gauss, views = preview["gauss"], preview["views"]
-
-    means_np = gauss["means"].detach().cpu().numpy()
-    pose_gl = self.trainer.datamodule.train_ds[0]["source"]["pose_gl"].numpy()
-    up = _up_in_source_frame(pose_gl)
-    poses_gl = _orbit_c2w_gl(means_np, up, num_frames, elevation_deg)
-    c2w_cv = poses_gl @ OPENGL_TO_OPENCV
-    viewmats = torch.from_numpy(np.linalg.inv(c2w_cv).astype(np.float32)).to(self.device)
-
-    return {
-      "gauss": gauss,
-      "viewmats": viewmats,
-      "K": views["K"][0],  # views["K"] is (V,3,3) for the whole supervision set; orbit uses only the source view's own K
-      "width": views["width"],
-      "height": views["height"],
-    }
 
 
 @hydra.main(version_base=None, config_path="conf", config_name="train_gs")

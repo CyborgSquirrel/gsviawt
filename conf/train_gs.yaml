@@ -175,7 +175,7 @@ callbacks:
     fps: 12
     crf: 28                    # x264 quality (higher = smaller/faster; fine for monitoring)
     elevation_deg: 20.0        # camera distance = the actual source view's own capture distance,
-                                # not a re-fit bounding-sphere framing -- see train_gs._orbit_c2w_gl
+                                # not a re-fit bounding-sphere framing -- see GSLightningModule.get_preview_source
 
   panel:
     _target_: module.PanelCallback

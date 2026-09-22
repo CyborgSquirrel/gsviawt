@@ -6,14 +6,20 @@ renders under a `pl.Trainer` (train_gs.py: a network's predicted Gaussians
 over a dataset; fit_gsplat.py: one scene's own Gaussians, directly). That's
 where the overlap actually is -- the loss/schedule/OOM-handling plumbing,
 plus the PanelCallback/OrbitCallback pair below, which each PULL a
-normalized {"gauss", ...} snapshot from the LightningModule (via
-get_preview_source()/get_orbit_source(), one implementation per script) and
-do the actual gsplat.rasterization()+encode+wandb-log call once, here.
-What's NOT shared -- deliberately -- is how each script gets from "current
-state" to that normalized snapshot: Gaussian representation, SH vs. flat
-colour, world- vs. source-camera frame, and (for orbit) camera-distance
-policy all differ per script for reasons documented at each
-get_preview_source()/get_orbit_source() implementation.
+normalized snapshot from the LightningModule (get_preview_source(), one
+implementation per script) and do the actual gsplat.rasterization()+
+encode+wandb-log call once, here.
+
+Both scripts' get_preview_source() returns Gaussians AND camera views in
+true WORLD space (train_gs.py's Gaussians are natively predicted in the
+source view's own camera frame -- see gs_dataset.py's module docstring --
+but get_preview_source() transforms them into world space using that
+view's own raw pose before returning, precisely so this module doesn't
+need to know or care about that distinction). That's what makes
+OrbitCallback fully shared below: one world-frame turntable formula
+(WORLD_UP/look_at_c2w), no per-script pose method at all -- it only needs
+a distance (each get_preview_source() includes its own "scene_scale") and
+the already-world-space Gaussians.
 """
 
 import contextlib as ctl
@@ -35,13 +41,34 @@ import wandb
 
 log = logging.getLogger(__name__)
 
-# Both scripts' conf/*.yaml lean on this for trainer.* fields that are a
-# small expression over another field rather than a literal (e.g.
-# "${eval:'max(1, ${val_every})'}") -- registered here, once, so importing
-# either script (train_gs.py imports fit_gsplat.py imports this module)
-# can't double-register it and raise.
+# Both scripts' conf/*.yaml lean on this for callback/trainer fields that are
+# a small expression over another field rather than a literal (e.g.
+# "${eval:'${iters} // 50'}") -- registered here, once, so importing either
+# script (train_gs.py imports fit_gsplat.py imports this module) can't
+# double-register it and raise.
 if not OmegaConf.has_resolver("eval"):
   OmegaConf.register_new_resolver("eval", eval)
+
+# Camera-local axis flip: Blender/OpenGL (X right, Y up, Z back) <-> OpenCV
+# (X right, Y down, Z forward). Canonical copy -- fit_gsplat.py and
+# gs_dataset.py each used to define their own identical constant.
+OPENGL_TO_OPENCV = np.diag([1.0, -1.0, -1.0, 1.0]).astype(np.float32)
+WORLD_UP = np.array([0.0, 0.0, 1.0], np.float32)  # Blender / render_objaverse is Z-up
+
+
+def look_at_c2w(eye, target, up=WORLD_UP):
+  """OpenGL camera-to-world (X right, Y up, -Z forward) looking from `eye`
+  at `target`. Canonical copy -- fit_gsplat.py and orbit_video.py each used
+  to define their own identical function."""
+  z = eye - target
+  z = z / (np.linalg.norm(z) + 1e-8)
+  if abs(np.dot(z, up)) > 0.999:
+    up = np.array([0.0, 1.0, 0.0], np.float32) if abs(up[1]) < 0.9 else np.array([1.0, 0.0, 0.0], np.float32)
+  x = np.cross(up, z); x = x / (np.linalg.norm(x) + 1e-8)
+  y = np.cross(z, x)
+  c2w = np.eye(4, dtype=np.float32)
+  c2w[:3, 0], c2w[:3, 1], c2w[:3, 2], c2w[:3, 3] = x, y, z, eye
+  return c2w
 
 
 class WarmupCosineAnnealingLR(torch.optim.lr_scheduler.SequentialLR):
@@ -271,21 +298,39 @@ def write_mp4(frames, path, fps, crf):
   return path
 
 
+def _orbit_viewmats(dist, num_frames, elevation_deg):
+  """N raw world-frame c2w poses on a circular orbit around the world
+  origin at radius `dist` (a fixed capture distance, not an auto-fit
+  bounding-sphere framing -- both scripts anchor to their own scene_scale
+  for the same "avoid exposing per-Gaussian spacing as a moire pattern"
+  reason, documented at each get_preview_source() implementation),
+  converted to gsplat-ready (N,4,4) world-to-camera viewmats (OpenCV
+  convention)."""
+  elev = np.radians(float(elevation_deg))
+  azimuths = np.linspace(0.0, 2 * np.pi, int(num_frames), endpoint=False)
+  poses = np.stack([
+    look_at_c2w(
+      np.array([np.cos(elev) * np.cos(az), np.cos(elev) * np.sin(az), np.sin(elev)], np.float32) * dist,
+      np.zeros(3, np.float32),
+    )
+    for az in azimuths
+  ])
+  c2w_cv = poses @ OPENGL_TO_OPENCV
+  return np.linalg.inv(c2w_cv).astype(np.float32)
+
+
 class OrbitCallback(pl.Callback):
   """Shared consumer half of the same pull pattern PanelCallback uses.
-  Pulls pl_module.get_orbit_source(num_frames, elevation_deg) --
-  {"gauss": {means,quats,scales,opacities,colors,sh_degree}, "viewmats":
-  (N,4,4), "K": (3,3), "width", "height"} -- expands K to (N,3,3), renders
-  all N orbit frames in ONE batched gsplat.rasterization() call, writes an
-  mp4, and logs wandb.Video.
+  Pulls pl_module.get_preview_source() -- same call PanelCallback makes,
+  same per-epoch cache -- and, since both scripts' Gaussians are already in
+  world space there (see this module's own docstring), builds ONE
+  world-frame turntable orbit (_orbit_viewmats, radius = the source's own
+  "scene_scale") entirely in here. No per-script pose method needed at
+  all. Renders all N orbit frames in ONE batched gsplat.rasterization()
+  call, writes an mp4, and logs wandb.Video.
 
   Train-stage only for now -- see PanelCallback's own note on why val is
-  deferred; same reasoning applies here.
-
-  Camera-pose generation (world-frame vs. source-camera-frame, fixed-at-
-  capture-distance vs. auto-fit) stays entirely inside each script's own
-  get_orbit_source() -- see train_gs.py's / fit_gsplat.py's own
-  implementations for why those genuinely differ and aren't unified here."""
+  deferred; same reasoning applies here."""
 
   def __init__(self, *, every_n_epochs: int, num_frames: int = 24,
               fps: int = 12, crf: int = 28, elevation_deg: float = 20.0):
@@ -322,14 +367,17 @@ class OrbitCallback(pl.Callback):
     frames = None
     with guarded_render(f"{stage}/orbit"), torch.no_grad():
       import gsplat
-      source = pl_module.get_orbit_source(self.num_frames, self.elevation_deg)
-      gauss, viewmats = source["gauss"], source["viewmats"]
-      Ks = source["K"][None].expand(viewmats.shape[0], -1, -1)
+      source = pl_module.get_preview_source()
+      gauss, views = source["gauss"], source["views"]
+      device = gauss["means"].device
+      viewmats = torch.from_numpy(
+        _orbit_viewmats(source["scene_scale"], self.num_frames, self.elevation_deg)).to(device)
+      Ks = views["K"][0][None].expand(viewmats.shape[0], -1, -1)
       rgb, _, _ = gsplat.rasterization(
         means=gauss["means"], quats=gauss["quats"], scales=gauss["scales"],
         opacities=gauss["opacities"], colors=gauss["colors"],
         viewmats=viewmats, Ks=Ks,
-        width=int(source["width"]), height=int(source["height"]),
+        width=int(views["width"]), height=int(views["height"]),
         sh_degree=gauss["sh_degree"], render_mode="RGB", packed=True,
       )
       rgb_np = (rgb.clamp(0.0, 1.0).cpu().numpy() * 255).astype("uint8")
