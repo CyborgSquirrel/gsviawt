@@ -17,7 +17,10 @@ so that 1:1 correspondence survives to the output.
 They are then optimized with `gsplat` against the RGB (L1 + D-SSIM) and alpha
 (L1) of the primary + secondary views. Secondary views contribute supervision
 only, never new Gaussians. Fully-occluded deeper-layer Gaussians (seen in no
-supplied view) keep their initial front-pixel colour.
+supplied view) keep their initial front-pixel colour. `val` view indices
+(disjoint from primary/secondary) never contribute Gaussians OR gradient --
+they exist purely for the val/loss* photometric metrics logged alongside
+training, comparable to train_gs.py's own train/val split.
 
 `images` may be a higher resolution than `depth_peel`: the seed grid and the
 output grids stay at the depth-peel resolution (`depth_intrinsics`), while the
@@ -35,6 +38,15 @@ Output is written next to the input as:
   <h5>.gsplat.view<primary>.ply  -- standard 3DGS point cloud (if write_ply)
   <h5>.gsplat.view<primary>.val/ -- gt|render comparison PNGs (if val_every)
 
+Trained as a `pl.LightningModule` (GSFitLightningModule) under a plain
+`pl.Trainer`, sharing its loss/schedule/OOM-handling building blocks with
+train_gs.py via gs_lightning.py -- see that module's docstring for what's
+actually shared vs. deliberately not. There's no dataset in the usual sense
+(one fixed scene is optimized every step, no batching/epochs over examples),
+so GSFitDataModule's loader is a length-1 dummy: one Lightning "epoch" is
+exactly one optimizer step, the same trick train_gs.py's GSFixedViewsDataset
+fixed-view mode uses (see bla/train_gs_lightning_plan.md).
+
 Config is Hydra (`conf/gsplat.yaml`); run in the container venv, e.g.
 
     docker exec -w /app gsviawt-app-gpu-1 /home/user/venv/bin/python fit_gsplat.py \\
@@ -49,19 +61,25 @@ import logging
 import os
 import shutil
 import sys
-import sysconfig
 import tempfile
 
 import h5py
 import hydra
+import lightning.pytorch as pl
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, reduce, repeat
-from omegaconf import DictConfig, OmegaConf
+from lightning.pytorch.loggers import WandbLogger
+from omegaconf import DictConfig, OmegaConf, open_dict
+from torch.utils.data import DataLoader
+
+import wandb
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from debug_pointcloud import unproject_depth_peel  # noqa: E402
+from gs_lightning import gaussian_window, ssim_map  # noqa: E402
 from util import intrinsics_name, timed  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -76,30 +94,25 @@ SH_C0 = 0.28209479177387814  # SH band-0 constant, for RGB <-> sh0 in the .ply
 # loading
 # ---------------------------------------------------------------------------
 
-def load_views(cfg: DictConfig):
-  """Read the primary + secondary views. Returns a dict of stacked arrays
-  (primary first) plus the raw primary-view arrays used for seeding."""
-  ds = cfg.datasets
-  primary = int(cfg.primary)
-  secondary = [int(i) for i in cfg.secondary if int(i) != primary]
-  seen = set()
-  secondary = [i for i in secondary if not (i in seen or seen.add(i))]
-  order = [primary, *secondary]
-
-  with h5py.File(cfg.hdf5_path, "r") as f:
+def _load_view_set(hdf5_path, ds, order):
+  """Read exactly the given view indices (order matters -- index 0 is treated
+  as "primary" for the mesh_index consistency check). Returns a dict of
+  stacked arrays; shared by load_views (primary+secondary) and
+  load_val_views (held-out views)."""
+  with h5py.File(hdf5_path, "r") as f:
     n = f[ds.pose].shape[0]
     for i in order:
       if not 0 <= i < n:
-        raise SystemExit(f"view index {i} out of range [0, {n}) in {cfg.hdf5_path}")
+        raise SystemExit(f"view index {i} out of range [0, {n}) in {hdf5_path}")
 
     if "mesh_index" in f:
       mi = f["mesh_index"][:]
       picked = {int(mi[i]) for i in order}
       if len(picked) > 1:
         raise SystemExit(
-          f"selected views span mesh_index {sorted(picked)} -- primary + secondary "
-          f"views must all be the same object")
-      mesh_idx = int(mi[primary])
+          f"selected views span mesh_index {sorted(picked)} -- views "
+          f"must all be the same object")
+      mesh_idx = int(mi[order[0]])
     else:
       mesh_idx = -1
 
@@ -123,10 +136,42 @@ def load_views(cfg: DictConfig):
       image_K = K
 
   return {
-    "order": order, "primary": primary, "secondary": secondary,
-    "mesh_index": mesh_idx, "mesh_path": mesh_path,
+    "order": order, "mesh_index": mesh_idx, "mesh_path": mesh_path,
     "images": images, "depth": depth, "K": K, "image_K": image_K, "pose": pose,
   }
+
+
+def load_views(cfg: DictConfig):
+  """Read the primary + secondary views. Returns a dict of stacked arrays
+  (primary first) plus the raw primary-view arrays used for seeding."""
+  primary = int(cfg.primary)
+  secondary = [int(i) for i in cfg.secondary if int(i) != primary]
+  seen = set()
+  secondary = [i for i in secondary if not (i in seen or seen.add(i))]
+  order = [primary, *secondary]
+  out = _load_view_set(cfg.hdf5_path, cfg.datasets, order)
+  out["primary"] = primary
+  out["secondary"] = secondary
+  return out
+
+
+def load_val_views(cfg: DictConfig):
+  """Held-out views (cfg.val) used only for the val/loss* photometric
+  metrics -- never seed or supervise the fit. Returns None if cfg.val is
+  empty. Raises if a val index overlaps primary/secondary (a held-out set
+  that's secretly also a training view would make the val metric meaningless)."""
+  val_idx = [int(i) for i in cfg.get("val", [])]
+  if not val_idx:
+    return None
+  used = {int(cfg.primary), *(int(i) for i in cfg.secondary)}
+  overlap = sorted(set(val_idx) & used)
+  if overlap:
+    raise SystemExit(
+      f"cfg.val views {overlap} overlap cfg.primary/secondary -- validation "
+      f"views must be held out of the fit")
+  seen = set()
+  val_idx = [i for i in val_idx if not (i in seen or seen.add(i))]
+  return _load_view_set(cfg.hdf5_path, cfg.datasets, val_idx)
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +220,7 @@ def init_gaussians(depth_primary, K_primary, pose_primary, image_primary,
 
 
 # ---------------------------------------------------------------------------
-# rendering / losses
+# rendering
 # ---------------------------------------------------------------------------
 
 def make_viewmats(poses):
@@ -183,32 +228,6 @@ def make_viewmats(poses):
   world-to-camera in OpenCV convention -- what gsplat wants."""
   c2w_cv = poses @ OPENGL_TO_OPENCV
   return np.linalg.inv(c2w_cv).astype(np.float32)
-
-
-def _gaussian_window(size=11, sigma=1.5, device="cpu"):
-  coords = torch.arange(size, dtype=torch.float32, device=device) - (size - 1) / 2
-  g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
-  g = (g / g.sum())
-  return (g[:, None] * g[None, :])[None, None]
-
-
-def ssim(x, y, window=None):
-  """x, y: (V,3,H,W) in [0,1]. Mean SSIM over the batch (standard 11x11
-  Gaussian-window SSIM, channels filtered independently)."""
-  if window is None:
-    window = _gaussian_window(device=x.device)
-  c = x.shape[1]
-  w = window.expand(c, 1, -1, -1)
-  pad = w.shape[-1] // 2
-  mu_x = F.conv2d(x, w, padding=pad, groups=c)
-  mu_y = F.conv2d(y, w, padding=pad, groups=c)
-  mu_x2, mu_y2, mu_xy = mu_x ** 2, mu_y ** 2, mu_x * mu_y
-  sig_x = F.conv2d(x * x, w, padding=pad, groups=c) - mu_x2
-  sig_y = F.conv2d(y * y, w, padding=pad, groups=c) - mu_y2
-  sig_xy = F.conv2d(x * y, w, padding=pad, groups=c) - mu_xy
-  c1, c2 = 0.01 ** 2, 0.03 ** 2
-  s = ((2 * mu_xy + c1) * (2 * sig_xy + c2)) / ((mu_x2 + mu_y2 + c1) * (sig_x + sig_y + c2))
-  return s.mean()
 
 
 def render(params, viewmats, Ks, width, height):
@@ -374,6 +393,10 @@ def dump_val(val_dir, it, panel):
 # artifact that turned out to be a real bug there -- keeping the same
 # distance the model was actually supervised at avoids manufacturing that
 # confusion here.
+#
+# NOTE: kept as plain functions here, not moved to gs_lightning.py or shared
+# with orbit_video.py/train_gs.py's own orbit callbacks -- deliberately out
+# of scope for this pass, see the PR description.
 # ---------------------------------------------------------------------------
 
 WORLD_UP = np.array([0.0, 0.0, 1.0], np.float32)  # Blender / render_objaverse is Z-up
@@ -430,10 +453,218 @@ def render_orbit_frames(params, K_ref, dist, width, height, device, num_frames=2
 
 
 def log_orbit_video(wandb_run, step, frames, fps, crf, workdir):
-  import wandb
   path = os.path.join(workdir, f"orbit_{step}.mp4")
   write_mp4(frames, path, fps, crf)
   wandb_run.log({"orbit": wandb.Video(path, caption=f"iter {step}", format="mp4")}, step=step)
+
+
+# ---------------------------------------------------------------------------
+# lightning module
+# ---------------------------------------------------------------------------
+
+class _SingleBatchDataset(torch.utils.data.Dataset):
+  """Length-1 dataset: fit_gsplat has no dataset in the usual sense (one
+  fixed set of views is fitted every step, not sampled from a corpus), so a
+  length-1 loader makes one Lightning "epoch" equal exactly one optimizer
+  step -- the same trick train_gs.py's GSFixedViewsDataset fixed-view mode
+  uses (see bla/train_gs_lightning_plan.md's epoch==step discussion). The
+  yielded value is never used; training_step/validation_step read straight
+  off the module's own registered buffers instead."""
+  def __len__(self):
+    return 1
+
+  def __getitem__(self, idx):
+    return 0
+
+
+class GSFitDataModule(pl.LightningDataModule):
+  def train_dataloader(self):
+    return DataLoader(_SingleBatchDataset(), batch_size=1)
+
+  def val_dataloader(self):
+    # Always returns a loader (even with no val views); GSFitLightningModule
+    # only actually renders when it has val views, and main() sets
+    # limit_val_batches=0 otherwise so this is a no-op in that case rather
+    # than needing a None-returning special case here.
+    return DataLoader(_SingleBatchDataset(), batch_size=1)
+
+
+class GSFitLightningModule(pl.LightningModule):
+  """One scene's Gaussian parameters, optimized directly (no encoder/decoder
+  network -- contrast train_gs.py's GSLightningModule, which predicts
+  Gaussians from an image). `views` is the primary+secondary supervision
+  set (contributes gradient); `val_views` (optional) is a disjoint held-out
+  set used only for the val/loss* metrics below."""
+
+  def __init__(self, cfg, g, uvl, views, val_views, scene_scale, K_orbit):
+    super().__init__()
+    self.cfg = cfg
+    self.uvl = uvl
+    self.scene_scale = scene_scale
+    self.optimize_means = bool(cfg.optimize_means)
+    self.K_orbit = K_orbit
+    self.orbit_workdir = None
+    self.views_seen = 0
+    self.final_loss = float("nan")
+    self.iters = int(cfg.iters)
+    self.log_every = max(1, self.iters // 10)
+
+    self.params = nn.ParameterDict({
+      k: nn.Parameter(torch.from_numpy(v), requires_grad=(k != "means" or self.optimize_means))
+      for k, v in g.items()
+    })
+    self.register_buffer("window", gaussian_window(), persistent=False)
+    self._register_view_buffers("", views)
+
+    self.has_val = val_views is not None
+    if self.has_val:
+      self._register_view_buffers("val_", val_views)
+
+    V = views["images"].shape[0]
+    views_per_iter = OmegaConf.select(cfg, "views_per_iter")
+    self.views_per_iter = V if views_per_iter is None else min(int(views_per_iter), V)
+    self.view_rng = np.random.default_rng(int(cfg.seed))
+
+    # stashed by training_step, reused by the val-panel dump when it already
+    # covers the full view set (views_per_iter >= V) -- avoids a redundant
+    # render, same optimization the original hand-rolled loop made.
+    self._last_rgb_c = None
+    self._last_alpha = None
+
+  def _register_view_buffers(self, prefix, views):
+    self.register_buffer(f"{prefix}viewmats", torch.from_numpy(make_viewmats(views["pose"])), persistent=False)
+    self.register_buffer(f"{prefix}Ks", torch.from_numpy(views["image_K"]), persistent=False)
+    gt_rgb = torch.from_numpy(views["images"][..., :3].astype(np.float32) / 255.0)
+    if views["images"].shape[-1] == 4:
+      gt_alpha = torch.from_numpy(views["images"][..., 3:4].astype(np.float32) / 255.0)
+    else:  # equal-resolution RGB-only file (guarded in main()): mask from the surface layer
+      gt_alpha = torch.from_numpy((views["depth"][:, :, :, 0] > 0).astype(np.float32))[..., None]
+    gt_rgb = gt_rgb * gt_alpha  # composite GT over black, matching a black-bg render
+    self.register_buffer(f"{prefix}gt_rgb", gt_rgb, persistent=False)
+    self.register_buffer(f"{prefix}gt_alpha", gt_alpha, persistent=False)
+
+  def configure_optimizers(self):
+    cfg = self.cfg
+    groups = [
+      {"params": [self.params["scales_log"]], "lr": float(cfg.lr.scales)},
+      {"params": [self.params["quats"]], "lr": float(cfg.lr.quats)},
+      {"params": [self.params["opac_logit"]], "lr": float(cfg.lr.opacities)},
+      {"params": [self.params["colors_logit"]], "lr": float(cfg.lr.colors)},
+    ]
+    if self.optimize_means:
+      groups.insert(0, {"params": [self.params["means"]], "lr": float(cfg.lr.means) * self.scene_scale})
+    return torch.optim.Adam(groups)
+
+  def _photom_loss(self, rgb, alpha, gt_rgb, gt_alpha):
+    rgb_c = rgb * alpha  # premultiply so bg stays black on both sides
+    l1 = (rgb_c - gt_rgb).abs().mean()
+    dssim = 1.0 - ssim_map(
+      rgb_c.permute(0, 3, 1, 2), gt_rgb.permute(0, 3, 1, 2), self.window).mean()
+    mask = (alpha - gt_alpha).abs().mean()
+    ls, lm = float(self.cfg.lambda_ssim), float(self.cfg.lambda_mask)
+    loss = (1 - ls) * l1 + ls * dssim + lm * mask
+    return loss, rgb_c, {"l1": l1, "dssim": dssim, "mask": mask}
+
+  def training_step(self, batch, batch_idx):
+    it = self.current_epoch
+    V = self.viewmats.shape[0]
+    if self.views_per_iter >= V:
+      vm, ks, gt_rgb, gt_alpha = self.viewmats, self.Ks, self.gt_rgb, self.gt_alpha
+    else:
+      idx = torch.from_numpy(
+        self.view_rng.choice(V, size=self.views_per_iter, replace=False)).to(self.device)
+      vm, ks, gt_rgb, gt_alpha = self.viewmats[idx], self.Ks[idx], self.gt_rgb[idx], self.gt_alpha[idx]
+
+    IH, IW = gt_rgb.shape[1:3]
+    rgb, alpha = render(self.params, vm, ks, IW, IH)
+    loss, rgb_c, parts = self._photom_loss(rgb, alpha, gt_rgb, gt_alpha)
+    self._last_rgb_c, self._last_alpha = rgb_c.detach(), alpha.detach()
+
+    self.views_seen += self.views_per_iter
+    self.final_loss = loss.item()  # plain float: fed to log.info/%f, save_output, wandb.summary
+    self.log("train/loss", loss, prog_bar=True, batch_size=1)
+    for k, v in parts.items():
+      self.log(f"train/loss/photom_{k}", v.detach(), batch_size=1)
+    self.log("views_seen", self.views_seen, reduce_fx="max", batch_size=1)
+
+    last = it == self.iters - 1
+    if it % self.log_every == 0 or last:
+      log.info("iter %d/%d  loss %.5f  (l1 %.5f  dssim %.5f  mask %.5f)",
+               it, self.iters, loss.item(), parts["l1"].item(), parts["dssim"].item(),
+               parts["mask"].item())
+    return loss
+
+  def validation_step(self, batch, batch_idx):
+    if not self.has_val:
+      return
+    IH, IW = self.val_gt_rgb.shape[1:3]
+    with torch.no_grad():
+      rgb, alpha = render(self.params, self.val_viewmats, self.val_Ks, IW, IH)
+      loss, _, parts = self._photom_loss(rgb, alpha, self.val_gt_rgb, self.val_gt_alpha)
+    self.log("val/loss", loss, batch_size=1)
+    for k, v in parts.items():
+      self.log(f"val/loss/photom_{k}", v, batch_size=1)
+
+  def params_np(self):
+    return {k: v.detach().cpu().numpy() for k, v in self.params.items()}
+
+  def _wandb_run(self):
+    return self.logger.experiment if self.logger is not None else None
+
+  def on_fit_start(self):
+    if bool(self.cfg.orbit.enabled):
+      self.orbit_workdir = tempfile.mkdtemp(prefix="fit_gsplat_orbit_")
+
+  def on_fit_end(self):
+    if self.orbit_workdir is not None:
+      shutil.rmtree(self.orbit_workdir, ignore_errors=True)
+      self.orbit_workdir = None
+
+  def on_train_epoch_end(self):
+    # `self.current_epoch` here is still the just-finished 0-indexed
+    # iteration (Lightning bumps it after this hook), matching the original
+    # hand-rolled loop's post-step `it` exactly -- no +1 correction needed
+    # (contrast train_gs.py's OrbitCallback, a separate pl.Callback where the
+    # bump has already happened by the time it runs).
+    it = self.current_epoch
+    last = it == self.iters - 1
+    cfg = self.cfg
+
+    val_every = int(cfg.val_every)
+    if val_every and (it % val_every == 0 or last):
+      self._dump_val_panel(it)
+
+    orbit_every = int(cfg.orbit.every) if cfg.orbit.enabled else 0
+    wandb_run = self._wandb_run()
+    if orbit_every and wandb_run is not None and (it % orbit_every == 0 or last):
+      IH, IW = self.gt_rgb.shape[1:3]
+      frames = render_orbit_frames(
+        self.params, self.K_orbit, self.scene_scale, IW, IH, self.device,
+        num_frames=cfg.orbit.num_frames, elevation_deg=cfg.orbit.elevation_deg,
+      )
+      log_orbit_video(wandb_run, it, frames, cfg.orbit.fps, cfg.orbit.crf, self.orbit_workdir)
+
+  def _dump_val_panel(self, it):
+    # Always panels against the FULL supervision view set, independent of
+    # what this step happened to sample -- otherwise the panel's row
+    # count/pairing would silently depend on views_per_iter. NOTE: this is
+    # the primary+secondary supervision set's own fit quality, NOT the
+    # val/loss* held-out metrics above -- same "val" name as the original
+    # script, now sitting a bit awkwardly next to the new held-out split;
+    # flagged in the PR description rather than renamed here.
+    V = self.viewmats.shape[0]
+    if self.views_per_iter >= V:
+      full_rgb_c, full_alpha = self._last_rgb_c, self._last_alpha
+    else:
+      IH, IW = self.gt_rgb.shape[1:3]
+      with torch.no_grad():
+        full_rgb, full_alpha = render(self.params, self.viewmats, self.Ks, IW, IH)
+        full_rgb_c = full_rgb * full_alpha
+    panel = _build_val_panel(self.gt_rgb, self.gt_alpha, full_rgb_c, full_alpha)
+    dump_val(f"{self.cfg.output_stem}.val", it, panel)
+    wandb_run = self._wandb_run()
+    if wandb_run is not None:
+      wandb_run.log({"val/panel": wandb.Image(panel, caption=f"iter {it}")}, step=it)
 
 
 # ---------------------------------------------------------------------------
@@ -450,10 +681,11 @@ def main(cfg: DictConfig) -> None:
 
   out_h5 = cfg.output_path or f"{cfg.hdf5_path}.gsplat.view{int(cfg.primary)}.h5"
   stem = out_h5[:-3] if out_h5.endswith(".h5") else out_h5
+  with open_dict(cfg):
+    cfg.output_stem = stem  # stashed so GSFitLightningModule can find the .val/ dir
 
-  wandb_run = None
+  wandb_run, logger = None, False
   if cfg.wandb.mode != "disabled":
-    import wandb
     wandb_run = wandb.init(
       project=cfg.wandb.project,
       mode=cfg.wandb.mode,
@@ -461,9 +693,11 @@ def main(cfg: DictConfig) -> None:
       name=cfg.wandb.name,
       config=OmegaConf.to_container(cfg, resolve=True),
     )
+    logger = WandbLogger(experiment=wandb_run)
 
   with timed("load"):
     views = load_views(cfg)
+    val_views = load_val_views(cfg)
   V = views["images"].shape[0]
   IH, IW = views["images"].shape[1:3]      # RGB render / supervision resolution
   DH, DW, L = views["depth"].shape[1:]     # depth-peel = seed + output-grid resolution
@@ -473,15 +707,11 @@ def main(cfg: DictConfig) -> None:
                      "derived. Use an RGBA render or equal resolutions.")
 
   views_per_iter = OmegaConf.select(cfg, "views_per_iter")
-  if views_per_iter is None:
-    views_per_iter = V
-  views_per_iter = min(views_per_iter, V)
-
-  log.info("primary=%d secondary=%s  %d views  RGB %dx%d  depth/grid %dx%d  %d peel layers  "
-           "views_per_iter=%s  mesh=%s",
-           views["primary"], views["secondary"], V, IW, IH, DW, DH, L,
-           views_per_iter if views_per_iter is not None else "all",
-           views["mesh_path"] or views["mesh_index"])
+  views_per_iter = V if views_per_iter is None else min(int(views_per_iter), V)
+  log.info("primary=%d secondary=%s val=%s  %d views  RGB %dx%d  depth/grid %dx%d  "
+           "%d peel layers  views_per_iter=%d  mesh=%s",
+           views["primary"], views["secondary"], val_views["order"] if val_views else [],
+           V, IW, IH, DW, DH, L, views_per_iter, views["mesh_path"] or views["mesh_index"])
 
   with timed("init"):
     g = init_gaussians(views["depth"][0], views["K"][0], views["pose"][0],
@@ -493,118 +723,29 @@ def main(cfg: DictConfig) -> None:
            n_gauss, DW, DH, per_layer.tolist())
 
   scene_scale = float(np.linalg.norm(views["pose"][0][:3, 3])) or 1.0
-  optimize_means = bool(cfg.optimize_means)
-  params = {
-    k: torch.nn.Parameter(torch.from_numpy(v).to(device),
-                          requires_grad=(k != "means" or optimize_means))
-    for k, v in g.items()
-  }
   log.info("Gaussian centers: %s",
-           "trainable" if optimize_means else "FROZEN at depth-peel seed positions")
+           "trainable" if bool(cfg.optimize_means) else "FROZEN at depth-peel seed positions")
 
-  viewmats = torch.from_numpy(make_viewmats(views["pose"])).to(device)
-  Ks = torch.from_numpy(views["image_K"]).to(device)   # render/supervise at RGB resolution
+  model = GSFitLightningModule(cfg, g, uvl, views, val_views, scene_scale, views["image_K"][0])
 
-  gt_rgb = torch.from_numpy(views["images"][..., :3].astype(np.float32) / 255.0).to(device)
-  if views["images"].shape[-1] == 4:
-    gt_alpha = torch.from_numpy(views["images"][..., 3:4].astype(np.float32) / 255.0).to(device)
-  else:  # equal-resolution RGB-only file (guarded above): mask from the surface layer
-    gt_alpha = (torch.from_numpy((views["depth"][:, :, :, 0] > 0).astype(np.float32))
-                .to(device)[..., None])  # NaN / -1.0 no-hit both -> 0
-  gt_rgb = gt_rgb * gt_alpha  # composite GT over black, matching a black-bg render
-
-  groups = [
-    {"params": [params["scales_log"]], "lr": float(cfg.lr.scales)},
-    {"params": [params["quats"]], "lr": float(cfg.lr.quats)},
-    {"params": [params["opac_logit"]], "lr": float(cfg.lr.opacities)},
-    {"params": [params["colors_logit"]], "lr": float(cfg.lr.colors)},
-  ]
-  if optimize_means:
-    groups.insert(0, {"params": [params["means"]], "lr": float(cfg.lr.means) * scene_scale})
-  opt = torch.optim.Adam(groups)
-  window = _gaussian_window(device=device)
-  ls, lm = float(cfg.lambda_ssim), float(cfg.lambda_mask)
-  val_every = int(cfg.val_every)
-
-  iters = int(cfg.iters)
-  try:
-    from tqdm import trange
-    it_range = trange(iters, disable=None)  # disable=None -> auto-off when not a tty
-  except ImportError:
-    it_range = range(iters)
-  log_every = max(1, iters // 10)
-
-  orbit_every = int(cfg.orbit.every) if cfg.orbit.enabled else 0
-  orbit_workdir = tempfile.mkdtemp(prefix="fit_gsplat_orbit_") if orbit_every else None
-  K_orbit = views["image_K"][0]
-
-  # Separate RNG (seeded, but independent of torch's global state) for
-  # per-iteration view subsampling -- only used when views_per_iter is set.
-  view_rng = np.random.default_rng(int(cfg.seed))
-
-  final_loss = float("nan")
-  views_seen = 0
+  trainer = pl.Trainer(
+    max_epochs=int(cfg.iters),
+    accelerator=("gpu" if device == "cuda" else "cpu"),
+    devices=1,
+    logger=logger,
+    enable_checkpointing=False,
+    num_sanity_val_steps=(2 if model.has_val else 0),
+    check_val_every_n_epoch=max(1, int(cfg.val_every)),
+    limit_val_batches=(1.0 if model.has_val else 0.0),
+    log_every_n_steps=10,  # matches the original loop's wandb logging cadence (it % 10 == 0)
+    **OmegaConf.to_container(cfg.trainer, resolve=True),
+  )
   with timed("optimize"):
-    for it in it_range:
-      if views_per_iter >= V:
-        vm_it, ks_it, gt_rgb_it, gt_alpha_it = viewmats, Ks, gt_rgb, gt_alpha
-      else:
-        idx = torch.from_numpy(view_rng.choice(V, size=views_per_iter, replace=False)).to(device)
-        vm_it, ks_it, gt_rgb_it, gt_alpha_it = viewmats[idx], Ks[idx], gt_rgb[idx], gt_alpha[idx]
+    trainer.fit(model, datamodule=GSFitDataModule())
 
-      views_seen += views_per_iter
-
-      rgb, alpha = render(params, vm_it, ks_it, IW, IH)
-      rgb_c = rgb * alpha  # premultiply so bg stays black on both sides
-      l1 = (rgb_c - gt_rgb_it).abs().mean()
-      dssim = 1.0 - ssim(rgb_c.permute(0, 3, 1, 2), gt_rgb_it.permute(0, 3, 1, 2), window)
-      mask = (alpha - gt_alpha_it).abs().mean()
-      loss = (1 - ls) * l1 + ls * dssim + lm * mask
-
-      opt.zero_grad(set_to_none=True)
-      loss.backward()
-      opt.step()
-      final_loss = loss.item()
-
-      last = it == iters - 1
-      if hasattr(it_range, "set_postfix") and it % 10 == 0:
-        it_range.set_postfix(loss=final_loss, l1=l1.item(), dssim=dssim.item(), mask=mask.item())
-      if it % log_every == 0 or last:
-        log.info("iter %d/%d  loss %.5f  (l1 %.5f  dssim %.5f  mask %.5f)",
-                 it, iters, final_loss, l1.item(), dssim.item(), mask.item())
-      if wandb_run is not None and (it % 10 == 0 or last):
-        wandb_run.log({
-          "train/loss": final_loss,
-          "train/loss/photom_l1": l1.item(),
-          "train/loss/photom_dssim": dssim.item(),
-          "train/loss/photom_mask": mask.item(),
-          "views_seen": views_seen,
-        }, step=it)
-      if val_every and (it % val_every == 0 or last):
-        # Always panel against the FULL view set, independent of what this
-        # step happened to sample -- otherwise the panel's row count/pairing
-        # would silently depend on views_per_iter.
-        if views_per_iter is None:
-          full_rgb_c, full_alpha = rgb_c, alpha
-        else:
-          with torch.no_grad():
-            full_rgb, full_alpha = render(params, viewmats, Ks, IW, IH)
-            full_rgb_c = full_rgb * full_alpha
-        panel = _build_val_panel(gt_rgb, gt_alpha, full_rgb_c, full_alpha)
-        dump_val(f"{stem}.val", it, panel)
-        if wandb_run is not None:
-          import wandb
-          wandb_run.log({"val/panel": wandb.Image(panel, caption=f"iter {it}")}, step=it)
-      if orbit_every and wandb_run is not None and (it % orbit_every == 0 or last):
-        frames = render_orbit_frames(
-          params, K_orbit, scene_scale, IW, IH, device,
-          num_frames=cfg.orbit.num_frames, elevation_deg=cfg.orbit.elevation_deg,
-        )
-        log_orbit_video(wandb_run, it, frames, cfg.orbit.fps, cfg.orbit.crf, orbit_workdir)
-
-  params_np = {k: v.detach().cpu().numpy() for k, v in params.items()}
+  params_np = model.params_np()
   with timed("write"):
-    save_output(out_h5, cfg, views, params_np, uvl, DH, DW, L, final_loss, scene_scale)
+    save_output(out_h5, cfg, views, params_np, uvl, DH, DW, L, model.final_loss, scene_scale)
     if bool(cfg.write_ply):
       st = write_ply(f"{stem}.ply", params_np, scene_scale,
                      cfg.ply_opacity_threshold,
@@ -612,15 +753,13 @@ def main(cfg: DictConfig) -> None:
       log.info(".ply: kept %d/%d Gaussians  (pruned %d low-opacity, %d huge, %d sliver)",
                st["kept"], st["total"], st["low_opacity"], st["huge"], st["sliver"])
 
-  log.info("final loss %.5f  ->  %s%s%s", final_loss, out_h5,
+  log.info("final loss %.5f  ->  %s%s%s", model.final_loss, out_h5,
            f"  {stem}.ply" if cfg.write_ply else "",
-           f"  {stem}.val/" if val_every else "")
+           f"  {stem}.val/" if int(cfg.val_every) else "")
   if wandb_run is not None:
-    wandb_run.summary["final_loss"] = final_loss
+    wandb_run.summary["final_loss"] = model.final_loss
     wandb_run.summary["num_gaussians"] = n_gauss
     wandb_run.finish()
-  if orbit_workdir is not None:
-    shutil.rmtree(orbit_workdir, ignore_errors=True)
 
 
 if __name__ == "__main__":

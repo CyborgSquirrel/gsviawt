@@ -42,7 +42,6 @@ import torch.nn.functional as F
 from einops import pack, rearrange, repeat
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import DictConfig, OmegaConf, open_dict
-from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 
 import wandb
@@ -54,40 +53,11 @@ from gs_dataset import (OPENGL_TO_OPENCV, GaussH5ValDataset,  # noqa: E402
                         _EmptyDataset, split_by_mesh, split_by_view)
 from gs_decoder import GaussianResnetDecoder, GSDecoderStack  # noqa: E402
 from gs_encoder import GSResnetEncoder  # noqa: E402
+from gs_lightning import WarmupCosineAnnealingLR, gaussian_window, guarded_render, ssim_map  # noqa: E402
 from orbit_video import look_at_c2w, write_mp4  # noqa: E402
 from util import collate_with_batch_size, pipe, set_mode, timed  # noqa: E402
 
 log = logging.getLogger(__name__)
-
-
-class WarmupCosineAnnealingLR(torch.optim.lr_scheduler.SequentialLR):
-  def __init__(
-    self,
-    optimizer: Optimizer,
-    total_steps: int,
-    warmup_steps: int,
-    min_lr: float = 0.0,
-  ) -> None:
-    self.total_steps = int(total_steps)
-    self.warmup_steps = max(1, int(warmup_steps))
-    self.min_lr = float(min_lr)
-
-    warmup = torch.optim.lr_scheduler.LinearLR(
-      optimizer,
-      start_factor=1.0 / self.warmup_steps,
-      end_factor=1.0,
-      total_iters=self.warmup_steps,
-    )
-    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-      optimizer,
-      T_max=max(1, self.total_steps - self.warmup_steps),
-      eta_min=self.min_lr,
-    )
-    super().__init__(
-      optimizer,
-      schedulers=[warmup, cosine],
-      milestones=[self.warmup_steps],
-    )
 
 # ---------------------------------------------------------------------------
 # model
@@ -339,32 +309,9 @@ def apply_ground_truth_overrides(gauss, gt, hit, predict_params, device):
 
 
 # ---------------------------------------------------------------------------
-# losses (SSIM ported from fit_gsplat.py's hand-rolled version, kept
-# unreduced over the view axis so source/target losses can be split out)
+# losses (gaussian_window/ssim_map now live in gs_lightning.py, shared with
+# fit_gsplat.py)
 # ---------------------------------------------------------------------------
-
-def _gaussian_window(size=11, sigma=1.5, device="cpu"):
-  coords = torch.arange(size, dtype=torch.float32, device=device) - (size - 1) / 2
-  g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
-  g = g / g.sum()
-  return (g[:, None] * g[None, :])[None, None]
-
-
-def ssim_map(x, y, window):
-  """x, y: (V,C,H,W) in [0,1]. Standard 11x11 Gaussian-window SSIM, returned
-  unreduced (per-pixel) so callers can average per-view instead of globally."""
-  c = x.shape[1]
-  w = window.expand(c, 1, -1, -1)
-  pad = w.shape[-1] // 2
-  mu_x = F.conv2d(x, w, padding=pad, groups=c)
-  mu_y = F.conv2d(y, w, padding=pad, groups=c)
-  mu_x2, mu_y2, mu_xy = mu_x ** 2, mu_y ** 2, mu_x * mu_y
-  sig_x = F.conv2d(x * x, w, padding=pad, groups=c) - mu_x2
-  sig_y = F.conv2d(y * y, w, padding=pad, groups=c) - mu_y2
-  sig_xy = F.conv2d(x * y, w, padding=pad, groups=c) - mu_xy
-  c1, c2 = 0.01 ** 2, 0.03 ** 2
-  return ((2 * mu_xy + c1) * (2 * sig_xy + c2)) / ((mu_x2 + mu_y2 + c1) * (sig_x + sig_y + c2))
-
 
 def per_view_losses(pred_rgb, pred_alpha, gt_rgb, gt_alpha, window, cfg_loss):
   """pred/gt _rgb: (V,H,W,3), _alpha: (V,H,W,1). Returns (per_view (V,) total
@@ -521,29 +468,6 @@ def _orbit_c2w_gl(means, up, num_frames, elevation_deg):
   return np.stack(poses).astype(np.float32)
 
 
-@ctl.contextmanager
-def _guarded_render(tag):
-  """Context manager: runs the wrapped block, catching CUDA OOM so a single
-  bad preview/validation render can't crash the whole training run. gsplat
-  has no built-in memory-budget/OOM-catch mechanism of its own -- an
-  outlier Gaussian scale (e.g. from an undertrained network early in
-  training) can blow up isect_tiles' allocation regardless of what else is
-  using the GPU (confirmed against gsplat's own GitHub issues #464/#487:
-  same failure mode, same root cause -- excessive Gaussian volume -- no
-  upstream fix). Only used at preview/validation call sites (render_orbit,
-  the orbit panel log, validation_step) where skipping one frame is safe
-  and correct -- NOT in the main training step, where an OOM mid-step
-  should still surface loudly rather than silently dropping an optimizer
-  step. Callers pre-initialize their result variable to a fallback (e.g.
-  None) BEFORE the `with` block and assign it from inside -- if a CUDA OOM
-  fires, that assignment is simply never reached and the fallback stands."""
-  try:
-    yield
-  except torch.OutOfMemoryError as e:
-    log.warning("%s: CUDA OOM during render, skipping this frame -- %s", tag, e)
-    torch.cuda.empty_cache()
-
-
 # ---------------------------------------------------------------------------
 # training loop
 # ---------------------------------------------------------------------------
@@ -688,7 +612,7 @@ class GSLightningModule(pl.LightningModule):
 
     with timed("build_model"):
       self.model = GSModel(cfg)
-    self.register_buffer("window", _gaussian_window(), persistent=False)
+    self.register_buffer("window", gaussian_window(), persistent=False)
 
     # One directory for everything this run produces (currently just
     # checkpoints, but named generically for whatever else lands here later
@@ -852,7 +776,7 @@ class OrbitCallback(pl.Callback):
     """Renders a turntable orbit of `item`'s source-view Gaussians. Returns a
     generator of (H,W,3) uint8 frames, or None if the source view seeded zero
     Gaussians (nothing to show) or the render hit a CUDA OOM (see
-    _guarded_render)."""
+    gs_lightning.guarded_render)."""
 
     B = batch["batch_size"]
 
@@ -863,7 +787,7 @@ class OrbitCallback(pl.Callback):
     # gauss = apply_ground_truth_overrides(gauss, gt, hit, predict_params, device)
 
     frames = None
-    with _guarded_render("orbit render"), torch.no_grad():
+    with guarded_render("orbit render"), torch.no_grad():
       # TODO: Actually properly support batch size > 1
       for (
         x_gauss_flat,
@@ -902,7 +826,7 @@ class OrbitCallback(pl.Callback):
           packed=True,
         )
         rgb_np = (rgb_out.clamp(0.0, 1.0).cpu().numpy() * 255).astype(np.uint8)
-    frames = [rgb_np[i] for i in range(rgb_np.shape[0])]
+        frames = [rgb_np[i] for i in range(rgb_np.shape[0])]
     return frames
 
   def _on_epoch_end(self, stage, trainer, pl_module):
@@ -1020,7 +944,7 @@ class ViewPanelCallback(pl.Callback):
         return
 
       model_pred = None
-      with _guarded_render(f"{stage}/orbit panel"), torch.no_grad():
+      with guarded_render(f"{stage}/orbit panel"), torch.no_grad():
         model_pred = model_forward(model, batch, need_render=True, device=device)
 
       pred_rgb = rearrange(model_pred["rgb"]    , "b v ... -> (b v) ...")
