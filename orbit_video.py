@@ -55,7 +55,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # fit_gsplat wires up the pip CUDA toolchain for gsplat's JIT build on import,
 # and gives us the camera-convention helper, SSIM, and the SH constant.
-from fit_gsplat import make_viewmats, ssim, SH_C0  # noqa: E402
+from fit_gsplat import make_viewmats, SH_C0  # noqa: E402
+from module import DSSIMLoss  # noqa: E402
 
 import h5py  # noqa: E402
 import hydra  # noqa: E402
@@ -301,15 +302,18 @@ def render_mesh_frames(cfg, poses, K, mesh_path, workdir):
   return out
 
 
-def _frame_metrics(mesh_f, gs_f, device):
-  """mesh_f, gs_f: (H,W,3) float [0,1]. Returns (psnr, ssim, mae)."""
+def _frame_metrics(mesh_f, gs_f, dssim):
+  """mesh_f, gs_f: (H,W,3) float [0,1]. `dssim`: a DSSIMLoss(reduction=
+  "mean") already on the right device (built once per compare_panels call,
+  not per frame). Returns (psnr, ssim, mae)."""
   diff = np.abs(mesh_f - gs_f)
   mae = float(diff.mean())
   mse = float((diff ** 2).mean())
   psnr = float("inf") if mse == 0 else 10.0 * np.log10(1.0 / mse)
+  device = dssim.window.device
   a = torch.from_numpy(np.ascontiguousarray(mesh_f)).permute(2, 0, 1)[None].to(device)
   b = torch.from_numpy(np.ascontiguousarray(gs_f)).permute(2, 0, 1)[None].to(device)
-  s = float(ssim(a, b))
+  s = float(1.0 - dssim(a, b))
   return psnr, s, mae
 
 
@@ -348,6 +352,8 @@ def compare_panels(cfg, gs_source, mesh_npy, device, metrics_out, pts_source=Non
   if len(mesh) != n:
     raise SystemExit(f"mesh render has {len(mesh)} frames, orbit has {n}")
 
+  dssim = DSSIMLoss(reduction="mean").to(device)
+
   for i in range(n):
     mrgba = np.asarray(mesh[i], np.float32) / 255.0
     a = mrgba[..., 3:4]
@@ -355,7 +361,7 @@ def compare_panels(cfg, gs_source, mesh_npy, device, metrics_out, pts_source=Non
     gs_u8 = np.asarray(gs_source[i], np.uint8)
     gf = gs_u8.astype(np.float32) / 255.0
 
-    psnr, s, mae = _frame_metrics(mf, gf, device)
+    psnr, s, mae = _frame_metrics(mf, gf, dssim)
     metrics_out.append({"frame": i, "psnr": psnr, "ssim": s, "mae": mae})
 
     tiles = {"mesh": (np.clip(mf, 0, 1) * 255 + 0.5).astype(np.uint8),

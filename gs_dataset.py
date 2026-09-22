@@ -498,6 +498,34 @@ def split_by_view(catalog: H5Catalog, val_fraction=0.1, seed=42):
   return H5Catalog._from_df(catalog.df[train_idx]), H5Catalog._from_df(catalog.df[val_idx])
 
 
+def split_by_indices(catalog: H5Catalog, train_idx, val_idx, seed=42, strict=True):
+  """Splits `catalog` at caller-given row positions (into catalog.df, the
+  same index space split_by_view's own random split operates in) instead of
+  a random val_fraction -- for reproducing one specific split (e.g. matching
+  an earlier run, or hand-picking which scenes are held out) rather than
+  reseeding a random one. `seed` is accepted only so GSDataModule.setup()
+  can call every data.split_fn the same way (split_fn(catalog,
+  seed=cfg.seed)); unused here.
+
+  `strict` (default True) requires train_idx/val_idx to exactly partition
+  catalog: (1) no index in both, and (2) together they cover every row
+  0..len(catalog)-1 -- a typo'd or stale index list fails loudly instead of
+  silently training/validating on the wrong rows. Set False to allow a
+  deliberate partial split (rows in neither list are just dropped) or an
+  intentional overlap."""
+  train_idx, val_idx = list(train_idx), list(val_idx)
+  if strict:
+    overlap = sorted(set(train_idx) & set(val_idx))
+    if overlap:
+      raise ValueError(f"split_by_indices: {overlap} appear in both train_idx and val_idx")
+    missing = sorted(set(range(len(catalog))) - set(train_idx) - set(val_idx))
+    if missing:
+      raise ValueError(
+        f"split_by_indices: strict=True requires train_idx+val_idx to cover every row "
+        f"in [0, {len(catalog)}) -- missing {missing}")
+  return H5Catalog._from_df(catalog.df[train_idx]), H5Catalog._from_df(catalog.df[val_idx])
+
+
 class GSPairDataset(Dataset):
   """Wraps an H5Catalog with "path", "mesh_id", "view_idx" columns (e.g. one
   half of a split_by_mesh result -- this class doesn't split anything

@@ -2,6 +2,10 @@
 # Splatting prediction model (Flash3D-style encoder/decoder) on
 # render_objaverse.py-schema HDF5 files. See train_gs.py's module docstring.
 
+defaults:
+  - data/split_fn: by_mesh
+  - _self_
+
 # Directory for everything a single run produces.
 output_dirname: 3dgs-model-${now:%Y-%m-%d_%H-%M-%S}
 output_dir: outputs/${output_dirname}
@@ -17,17 +21,12 @@ data:
 
   # Train/val split for ordinary multi-scene training (ignored when
   # fixed_source_view or photom_h5_val is set -- see their own comments
-  # below). _target_ picks the split granularity: gs_dataset.split_by_mesh
-  # (default -- never splits a single mesh's views across train/val) or
-  # gs_dataset.split_by_view (splits individual views; the same mesh can
-  # land in both). _partial_: true bakes val_fraction in now, so
-  # GSDataModule.setup() just calls split_fn(catalog, seed=cfg.seed).
-  # val_fraction: 0 disables the split (train_ds gets everything, val_ds
-  # empty) -- see split_by_mesh/split_by_view's own docstrings.
-  split_fn:
-    _target_: gs_dataset.split_by_mesh
-    _partial_: true
-    val_fraction: 0.1
+  # below). A config group (conf/data/split_fn/*.yaml, picked via the
+  # `defaults:` list up top) rather than inline here, so the strategy is a
+  # one-token CLI override instead of rewriting _target_ by hand, e.g.:
+  #   data/split_fn=by_view data.split_fn.val_fraction=0.2
+  #   data/split_fn=by_indices data.split_fn.train_idx='[0,1,2]' data.split_fn.val_idx='[3,4]'
+  # See conf/data/split_fn/*.yaml for what each option takes.
 
   # Single-batch overfit mode (fit_gsplat.py's primary/secondary terms
   # applied here): if set, train on this EXACT source+target view set every

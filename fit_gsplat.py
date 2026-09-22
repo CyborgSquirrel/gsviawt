@@ -1,11 +1,24 @@
 #!/usr/bin/env python3
 """Optimize a layered 3D Gaussian Splatting model from one render HDF5.
 
-Input is an `.h5` in the `render_objaverse.py` schema (`images`, `depth_peel`,
-`depth_intrinsics`, `image_intrinsics`, `camera_pose`, `mesh_index`; legacy
-`camera_intrinsics` is also accepted). You pick one **primary** view index and
-zero or more **secondary** view indices; all must show the same object (same
-`mesh_index`).
+Input is an `.h5` (or glob/list of them) in the `render_objaverse.py` schema
+(`images`, `depth_peel`, `depth_intrinsics`, `image_intrinsics`, `camera_pose`,
+`mesh_index`; legacy `camera_intrinsics` is also accepted), read via
+`gs_dataset.H5Catalog` and split into train/val view sets with `data.split_fn`
+(a Hydra config group at `conf/data/split_fn/*.yaml`, the exact same one
+train_gs.py uses -- see `conf/gsplat.yaml`'s `defaults:`). fit_gsplat.py fits
+ONE scene at a time: it currently only ever uses train/val item 0
+(GSFitSceneDataset's docstring covers the multi-mesh caveat -- not handled
+yet). All of a scene's views must share the same `mesh_index`, checked at
+load time.
+
+Within that scene's TRAIN split, the **primary** view -- whichever one
+sorts first in the (already-split) catalog -- seeds the Gaussians; the
+rest are **secondary**, supervision-only views. With
+`data.split_fn=gs_dataset.split_by_indices`, that's exactly the first
+entry of `train_idx` -- put the view you want to seed from there for
+explicit control (e.g. `data/split_fn=by_indices
+data.split_fn.train_idx='[0,1,2]' data.split_fn.val_idx='[3,4]'`).
 
 The Gaussians are seeded entirely from the primary view's 6-layer depth peel --
 every pixel-hit in every peel layer becomes one Gaussian, back-projected to world
@@ -15,12 +28,12 @@ depth map, and the optimizer never adds or removes Gaussians (no densification),
 so that 1:1 correspondence survives to the output.
 
 They are then optimized with `gsplat` against the RGB (L1 + D-SSIM) and alpha
-(L1) of the primary + secondary views. Secondary views contribute supervision
-only, never new Gaussians. Fully-occluded deeper-layer Gaussians (seen in no
-supplied view) keep their initial front-pixel colour. `val` view indices
-(disjoint from primary/secondary) never contribute Gaussians OR gradient --
-they exist purely for the val/loss* photometric metrics logged alongside
-training, comparable to train_gs.py's own train/val split.
+(L1) of the primary + secondary (i.e. every train-split) views. Secondary views
+contribute supervision only, never new Gaussians. Fully-occluded deeper-layer
+Gaussians (seen in no supplied view) keep their initial front-pixel colour. The
+val-split views (if any) never contribute Gaussians OR gradient -- they exist
+purely for the val/loss* photometric metrics logged alongside training,
+comparable to train_gs.py's own train/val split.
 
 `images` may be a higher resolution than `depth_peel`: the seed grid and the
 output grids stay at the depth-peel resolution (`depth_intrinsics`), while the
@@ -50,7 +63,7 @@ fixed-view mode uses (see bla/train_gs_lightning_plan.md).
 Config is Hydra (`conf/gsplat.yaml`); run in the container venv, e.g.
 
     docker exec -w /app gsviawt-app-gpu-1 /home/user/venv/bin/python fit_gsplat.py \\
-        hdf5_path=/app/bla/obj_lite.h5 primary=0 'secondary=[1,2,3]' iters=1500
+        hdf5_path=/app/bla/obj_lite.h5 iters=1500
 
 gsplat JIT-compiles CUDA kernels on first import; this module points it at the
 pip `nvidia-cuda-nvcc` toolchain (the base image has no system `nvcc`).
@@ -67,18 +80,20 @@ import h5py
 import hydra
 import lightning.pytorch as pl
 import numpy as np
+import polars as pl_
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, reduce, repeat
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import DictConfig, OmegaConf, open_dict
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
 import wandb
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from debug_pointcloud import unproject_depth_peel  # noqa: E402
+from gs_dataset import H5Catalog  # noqa: E402
 from module import DSSIMLoss  # noqa: E402
 from util import intrinsics_name, timed  # noqa: E402
 
@@ -97,8 +112,8 @@ SH_C0 = 0.28209479177387814  # SH band-0 constant, for RGB <-> sh0 in the .ply
 def _load_view_set(hdf5_path, ds, order):
   """Read exactly the given view indices (order matters -- index 0 is treated
   as "primary" for the mesh_index consistency check). Returns a dict of
-  stacked arrays; shared by load_views (primary+secondary) and
-  load_val_views (held-out views)."""
+  stacked arrays; called once per GSFitSceneDataset item (one mesh's train
+  or val view set)."""
   with h5py.File(hdf5_path, "r") as f:
     n = f[ds.pose].shape[0]
     for i in order:
@@ -136,42 +151,54 @@ def _load_view_set(hdf5_path, ds, order):
       image_K = K
 
   return {
-    "order": order, "mesh_index": mesh_idx, "mesh_path": mesh_path,
+    "path": hdf5_path, "order": order, "mesh_index": mesh_idx, "mesh_path": mesh_path,
     "images": images, "depth": depth, "K": K, "image_K": image_K, "pose": pose,
   }
 
 
-def load_views(cfg: DictConfig):
-  """Read the primary + secondary views. Returns a dict of stacked arrays
-  (primary first) plus the raw primary-view arrays used for seeding."""
-  primary = int(cfg.primary)
-  secondary = [int(i) for i in cfg.secondary if int(i) != primary]
-  seen = set()
-  secondary = [i for i in secondary if not (i in seen or seen.add(i))]
-  order = [primary, *secondary]
-  out = _load_view_set(cfg.hdf5_path, cfg.datasets, order)
-  out["primary"] = primary
-  out["secondary"] = secondary
-  return out
+class GSFitSceneDataset(Dataset):
+  """Wraps an H5Catalog (e.g. one half of a split_fn result), grouped by
+  mesh -- one item = one mesh's ENTIRE view set (all of that mesh's rows in
+  the catalog), read as flat world-space arrays via _load_view_set.
 
+  Deliberately NOT gs_dataset.GSPairDataset's per-view item shape:
+  GSPairDataset unprojects into the SOURCE CAMERA's own frame, built for
+  train_gs.py's Flash3D-style network (see gs_dataset.py's module
+  docstring). fit_gsplat.py needs true world-space Gaussians -- portable to
+  a .ply, an orbit video, any external 3DGS viewer (see render_orbit_frames'
+  docstring below) -- so seeding stays on
+  debug_pointcloud.unproject_depth_peel(space="world") via init_gaussians,
+  entirely unaffected by this class.
 
-def load_val_views(cfg: DictConfig):
-  """Held-out views (cfg.val) used only for the val/loss* photometric
-  metrics -- never seed or supervise the fit. Returns None if cfg.val is
-  empty. Raises if a val index overlaps primary/secondary (a held-out set
-  that's secretly also a training view would make the val metric meaningless)."""
-  val_idx = [int(i) for i in cfg.get("val", [])]
-  if not val_idx:
-    return None
-  used = {int(cfg.primary), *(int(i) for i in cfg.secondary)}
-  overlap = sorted(set(val_idx) & used)
-  if overlap:
-    raise SystemExit(
-      f"cfg.val views {overlap} overlap cfg.primary/secondary -- validation "
-      f"views must be held out of the fit")
-  seen = set()
-  val_idx = [i for i in val_idx if not (i in seen or seen.add(i))]
-  return _load_view_set(cfg.hdf5_path, cfg.datasets, val_idx)
+  Within a mesh's view set, `order[0]` (that group's first row, in catalog
+  order) is the "primary" view that seeds Gaussians; the rest are
+  supervision-only "secondary" views -- fit_gsplat.py's own primary/
+  secondary terminology, just no longer separate config fields: it's now
+  "whichever view sorts first for that mesh in the (already-split)
+  catalog." With split_fn=gs_dataset.split_by_indices, that's exactly the
+  first entry of train_idx/val_idx -- put the view you want to seed from
+  first there for explicit control.
+
+  len(dataset) == number of distinct meshes in the catalog. main() only
+  ever fits dataset[0] for now (single-scene) -- a later multi-scene
+  fit_gsplat.py would loop over every item instead, but that's not
+  implemented here."""
+
+  def __init__(self, catalog: H5Catalog, ds_names):
+    self.ds_names = ds_names
+    groups_df = catalog.df.group_by(["path", "mesh_id"], maintain_order=True).agg(pl_.col("view_idx"))
+    self.groups = list(groups_df.iter_rows(named=True))
+
+  def __len__(self):
+    return len(self.groups)
+
+  def __getitem__(self, idx):
+    g = self.groups[idx]
+    order = [int(v) for v in g["view_idx"]]
+    out = _load_view_set(g["path"], self.ds_names, order)
+    out["primary"] = order[0]
+    out["secondary"] = order[1:]
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -681,7 +708,25 @@ def main(cfg: DictConfig) -> None:
   logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
   torch.manual_seed(int(cfg.seed))
 
-  out_h5 = cfg.output_path or f"{cfg.hdf5_path}.gsplat.view{int(cfg.primary)}.h5"
+  with timed("load"):
+    catalog = H5Catalog(
+      cfg.hdf5_path,
+      H5Catalog.path().alias("path"),
+      H5Catalog.index().alias("view_idx"),
+      H5Catalog.dataset("mesh_index").alias("mesh_id"),
+    )
+    split_fn = hydra.utils.instantiate(cfg.data.split_fn)
+    train_catalog, val_catalog = split_fn(catalog, seed=cfg.seed)
+    train_ds = GSFitSceneDataset(train_catalog, cfg.datasets)
+    val_ds = GSFitSceneDataset(val_catalog, cfg.datasets)
+    if len(train_ds) == 0:
+      raise SystemExit("train split is empty -- check hdf5_path / split_fn")
+    # main() only ever fits item 0 (single-scene) -- see GSFitSceneDataset's
+    # own docstring for the multi-mesh caveat.
+    views = train_ds[0]
+    val_views = val_ds[0] if len(val_ds) > 0 else None
+
+  out_h5 = cfg.output_path or f"{views['path']}.gsplat.view{views['primary']}.h5"
   stem = out_h5[:-3] if out_h5.endswith(".h5") else out_h5
 
   wandb_run, logger = None, False
@@ -695,9 +740,6 @@ def main(cfg: DictConfig) -> None:
     )
     logger = WandbLogger(experiment=wandb_run)
 
-  with timed("load"):
-    views = load_views(cfg)
-    val_views = load_val_views(cfg)
   with open_dict(cfg):
     cfg.output_stem = stem              # so GSFitLightningModule can find the .val/ dir
     cfg.has_val = val_views is not None  # read by conf/gsplat.yaml's trainer.* interpolations

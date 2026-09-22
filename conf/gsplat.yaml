@@ -1,19 +1,26 @@
 # Config for fit_gsplat.py -- optimize a 3D Gaussian Splatting model from one
 # render HDF5 (render_objaverse.py / capture_turntable.py schema), seeded from
-# the primary view's 6-layer depth peel and supervised by primary + secondary
-# views. See fit_gsplat.py's module docstring.
+# the PRIMARY view's 6-layer depth peel and supervised by every view in the
+# train split. See fit_gsplat.py's module docstring, and GSFitSceneDataset's
+# docstring for what "primary" means now (no longer its own config field).
+
+defaults:
+  # Reuses train_gs.py's own conf/data/split_fn/*.yaml option files verbatim
+  # (lands at data.split_fn here too, even though nothing else in this
+  # config lives under data: -- keeps the override syntax identical to
+  # train_gs.py's, e.g. data/split_fn=by_indices
+  # data.split_fn.train_idx='[0,1,2]' data.split_fn.val_idx='[3,4]' (the
+  # first entry of train_idx is the seeding "primary" view -- see
+  # GSFitSceneDataset). by_view (not train_gs.yaml's by_mesh default):
+  # fit_gsplat.py fits ONE scene at a time, so a corpus is typically
+  # single-mesh already, where by_mesh degenerates to "everything train,
+  # nothing val" (see its own docstring) -- by_view actually does
+  # something useful here.
+  - data/split_fn: by_view
+  - _self_
 
 # --- input ---
-hdf5_path: /app/bla/objaverse_renders.h5
-primary: 0                 # primary view index (seeds the Gaussians)
-secondary: []             # extra view indices for supervision, e.g. [1,2,3]
-                          # (primary + secondary must all be the same mesh_index)
-
-# Held-out view indices used ONLY for the val/* photometric metrics below --
-# never seed Gaussians, never supervise (must be disjoint from primary/secondary,
-# checked at startup). [] -> no validation split (val/* metrics just don't log,
-# same as today). Comparable in spirit to train_gs.py's data.split_fn.
-val: []
+hdf5_path: /app/bla/objaverse_renders.h5   # str, list, or glob(s)
 
 # null -> "<hdf5_path>.gsplat.view<primary>.h5" (+ .ply, + .val/ alongside)
 output_path: null
@@ -57,10 +64,10 @@ knn_k: 4                  # neighbours used to size each Gaussian's initial scal
 
 # --- validation / output ---
 # Cadence (in iters) for BOTH: the gt|render PNG panel dump below (always
-# against the primary+secondary supervision set, regardless of `val`) AND,
-# when `val` is non-empty, the held-out val/loss* metrics (Lightning's
+# against the train split, regardless of whether split_fn produced a val
+# split) AND, when it did, the held-out val/loss* metrics (Lightning's
 # check_val_every_n_epoch). 0 disables the panel dump; the val/loss* metrics
-# just don't log if `val` is empty, independent of this.
+# just don't log if the val split is empty, independent of this.
 val_every: 500
 write_ply: true           # also write a standard 3DGS .ply next to the .h5
 # .ply pruning -- all off by default (the .h5 always keeps every Gaussian).
@@ -99,8 +106,9 @@ orbit:
 
 # pl.Trainer kwargs -- everything except `logger` (built in code from the
 # wandb run, or False when wandb is disabled). `has_val` isn't a field you
-# set: main() injects it (== bool(len(cfg.val))) before the trainer is built,
-# same trick train_gs.yaml's sched.total_steps uses.
+# set: main() injects it (== whether split_fn produced a non-empty val
+# split for this mesh) before the trainer is built, same trick
+# train_gs.yaml's sched.total_steps uses.
 trainer:
   max_epochs: ${iters}
   accelerator: auto
