@@ -13,7 +13,7 @@ secondary: []             # extra view indices for supervision, e.g. [1,2,3]
 output_path: null
 
 # --- optimization ---
-iters: 3000
+iters: 10000
 seed: 42
 device: cuda              # cuda | cpu
 

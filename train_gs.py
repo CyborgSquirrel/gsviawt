@@ -25,6 +25,7 @@ gsplat JIT-compiles CUDA kernels on first import; see _setup_cuda_toolchain
 """
 
 import contextlib as ctl
+import functools as ft
 import logging
 import os
 import shutil
@@ -683,6 +684,7 @@ class GSLightningModule(pl.LightningModule):
   def __init__(self, cfg):
     super().__init__()
     self.cfg = cfg
+    self.views_seen = 0
 
     with timed("build_model"):
       self.model = GSModel(cfg)
@@ -717,6 +719,7 @@ class GSLightningModule(pl.LightningModule):
     B = batch["batch_size"]
     _, V, *_ = batch["views"]["rgb"].shape
 
+    @ft.wraps(self.log)
     def _log(key, *args, **kwargs):
       self.log(f"{stage}/{key}", *args, **kwargs, batch_size=B)
 
@@ -728,6 +731,10 @@ class GSLightningModule(pl.LightningModule):
       or cfg.loss.photom.ssim_weight > 0
       or cfg.loss.photom.mask_weight > 0
     )
+
+    if stage == "train":
+      self.views_seen += B * V
+    self.log("views_seen", self.views_seen, reduce_fx="max")
 
     # forward pass
     model_pred = model_forward(self.model, batch, need_render=need_render, device=device)

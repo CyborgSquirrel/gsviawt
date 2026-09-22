@@ -64,7 +64,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from debug_pointcloud import unproject_depth_peel  # noqa: E402
 from util import intrinsics_name, timed  # noqa: E402
 
-log = logging.getLogger("fit_gsplat")
+log = logging.getLogger(__name__)
 
 # camera-local axis flip: Blender/OpenGL (X right, Y up, Z back) <-> OpenCV
 # (X right, Y down, Z forward). Same flip `debug_pointcloud` applies inline.
@@ -455,8 +455,11 @@ def main(cfg: DictConfig) -> None:
   if cfg.wandb.mode != "disabled":
     import wandb
     wandb_run = wandb.init(
-      project=cfg.wandb.project, mode=cfg.wandb.mode, tags=list(cfg.wandb.tags),
-      name=cfg.wandb.name, config=OmegaConf.to_container(cfg, resolve=True),
+      project=cfg.wandb.project,
+      mode=cfg.wandb.mode,
+      tags=list(cfg.wandb.tags),
+      name=cfg.wandb.name,
+      config=OmegaConf.to_container(cfg, resolve=True),
     )
 
   with timed("load"):
@@ -468,8 +471,12 @@ def main(cfg: DictConfig) -> None:
     raise SystemExit("RGB-only file (no alpha) with images and depth_peel at "
                      "different resolutions is not supported -- the mask can't be "
                      "derived. Use an RGBA render or equal resolutions.")
-  views_per_iter = cfg.get("views_per_iter", None)
-  views_per_iter = None if views_per_iter is None else min(int(views_per_iter), V)
+
+  views_per_iter = OmegaConf.select(cfg, "views_per_iter")
+  if views_per_iter is None:
+    views_per_iter = V
+  views_per_iter = min(views_per_iter, V)
+
   log.info("primary=%d secondary=%s  %d views  RGB %dx%d  depth/grid %dx%d  %d peel layers  "
            "views_per_iter=%s  mesh=%s",
            views["primary"], views["secondary"], V, IW, IH, DW, DH, L,
@@ -536,13 +543,16 @@ def main(cfg: DictConfig) -> None:
   view_rng = np.random.default_rng(int(cfg.seed))
 
   final_loss = float("nan")
+  views_seen = 0
   with timed("optimize"):
     for it in it_range:
-      if views_per_iter is None:
+      if views_per_iter >= V:
         vm_it, ks_it, gt_rgb_it, gt_alpha_it = viewmats, Ks, gt_rgb, gt_alpha
       else:
         idx = torch.from_numpy(view_rng.choice(V, size=views_per_iter, replace=False)).to(device)
         vm_it, ks_it, gt_rgb_it, gt_alpha_it = viewmats[idx], Ks[idx], gt_rgb[idx], gt_alpha[idx]
+
+      views_seen += views_per_iter
 
       rgb, alpha = render(params, vm_it, ks_it, IW, IH)
       rgb_c = rgb * alpha  # premultiply so bg stays black on both sides
@@ -564,8 +574,11 @@ def main(cfg: DictConfig) -> None:
                  it, iters, final_loss, l1.item(), dssim.item(), mask.item())
       if wandb_run is not None and (it % 10 == 0 or last):
         wandb_run.log({
-          "train/loss": final_loss, "train/l1": l1.item(),
-          "train/dssim": dssim.item(), "train/mask": mask.item(),
+          "train/loss": final_loss,
+          "train/loss/photom_l1": l1.item(),
+          "train/loss/photom_dssim": dssim.item(),
+          "train/loss/photom_mask": mask.item(),
+          "views_seen": views_seen,
         }, step=it)
       if val_every and (it % val_every == 0 or last):
         # Always panel against the FULL view set, independent of what this
