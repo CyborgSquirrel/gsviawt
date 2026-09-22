@@ -637,12 +637,13 @@ class GSLightningModule(pl.LightningModule):
 
     return out
 
-  def get_preview_source(self):
-    """Gaussians + views, in true WORLD space, for module.PanelCallback's
-    [GT | render | |diff|] panel AND module.OrbitCallback's turntable video
-    -- both pull this same method, same per-epoch cache. Computed from a
-    fixed train item (self.trainer.datamodule's train_ds[0]) via this
-    model's own forward pass.
+  def _preview_entry(self, item):
+    """One stage's {"gauss","scene_scale","views"} entry for
+    get_preview_source() below, computed from a SINGLE fixed dataset item
+    (train_ds[0], or val_ds[0] for the "val" stage) via this model's own
+    forward pass -- in true WORLD space, for module.PanelCallback's
+    [GT | render | |diff|] panel and module.OrbitCallback's turntable
+    video.
 
     The model's own Gaussians are natively predicted in the source view's
     own camera frame (see gs_dataset.py's module docstring -- there's no
@@ -668,11 +669,7 @@ class GSLightningModule(pl.LightningModule):
 
     NOTE(andrei): Not sure if setting model to eval is the right move here,
     but gonna do it for now."""
-    epoch = self.current_epoch
-    if getattr(self, "_preview_cache_epoch", None) == epoch:
-      return self._preview_cache
-
-    batch = collate_with_batch_size([self.trainer.datamodule.train_ds[0]])
+    batch = collate_with_batch_size([item])
     device = self.device
     with set_mode(self.model, "eval"), torch.no_grad():
       gauss = self.model(
@@ -701,7 +698,7 @@ class GSLightningModule(pl.LightningModule):
     viewmat_np = v["viewmat"][0].numpy()               # (V,4,4), source-relative
     world_viewmat = viewmat_np @ np.linalg.inv(c2w_cv)  # (V,4,4), true world-to-camera
 
-    source = {
+    return {
       "gauss": flat,
       # scene_scale: the source camera's own real distance from the world
       # origin -- module.OrbitCallback's orbit radius (matches
@@ -716,7 +713,33 @@ class GSLightningModule(pl.LightningModule):
         "gt_rgb": v["rgb"][0].to(device),
       },
     }
-    self._preview_cache_epoch, self._preview_cache = epoch, source
+
+  def get_preview_source(self, mode):
+    """{"train": entry, "val": entry-or-None} for module.PanelCallback/
+    OrbitCallback -- see module.py's own comment block for the full
+    contract. Unlike fit_gsplat.py's version, train and val here are NOT
+    the same Gaussians rendered against different views -- the model
+    predicts an entirely different Gaussian set per forward-passed item,
+    so each stage gets its own full _preview_entry() call (own gauss, own
+    scene_scale, own views), from a fixed dataset item (train_ds[0], or
+    val_ds[0] for "val").
+
+    mode picks both the cache granularity (epoch: once per
+    self.current_epoch; step: once per self.trainer.global_step) and
+    whether "val" is computed at all -- skipped (left None) in epoch mode
+    even when a val split exists, since nothing pulls it there (see
+    module.PanelCallback._step) -- this avoids the extra forward pass on
+    every epoch-cadence tick when it's not needed."""
+    key = (mode, self.current_epoch if mode == "epoch" else self.trainer.global_step)
+    if getattr(self, "_preview_cache_key", None) == key:
+      return self._preview_cache
+
+    val_ds = self.trainer.datamodule.val_ds
+    source = {
+      "train": self._preview_entry(self.trainer.datamodule.train_ds[0]),
+      "val": self._preview_entry(val_ds[0]) if mode == "step" and len(val_ds) > 0 else None,
+    }
+    self._preview_cache_key, self._preview_cache = key, source
     return source
 
 

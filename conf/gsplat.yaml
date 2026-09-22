@@ -26,9 +26,12 @@ hdf5_path: /app/bla/objaverse_renders.h5   # str, list, or glob(s)
 output_path: null
 
 # --- optimization ---
-iters: 10000                # trainer.max_epochs -- one Lightning "epoch" is a
-                             # full pass over the train split's views now (see
-                             # GSFitDataModule), not a single optimizer step.
+iters: 10000                # trainer.max_steps -- a raw optimizer-step count,
+                             # independent of train split size / loader.
+                             # batch_size below (an "epoch" -- one full pass
+                             # over the train split -- still exists and drives
+                             # check_val_every_n_epoch, but doesn't bound
+                             # training length; trainer.max_epochs is -1).
 seed: 42
 
 # Views per training step, rendered+compared together in one batch (a plain
@@ -93,11 +96,11 @@ wandb:
 callbacks:
   panel:
     _target_: module.PanelCallback
-    every_n_epochs: ${eval:'${iters} // 50'}
+    every_n_steps: ${eval:'${iters} // 50'}
 
   orbit:
     _target_: module.OrbitCallback
-    every_n_epochs: ${eval:'${iters} // 50'}
+    every_n_steps: ${eval:'${iters} // 50'}
     num_frames: 24
     fps: 12
     crf: 28
@@ -111,7 +114,11 @@ callbacks:
 # hands Lightning a gs_dataset._EmptyDataset and it skips validation on its
 # own, same as train_gs.py.
 trainer:
-  max_epochs: ${iters}
+  max_steps: ${iters}
+  max_epochs: -1             # unbounded -- max_steps alone ends training;
+                              # epochs still happen (and still drive
+                              # check_val_every_n_epoch below), just aren't
+                              # what training length is measured in.
   accelerator: auto
   devices: 1
   enable_checkpointing: false

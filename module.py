@@ -33,7 +33,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import pack, rearrange
+from einops import pack, rearrange, repeat
 from omegaconf import OmegaConf
 from torch.optim import Optimizer
 
@@ -191,26 +191,33 @@ def guarded_render(tag):
 # you have those arrays -- the render call, building the panel image, and
 # logging it -- lives here.
 #
-# Pull, not push: PanelCallback below CALLS pl_module.get_preview_source()
-# itself, only when its own every_n_epochs cadence actually fires, instead
-# of some other callback unconditionally stashing a value onto pl_module
-# every epoch whether or not it's ever read. Each LightningModule
-# (train_gs.py's GSLightningModule, fit_gsplat.py's GSFitLightningModule)
-# implements that one method itself, returning
-#   {"gauss": {"means","quats","scales","opacities","colors","sh_degree"},
-#    "views": {"viewmat","K","width","height","gt_rgb"}}
+# Pull, not push: PanelCallback below CALLS pl_module.get_preview_source(mode)
+# itself, only when its own cadence (every_n_epochs XOR every_n_steps --
+# see __init__) actually fires, instead of some other callback
+# unconditionally stashing a value onto pl_module every epoch whether or
+# not it's ever read. Each LightningModule (train_gs.py's GSLightningModule,
+# fit_gsplat.py's GSFitLightningModule) implements that one method itself,
+# taking mode ("epoch" | "step", matching which cadence fired) and
+# returning
+#   {"train": {"gauss": {...}, "scene_scale": float,
+#              "views": {"viewmat","K","width","height","gt_rgb"}},
+#    "val": same shape, or None}
 # (gauss arrays already flattened/activated -- exactly what render() already
 # needs in fit_gsplat.py, or one flatten_gaussians() yield in train_gs.py;
-# gt_rgb: (V,C,H,W) in [0,1]; sh_degree: None or an int) -- and caching it
-# per-epoch (see either implementation) so a second caller in the same
-# epoch (there isn't one yet, but nothing here assumes there won't be)
-# doesn't redundantly redo the forward pass. No callback ordering to get
-# right, no per-epoch cost on epochs the panel isn't even logged.
+# gt_rgb: (V,C,H,W) in [0,1]; sh_degree: None or an int) -- cached keyed by
+# (mode, epoch-or-step) (see either implementation) so a second caller at
+# the same point doesn't redundantly redo the forward pass. No callback
+# ordering to get right, no cost on ticks the panel isn't even logged.
 #
-# Train-stage only for now: on_validation_epoch_end is commented out below
-# rather than implemented, since it's not yet clear what fit_gsplat.py
-# would put in preview_source for "val" that's comparable to train_gs.py's
-# val split -- revisit once that's settled instead of guessing now.
+# "val" is only ever populated in step mode (mode == "step"): epoch mode
+# stays train-only, same as it always has been (on_train_epoch_end is the
+# only epoch-cadence hook either callback implements -- there's no
+# on_validation_epoch_end here, deliberately). Step mode has no equivalent
+# "validation batch end" hook to split train/val across, so instead
+# on_train_batch_end logs BOTH stages together in one wandb.log call
+# whenever it fires and a val split exists (get_preview_source(mode)
+# leaves "val" as None otherwise, or in epoch mode where nothing asks for
+# it) -- see _step below on both callbacks.
 # ---------------------------------------------------------------------------
 
 def _build_panel(gt_rgb, pred_rgb):
@@ -228,55 +235,89 @@ def _build_panel(gt_rgb, pred_rgb):
   return pack(rows, "c h *")[0]
 
 
+def _cadence_check(every_n_epochs, every_n_steps, cls_name):
+  if (every_n_epochs is None) == (every_n_steps is None):
+    raise ValueError(f"{cls_name}: pass exactly one of every_n_epochs/every_n_steps")
+
+
 class PanelCallback(pl.Callback):
   """Shared consumer half of the preview_source hand-off -- see this
   module's own comment block above for the full contract. Pulls
-  pl_module.get_preview_source() and renders its Gaussians into its views
-  in ONE gsplat.rasterization() call, then logs a [GT | render | |diff|]
-  panel."""
+  pl_module.get_preview_source(mode) and renders its Gaussians into its
+  views in ONE gsplat.rasterization() call per stage, then logs a
+  [GT | render | |diff|] panel per stage.
 
-  def __init__(self, *, every_n_epochs: int):
+  every_n_epochs XOR every_n_steps picks which cadence this instance
+  fires on (exactly one must be set) -- epoch cadence only ever previews
+  "train" (on_train_epoch_end); step cadence previews "train" and, when a
+  val split exists, "val" too, together in one wandb.log call
+  (on_train_batch_end -- there's no per-step validation loop to hook a
+  separate "val batch end" into)."""
+
+  def __init__(self, *, every_n_epochs: int | None = None, every_n_steps: int | None = None):
+    _cadence_check(every_n_epochs, every_n_steps, "PanelCallback")
     self.every_n_epochs = every_n_epochs
+    self.every_n_steps = every_n_steps
 
   def on_train_epoch_end(self, trainer, pl_module):
-    self._on_epoch_end("train", trainer, pl_module)
+    self._step("epoch", trainer, pl_module)
 
-  # Deliberately not implemented -- see this module's comment block above.
-  # def on_validation_epoch_end(self, trainer, pl_module):
-  #   self._on_epoch_end("val", trainer, pl_module)
+  def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+    self._step("step", trainer, pl_module)
 
-  def _on_epoch_end(self, stage, trainer, pl_module):
-    # Count of COMPLETED epochs (Lightning hasn't bumped trainer.current_epoch
-    # yet at this point in the hook) -- "every_n_epochs=1" means "every
-    # epoch", matching conf/*.yaml's comment on that field elsewhere.
-    epoch = trainer.current_epoch + 1
-    if epoch % self.every_n_epochs != 0:
-      return
+  def _step(self, mode, trainer, pl_module):
+    """mode: "epoch" (from on_train_epoch_end) or "step" (from
+    on_train_batch_end) -- a no-op unless this instance is actually
+    configured for that mode (every_n_epochs/every_n_steps, see
+    __init__)."""
+    if mode == "epoch":
+      if self.every_n_epochs is None:
+        return
+      # Count of COMPLETED epochs (Lightning hasn't bumped
+      # trainer.current_epoch yet at this point in the hook) --
+      # "every_n_epochs=1" means "every epoch", matching conf/*.yaml's
+      # comment on that field elsewhere.
+      n = trainer.current_epoch + 1
+      if n % self.every_n_epochs != 0:
+        return
+      stages = ("train",)
+    else:
+      if self.every_n_steps is None:
+        return
+      n = trainer.global_step  # count of COMPLETED optimizer steps
+      if n == 0 or n % self.every_n_steps != 0:
+        return
+      stages = ("train", "val")
+
     wandb_run = pl_module.logger.experiment if pl_module.logger is not None else None
     if wandb_run is None:
       return
 
-    panel = None
-    with guarded_render(f"{stage}/panel"), torch.no_grad():
+    log_payload = {}
+    with guarded_render(f"{mode}/panel"), torch.no_grad():
       import gsplat
-      source = pl_module.get_preview_source()
-      gauss, views = source["gauss"], source["views"]
-      rgb, _, _ = gsplat.rasterization(
-        means=gauss["means"], quats=gauss["quats"], scales=gauss["scales"],
-        opacities=gauss["opacities"], colors=gauss["colors"],
-        viewmats=views["viewmat"], Ks=views["K"],
-        width=int(views["width"]), height=int(views["height"]),
-        sh_degree=gauss["sh_degree"], render_mode="RGB", packed=True,
-      )
-      pred_rgb = rearrange(rgb.clamp(0.0, 1.0), "v h w c -> v c h w")
-      panel = _build_panel(views["gt_rgb"], pred_rgb)
-    if panel is None:
+      source = pl_module.get_preview_source(mode)
+      for stage in stages:
+        entry = source.get(stage)
+        if entry is None:
+          continue
+        gauss, views = entry["gauss"], entry["views"]
+        rgb, _, _ = gsplat.rasterization(
+          means=gauss["means"], quats=gauss["quats"], scales=gauss["scales"],
+          opacities=gauss["opacities"], colors=gauss["colors"],
+          viewmats=views["viewmat"], Ks=views["K"],
+          width=int(views["width"]), height=int(views["height"]),
+          sh_degree=gauss["sh_degree"], render_mode="RGB", packed=True,
+        )
+        pred_rgb = rearrange(rgb.clamp(0.0, 1.0), "v h w c -> v c h w")
+        panel = _build_panel(views["gt_rgb"], pred_rgb)
+        log_payload[f"{stage}/panel"] = wandb.Image(
+          panel, caption="GT | render | |diff|, one row per view")
+    if not log_payload:
       return
 
-    wandb_run.log({
-      f"{stage}/panel": wandb.Image(
-        panel, caption="GT | render | |diff|, one row per view"),
-    })
+    log_payload["views_seen"] = pl_module.views_seen  # TODO: better way to handle this
+    wandb_run.log(log_payload)
 
 
 def write_mp4(frames, path, fps, crf):
@@ -321,20 +362,23 @@ def _orbit_viewmats(dist, num_frames, elevation_deg):
 
 class OrbitCallback(pl.Callback):
   """Shared consumer half of the same pull pattern PanelCallback uses.
-  Pulls pl_module.get_preview_source() -- same call PanelCallback makes,
-  same per-epoch cache -- and, since both scripts' Gaussians are already in
+  Pulls pl_module.get_preview_source(mode) -- same call PanelCallback
+  makes, same cache -- and, since both scripts' Gaussians are already in
   world space there (see this module's own docstring), builds ONE
-  world-frame turntable orbit (_orbit_viewmats, radius = the source's own
-  "scene_scale") entirely in here. No per-script pose method needed at
-  all. Renders all N orbit frames in ONE batched gsplat.rasterization()
-  call, writes an mp4, and logs wandb.Video.
+  world-frame turntable orbit per stage (_orbit_viewmats, radius = that
+  stage's own "scene_scale") entirely in here. No per-script pose method
+  needed at all. Renders all N orbit frames of a stage in ONE batched
+  gsplat.rasterization() call, writes an mp4, and logs wandb.Video.
 
-  Train-stage only for now -- see PanelCallback's own note on why val is
-  deferred; same reasoning applies here."""
+  every_n_epochs XOR every_n_steps picks which cadence this instance
+  fires on -- see PanelCallback's own docstring, same contract exactly
+  (epoch cadence == train only; step cadence == train + val together)."""
 
-  def __init__(self, *, every_n_epochs: int, num_frames: int = 24,
-              fps: int = 12, crf: int = 28, elevation_deg: float = 20.0):
+  def __init__(self, *, every_n_epochs: int | None = None, every_n_steps: int | None = None,
+              num_frames: int = 24, fps: int = 12, crf: int = 28, elevation_deg: float = 20.0):
+    _cadence_check(every_n_epochs, every_n_steps, "OrbitCallback")
     self.every_n_epochs = every_n_epochs
+    self.every_n_steps = every_n_steps
     self.num_frames = num_frames
     self.fps = fps
     self.crf = crf
@@ -350,43 +394,58 @@ class OrbitCallback(pl.Callback):
       self.workdir = None
 
   def on_train_epoch_end(self, trainer, pl_module):
-    self._on_epoch_end("train", trainer, pl_module)
+    self._step("epoch", trainer, pl_module)
 
-  # Deliberately not implemented -- see PanelCallback.
-  # def on_validation_epoch_end(self, trainer, pl_module):
-  #   self._on_epoch_end("val", trainer, pl_module)
+  def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+    self._step("step", trainer, pl_module)
 
-  def _on_epoch_end(self, stage, trainer, pl_module):
-    epoch = trainer.current_epoch + 1
-    if epoch % self.every_n_epochs != 0:
-      return
+  def _step(self, mode, trainer, pl_module):
+    if mode == "epoch":
+      if self.every_n_epochs is None:
+        return
+      n = trainer.current_epoch + 1  # count of COMPLETED epochs
+      if n % self.every_n_epochs != 0:
+        return
+      stages = ("train",)
+    else:
+      if self.every_n_steps is None:
+        return
+      n = trainer.global_step  # count of COMPLETED optimizer steps
+      if n == 0 or n % self.every_n_steps != 0:
+        return
+      stages = ("train", "val")
+
     wandb_run = pl_module.logger.experiment if pl_module.logger is not None else None
     if wandb_run is None:
       return
 
-    frames = None
-    with guarded_render(f"{stage}/orbit"), torch.no_grad():
+    log_payload = {}
+    with guarded_render(f"{mode}/orbit"), torch.no_grad():
       import gsplat
-      source = pl_module.get_preview_source()
-      gauss, views = source["gauss"], source["views"]
-      device = gauss["means"].device
-      viewmats = torch.from_numpy(
-        _orbit_viewmats(source["scene_scale"], self.num_frames, self.elevation_deg)).to(device)
-      Ks = views["K"][0][None].expand(viewmats.shape[0], -1, -1)
-      rgb, _, _ = gsplat.rasterization(
-        means=gauss["means"], quats=gauss["quats"], scales=gauss["scales"],
-        opacities=gauss["opacities"], colors=gauss["colors"],
-        viewmats=viewmats, Ks=Ks,
-        width=int(views["width"]), height=int(views["height"]),
-        sh_degree=gauss["sh_degree"], render_mode="RGB", packed=True,
-      )
-      rgb_np = (rgb.clamp(0.0, 1.0).cpu().numpy() * 255).astype("uint8")
-      frames = [rgb_np[i] for i in range(rgb_np.shape[0])]
-    if frames is None:
+      source = pl_module.get_preview_source(mode)
+      for stage in stages:
+        entry = source.get(stage)
+        if entry is None:
+          continue
+        gauss, views = entry["gauss"], entry["views"]
+        device = gauss["means"].device
+        viewmats = torch.from_numpy(
+          _orbit_viewmats(entry["scene_scale"], self.num_frames, self.elevation_deg)).to(device)
+        Ks = repeat(views["K"][0], "... -> b ...", b=viewmats.shape[0])
+        rgb, _, _ = gsplat.rasterization(
+          means=gauss["means"], quats=gauss["quats"], scales=gauss["scales"],
+          opacities=gauss["opacities"], colors=gauss["colors"],
+          viewmats=viewmats, Ks=Ks,
+          width=int(views["width"]), height=int(views["height"]),
+          sh_degree=gauss["sh_degree"], render_mode="RGB", packed=True,
+        )
+        rgb_np = (rgb.clamp(0.0, 1.0).cpu().numpy() * 255).astype("uint8")
+        frames = [rgb_np[i] for i in range(rgb_np.shape[0])]
+        path = os.path.join(self.workdir, f"{stage}_orbit_{mode}{n}.mp4")
+        write_mp4(frames, path, self.fps, self.crf)
+        log_payload[f"{stage}/orbit"] = wandb.Video(path, caption=f"{mode} {n}", format="mp4")
+    if not log_payload:
       return
 
-    path = os.path.join(self.workdir, f"{stage}_orbit_{trainer.current_epoch}.mp4")
-    write_mp4(frames, path, self.fps, self.crf)
-    wandb_run.log({
-      f"{stage}/orbit": wandb.Video(path, caption=f"epoch {epoch}", format="mp4"),
-    })
+    log_payload["views_seen"] = pl_module.views_seen  # TODO: better way to handle this
+    wandb_run.log(log_payload)

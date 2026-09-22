@@ -56,10 +56,11 @@ train_gs.py via module.py -- see that module's docstring for what's
 actually shared vs. deliberately not. Supervision views flow through a
 real `GSFitViewDataset`/`GSFitDataModule` (one item = one view;
 `loader.batch_size`, default 1, picks how many are rendered+compared per
-step, replacing what used to be manual per-iteration subsampling) -- a
-PyTorch "epoch" is therefore a full pass over the train split, not a
-single step. `iters` (== `trainer.max_epochs`) means epochs in that
-sense, same as train_gs.py.
+step, replacing what used to be manual per-iteration subsampling). `iters`
+(== `trainer.max_steps`) is a raw optimizer-step count, independent of
+train split size / batch_size -- a PyTorch "epoch" (one full pass over
+the train split) still exists and drives `check_val_every_n_epoch` /
+per-epoch-cadence callbacks, but doesn't bound training length itself.
 
 Config is Hydra (`conf/gsplat.yaml`); run in the container venv, e.g.
 
@@ -547,39 +548,54 @@ class GSFitLightningModule(pl.LightningModule):
   def params_np(self):
     return {k: v.detach().cpu().numpy() for k, v in self.params.items()}
 
-  def get_preview_source(self):
-    """Gaussians + views for module.PanelCallback's [GT | render | |diff|]
-    panel. No model, no dataset batch -- the 3DGS IS self.params, this
-    optimization's own live state -- so this just activates it
-    (activate_gaussians, the same helper render() uses) and packages it
-    with the fixed FULL supervision view set (self.viewmats etc, from
-    _register_view_buffers -- independent of GSFitDataModule's per-step
-    batches). Cached per epoch the same way GSLightningModule's own
-    version is, for the same reason -- see there."""
-    epoch = self.current_epoch
-    if getattr(self, "_preview_cache_epoch", None) == epoch:
+  def get_preview_source(self, mode):
+    """{"train": entry, "val": entry-or-None} for module.PanelCallback/
+    OrbitCallback -- see module.py's own comment block for the full
+    contract. No model, no dataset batch -- the 3DGS IS self.params, this
+    optimization's own live state, shared by every stage (unlike
+    train_gs.py's model, which predicts a DIFFERENT Gaussian set per
+    forward-passed item) -- so this just activates it once
+    (activate_gaussians, the same helper render() uses) and pairs it with
+    each stage's own fixed view set (self.viewmats/self.val_viewmats etc,
+    from _register_view_buffers -- independent of GSFitDataModule's
+    per-step batches).
+
+    mode picks both the cache granularity (epoch: once per
+    self.current_epoch; step: once per self.trainer.global_step) and
+    whether "val" is computed at all -- skipped (left None) in epoch mode
+    even when a val split exists, since nothing pulls it there (see
+    module.PanelCallback._step)."""
+    key = (mode, self.current_epoch if mode == "epoch" else self.trainer.global_step)
+    if getattr(self, "_preview_cache_key", None) == key:
       return self._preview_cache
 
     with torch.no_grad():
       gauss = activate_gaussians(self.params)
     gauss["sh_degree"] = None
-    source = {
-      "gauss": gauss,
-      # scene_scale: the primary view's own real capture distance from the
-      # (world) origin -- module.OrbitCallback's orbit radius. Already true
-      # world space here (see this module's docstring), unlike
-      # train_gs.py's version of this field, which has to derive an
-      # equivalent quantity from a camera-relative frame.
-      "scene_scale": self.scene_scale,
-      "views": {
-        "viewmat": self.viewmats,
-        "K": self.Ks,
-        "width": self.gt_rgb.shape[2],
-        "height": self.gt_rgb.shape[1],
-        "gt_rgb": rearrange(self.gt_rgb, "v h w c -> v c h w"),
-      },
-    }
-    self._preview_cache_epoch, self._preview_cache = epoch, source
+
+    def _entry(prefix):
+      gt_rgb = getattr(self, f"{prefix}gt_rgb", None)
+      if gt_rgb is None:
+        return None
+      return {
+        "gauss": gauss,
+        # scene_scale: the primary view's own real capture distance from the
+        # (world) origin -- module.OrbitCallback's orbit radius. Already true
+        # world space here (see this module's docstring), unlike
+        # train_gs.py's version of this field, which has to derive an
+        # equivalent quantity from a camera-relative frame.
+        "scene_scale": self.scene_scale,
+        "views": {
+          "viewmat": getattr(self, f"{prefix}viewmats"),
+          "K": getattr(self, f"{prefix}Ks"),
+          "width": gt_rgb.shape[2],
+          "height": gt_rgb.shape[1],
+          "gt_rgb": rearrange(gt_rgb, "v h w c -> v c h w"),
+        },
+      }
+
+    source = {"train": _entry(""), "val": _entry("val_") if mode == "step" else None}
+    self._preview_cache_key, self._preview_cache = key, source
     return source
 
   def _wandb_run(self):
