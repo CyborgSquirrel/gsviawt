@@ -631,6 +631,34 @@ class GSFitLightningModule(pl.LightningModule):
   def params_np(self):
     return {k: v.detach().cpu().numpy() for k, v in self.params.items()}
 
+  def get_preview_source(self):
+    """Gaussians + views for module.PanelCallback's [GT | render | |diff|]
+    panel. No model, no dataset batch -- the 3DGS IS self.params, this
+    optimization's own live state -- so this just activates it
+    (activate_gaussians, the same helper render() uses) and packages it
+    with the fixed supervision view set. Cached per "epoch" (== optimizer
+    step here) the same way GSLightningModule's own version is, for the
+    same reason -- see there."""
+    epoch = self.current_epoch
+    if getattr(self, "_preview_cache_epoch", None) == epoch:
+      return self._preview_cache
+
+    with torch.no_grad():
+      gauss = activate_gaussians(self.params)
+    gauss["sh_degree"] = None
+    source = {
+      "gauss": gauss,
+      "views": {
+        "viewmat": self.viewmats,
+        "K": self.Ks,
+        "width": self.gt_rgb.shape[2],
+        "height": self.gt_rgb.shape[1],
+        "gt_rgb": rearrange(self.gt_rgb, "v h w c -> v c h w"),
+      },
+    }
+    self._preview_cache_epoch, self._preview_cache = epoch, source
+    return source
+
   def _wandb_run(self):
     return self.logger.experiment if self.logger is not None else None
 
@@ -688,34 +716,6 @@ class GSFitLightningModule(pl.LightningModule):
     wandb_run = self._wandb_run()
     if wandb_run is not None:
       wandb_run.log({"val/panel": wandb.Image(panel, caption=f"iter {it}")}, step=it)
-
-
-class PreviewSourceCallback(pl.Callback):
-  """Producer half of module.PanelCallback's preview_source hand-off (see
-  that module's own comment block for the full contract). Unlike
-  train_gs.py's version, there's no model and no dataset batch to run here
-  -- the 3DGS IS pl_module.params, this optimization's own live state --
-  so this just activates it (activate_gaussians, the same helper render()
-  uses) and packages it with the fixed supervision view set.
-
-  Train-stage only for now -- see module.PanelCallback."""
-
-  def on_fit_start(self, trainer, pl_module):
-    pl_module.preview_source = None  # owned by this callback, not GSFitLightningModule
-
-  def on_train_epoch_end(self, trainer, pl_module):
-    gauss = activate_gaussians(pl_module.params)
-    gauss["sh_degree"] = None
-    pl_module.preview_source = {
-      "gauss": gauss,
-      "views": {
-        "viewmat": pl_module.viewmats,
-        "K": pl_module.Ks,
-        "width": pl_module.gt_rgb.shape[2],
-        "height": pl_module.gt_rgb.shape[1],
-        "gt_rgb": rearrange(pl_module.gt_rgb, "v h w c -> v c h w"),
-      },
-    }
 
 
 # ---------------------------------------------------------------------------

@@ -155,23 +155,21 @@ def guarded_render(tag):
 # you have those arrays -- the render call, building the panel image, and
 # logging it -- lives here.
 #
-# The hand-off: each script defines its OWN `PreviewSourceCallback`
-# (`__main__.PreviewSourceCallback` in both conf/train_gs.yaml and
-# conf/gsplat.yaml -- same name, different file-local class, same convention
-# OrbitCallback/ViewPanelCallback already used), which on_train_epoch_end
-# stashes
-#   pl_module.preview_source = {
-#     "gauss": {"means","quats","scales","opacities","colors","sh_degree"},
-#     "views": {"viewmat","K","width","height","gt_rgb"},
-#   }
-# (gauss arrays already flattened/activated -- exactly what render()
-# already needs in fit_gsplat.py, or one flatten_gaussians() yield in
-# train_gs.py; gt_rgb: (V,C,H,W) in [0,1]; sh_degree: None or an int).
-# PanelCallback below just reads that dict -- it has no idea which script
-# produced it. Hydra callback order matters: PreviewSourceCallback must be
-# listed before PanelCallback in conf/*.yaml's `callbacks:` (Lightning
-# calls callbacks in list order), so the stash is fresh before this reads
-# it, not one epoch stale.
+# Pull, not push: PanelCallback below CALLS pl_module.get_preview_source()
+# itself, only when its own every_n_epochs cadence actually fires, instead
+# of some other callback unconditionally stashing a value onto pl_module
+# every epoch whether or not it's ever read. Each LightningModule
+# (train_gs.py's GSLightningModule, fit_gsplat.py's GSFitLightningModule)
+# implements that one method itself, returning
+#   {"gauss": {"means","quats","scales","opacities","colors","sh_degree"},
+#    "views": {"viewmat","K","width","height","gt_rgb"}}
+# (gauss arrays already flattened/activated -- exactly what render() already
+# needs in fit_gsplat.py, or one flatten_gaussians() yield in train_gs.py;
+# gt_rgb: (V,C,H,W) in [0,1]; sh_degree: None or an int) -- and caching it
+# per-epoch (see either implementation) so a second caller in the same
+# epoch (there isn't one yet, but nothing here assumes there won't be)
+# doesn't redundantly redo the forward pass. No callback ordering to get
+# right, no per-epoch cost on epochs the panel isn't even logged.
 #
 # Train-stage only for now: on_validation_epoch_end is commented out below
 # rather than implemented, since it's not yet clear what fit_gsplat.py
@@ -196,9 +194,10 @@ def _build_panel(gt_rgb, pred_rgb):
 
 class PanelCallback(pl.Callback):
   """Shared consumer half of the preview_source hand-off -- see this
-  module's own comment block above for the full contract. Renders
-  pl_module.preview_source's Gaussians into its views in ONE
-  gsplat.rasterization() call and logs a [GT | render | |diff|] panel."""
+  module's own comment block above for the full contract. Pulls
+  pl_module.get_preview_source() and renders its Gaussians into its views
+  in ONE gsplat.rasterization() call, then logs a [GT | render | |diff|]
+  panel."""
 
   def __init__(self, *, every_n_epochs: int):
     self.every_n_epochs = every_n_epochs
@@ -220,14 +219,12 @@ class PanelCallback(pl.Callback):
     wandb_run = pl_module.logger.experiment if pl_module.logger is not None else None
     if wandb_run is None:
       return
-    source = pl_module.preview_source
-    if source is None:
-      return
-    gauss, views = source["gauss"], source["views"]
 
     panel = None
     with guarded_render(f"{stage}/panel"), torch.no_grad():
       import gsplat
+      source = pl_module.get_preview_source()
+      gauss, views = source["gauss"], source["views"]
       rgb, _, _ = gsplat.rasterization(
         means=gauss["means"], quats=gauss["quats"], scales=gauss["scales"],
         opacities=gauss["opacities"], colors=gauss["colors"],

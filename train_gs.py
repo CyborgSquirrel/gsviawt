@@ -707,6 +707,48 @@ class GSLightningModule(pl.LightningModule):
 
     return out
 
+  def get_preview_source(self):
+    """Gaussians + views for module.PanelCallback's [GT | render | |diff|]
+    panel, computed from a fixed train item (self.trainer.datamodule's
+    train_ds[0]) via this model's own forward pass. Cached per-epoch
+    (lazily -- no __init__ changes needed for this, it's this method's own
+    bookkeeping) so a second call in the same epoch doesn't redundantly
+    redo the forward pass; called on-demand by PanelCallback, only on
+    epochs it's actually about to log, not every epoch.
+
+    NOTE(andrei): Not sure if setting model to eval is the right move here,
+    but gonna do it for now."""
+    epoch = self.current_epoch
+    if getattr(self, "_preview_cache_epoch", None) == epoch:
+      return self._preview_cache
+
+    batch = collate_with_batch_size([self.trainer.datamodule.train_ds[0]])
+    device = self.device
+    with set_mode(self.model, "eval"), torch.no_grad():
+      gauss = self.model(
+        batch["views"]["rgb"][:, 0].to(device),
+        batch["source"]["xyz_cam"].to(device),
+      )
+      flat = next(flatten_gaussians(
+        batch["batch_size"], gauss,
+        batch["source"]["xyz_cam"].to(device), batch["source"]["hit"].to(device),
+      ))
+    flat["sh_degree"] = self.model.max_sh_degree
+
+    v = batch["views"]
+    source = {
+      "gauss": flat,
+      "views": {
+        "viewmat": v["viewmat"][0].to(device),
+        "K": v["K_image"][0].to(device),
+        "width": v["rgb"].shape[-1],
+        "height": v["rgb"].shape[-2],
+        "gt_rgb": v["rgb"][0].to(device),
+      },
+    }
+    self._preview_cache_epoch, self._preview_cache = epoch, source
+    return source
+
 
 class OrbitCallback(pl.Callback):
   def __init__(
@@ -840,64 +882,6 @@ class OrbitCallback(pl.Callback):
     if self.workdir is not None:
       shutil.rmtree(self.workdir, ignore_errors=True)
       self.workdir = None
-
-
-# ---------------------------------------------------------------------------
-# wandb image panels
-# ---------------------------------------------------------------------------
-
-class PreviewSourceCallback(pl.Callback):
-  """Producer half of module.PanelCallback's preview_source hand-off (see
-  that module's own comment block for the full contract and why this is a
-  separate callback). Runs the model on a fixed train item, flattens its
-  predicted Gaussians into gsplat.rasterization-ready arrays via the
-  existing model()/flatten_gaussians() pieces, and stashes
-  pl_module.preview_source. No cadence gating of its own -- cheap next to a
-  real training epoch (one forward pass on one fixed item), so it just
-  refreshes every epoch; module.PanelCallback alone decides when to
-  actually render+log from it.
-
-  Train-stage only for now -- see module.PanelCallback."""
-
-  def __init__(self):
-    self.train_batch = None
-
-  def on_fit_start(self, trainer, pl_module):
-    pl_module.preview_source = None  # owned by this callback, not GSLightningModule
-    dm = trainer.datamodule
-    self.train_batch = collate_with_batch_size([dm.train_ds[0]])
-
-  def on_train_epoch_end(self, trainer, pl_module):
-    if self.train_batch is None:
-      return
-    model = pl_module.model
-    device = pl_module.device
-    batch = self.train_batch
-
-    # NOTE(andrei): Not sure if setting model to eval is the right move here,
-    # but gonna do it for now.
-    with set_mode(model, "eval"), torch.no_grad():
-      gauss = model(
-        batch["views"]["rgb"][:, 0].to(device),
-        batch["source"]["xyz_cam"].to(device),
-      )
-      flat = next(flatten_gaussians(
-        batch["batch_size"], gauss,
-        batch["source"]["xyz_cam"].to(device), batch["source"]["hit"].to(device),
-      ))
-    flat["sh_degree"] = model.max_sh_degree
-
-    v = batch["views"]
-    pl_module.preview_source = {
-      "gauss": flat,
-      "views": {
-        "viewmat": v["viewmat"][0].to(device),
-        "K": v["K_image"][0].to(device),
-        "width": v["rgb"].shape[-1],
-        "height": v["rgb"].shape[-2],
-        "gt_rgb": v["rgb"][0].to(device),
-      },
-    }
 
 
 @hydra.main(version_base=None, config_path="conf", config_name="train_gs")

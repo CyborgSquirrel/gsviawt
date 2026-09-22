@@ -177,11 +177,6 @@ callbacks:
     elevation_deg: 20.0        # camera distance = the actual source view's own capture distance,
                                 # not a re-fit bounding-sphere framing -- see train_gs._orbit_c2w_gl
 
-  # preview_source must come before panel -- Lightning calls callbacks in
-  # this list's order, and panel reads what preview_source just stashed.
-  preview_source:
-    _target_: __main__.PreviewSourceCallback
-
   panel:
     _target_: module.PanelCallback
     every_n_epochs: ${eval:'${trainer.max_epochs} // 50'}
