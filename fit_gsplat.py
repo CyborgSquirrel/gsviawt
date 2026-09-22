@@ -526,7 +526,6 @@ class GSFitLightningModule(pl.LightningModule):
     self.final_loss = float("nan")
     self.iters = int(cfg.iters)
     self.log_every = max(1, self.iters // 10)
-    self.preview_source = None  # stashed by PreviewSourceCallback, read by module.PanelCallback
 
     self.params = nn.ParameterDict({
       k: nn.Parameter(torch.from_numpy(v), requires_grad=(k != "means" or self.optimize_means))
@@ -700,6 +699,9 @@ class PreviewSourceCallback(pl.Callback):
   uses) and packages it with the fixed supervision view set.
 
   Train-stage only for now -- see module.PanelCallback."""
+
+  def on_fit_start(self, trainer, pl_module):
+    pl_module.preview_source = None  # owned by this callback, not GSFitLightningModule
 
   def on_train_epoch_end(self, trainer, pl_module):
     gauss = activate_gaussians(pl_module.params)

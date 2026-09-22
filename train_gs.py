@@ -577,7 +577,6 @@ class GSLightningModule(pl.LightningModule):
     super().__init__()
     self.cfg = cfg
     self.views_seen = 0
-    self.preview_source = None  # stashed by PreviewSourceCallback, read by module.PanelCallback
 
     with timed("build_model"):
       self.model = GSModel(cfg)
@@ -864,6 +863,7 @@ class PreviewSourceCallback(pl.Callback):
     self.train_batch = None
 
   def on_fit_start(self, trainer, pl_module):
+    pl_module.preview_source = None  # owned by this callback, not GSLightningModule
     dm = trainer.datamodule
     self.train_batch = collate_with_batch_size([dm.train_ds[0]])
 
