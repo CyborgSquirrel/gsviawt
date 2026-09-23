@@ -506,8 +506,17 @@ class GSFitLightningModule(pl.LightningModule):
       groups.insert(0, {"params": [self.params["means"]], "lr": float(cfg.lr.means) * self.scene_scale})
     return torch.optim.Adam(groups)
 
-  def _photom_loss(self, rgb, alpha, gt_rgb, gt_alpha):
+  def _photom_loss(self, rgb, alpha, gt_rgb, gt_alpha, bg_colors=None):
     rgb_c = rgb * alpha  # premultiply so bg stays black on both sides
+    if bg_colors is not None:
+      # Composite both pred and gt onto the same random per-item background
+      # (one color per batch item, not per pixel) instead of leaving both
+      # premultiplied-over-black -- rgb_c/gt_rgb are already premultiplied,
+      # so += bg*(1-alpha) is a full recomposite, no un-premultiply needed.
+      # alpha's own mask loss below is unaffected (background-independent).
+      bg = bg_colors[:, None, None, :]  # (B,1,1,3), broadcasts against (B,H,W,C)
+      rgb_c = rgb_c + bg * (1.0 - alpha)
+      gt_rgb = gt_rgb + bg * (1.0 - gt_alpha)
     l1 = (rgb_c - gt_rgb).abs().mean()
     dssim = self.dssim(rgb_c.permute(0, 3, 1, 2), gt_rgb.permute(0, 3, 1, 2))
     mask = (alpha - gt_alpha).abs().mean()
@@ -530,9 +539,15 @@ class GSFitLightningModule(pl.LightningModule):
     vm, ks = batch["viewmat"], batch["K"]
     IH, IW = gt_rgb.shape[1:3]
 
+    # Random per-item background compositing (cfg.random_bg): train stage
+    # only, and only this loss computation -- get_preview_source() never
+    # calls render()/_photom_loss, so visualizations are unaffected
+    # regardless of this flag.
+    bg_colors = torch.rand(B, 3, device=gt_rgb.device) if (stage == "train" and self.cfg.random_bg) else None
+
     with torch.set_grad_enabled(stage == "train"):
       rgb, alpha = render(self.params, vm, ks, IW, IH)
-      loss, _, parts = self._photom_loss(rgb, alpha, gt_rgb, gt_alpha)
+      loss, _, parts = self._photom_loss(rgb, alpha, gt_rgb, gt_alpha, bg_colors=bg_colors)
 
     _log("loss", loss, prog_bar=(stage == "train"))
     for k, v in parts.items():

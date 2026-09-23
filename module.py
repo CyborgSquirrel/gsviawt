@@ -200,7 +200,8 @@ def guarded_render(tag):
 # taking mode ("epoch" | "step", matching which cadence fired) and
 # returning
 #   {"train": {"gauss": {...}, "scene_scale": float,
-#              "views": {"viewmat","K","width","height","gt_rgb"}},
+#              "views": {"viewmat","K","width","height","gt_rgb"},
+#              "gauss_layers": {...} (optional)},
 #    "val": same shape, or None}
 # (gauss arrays already flattened/activated -- exactly what render() already
 # needs in fit_gsplat.py, or one flatten_gaussians() yield in train_gs.py;
@@ -208,6 +209,13 @@ def guarded_render(tag):
 # (mode, epoch-or-step) (see either implementation) so a second caller at
 # the same point doesn't redundantly redo the forward pass. No callback
 # ordering to get right, no cost on ticks the panel isn't even logged.
+#
+# gauss_layers (optional, only train_gs.py's GSLightningModule populates
+# it): the PRE-flatten_gaussians per-layer decoder output -- {"scale":
+# (L,3,H,W), "hit": (L,H,W) bool, ...the rest of the raw gauss dict} --
+# ScaleLayersCallback below reads this instead of "gauss" specifically so a
+# single exploded pixel doesn't disappear into flatten_gaussians' ~14k-point
+# mean/render.
 #
 # "val" is only ever populated in step mode (mode == "step"): epoch mode
 # stays train-only, same as it always has been (on_train_epoch_end is the
@@ -313,6 +321,110 @@ class PanelCallback(pl.Callback):
         panel = _build_panel(views["gt_rgb"], pred_rgb)
         log_payload[f"{stage}/panel"] = wandb.Image(
           panel, caption="GT | render | |diff|, one row per view")
+    if not log_payload:
+      return
+
+    log_payload["views_seen"] = pl_module.views_seen  # TODO: better way to handle this
+    wandb_run.log(log_payload)
+
+
+def _colorize_scale_layers(scale, hit):
+  """scale: (L,3,H,W) tensor -- the raw per-axis scale MULTIPLIER for each
+  depth-peel layer, straight from the decoder (train_gs.py's GSModel
+  output), before flatten_gaussians collapses layers/pixels into one point
+  list. hit: (L,H,W) bool -- which grid cells hold an actual Gaussian
+  (the rest is empty depth-peel padding).
+
+  Returns one uint8 (H, L*W, 3) array: log10(max-axis scale) colorized
+  (inferno) per layer side by side, invalid cells rendered flat gray so
+  "no Gaussian here" reads differently from "small Gaussian here" under
+  the colormap. Normalized against this call's OWN min/max (not a fixed
+  range) -- the point is spotting a relative outlier, and the value can
+  span many orders of magnitude (an exp() activation with no upper
+  clamp -- see loss.scale_reg's own docstring in conf/train_gs.yaml)."""
+  import matplotlib
+
+  scale_np = scale.detach().float().cpu().numpy()       # (L,3,H,W)
+  hit_np = hit.detach().cpu().numpy().astype(bool)       # (L,H,W)
+  mag = scale_np.max(axis=1)                             # (L,H,W) -- worst axis per pixel
+
+  log_mag = np.log10(np.clip(mag, 1e-8, None))
+  valid = log_mag[hit_np]
+  lo, hi = (float(valid.min()), float(valid.max())) if valid.size else (0.0, 1.0)
+  if hi <= lo:
+    hi = lo + 1.0
+  norm = np.clip((log_mag - lo) / (hi - lo), 0.0, 1.0)
+
+  cmap = matplotlib.colormaps["inferno"]
+  rgb = (cmap(norm)[..., :3] * 255).astype(np.uint8)     # (L,H,W,3)
+  rgb[~hit_np] = 60
+
+  image = np.concatenate([rgb[l] for l in range(rgb.shape[0])], axis=1)  # (H, L*W, 3)
+  return image
+
+
+class ScaleLayersCallback(pl.Callback):
+  """Per-depth-peel-layer visualization of the model's predicted Gaussian
+  `scale`, pulled from the UNFLATTENED gauss_layers entry
+  get_preview_source() puts alongside its usual flattened "gauss" (see
+  train_gs.py's _preview_entry) -- flatten_gaussians concatenates every
+  layer/pixel into one ~14k-point cloud for PanelCallback/OrbitCallback,
+  which is exactly where a single exploded pixel goes invisible (buried in
+  the mean/the render). This reads the pre-flatten (L,C,H,W) grid straight
+  from the decoder instead, so one bad pixel in one layer stays visually
+  and numerically identifiable.
+
+  Same pull/cadence contract as PanelCallback/OrbitCallback (see this
+  module's own top-of-file comment block): every_n_epochs XOR
+  every_n_steps, pulls pl_module.get_preview_source(mode) (same call,
+  same cache). Stages whose entry has no "gauss_layers" key (an
+  implementation that doesn't populate it) are skipped, same as a stage
+  with no entry at all."""
+
+  def __init__(self, *, every_n_epochs: int | None = None, every_n_steps: int | None = None):
+    _cadence_check(every_n_epochs, every_n_steps, "ScaleLayersCallback")
+    self.every_n_epochs = every_n_epochs
+    self.every_n_steps = every_n_steps
+
+  def on_train_epoch_end(self, trainer, pl_module):
+    self._step("epoch", trainer, pl_module)
+
+  def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+    self._step("step", trainer, pl_module)
+
+  def _step(self, mode, trainer, pl_module):
+    if mode == "epoch":
+      if self.every_n_epochs is None:
+        return
+      n = trainer.current_epoch + 1  # count of COMPLETED epochs
+      if n % self.every_n_epochs != 0:
+        return
+      stages = ("train",)
+    else:
+      if self.every_n_steps is None:
+        return
+      n = trainer.global_step  # count of COMPLETED optimizer steps
+      if n == 0 or n % self.every_n_steps != 0:
+        return
+      stages = ("train", "val")
+
+    wandb_run = pl_module.logger.experiment if pl_module.logger is not None else None
+    if wandb_run is None:
+      return
+
+    log_payload = {}
+    with guarded_render(f"{mode}/scale_layers"), torch.no_grad():
+      source = pl_module.get_preview_source(mode)
+      for stage in stages:
+        entry = source.get(stage)
+        if entry is None:
+          continue
+        layers = entry.get("gauss_layers")
+        if layers is None:
+          continue
+        image = _colorize_scale_layers(layers["scale"], layers["hit"])
+        log_payload[f"{stage}/scale_layers"] = wandb.Image(
+          image, caption="log10(max-axis scale) per depth-peel layer, left to right")
     if not log_payload:
       return
 

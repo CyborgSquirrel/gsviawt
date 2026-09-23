@@ -52,8 +52,9 @@ import wandb
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
 from fit_gsplat import SH_C0  # noqa: E402
 from gs_dataset import (OPENGL_TO_OPENCV, GaussH5ValDataset,  # noqa: E402
-                        GSFixedViewsDataset, GSPairDataset, H5Catalog,
-                        _EmptyDataset, rotate_quats_wxyz)
+                        GSFixedSourceDataset, GSFixedViewsDataset,
+                        GSPairDataset, H5Catalog, _EmptyDataset,
+                        rotate_quats_wxyz)
 from gs_decoder import GaussianResnetDecoder, GSDecoderStack  # noqa: E402
 from gs_encoder import GSResnetEncoder  # noqa: E402
 from module import DSSIMLoss, WarmupCosineAnnealingLR  # noqa: E402
@@ -91,6 +92,7 @@ class GSModel(nn.Module):
       opacity_scale=cfg.model.opacity_scale, opacity_bias=cfg.model.opacity_bias,
       scale_scale=cfg.model.scale_scale, scale_bias=cfg.model.scale_bias,
       sh_scale=cfg.model.sh_scale, scale_lambda=cfg.model.scale_lambda,
+      zero_init_last_conv=cfg.model.zero_init_last_conv,
     )
     self.decoder = GSDecoderStack(
       self.encoder.num_ch_enc,
@@ -153,8 +155,13 @@ def model_forward(
   *,
   need_flat_gauss: bool=False,
   need_render: bool=False,
+  render_view_idx = None,
+  bg_colors = None,
   device,
 ):
+  if render_view_idx is None:
+    render_view_idx = slice(None)
+
   B = batch["batch_size"]
 
   out = {}
@@ -165,6 +172,8 @@ def model_forward(
 
   # render 3DGS if necessary
   if need_render:
+    rvi = render_view_idx
+
     # TODO: overrides
     # gauss_render = gauss_pred
     # gt = item.get("ground_truth")
@@ -176,13 +185,22 @@ def model_forward(
     pred_rgb = []
     pred_alpha = []
 
+    # bg_colors: (B,3) or None -- one random background color per BATCH
+    # item (not per view; every view of a given item composites onto the
+    # same color), used only by _step's train-stage random-bg-compositing
+    # option (see loss.random_bg). None (default): unchanged behavior, no
+    # background passed to gsplat (whatever it renders against internally).
+    bg_iter = bg_colors if bg_colors is not None else [None] * B
+
     for (
+      bg,
       x_viewmats,
       x_Ks,
       x_gauss_flat,
     ) in zip(
-      batch["views"]["viewmat"].to(device), # (B,V,N,M)
-      batch["views"]["K_image"].to(device), # (B,V,N,M)
+      bg_iter,
+      batch["views"]["viewmat"][:,rvi].to(device), # (B,V,N,M)
+      batch["views"]["K_image"][:,rvi].to(device), # (B,V,N,M)
       flatten_gaussians(
         B,
         out["gauss"],
@@ -205,10 +223,15 @@ def model_forward(
         sh_degree=model.max_sh_degree,
         render_mode="RGB",
         packed=True,
+        # packed=True (always, here) -> gsplat's low-level rasterizer wants
+        # backgrounds shaped just (channels,), shared across every view in
+        # this call, not one per view -- which is exactly the granularity
+        # we want (one call per batch item already).
+        backgrounds=bg if bg is not None else None,
       )
 
       x_pred_rgb   = rearrange(x_pred_rgb, "v h w c -> v c h w")
-      x_pred_alpha = rearrange(x_pred_rgb, "v h w c -> v c h w")
+      x_pred_alpha = rearrange(x_pred_alpha, "v h w c -> v c h w")
 
       pred_rgb.append(x_pred_rgb)
       pred_alpha.append(x_pred_alpha)
@@ -406,7 +429,7 @@ def _external_val_dataset(cfg):
   )
   return GSPairDataset(
     catalog, num_layers=cfg.data.num_layers, num_target_views=cfg.data.num_target_views,
-    seed=cfg.seed, deterministic_targets=True,
+    seed=cfg.seed, deterministic_targets=True, allow_source_as_target=cfg.data.allow_source_as_target,
   )
 
 
@@ -463,9 +486,41 @@ class GSDataModule(pl.LightningDataModule):
       )
       self.train_ds = GSPairDataset(
         catalog, num_layers=cfg.data.num_layers, num_target_views=cfg.data.num_target_views,
-        seed=cfg.seed, deterministic_targets=False,
+        seed=cfg.seed, deterministic_targets=False, source_views=cfg.data.source_views,
+        allow_source_as_target=cfg.data.allow_source_as_target,
       )
       self.val_ds = _external_val_dataset(cfg)
+    elif cfg.data.val_target_views is not None:
+      # Single-fixed-source setup (data.source_views == exactly one entry)
+      # validated by holding out a set of TARGET views instead of by
+      # mesh/view split -- GSPairDataset's own row-indexed val collapses to
+      # 1 row (or 0, across a mesh-level split_fn) when there's only one
+      # eligible source, giving no real per-epoch validation signal (see
+      # GSFixedSourceDataset's own docstring). Bypasses data.split_fn
+      # entirely, same rationale as the photom_h5_val branch above --
+      # assumes a single-mesh catalog, since target_views/val_target_views
+      # are raw view_idx values with no mesh_id qualifier.
+      if cfg.data.source_views is None or len(cfg.data.source_views) != 1:
+        raise SystemExit("data.val_target_views requires exactly one data.source_views entry")
+      catalog = H5Catalog(
+        cfg.data.photom_h5,
+        H5Catalog.path().alias("path"),
+        H5Catalog.index().alias("view_idx"),
+        H5Catalog.dataset("mesh_index").alias("mesh_id"),
+      )
+      source_view = int(catalog.take([cfg.data.source_views[0]]).df["view_idx"][0])
+      val_targets = [int(v) for v in cfg.data.val_target_views]
+      val_targets_set = set(val_targets)
+      self.train_ds = GSPairDataset(
+        catalog, num_layers=cfg.data.num_layers, num_target_views=cfg.data.num_target_views,
+        seed=cfg.seed, deterministic_targets=False, source_views=cfg.data.source_views,
+        allow_source_as_target=cfg.data.allow_source_as_target,
+        target_views=[v for v in catalog.df["view_idx"].to_list() if v not in val_targets_set],
+      )
+      self.val_ds = GSFixedSourceDataset(
+        catalog, source_view=source_view, target_views=val_targets,
+        num_layers=cfg.data.num_layers, targets_per_item=cfg.data.val_targets_per_item,
+      )
     else:
       catalog = H5Catalog(
         cfg.data.photom_h5,
@@ -479,11 +534,12 @@ class GSDataModule(pl.LightningDataModule):
 
       self.train_ds = GSPairDataset(
         train_catalog, num_layers=cfg.data.num_layers, num_target_views=cfg.data.num_target_views,
-        seed=cfg.seed, deterministic_targets=False,
+        seed=cfg.seed, deterministic_targets=False, source_views=cfg.data.source_views,
+        allow_source_as_target=cfg.data.allow_source_as_target,
       )
       self.val_ds = GSPairDataset(
         val_catalog, num_layers=cfg.data.num_layers, num_target_views=cfg.data.num_target_views,
-        seed=cfg.seed, deterministic_targets=True,
+        seed=cfg.seed, deterministic_targets=True, allow_source_as_target=cfg.data.allow_source_as_target,
       )
     if len(self.train_ds) == 0:
       raise SystemExit("train split is empty -- check data.photom_h5 / data.split_fn")
@@ -562,18 +618,47 @@ class GSLightningModule(pl.LightningModule):
     cfg = self.cfg
     device = self.device
 
+    source_view_idx = 0
+    target_view_idx = list(range(1, V))
+
+    # figure out which views we'll render
+    render_view_idx = []
+
+    render_source_view_idx = None
+    if "source" in cfg.loss.photom["for"]:
+      render_source_view_idx = len(render_view_idx)
+      render_view_idx += [source_view_idx]
+
+    render_target_view_idx = None
+    if "target" in cfg.loss.photom["for"]:
+      render_target_view_idx = list(range(len(render_view_idx), len(render_view_idx) + len(target_view_idx)))
+      render_view_idx += target_view_idx
+
     need_render = (
       cfg.loss.photom.l1_weight > 0
-      or cfg.loss.photom.ssim_weight > 0
-      or cfg.loss.photom.mask_weight > 0
+      or cfg.loss.photom.dssim_weight > 0
+      # or cfg.loss.photom.mask_weight > 0
     )
 
     if stage == "train":
-      self.views_seen += B * V
+      self.views_seen += B * len(render_view_idx)
     self.log("views_seen", self.views_seen, reduce_fx="max")
 
+    # Random per-item background compositing (loss.random_bg): train-stage
+    # only, and only affects this render/loss computation -- _preview_entry
+    # (panels/orbit videos) never calls model_forward, so visualizations are
+    # unaffected regardless of this flag.
+    bg_colors = torch.rand(B, 3, device=device) if (stage == "train" and cfg.loss.random_bg) else None
+
     # forward pass
-    model_pred = model_forward(self.model, batch, need_render=need_render, device=device)
+    model_pred = model_forward(
+      self.model,
+      batch,
+      need_render=need_render,
+      render_view_idx=render_view_idx,
+      bg_colors=bg_colors,
+      device=device,
+    )
     pred_rgb = model_pred["rgb"]
     pred_alpha = model_pred["alpha"]
 
@@ -582,21 +667,38 @@ class GSLightningModule(pl.LightningModule):
     out = {}
 
     # photometric losses
-    gt_rgb = batch["views"]["rgb"]
-    gt_alpha = batch["views"]["alpha"]
+    gt_rgb = batch["views"]["rgb"][:, render_view_idx]
+    gt_alpha = batch["views"]["alpha"][:, render_view_idx]
+    if bg_colors is not None:
+      # gt_rgb is rendered (render_objaverse.py) premultiplied over BLACK,
+      # i.e. gt_rgb == true_fg_color*alpha already -- recompositing onto a
+      # different background is just += bg*(1-alpha), no un-premultiply
+      # needed. Same bg_colors the pred render above used, so pred/gt are
+      # compared on a matching background.
+      gt_rgb = gt_rgb + bg_colors[:, None, :, None, None] * (1.0 - gt_alpha)
 
     def _splatter_metric(metric_name, metric_full):
       """
       metric_full: (B,V,...)
       """
       _log(f"{metric_name}", metric_full.mean().detach())
-      _log(f"{metric_name}/source", metric_full[:,0].mean().detach())
-      _log(f"{metric_name}/targets", metric_full[:,1:].mean().detach())
+      if render_source_view_idx is not None:
+        _log(
+          f"{metric_name}/source",
+          metric_full[:,render_source_view_idx].mean().detach(),
+        )
+      if render_target_view_idx is not None:
+        _log(
+          f"{metric_name}/targets",
+          metric_full[:,render_target_view_idx].mean().detach(),
+        )
+
+    RV = len(render_view_idx)
 
     def f(a):
       return rearrange(a, "b v ... -> (b v) ...")
     def g(a):
-      return rearrange(a, "(b v) ... -> b v ...", b=B, v=V)
+      return rearrange(a, "(b v) ... -> b v ...", b=B, v=RV)
 
     # NOMERGE: Composite GT RGB onto white background
 
@@ -696,6 +798,15 @@ class GSLightningModule(pl.LightningModule):
       ))
     flat["sh_degree"] = self.model.max_sh_degree
 
+    # Unflattened (pre-flatten_gaussians) per-layer snapshot, for
+    # module.ScaleLayersCallback -- `gauss` here is still the raw decoder
+    # output (batch dim intact, one layer axis per Gaussian field), never
+    # mutated by the flatten/world-space-transform steps below. batch dim
+    # is 1 (single fixed preview item), so index it out: each field is
+    # (L,C,H,W), matching flatten_gaussians' own per-item slicing.
+    gauss_layers = {k: v[0].detach() for k, v in gauss.items()}
+    gauss_layers["hit"] = batch["source"]["hit"][0]
+
     # world <- source-camera-frame, from this item's own known real pose.
     pose_gl_np = batch["source"]["pose_gl"][0].numpy()
     c2w_cv = pose_gl_np @ OPENGL_TO_OPENCV
@@ -714,6 +825,7 @@ class GSLightningModule(pl.LightningModule):
 
     return {
       "gauss": flat,
+      "gauss_layers": gauss_layers,
       # scene_scale: the source camera's own real distance from the world
       # origin -- module.OrbitCallback's orbit radius (matches
       # fit_gsplat.py's own scene_scale: norm of a capture camera's own

@@ -24,7 +24,11 @@ plan calls out explicitly):
                                                  different viewing distance, etc.) exceeds that
                                                  floor.
     rotation = normalize(raw_quat, dim=channel) unit quaternion, wxyz, no sign constraint
-    sh_dc    = raw                              unconstrained, SH band-0 color coeff
+    sh_dc    = (sigmoid(raw)-0.5) / SH_C0       SH band-0 color coeff, chosen so that the
+                                                 rendered color (SH_C0*sh_dc+0.5, evaluated by
+                                                 gsplat/compute_direct_loss) works out to exactly
+                                                 sigmoid(raw) -- bounded in (0,1), same pattern as
+                                                 opacity above.
     sh_rest  = raw                              unconstrained, SH band-1+ coeffs (only if max_sh_degree>0)
 """
 
@@ -35,6 +39,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+
+from fit_gsplat import SH_C0
 
 
 def upsample(x, mode="nearest"):
@@ -95,7 +101,8 @@ class GaussianResnetDecoder(nn.Module):
   def __init__(self, num_ch_enc, num_layers, max_sh_degree,
               num_ch_dec=(32, 32, 64, 128, 256), upsample_mode="nearest",
               use_skips=True, opacity_scale=1e-3, opacity_bias=0.0,
-              scale_scale=1e-1, scale_bias=0.02, sh_scale=1.0, scale_lambda=0.01):
+              scale_scale=1e-1, scale_bias=0.02, sh_scale=1.0, scale_lambda=0.01,
+              zero_init_last_conv=False):
     super().__init__()
     self.use_skips = use_skips
     self.upsample_mode = upsample_mode
@@ -129,11 +136,15 @@ class GaussianResnetDecoder(nn.Module):
     self.decoder = nn.ModuleList(list(convs.values()))
     self.out = nn.Conv2d(int(self.num_ch_dec[0]), self.num_output_channels, 1)
 
-    start = 0
-    for out_channels, scale, bias in zip(self.split_dimensions, scale_inits, bias_inits):
-      nn.init.xavier_uniform_(self.out.weight[start:start + out_channels], scale)
-      nn.init.constant_(self.out.bias[start:start + out_channels], bias)
-      start += out_channels
+    if zero_init_last_conv:
+      nn.init.zeros_(self.out.weight)
+      nn.init.zeros_(self.out.bias)
+    else:
+      start = 0
+      for out_channels, scale, bias in zip(self.split_dimensions, scale_inits, bias_inits):
+        nn.init.xavier_uniform_(self.out.weight[start:start + out_channels], scale)
+        nn.init.constant_(self.out.bias[start:start + out_channels], bias)
+        start += out_channels
 
   def forward(self, input_features):
     """input_features: 5 encoder feature maps, finest first / coarsest last
@@ -178,8 +189,17 @@ class GaussianResnetDecoder(nn.Module):
       "opacity": torch.sigmoid(stack_layers(per_field["opacity"])),
       "raw_scale": raw_scale,
       "scale": torch.exp(raw_scale),
-      "rotation": F.normalize(stack_layers(per_field["rotation"]), dim=2),
-      "sh_dc": stack_layers(per_field["sh_dc"]),
+      # +1e-6: guards the exact-zero raw quaternion (all channels 0, e.g. under
+      # zero_init_last_conv) -- F.normalize's own eps only clamps the norm
+      # denominator, so a true zero vector normalizes to itself (still zero,
+      # not a unit quaternion). Negligible next to any real trained value.
+      "rotation": F.normalize(stack_layers(per_field["rotation"]) + 1e-6, dim=2),
+      # sigmoid-bounded color: gsplat/compute_direct_loss both evaluate
+      # rendered color as SH_C0*sh_dc + 0.5 (degree-0 SH), so expressing
+      # sh_dc as (sigmoid(raw)-0.5)/SH_C0 here makes that evaluate back out
+      # to exactly sigmoid(raw) -- bounded in (0,1), same pattern as opacity
+      # above, instead of the previous fully-unconstrained raw value.
+      "sh_dc": (torch.sigmoid(stack_layers(per_field["sh_dc"])) - 0.5) / SH_C0,
     }
     if self.max_sh_degree != 0:
       out["sh_rest"] = stack_layers(per_field["sh_rest"])
