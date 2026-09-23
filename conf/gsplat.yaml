@@ -51,6 +51,14 @@ optimize_means: false
 # --- losses ---
 lambda_ssim: 0.2          # weight of the (1 - SSIM) term in the RGB loss
 lambda_mask: 1.0          # weight of the L1 rendered-alpha vs image-alpha term
+# Composite both the predicted render AND the ground truth onto a random
+# per-item background color before the l1/dssim terms above (mask, the
+# alpha term, is background-independent and unaffected) -- train stage
+# only, never val, never get_preview_source's panel/orbit visualizations
+# (they don't call render()/_photom_loss at all). One random color per
+# batch item, uniform in [0,1]^3. false (default): unchanged behavior,
+# both sides stay premultiplied-over-black.
+random_bg: false
 
 # --- Adam learning rates (means additionally scaled by scene_scale) ---
 lr:
@@ -82,7 +90,7 @@ datasets:
 
 wandb:
   project: gsviawt
-  mode: disabled              # online | offline | disabled
+  mode: online                # online | offline | disabled
   tags: [3dgs-optim]
   name: null
 
