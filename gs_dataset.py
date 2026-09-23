@@ -544,17 +544,39 @@ class GSPairDataset(Dataset):
   Mesh grouping (which views are siblings of a given source view) is
   derived once here at construction, via a vectorized group_by over the
   catalog's own rows.
+
+  source_views: optional list of row positions (same index space as
+  H5Catalog.take()/split_by_indices) eligible to be a SOURCE view -- i.e.
+  what `__len__`/`__getitem__` index over. Target-view sampling is
+  unaffected -- self.groups (below) is always built from the FULL catalog,
+  so targets are still drawn from every view of the source's mesh regardless
+  of this restriction. None (default): every catalog row is eligible, same
+  as before this option existed.
+
+  allow_source_as_target: whether the source view itself is eligible to also
+  be sampled into its own target_views list. False (default, unchanged
+  behavior): source_view is excluded, so every target is a genuinely
+  different view. True: source_view is just another member of the mesh's
+  view pool, same odds as any other view.
+
+  target_views: optional list/set of raw view_idx values (the same domain
+  as self.groups' own values -- NOT row positions like source_views above)
+  eligible to be sampled as a TARGET, applied per-mesh at construction (once,
+  not a per-__getitem__ filter). Lets a caller hold out a set of views from
+  training's target pool (e.g. to keep them unseen for a separate
+  validation dataset over the same fixed source -- see
+  GSFixedSourceDataset). None (default): every view in the mesh group is
+  eligible, unchanged behavior.
   """
 
   def __init__(self, catalog: H5Catalog, num_layers=6, num_target_views=3, seed=42,
-              deterministic_targets=False):
-    self.source_view = 0
-    self.target_views = tuple(range(1, num_target_views+1))
-
+              deterministic_targets=False, source_views=None,
+              allow_source_as_target=False, target_views=None):
     self.catalog = catalog
     self.num_layers = num_layers
     self.num_target_views = num_target_views
     self.seed = seed
+    self.allow_source_as_target = allow_source_as_target
     # Whether target-view sampling is reproducible (seeded off idx) or fresh
     # every __getitem__ call -- e.g. stable val visualizations/metrics vs.
     # data variety across train epochs. No default tied to a "split" concept
@@ -567,34 +589,92 @@ class GSPairDataset(Dataset):
       (row["path"], row["mesh_id"]): row["view_idx"]
       for row in groups_df.iter_rows(named=True)
     }
+    if target_views is not None:
+      allowed = set(target_views)
+      self.groups = {k: [v for v in vs if v in allowed] for k, vs in self.groups.items()}
+
+    self.source_catalog = catalog if source_views is None else catalog.take(source_views)
 
     log.info(
-      "GSPairDataset: %d mesh groups / %d views",
-      len(self.groups), len(catalog),
+      "GSPairDataset: %d mesh groups / %d views (%d eligible as source)",
+      len(self.groups), len(catalog), len(self.source_catalog),
     )
 
   def __len__(self):
-    return len(self.catalog)
+    return len(self.source_catalog)
 
   def __getitem__(self, idx):
-    row = self.catalog[idx]
+    row = self.source_catalog[idx]
     path, mesh_id, source_view = row["path"], row["mesh_id"], row["view_idx"]
     views = self.groups[(path, mesh_id)]
     f = _get_h5(path)
 
     rng = random.Random(f"{self.seed}_{idx}") if self.deterministic_targets else random.Random()
-    # Sample num_target_views+1 candidates (all still <= len(views), since
-    # num_target_views <= len(views)-1) and drop source_view from that small
-    # sample instead of first filtering it out of the whole (possibly much
-    # larger) views list -- avoids an O(len(views)) scan every call.
-    k = min(self.num_target_views, len(views) - 1)
-    if k <= 0:
-      target_views = []
+    if self.allow_source_as_target:
+      k = min(self.num_target_views, len(views))
+      target_views = rng.sample(views, k) if k > 0 else []
     else:
-      sampled = rng.sample(views, k + 1)
-      target_views = [v for v in sampled if v != source_view][:k]
+      # Sample num_target_views+1 candidates (all still <= len(views), since
+      # num_target_views <= len(views)-1) and drop source_view from that small
+      # sample instead of first filtering it out of the whole (possibly much
+      # larger) views list -- avoids an O(len(views)) scan every call.
+      k = min(self.num_target_views, len(views) - 1)
+      if k <= 0:
+        target_views = []
+      else:
+        sampled = rng.sample(views, k + 1)
+        target_views = [v for v in sampled if v != source_view][:k]
 
     return _build_item(f, path, source_view, target_views, self.num_layers, mesh_id)
+
+
+class GSFixedSourceDataset(Dataset):
+  """One fixed SOURCE view, indexed by held-out TARGET view instead of by
+  source row -- for validating a fixed-source setup (e.g.
+  data.source_views=[N] on GSPairDataset) where indexing by source row
+  collapses len(dataset) to 1 (or, across a mesh-level split_fn, 0), giving
+  no real per-epoch validation signal. This class doesn't split anything
+  itself -- target_views is the caller's own held-out list (e.g. the
+  complement of whatever GSPairDataset.target_views excludes from train's
+  own sampling pool, so train/val target sets stay disjoint).
+
+  targets_per_item: how many target views one row renders/supervises at
+  once, all through a SINGLE encoder pass on the shared source (see
+  GSModel.forward/model_forward -- only batch["views"]["rgb"][:,0], the
+  source, is ever encoded). len(dataset) == ceil(len(target_views) /
+  targets_per_item). 1 (default): one row per held-out view, so a metric
+  averaged over the whole val set sees every held-out view exactly once
+  per epoch, matching GSPairDataset's own val convention
+  (deterministic_targets=True) of one full, stable pass per epoch.
+  """
+
+  def __init__(self, catalog: H5Catalog, source_view, target_views, num_layers=6, targets_per_item=1):
+    rows = catalog.df.filter(pl.col("view_idx") == source_view)
+    if len(rows) != 1:
+      raise ValueError(
+        f"GSFixedSourceDataset: expected exactly one catalog row for "
+        f"source_view={source_view}, found {len(rows)}")
+    row = rows.row(0, named=True)
+    self.path = row["path"]
+    self.mesh_id = row["mesh_id"]
+    self.source_view = int(source_view)
+    self.target_views = [int(v) for v in target_views]
+    self.num_layers = num_layers
+    self.targets_per_item = targets_per_item
+
+    log.info(
+      "GSFixedSourceDataset: source_view=%d, %d held-out target views (%d rows, %d per row)",
+      self.source_view, len(self.target_views), len(self), targets_per_item,
+    )
+
+  def __len__(self):
+    return -(-len(self.target_views) // self.targets_per_item)  # ceil div
+
+  def __getitem__(self, idx):
+    start = idx * self.targets_per_item
+    chunk = self.target_views[start:start + self.targets_per_item]
+    f = _get_h5(self.path)
+    return _build_item(f, self.path, self.source_view, chunk, self.num_layers, self.mesh_id)
 
 
 class GSFixedViewsDataset(Dataset):
