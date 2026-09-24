@@ -64,7 +64,7 @@ opacity_reset:
 # reference's densify_and_prune pruning half: low-opacity, oversized-in-world,
 # and (after the first opacity-reset window) oversized-on-screen. ---
 prune:
-  enabled: true
+  enabled: false
   from_iter: 500
   until_iter: 15000
   every: 100
