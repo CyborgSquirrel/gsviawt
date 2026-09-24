@@ -1,0 +1,112 @@
+# Config for fit_3dgs.py -- reference-3DGS-style optimization of Gaussians
+# seeded from one render HDF5's primary-view depth peel (render_objaverse.py /
+# fit_gsplat.py schema), porting the original Inria training loop (SH color +
+# degree schedule, per-parameter LRs, opacity reset, low-opacity/oversized
+# pruning, one-random-camera-per-step sampling) -- EXCEPT clone/split
+# densification, which is deliberately not ported: see fit_3dgs.py's module
+# docstring for why (Gaussian centers stay pixel-aligned to the seed grid).
+
+# --- input ---
+hdf5_path: /app/bla/objaverse_renders.h5
+primary: 0                 # primary view index (seeds the Gaussians)
+secondary: []             # extra view indices for supervision, e.g. [1,2,3]
+                          # (primary + secondary must all be the same mesh_index)
+
+# null -> "<hdf5_path>.fit3dgs.view<primary>.h5" (+ .ply, + .val/ alongside)
+output_path: null
+
+# --- optimization ---
+iters: 30000              # reference default (scene has a fixed Gaussian count
+                          # here, no densification growth, so this may converge
+                          # well before 30k in practice -- override freely)
+seed: 42
+device: cuda              # cuda | cpu
+
+# Cameras rendered/supervised per iteration, sampled without replacement from
+# the primary+secondary set, reshuffling every full pass (epoch) over that
+# set -- the reference's exact one-random-camera-per-step loop (unlike
+# fit_gsplat.py's views_per_iter, which draws an independent random subset
+# every iteration with no per-epoch coverage guarantee). null = all views
+# every iteration (full-batch, fit_gsplat.py's original default behaviour).
+views_per_iter: 1
+
+# Gaussian centers are ALWAYS frozen at their depth-peel back-projected seed
+# positions (unlike the reference, which optimizes xyz and freely
+# clones/splits new Gaussians at arbitrary positions) -- this script only ever
+# removes seeded Gaussians, never adds any off-grid ones. See docstring.
+
+# --- SH color ---
+max_sh_degree: 3          # reference default; features_dc + up to this many SH bands
+sh_degree_interval: 1000  # bump active_sh_degree by 1 every N iters (reference: 1000)
+
+# --- losses ---
+lambda_dssim: 0.2         # weight of the (1 - SSIM) term; loss = (1-lambda)*L1 + lambda*(1-SSIM)
+
+# --- Adam learning rates (reference constants; no lr.means -- centers are frozen) ---
+lr:
+  features_dc: 2.5e-3
+  features_rest: 1.25e-4   # reference's feature_lr / 20
+  opacities: 2.5e-2
+  scales: 5.0e-3
+  quats: 1.0e-3
+
+# --- initialization (same seeding scheme as fit_gsplat.py) ---
+init_opacity: 0.1         # starting opacity for every seeded Gaussian
+knn_k: 4                  # neighbours used to size each Gaussian's initial scale
+
+# --- opacity reset (reference: cap sigmoid(opacity) at `value` every `every` iters) ---
+opacity_reset:
+  enabled: true
+  every: 3000
+  value: 0.01
+
+# --- pruning: remove-only (no clone/split -- see docstring). Ports the
+# reference's densify_and_prune pruning half: low-opacity, oversized-in-world,
+# and (after the first opacity-reset window) oversized-on-screen. ---
+prune:
+  enabled: false
+  from_iter: 500
+  until_iter: 15000
+  every: 100
+  min_opacity: 0.005        # reference's hardcoded prune threshold
+  max_scale_ratio: 0.1      # prune scale max axis > this * scene_scale (reference: 0.1 * extent)
+  max_screen_size: 20       # prune 2D radius (px) > this, only once iter > opacity_reset.every
+
+# --- validation / output ---
+val_every: 500            # dump gt|render PNGs every N iters (0 disables)
+write_ply: true           # also write a standard 3DGS .ply (full SH) next to the .h5
+# .ply pruning -- all off by default (the .h5 always keeps every surviving Gaussian).
+ply_opacity_threshold: null
+ply_max_scale_ratio: null
+ply_max_anisotropy: null
+
+# --- dataset-name overrides (for non-standard files) ---
+datasets:
+  images: images
+  depth: depth_peel
+  intrinsics: depth_intrinsics
+  image_intrinsics: image_intrinsics
+  pose: camera_pose
+
+wandb:
+  project: gsviawt
+  mode: disabled              # online | offline | disabled
+  tags: [fit-3dgs]
+  name: null
+
+# Turntable orbit preview, logged as wandb.Video (needs wandb.mode != disabled).
+# Anchored to the primary view's own actual capture distance, same rationale
+# as fit_gsplat.py's orbit (see its render_orbit_frames docstring).
+orbit:
+  enabled: true
+  every: 500
+  num_frames: 24
+  fps: 12
+  crf: 28
+  elevation_deg: 20.0
+
+hydra:
+  job:
+    chdir: false          # stay in cwd; output paths are absolute / input-relative
+  run:
+    dir: outputs/fit_3dgs/${now:%Y-%m-%d_%H-%M-%S}   # hydra's .log + .hydra/ land here (gitignored)
