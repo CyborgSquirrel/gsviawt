@@ -255,6 +255,23 @@ RUN \
   uv sync --inexact --extra viz
 EOF
 
+# Splatter Image (github.com/szymanowiczs/splatter-image @ 78a6ad0) inference
+# test, vendored whole under splatter-image/. Its renderer needs the classic
+# diff-gaussian-rasterization API (2-tuple return, no antialiasing field), so
+# it carries its own copy of graphdeco-inria/diff-gaussian-rasterization
+# (main @ 59f5f77, +glm) rather than reusing gaussian-splatting's -- newer
+# rasterizer forks break the call signature. Patched for a missing
+# `#include <cstdint>` that gcc 13 no longer pulls in transitively. Reuses
+# gsplat's CUDA_HOME / TORCH_CUDA_ARCH_LIST from above.
+RUN \
+  --mount=type=cache,uid=$XUID,gid=$XGID,dst=$UV_PYTHON_CACHE_DIR,id=uv \
+<<EOF
+  uv pip install --no-build-isolation ./splatter-image/submodules/diff-gaussian-rasterization
+  # [cpu]: background removal is a one-shot U2Net pass, not worth contending
+  # with training/inference jobs for the 10GB card's VRAM.
+  uv pip install "rembg[cpu]"
+EOF
+
 # Set entrypoint
 ENTRYPOINT ["/app/container/entrypoint.sh"]
 

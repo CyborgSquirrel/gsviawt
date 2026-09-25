@@ -1,0 +1,31 @@
+# Config for splatter_image_infer.py -- single-image inference with the
+# pretrained "cars" checkpoint from szymanowiczs/splatter-image
+# (https://huggingface.co/szymanowiczs/splatter-image-v1).
+
+# --- input ---
+image: ???                  # str, path to the input photo (required)
+
+# --- output ---
+out_dir: outputs/splatter_image/${now:%Y-%m-%d}/${now:%H-%M-%S}
+export_ply: true            # write reconstruction.ply (viewable in any 3DGS/point-cloud viewer)
+export_loop: true           # write loop.mp4, a turntable render of the reconstruction
+
+# --- preprocessing ---
+# The model was trained on centered objects against a plain white background
+# at 128x128 (see the downloaded config_cars.yaml). remove_background runs
+# rembg first so arbitrary photos get there; turn it off for inputs that are
+# already isolated (e.g. demo_examples/*.png with clean backgrounds).
+remove_background: true
+foreground_ratio: 0.65      # fraction of the 128x128 frame the foreground should fill
+
+# --- camera ---
+# SRN ShapeNet (cars/chairs) renders place the camera at radius 1.3 from the
+# object center -- see PixelNeRF/SRN's dataset convention, and consistent
+# with the midpoint of this model's znear/zfar (0.8/1.8, from config_cars.yaml).
+# There's no ground-truth camera for an arbitrary input photo, so this is the
+# best stand-in for "front-on, at the distance the network was trained on".
+source_radius: 1.3
+num_loop_views: 120
+fps: 25
+
+device: cuda:0
