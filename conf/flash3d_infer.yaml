@@ -1,0 +1,11 @@
+image: ???                  # str, path to the input photo (required)
+out_dir: outputs/flash3d/${now:%Y-%m-%d}/${now:%H-%M-%S}
+export_ply: true
+export_loop: true
+min_opacity: 0.5            # drop near-transparent Gaussians before export (matches the official demo)
+max_yaw_deg: 15.0           # preview loop: how far the camera pans each way from the source view
+num_loop_views: 60
+fps: 25
+znear: 0.01
+zfar: 100.0
+device: cuda:0

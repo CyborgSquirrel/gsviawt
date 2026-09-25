@@ -1,3 +1,5 @@
+name: gsviawt-flash3d
+
 services:
   app-base:
     profiles: ["_base"]
@@ -49,7 +51,7 @@ services:
     profiles: ["cpu"]
     build:
       x-bake:
-        output: ["type=docker,name=gsviawt-app-cpu:latest,compression=zstd,compression-level=3,force-compression=true"]
+        output: ["type=docker,name=gsviawt-flash3d-app-cpu:latest,compression=zstd,compression-level=3,force-compression=true"]
 
   app-gpu:
     extends:
@@ -57,7 +59,7 @@ services:
     profiles: ["gpu"]
     build:
       x-bake:
-        output: ["type=docker,name=gsviawt-app-gpu:latest,compression=zstd,compression-level=3,force-compression=true"]
+        output: ["type=docker,name=gsviawt-flash3d-app-gpu:latest,compression=zstd,compression-level=3,force-compression=true"]
     deploy:
       resources:
         reservations:

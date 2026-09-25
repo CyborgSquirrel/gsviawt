@@ -255,6 +255,39 @@ RUN \
   uv sync --inexact --extra viz
 EOF
 
+# Flash3D (github.com/eldar/flash3d) inference test, vendored under flash3d/
+# (networks/ + unidepth/, pulled from the official HF Space
+# huggingface.co/spaces/szymanowiczs/flash3d rather than the base repo,
+# which has no single-image demo of its own and would torch.hub-pull
+# whatever UniDepth's `main` branch looks like today -- that repo has since
+# moved to v2 and would silently mismatch this checkpoint). Its renderer
+# needs eldar/diff-gaussian-rasterization-w-pose (adds pose-conditioned
+# rendering), a different fork from splatter-image's -- same package name
+# (diff_gaussian_rasterization) as that one, so the two are mutually
+# exclusive in one venv; fine, since they're separate images. Patched for
+# the same missing `#include <cstdint>` as splatter-image's rasterizer,
+# plus a helper_math.h `lerp()` redeclaration that conflicts with CUDA 12+'s
+# own header (see submodules/diff-gaussian-rasterization-w-pose/
+# cuda_rasterizer/helper_math.h).
+#
+# xformers is the one genuinely new pip dependency here. The vendored
+# unidepth/ imports it unconditionally for one attention variant
+# (NystromBlock), but that variant isn't actually used at inference time by
+# this checkpoint's backbone -- unidepth/layers/nystrom_attention.py falls
+# back to exact attention when xformers.components (an API xformers has
+# since dropped entirely) isn't importable. So this is a soft dependency,
+# not a hard requirement pinned to flash3d's old torch==2.2.2/CUDA 11.8
+# stack -- `uv pip install xformers` here just gets the current build,
+# which satisfies the *unconditional* top-level import even though its
+# `.components` submodule (and thus the real Nystrom approximation) isn't
+# actually usable with it.
+RUN \
+  --mount=type=cache,uid=$XUID,gid=$XGID,dst=$UV_PYTHON_CACHE_DIR,id=uv \
+<<EOF
+  uv pip install --no-build-isolation ./submodules/diff-gaussian-rasterization-w-pose
+  uv pip install xformers
+EOF
+
 # Set entrypoint
 ENTRYPOINT ["/app/container/entrypoint.sh"]
 
