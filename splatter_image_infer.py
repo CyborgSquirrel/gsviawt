@@ -32,10 +32,12 @@ _SPLATTER_IMAGE_ROOT = Path(__file__).resolve().parent / "splatter-image"
 if str(_SPLATTER_IMAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(_SPLATTER_IMAGE_ROOT))
 
+from plyfile import PlyData, PlyElement  # noqa: E402
+
 from gaussian_renderer import render_predicted  # noqa: E402
 from scene.gaussian_predictor import GaussianSplatPredictor  # noqa: E402
 from utils.app_utils import (  # noqa: E402
-    export_to_obj,
+    construct_list_of_attributes,
     remove_background,
     resize_foreground,
     resize_to_128,
@@ -114,6 +116,36 @@ def _target_cameras(model_cfg: DictConfig, radius: float, num_views: int):
     return world_view_transforms, full_proj_transforms, camera_centers
 
 
+def _export_ply(reconstruction: dict, path: str) -> None:
+    """Write a batch-of-1, un-activated reconstruction (model(..., activate_output=False)) as a
+    standard INRIA-format 3DGS .ply, in the network's own native coordinate frame.
+
+    Upstream's own export_to_obj (utils/app_utils.py) additionally rotates everything by a fixed
+    matrix tuned for their Gradio 3D viewer -- that breaks orbit_video.py's Z-up world convention
+    (confirmed empirically: with that rotation applied, the object spins around its nose-tail axis
+    instead of yawing level). The network's raw frame already renders upright there, so this skips
+    that rotation rather than trying to undo it downstream every time.
+    """
+    r = {k: v[0] for k, v in reconstruction.items()}
+    valid = torch.where(r["opacity"] > -2.5)[0]
+
+    xyz = r["xyz"][valid].detach().cpu().numpy()
+    normals = np.zeros_like(xyz)
+    f_dc = r["features_dc"][valid].detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+    f_rest = r["features_rest"][valid].detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+    opacities = r["opacity"][valid].detach().cpu().numpy()
+    # enlarge Gaussians slightly, like upstream -- otherwise the .ply has artefacts
+    scale = (r["scaling"][valid] + torch.abs(r["scaling"][valid] * 0.1)).detach().cpu().numpy()
+    rotation = r["rotation"][valid].detach().cpu().numpy()
+
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    dtype_full = [(attribute, "f4") for attribute in construct_list_of_attributes()]
+    elements = np.empty(xyz.shape[0], dtype=dtype_full)
+    attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+    elements[:] = list(map(tuple, attributes))
+    PlyData([PlyElement.describe(elements, "vertex")]).write(path)
+
+
 @hydra.main(version_base=None, config_path="conf", config_name="splatter_image_infer")
 @torch.no_grad()
 def main(cfg: DictConfig) -> None:
@@ -143,7 +175,7 @@ def main(cfg: DictConfig) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if cfg.export_ply:
-        export_to_obj(reconstruction_unactivated, str(out_dir / "reconstruction.ply"))
+        _export_ply(reconstruction_unactivated, str(out_dir / "reconstruction.ply"))
         log.info("Wrote %s", out_dir / "reconstruction.ply")
 
     if cfg.export_loop:
