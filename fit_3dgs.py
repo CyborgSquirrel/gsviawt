@@ -20,12 +20,18 @@ train.py on this exact scene at every checkpoint.
 `gaussian_layout: layered` is the other option, for an h5 scene only (see
 load_scene_h5/init_gaussians_layered): seeds one Gaussian per depth-peel
 hit in the primary train view instead, same as fit_gsplat.py's own
-seeding (reused verbatim), and disables densification entirely -- the
-Gaussian count stays fixed all run, its (u, v, layer) origin in that
-view's depth grid tracked throughout, so the final params can be scattered
-back into a fit_gsplat.py-schema grid .h5 (save_output_layered) alongside
-the usual flat output. Everything else (loss, optimizers, training loop,
-SH color) is unchanged from `set` mode -- the params stay a plain flat
+seeding (reused verbatim), and disables growing/splitting/pruning
+specifically (refine_start_iter pushed past cfg.iters, so DefaultStrategy's
+own grow/prune gate never trips) -- the Gaussian count stays fixed all
+run, its (u, v, layer) origin in that view's depth grid tracked
+throughout, so the final params can be scattered back into a
+fit_gsplat.py-schema grid .h5 (save_output_layered) alongside the usual
+flat output. Periodic OPACITY RESET is a separate mechanism (gated by
+reset_every, not refine_start_iter) and is deliberately left running --
+it mutates existing Gaussians' opacity in place, never adds/removes/
+reorders any, so it doesn't disturb the fixed layer stack at all.
+Everything else (loss, optimizers, training loop, SH color) is unchanged
+from `set` mode -- the params stay a plain flat
 ParameterDict either way; "layered" only changes how they're seeded, that
 densify/prune never runs, and one extra file gets written at the end.
 
@@ -518,25 +524,32 @@ class Fit3DGSLightningModule(pl.LightningModule):
 
     # gaussian_layout="layered" keeps a fixed 1:1 Gaussian<->(u,v,layer)
     # correspondence (see init_gaussians_layered/save_output_layered) --
-    # DefaultStrategy adds/removes Gaussians (grow/split/prune), which
-    # would break that correspondence, so it's skipped entirely here
-    # (self.strategy stays None; training_step below guards every call on
-    # it), matching fit_gsplat.py's own plain-Adam-only loop exactly.
-    self.strategy, self.strategy_state = None, None
-    if not layered:
-      import gsplat.strategy as gsstrat
-      self.strategy = gsstrat.DefaultStrategy(
-        prune_opa=float(cfg.densify.prune_opacity), grow_grad2d=float(cfg.densify.grad_threshold),
-        grow_scale3d=float(cfg.percent_dense), prune_scale3d=float(cfg.densify.prune_scale3d),
-        refine_start_iter=int(cfg.densify.from_iter), refine_stop_iter=int(cfg.densify.until_iter),
-        refine_every=int(cfg.densify.interval), reset_every=int(cfg.opacity_reset_interval),
-        absgrad=False, revised_opacity=False,
-      )
-      # initialize_state()'s tensors are created lazily (None until the first
-      # step_post_backward call, then allocated directly on whatever device
-      # the render `info` is on) -- no manual device placement needed here,
-      # unlike a plain dict of eagerly-created tensors would.
-      self.strategy_state = self.strategy.initialize_state(scene_scale=scene_extent)
+    # growing/splitting/pruning would break that, so those specifically
+    # must never fire. DefaultStrategy's step_post_backward ALSO does
+    # periodic opacity reset (gated independently by reset_every, not by
+    # refine_start_iter/refine_every) -- resetting a Gaussian's opacity
+    # in place doesn't add/remove/reorder anything, so it's perfectly
+    # compatible with a fixed layer stack and stays on. Rather than
+    # skip the strategy object entirely (which would also silently kill
+    # that reset), only refine_start_iter is pushed past cfg.iters --
+    # grow/prune's own "step > refine_start_iter" gate then never trips
+    # for the whole run, while everything else in step_post_backward
+    # (opacity reset, the per-step grad2d/count bookkeeping) runs exactly
+    # as it would in "set" mode.
+    import gsplat.strategy as gsstrat
+    refine_start_iter = int(cfg.iters) if layered else int(cfg.densify.from_iter)
+    self.strategy = gsstrat.DefaultStrategy(
+      prune_opa=float(cfg.densify.prune_opacity), grow_grad2d=float(cfg.densify.grad_threshold),
+      grow_scale3d=float(cfg.percent_dense), prune_scale3d=float(cfg.densify.prune_scale3d),
+      refine_start_iter=refine_start_iter, refine_stop_iter=int(cfg.densify.until_iter),
+      refine_every=int(cfg.densify.interval), reset_every=int(cfg.opacity_reset_interval),
+      absgrad=False, revised_opacity=False,
+    )
+    # initialize_state()'s tensors are created lazily (None until the first
+    # step_post_backward call, then allocated directly on whatever device
+    # the render `info` is on) -- no manual device placement needed here,
+    # unlike a plain dict of eagerly-created tensors would.
+    self.strategy_state = self.strategy.initialize_state(scene_scale=scene_extent)
 
     # A fixed handful of preview cameras (module.PanelCallback/OrbitCallback,
     # via get_preview_source() below) -- not the full train/val split (that's
@@ -572,8 +585,7 @@ class Fit3DGSLightningModule(pl.LightningModule):
       "scales": torch.optim.Adam([self.params["scales"]], lr=float(cfg.lr.scales), eps=1e-15),
       "quats": torch.optim.Adam([self.params["quats"]], lr=float(cfg.lr.quats), eps=1e-15),
     }
-    if self.strategy is not None:
-      self.strategy.check_sanity(self.params, self.optimizers_dict)
+    self.strategy.check_sanity(self.params, self.optimizers_dict)
     return list(self.optimizers_dict.values())
 
   def _photom_loss(self, rgb, gt_rgb):
@@ -609,12 +621,7 @@ class Fit3DGSLightningModule(pl.LightningModule):
     rgb, alpha, info = render(self.params, self.active_sh_degree, viewmat, K, W, H)
     # step_pre_backward calls info["means2d"].retain_grad() -- must run
     # before backward for a non-leaf tensor to keep its .grad populated.
-    # Skipped in layered mode along with step_post_backward below (no
-    # strategy at all there -- see __init__'s comment): retain_grad() is
-    # otherwise harmless to skip, means2d's gradient just isn't needed by
-    # anything when there's no grow/prune decision to feed it into.
-    if self.strategy is not None:
-      self.strategy.step_pre_backward(self.params, self.optimizers_dict, self.strategy_state, it, info)
+    self.strategy.step_pre_backward(self.params, self.optimizers_dict, self.strategy_state, it, info)
     loss, parts = self._photom_loss(rgb, gt_rgb)
 
     for opt in self.optimizers_dict.values():
@@ -624,13 +631,15 @@ class Fit3DGSLightningModule(pl.LightningModule):
     for opt in self.optimizers_dict.values():
       opt.step()
 
-    if self.strategy is not None:
-      # Post-backward, post-step (matches gsplat's own reference trainer's
-      # ordering, examples/simple_trainer.py -- grow/prune happens AFTER this
-      # step's gradient update is applied, using the gradient info accumulated
-      # THIS step, so it acts on next step's population, not this one's).
-      self.strategy.step_post_backward(
-        self.params, self.optimizers_dict, self.strategy_state, it, info, packed=True)
+    # Post-backward, post-step (matches gsplat's own reference trainer's
+    # ordering, examples/simple_trainer.py -- grow/prune happens AFTER this
+    # step's gradient update is applied, using the gradient info accumulated
+    # THIS step, so it acts on next step's population, not this one's).
+    # Always called, in both gaussian_layout modes: __init__ is what
+    # actually disables grow/prune for "layered" (refine_start_iter pushed
+    # past cfg.iters), not a guard here -- opacity reset still needs to run.
+    self.strategy.step_post_backward(
+      self.params, self.optimizers_dict, self.strategy_state, it, info, packed=True)
 
     self.views_seen += gt_rgb.shape[0]
     self.final_loss = loss.item()
