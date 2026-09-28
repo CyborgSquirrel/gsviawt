@@ -401,42 +401,62 @@ def configure_device(device):
 def run(cfg):
   import hydra
   import h5py
-  from util import LazyDataset, timed
   from omegaconf import OmegaConf
+  from util import LazyDataset
 
   logging.basicConfig(level=logging.INFO)
-  if cfg.source_path is not None:
-    return rerender_depth(cfg)
-  scene = bpy.context.scene
-  scene.render.engine = str(cfg.render_engine)
-  scene.render.resolution_percentage = 100
-  scene.render.film_transparent = bool(cfg.film_transparent)
-  if scene.render.engine == "CYCLES":
-    scene.cycles.samples = int(cfg.cycles_samples)
-    scene.cycles.use_denoising = True
-  configure_device(str(cfg.device))
-
-  view_strategy = hydra.utils.instantiate(cfg.view_strategy)
-  meshes = list(hydra.utils.instantiate(cfg.mesh_strategy).meshes())
-  Lmax = int(cfg.max_peel_layers)
-  W, H = int(cfg.width), int(cfg.height)
-  if cfg.depth_width is None or cfg.depth_height is None:
-    raise ValueError("depth_width/depth_height must be set (config default is "
-                     "${width}/${height}; use that to match the RGB pass)")
-  DW, DH = int(cfg.depth_width), int(cfg.depth_height)
-  logger.info("RGB %dx%d, depth-peel %dx%d", W, H, DW, DH)
-
-  os.makedirs(os.path.dirname(cfg.output_path) or ".", exist_ok=True)
-  img_kw = dict(chunks=(1, H, W, 4), compression="gzip", compression_opts=4)
-  depth_kw = dict(chunks=(1, DH, DW, Lmax), compression="gzip", compression_opts=4)
 
   with ctl.ExitStack() as stack:
+    # Depth-only re-render: the scene (meshes, poses, lens, normalize, ...)
+    # comes from the source file's config_json + datasets; only the depth
+    # resolution, device and output path come from this run's cfg.
+    src = None
+    if cfg.source_path is not None:
+      if os.path.abspath(cfg.source_path) == os.path.abspath(cfg.output_path):
+        raise ValueError("output_path must differ from source_path")
+      src = stack.enter_context(h5py.File(cfg.source_path, "r"))
+      cfg = OmegaConf.merge(
+        json.loads(src.attrs["config_json"]),
+        {k: cfg[k] for k in ("depth_width", "depth_height", "device",
+                             "output_path", "source_path")})
+
+    scene = bpy.context.scene
+    scene.render.engine = str(cfg.render_engine)
+    scene.render.resolution_percentage = 100
+    scene.render.film_transparent = bool(cfg.film_transparent)
+    if scene.render.engine == "CYCLES":
+      scene.cycles.samples = int(cfg.cycles_samples)
+      scene.cycles.use_denoising = True
+    configure_device(str(cfg.device))
+
+    W, H = int(cfg.width), int(cfg.height)
+    if cfg.depth_width is None or cfg.depth_height is None:
+      raise ValueError("depth_width/depth_height must be set (config default is "
+                       "${width}/${height}; use that to match the RGB pass)")
+    DW, DH = int(cfg.depth_width), int(cfg.depth_height)
+    if src is None:
+      view_strategy = hydra.utils.instantiate(cfg.view_strategy)
+      meshes = list(hydra.utils.instantiate(cfg.mesh_strategy).meshes())
+      Lmax = int(cfg.max_peel_layers)
+      mesh_views = lambda mi: _strategy_views(cfg, view_strategy)
+    else:
+      meshes = list(src["mesh_paths"].asstr()[()])
+      Lmax = int(src["depth_peel"].shape[-1])
+      mesh_views = lambda mi: _source_views(src, mi)
+    logger.info("RGB %dx%d, depth-peel %dx%d", W, H, DW, DH)
+
+    os.makedirs(os.path.dirname(cfg.output_path) or ".", exist_ok=True)
+    img_kw = dict(chunks=(1, H, W, 4), compression="gzip", compression_opts=4)
+    depth_kw = dict(chunks=(1, DH, DW, Lmax), compression="gzip", compression_opts=4)
+
     tmp = stack.enter_context(TemporaryDirectory())
     hf = stack.enter_context(h5py.File(cfg.output_path, "w"))
     hf.attrs["config_json"] = json.dumps(OmegaConf.to_container(cfg, resolve=True))
     hf.create_dataset("mesh_paths", data=meshes, dtype=h5py.string_dtype("utf-8"))
 
-    ds_img = stack.enter_context(LazyDataset(hf, "images", dataset_kwargs=img_kw)) if cfg.render else None
+    # when re-rendering, the RGB images are copied from the source, not rendered
+    render_rgb = cfg.render and src is None
+    ds_img = stack.enter_context(LazyDataset(hf, "images", dataset_kwargs=img_kw)) if render_rgb else None
     ds_pose = stack.enter_context(LazyDataset(hf, "camera_pose"))
     # two intrinsics datasets, both always written (identical when the RGB and
     # depth-peel resolutions match) so consumers never have to guess which K a
@@ -449,13 +469,23 @@ def run(cfg):
 
     failed = []
     for mi, mesh_path in enumerate(meshes):
+      views = list(mesh_views(mi))
+      if not views:
+        continue  # re-render: mesh has no rows in the source (it failed there)
       try:
-        _render_mesh(cfg, scene, mi, mesh_path, view_strategy, W, H, DW, DH, Lmax, tmp,
+        _render_mesh(cfg, scene, mi, mesh_path, views, W, H, DW, DH, Lmax, tmp,
                      ds_img, ds_pose, ds_depth_intr, ds_img_intr, ds_depth, ds_mesh, ds_scale)
       except Exception:
+        if src is not None:
+          raise  # skipping would misalign rows with the copied images
         logger.exception("mesh %d (%s) failed -- skipping", mi, mesh_path)
         failed.append(mi)
 
+    if src is not None:
+      if "images" in src:
+        src.copy("images", hf)
+      if "failed_mesh_indices" in src.attrs:
+        hf.attrs["failed_mesh_indices"] = src.attrs["failed_mesh_indices"]
     if failed:
       hf.attrs["failed_mesh_indices"] = json.dumps(failed)
       logger.warning("%d/%d meshes failed: %s", len(failed), len(meshes), failed)
@@ -463,11 +493,41 @@ def run(cfg):
   logger.info("wrote %s", cfg.output_path)
 
 
-def _render_mesh(cfg, scene, mi, mesh_path, view_strategy, W, H, DW, DH, Lmax, tmp,
+def _strategy_views(cfg, view_strategy):
+  """(label, place(cam)) per view the strategy yields for one mesh."""
+  for tilt_deg, az_deg, view_dir in view_strategy.views():
+    vd = np.asarray(view_dir, np.float64)
+    r = float(np.linalg.norm(vd)) or 1.0
+    # A view strategy may encode a per-view camera distance as the view_dir
+    # magnitude (see view_strategy.RandomViews); unit length means "use
+    # cfg.camera_distance".
+    dist = float(cfg.camera_distance) if abs(r - 1.0) < 1e-3 else r
+
+    def place(cam, loc=Vector(vd / r * dist)):
+      cam.location = loc
+      aim_camera(cam)
+    yield f"tilt={tilt_deg:.1f} az={az_deg:.1f}", place
+
+
+def _source_views(src, mi):
+  """(label, place(cam)) per row of mesh `mi` in a source render h5, putting
+  the camera back where it was for that row."""
+  for row in np.flatnonzero(src["mesh_index"][()] == mi):
+    pose = src["camera_pose"][row].astype(np.float64)
+    if "depth_scale" in src:
+      pose[:3, 3] /= float(src["depth_scale"][row])  # undo camera_depth_target -> scene units
+
+    def place(cam, m=Matrix(pose.tolist())):
+      cam.matrix_world = m
+    yield f"row={row}", place
+
+
+def _render_mesh(cfg, scene, mi, mesh_path, views, W, H, DW, DH, Lmax, tmp,
                  ds_img, ds_pose, ds_depth_intr, ds_img_intr, ds_depth, ds_mesh, ds_scale):
-  """Load, normalize and render one mesh for every view the strategy yields,
-  appending a row per view to the open datasets. Raises on any Blender
-  failure (bad glb, degenerate bbox, ...) so run() can skip the mesh.
+  """Load, normalize and render one mesh for every (label, place(cam)) in
+  `views`, appending a row per view to the open datasets. Raises on any
+  Blender failure (bad glb, degenerate bbox, ...) so run() can skip the mesh.
+  RGB is rendered only when ds_img is given.
 
   W,H is the RGB resolution; DW,DH the depth-peel resolution (equal unless
   cfg.depth_width/height override)."""
@@ -483,20 +543,13 @@ def _render_mesh(cfg, scene, mi, mesh_path, view_strategy, W, H, DW, DH, Lmax, t
   peel_mat, peel_tex, peel_eps = build_depth_peel_material()
   mesh_objs = scene_meshes()
 
-  for tilt_deg, az_deg, view_dir in view_strategy.views():
-    vd = np.asarray(view_dir, np.float64)
-    r = float(np.linalg.norm(vd)) or 1.0
-    # A view strategy may encode a per-view camera distance as the view_dir
-    # magnitude (see view_strategy.RandomViews); unit length means "use
-    # cfg.camera_distance".
-    dist = float(cfg.camera_distance) if abs(r - 1.0) < 1e-3 else r
-    cam.location = Vector(vd / r * dist)
-    aim_camera(cam)
+  for view_label, place in views:
+    place(cam)
     bpy.context.view_layer.update()
-    label = f"mesh={mi} tilt={tilt_deg:.1f} az={az_deg:.1f}"
+    label = f"mesh={mi} {view_label}"
 
     with timed(f"{label} render"):
-      if cfg.render:
+      if ds_img is not None:
         rgba = render_rgba(os.path.join(tmp, "rgb.png"), W, H)
       depth_vol, _ = depth_peel(mesh_objs, peel_mat, peel_tex, peel_eps,
                                 rl, comp, DW, DH, Lmax, tmp)
@@ -522,107 +575,6 @@ def _render_mesh(cfg, scene, mi, mesh_path, view_strategy, W, H, DW, DH, Lmax, t
     ds_depth.append(depth_vol.astype(np.float32))
     ds_mesh.append(np.int64(mi))
     ds_scale.append(np.float32(depth_scale))
-
-
-# ---------------------------------------------------------------------------
-# depth-only re-render of an existing dataset
-# ---------------------------------------------------------------------------
-
-# Datasets rerender_depth() regenerates; everything else in the source h5 is
-# copied through unchanged. `camera_intrinsics` is the legacy single-K name
-# (see util.intrinsics_name).
-_RERENDERED = {"depth_peel", "depth_intrinsics", "camera_intrinsics"}
-
-
-def rerender_depth(cfg):
-  """Re-render only `depth_peel` of the dataset at cfg.source_path at
-  cfg.depth_width x cfg.depth_height, writing a new h5 to cfg.output_path.
-
-  Everything that defines the scene -- mesh list, normalize_object, camera
-  lens/sensor, per-view camera_pose and depth_scale, peel layer count, render
-  engine -- comes from the source file (its datasets + config_json), not
-  from cfg; only depth_width/depth_height/device/output_path are taken from
-  cfg. `images`, `image_intrinsics`, `camera_pose`, `mesh_index`,
-  `depth_scale`, `mesh_paths` (and anything else) are copied verbatim, so
-  rows line up 1:1 with the source (and any `.wt.h5` made from it). A mesh
-  that fails to load raises instead of being skipped, to keep that
-  alignment."""
-  import h5py
-  from omegaconf import OmegaConf
-  from util import LazyDataset, timed
-
-  if cfg.depth_width is None or cfg.depth_height is None:
-    raise ValueError("depth_width/depth_height must be set")
-  DW, DH = int(cfg.depth_width), int(cfg.depth_height)
-  if os.path.abspath(cfg.source_path) == os.path.abspath(cfg.output_path):
-    raise ValueError("output_path must differ from source_path")
-
-  with ctl.ExitStack() as stack:
-    src = stack.enter_context(h5py.File(cfg.source_path, "r"))
-    src_cfg = OmegaConf.create(json.loads(src.attrs["config_json"]))
-    meshes = list(src["mesh_paths"].asstr()[()])
-    mesh_index = src["mesh_index"][()]
-    poses = src["camera_pose"][()]
-    scales = src["depth_scale"][()] if "depth_scale" in src else np.ones(len(poses), np.float32)
-    Lmax = int(src["depth_peel"].shape[-1])
-    sh, sw = src["depth_peel"].shape[1:3]
-    logger.info("re-rendering depth of %s (%d views, %d meshes): %dx%d -> %dx%d",
-                cfg.source_path, len(poses), len(meshes), sw, sh, DW, DH)
-
-    scene = bpy.context.scene
-    scene.render.engine = str(src_cfg.render_engine)
-    scene.render.resolution_percentage = 100
-    configure_device(str(cfg.device))
-
-    os.makedirs(os.path.dirname(cfg.output_path) or ".", exist_ok=True)
-    dst = stack.enter_context(h5py.File(cfg.output_path, "w"))
-    for k, v in src.attrs.items():
-      dst.attrs[k] = v
-    out_cfg = OmegaConf.to_container(src_cfg, resolve=True)
-    out_cfg["depth_width"], out_cfg["depth_height"] = DW, DH
-    out_cfg["source_path"] = str(cfg.source_path)
-    dst.attrs["config_json"] = json.dumps(out_cfg)
-    for name in src:
-      if name not in _RERENDERED:
-        src.copy(name, dst)
-    if "images" in src and "image_intrinsics" not in src and "camera_intrinsics" in src:
-      # legacy file: its single K matched the images too
-      src.copy("camera_intrinsics", dst, name="image_intrinsics")
-
-    depth_kw = dict(chunks=(1, DH, DW, Lmax), compression="gzip", compression_opts=4)
-    ds_depth_intr = stack.enter_context(LazyDataset(dst, "depth_intrinsics"))
-    ds_depth = stack.enter_context(LazyDataset(dst, "depth_peel", dataset_kwargs=depth_kw))
-    tmp = stack.enter_context(TemporaryDirectory())
-
-    # Views are grouped by mesh, so loading each mesh once in order visits
-    # rows in order; check that rather than assume it.
-    if np.any(np.diff(mesh_index) < 0):
-      raise ValueError("source mesh_index isn't non-decreasing; can't re-render in row order")
-    for mi in np.unique(mesh_index):
-      rows = np.flatnonzero(mesh_index == mi)
-      mesh_path = meshes[mi]
-      reset_scene()
-      load_object(mesh_path)
-      if src_cfg.normalize_object:
-        normalize_object()
-      cam = setup_camera(src_cfg)
-      rl, comp = setup_depth_compositor(scene, bpy.context.view_layer)
-      peel_mat, peel_tex, peel_eps = build_depth_peel_material()
-      mesh_objs = scene_meshes()
-
-      for row in rows:
-        s = float(scales[row])
-        pose = poses[row].astype(np.float64)
-        pose[:3, 3] /= s  # undo camera_depth_target rescale -> scene units
-        cam.matrix_world = Matrix(pose.tolist())
-        bpy.context.view_layer.update()
-        with timed(f"row={row} mesh={mi} depth"):
-          depth_vol, _ = depth_peel(mesh_objs, peel_mat, peel_tex, peel_eps,
-                                    rl, comp, DW, DH, Lmax, tmp)
-        ds_depth_intr.append(camera_intrinsics(cam.data, DW, DH))
-        ds_depth.append((depth_vol * s).astype(np.float32))
-
-  logger.info("wrote %s", cfg.output_path)
 
 
 def main():
