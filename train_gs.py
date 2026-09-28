@@ -5,9 +5,11 @@ Flash3D-style encoder/decoder (gs_encoder.py / gs_decoder.py): a ResNet-50
 trunk over RGB concatenated with a pixel-aligned multi-layer point cloud
 (gs_dataset.py), decoding per-pixel per-layer Gaussian appearance/shape
 parameters (opacity, scale, rotation, SH-degree-1 color). Gaussian positions
-are NOT predicted -- they're fixed exactly to the input point cloud (see
-gs_dataset.py's dense_unproject_camera), so there's no depth-prediction
-network and no learned offset, unlike Flash3D itself.
+are anchored to the input point cloud (see gs_dataset.py's
+dense_unproject_camera), so there's no depth-prediction network, unlike
+Flash3D itself. By default they're fixed exactly to it; with
+model.predict_mean_offset the decoder also predicts a residual offset on
+top of that anchor (see flatten_gaussians).
 
 Training objective (Flash3D's cross-view photometric setup): encode one
 source view, render the predicted Gaussians into the source view itself
@@ -71,8 +73,9 @@ class GSModel(nn.Module):
   """Encoder + decoder wrapper: builds the concatenated [RGB, per-layer xyz,
   per-layer validity] input tensor, runs it through the ResNet trunk, and
   returns per-pixel per-layer Gaussian appearance/shape parameters. Positions
-  are not part of this module's output -- see gs_dataset.dense_unproject_camera
-  and flatten_gaussians below."""
+  are anchored to the input point cloud (gs_dataset.dense_unproject_camera);
+  with cfg.model.predict_mean_offset the output also carries a residual
+  camera-space "offset" on top of that anchor -- see flatten_gaussians below."""
 
   def __init__(self, cfg):
     super().__init__()
@@ -94,6 +97,7 @@ class GSModel(nn.Module):
       scale_scale=cfg.model.scale_scale, scale_bias=cfg.model.scale_bias,
       sh_scale=cfg.model.sh_scale, scale_lambda=cfg.model.scale_lambda,
       zero_init_last_conv=cfg.model.zero_init_last_conv,
+      predict_mean_offset=cfg.model.predict_mean_offset,
     )
     self.decoder = GSDecoderStack(
       self.encoder.num_ch_enc,
@@ -267,6 +271,11 @@ def flatten_gaussians(b, gauss, xyz_cam, hit):
 
   for idx in range(b):
     means_flat = rearrange(xyz_cam[idx], "l h w c -> (l h w) c")
+    if "offset" in gauss:
+      # model.predict_mean_offset: means = depth-peel position (frozen
+      # anchor, no grad) + predicted residual offset. The one place the two
+      # get resolved -- every render/preview goes through here.
+      means_flat = means_flat + rearrange(gauss["offset"][idx], "l c h w -> (l h w) c")
     valid_flat = rearrange(hit[idx], "l h w -> (l h w)")
 
     opacity_flat  = rearrange(gauss["opacity"] [idx], "l c h w -> (l h w c)") * valid_flat.to(gauss["opacity"].dtype)
@@ -765,6 +774,23 @@ class GSLightningModule(pl.LightningModule):
 
       loss = loss + cfg.loss.scale_reg_weight * scale_reg
       _log("loss/scale_reg", scale_reg.detach())
+
+    ## mean offset regularization
+    # L2 penalty on the predicted offset itself (not the resolved position),
+    # pulling Gaussians back toward their depth-peel anchor -- same term as
+    # 3dgs-paper-repro's fit_3dgs.py mean_offset_reg_weight. Train stage
+    # only, like there. Averaged over valid (hit) Gaussians only, so the
+    # weight doesn't get diluted by the (many) empty pixels/layers.
+    if (
+      stage == "train"
+      and "offset" in model_pred["gauss"]
+      and cfg.loss.mean_offset_reg_weight > 0
+    ):
+      hit = batch["source"]["hit"].to(device) # (B,L,H,W)
+      offset_sq = model_pred["gauss"]["offset"].pow(2).sum(dim=2) # (B,L,H,W)
+      mean_offset_reg = offset_sq[hit].mean() if hit.any() else torch.zeros((), device=device)
+      loss = loss + cfg.loss.mean_offset_reg_weight * mean_offset_reg
+      _log("loss/mean_offset_reg", mean_offset_reg.detach())
 
     # TODO: skim through this code, fix it up
     # if need_direct:

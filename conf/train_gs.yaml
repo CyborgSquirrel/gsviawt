@@ -176,6 +176,16 @@ model:
   # encoder features contributing nothing until gradients grow the weight
   # away from zero. false (default): unchanged Xavier-uniform init.
   zero_init_last_conv: false
+  # Residual mean prediction: the decoder also emits a per-pixel per-layer
+  # camera-space xyz offset (3 extra channels per layer, zero-initialized),
+  # and each Gaussian's mean becomes depth-peel position + offset instead of
+  # the depth-peel position alone -- see train_gs.flatten_gaussians. Same idea
+  # as 3dgs-paper-repro's fit_3dgs.py layered mode (frozen original +
+  # optimizable offset), predicted by the network here instead of optimized
+  # per-scene. Regularized by loss.mean_offset_reg_weight. false (default):
+  # unchanged behavior, and the decoder's output conv keeps its old shape, so
+  # existing checkpoints still load.
+  predict_mean_offset: false
   # Which Gaussian fields the network is trained/trusted to predict; the rest
   # are overwritten with data.gauss_h5 values before
   # flattening/rendering. E.g. [scale] isolates scale's own learning signal
@@ -208,6 +218,15 @@ loss:
   scale_reg_weight: 0.001    # 0 disables; penalizes scale > scale_reg_thresh
   scale_reg_thresh: 0.05     # ~5% of a unit-cube object -- already a big single Gaussian.
                               # (2.0, Flash3D's own value, was 2x the whole object -- inert here.)
+
+  # model.predict_mean_offset only: weight on an L2 penalty on the predicted
+  # offset (offset.pow(2).sum(-1), averaged over valid Gaussians) added to
+  # the train loss, pulling Gaussians back toward their depth-peel anchor
+  # instead of letting the offset drift unconstrained. 0 disables the penalty
+  # term (offset still predicted, just unregularized). No effect when
+  # predict_mean_offset=false. Same untuned default as 3dgs-paper-repro's
+  # conf/fit_3dgs.yaml -- adjust to taste.
+  mean_offset_reg_weight: 0.01
 
   # Direct per-pixel supervision of the model's own predicted Gaussian
   # params against a fit_gsplat.py ground-truth .h5 (data.gauss_h5),

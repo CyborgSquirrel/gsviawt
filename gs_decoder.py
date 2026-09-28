@@ -2,9 +2,12 @@
 models/decoder/{resnet_decoder,gaussian_decoder}.py (~/projects/flash3d).
 
 Differences from Flash3D:
-  - No offset/xyz output. Gaussian positions come straight from the input
-    point cloud (gs_dataset.py's `dense_unproject_camera`), never predicted
-    or refined here.
+  - Gaussian positions are anchored to the input point cloud
+    (gs_dataset.py's `dense_unproject_camera`). By default there's no
+    offset/xyz output at all; with predict_mean_offset=True the head also
+    emits a residual camera-space offset added on top of that anchor (see
+    train_gs.flatten_gaussians), zero-initialized so training starts exactly
+    at the depth-peel point cloud.
   - `num_layers` is a free hyperparameter (Flash3D hardcodes 2).
 
 Per-pixel, per-layer parameterization (this is the "parameterization" the
@@ -30,6 +33,8 @@ plan calls out explicitly):
                                                  sigmoid(raw) -- bounded in (0,1), same pattern as
                                                  opacity above.
     sh_rest  = raw                              unconstrained, SH band-1+ coeffs (only if max_sh_degree>0)
+    offset   = raw                              unconstrained camera-space xyz residual added to the
+                                                 depth-peel position (only if predict_mean_offset)
 """
 
 from collections import OrderedDict
@@ -67,24 +72,44 @@ class ConvBlock(nn.Module):
     return self.nonlin(self.conv(x))
 
 
-def gaussian_split_dims(max_sh_degree):
+def gaussian_field_names(max_sh_degree, predict_mean_offset=False):
+  """Per-Gaussian-layer output field names, in gaussian_split_dims order."""
+  names = ["opacity", "scale", "rotation", "sh_dc"]
+  if max_sh_degree != 0:
+    names.append("sh_rest")
+  if predict_mean_offset:
+    names.append("offset")
+  return names
+
+
+def gaussian_split_dims(max_sh_degree, predict_mean_offset=False):
   """Per-Gaussian-layer output channel groups, in this fixed order:
-  opacity(1), scale(3), rotation(4), sh_dc(3)[, sh_rest(3*((deg+1)^2-1))]."""
+  opacity(1), scale(3), rotation(4), sh_dc(3)[, sh_rest(3*((deg+1)^2-1))][, offset(3)].
+  offset goes last so enabling it leaves every other group's channel slice
+  unchanged."""
   dims = [1, 3, 4, 3]
   if max_sh_degree != 0:
     dims.append(3 * ((max_sh_degree + 1) ** 2 - 1))
+  if predict_mean_offset:
+    dims.append(3)
   return dims
 
 
 def gaussian_init_scales_biases(max_sh_degree, opacity_scale, opacity_bias,
-                                scale_scale, scale_bias, sh_scale):
+                                scale_scale, scale_bias, sh_scale,
+                                predict_mean_offset=False):
   """Xavier-uniform (scale, bias) per output group, in gaussian_split_dims
   order. Rotation/sh_dc init scales (1.0, 5.0) are Flash3D's own hardcoded
-  literals (not exposed as config there either) -- kept identical here."""
+  literals (not exposed as config there either) -- kept identical here.
+  offset's scale is None: zero-init (weight and bias), not Xavier -- see
+  GaussianResnetDecoder.__init__."""
   scales = [opacity_scale, scale_scale, 1.0, 5.0]
   biases = [opacity_bias, float(np.log(scale_bias)), 0.0, 0.0]
   if max_sh_degree != 0:
     scales.append(sh_scale)
+    biases.append(0.0)
+  if predict_mean_offset:
+    scales.append(None)
     biases.append(0.0)
   return scales, biases
 
@@ -102,7 +127,7 @@ class GaussianResnetDecoder(nn.Module):
               num_ch_dec=(32, 32, 64, 128, 256), upsample_mode="nearest",
               use_skips=True, opacity_scale=1e-3, opacity_bias=0.0,
               scale_scale=1e-1, scale_bias=0.02, sh_scale=1.0, scale_lambda=0.01,
-              zero_init_last_conv=False):
+              zero_init_last_conv=False, predict_mean_offset=False):
     super().__init__()
     self.use_skips = use_skips
     self.upsample_mode = upsample_mode
@@ -111,10 +136,12 @@ class GaussianResnetDecoder(nn.Module):
     self.max_sh_degree = max_sh_degree
     self.num_layers = num_layers
     self.scale_lambda = scale_lambda
+    self.predict_mean_offset = predict_mean_offset
 
-    per_layer_dims = gaussian_split_dims(max_sh_degree)
+    per_layer_dims = gaussian_split_dims(max_sh_degree, predict_mean_offset)
     per_layer_scales, per_layer_biases = gaussian_init_scales_biases(
-      max_sh_degree, opacity_scale, opacity_bias, scale_scale, scale_bias, sh_scale)
+      max_sh_degree, opacity_scale, opacity_bias, scale_scale, scale_bias, sh_scale,
+      predict_mean_offset)
     self.split_dimensions = per_layer_dims * num_layers
     scale_inits = per_layer_scales * num_layers
     bias_inits = per_layer_biases * num_layers
@@ -142,14 +169,21 @@ class GaussianResnetDecoder(nn.Module):
     else:
       start = 0
       for out_channels, scale, bias in zip(self.split_dimensions, scale_inits, bias_inits):
-        nn.init.xavier_uniform_(self.out.weight[start:start + out_channels], scale)
+        if scale is None:
+          # offset: zero-init, so every Gaussian starts exactly at its
+          # depth-peel position (same as 3dgs-paper-repro's fit_3dgs.py
+          # zero-initialized offset). Gradients still reach these weights
+          # through the (nonzero) decoder features.
+          nn.init.zeros_(self.out.weight[start:start + out_channels])
+        else:
+          nn.init.xavier_uniform_(self.out.weight[start:start + out_channels], scale)
         nn.init.constant_(self.out.bias[start:start + out_channels], bias)
         start += out_channels
 
   def forward(self, input_features):
     """input_features: 5 encoder feature maps, finest first / coarsest last
     (GSResnetEncoder's output). Returns a dict of (B, num_layers, C, H, W):
-    opacity(1), scale(3), rotation(4), sh_dc(3)[, sh_rest(K)]."""
+    opacity(1), scale(3), rotation(4), sh_dc(3)[, sh_rest(K)][, offset(3)]."""
     x = input_features[-1]
     for i in range(len(self.num_ch_dec) - 1, -1, -1):
       x = self.convs[("upconv", i, 0)](x)
@@ -159,13 +193,11 @@ class GaussianResnetDecoder(nn.Module):
       x = self.convs[("upconv", i, 1)](x)
     x = self.out(x)  # (B, num_layers * per_layer_dims, H, W)
 
-    per_layer_dims = gaussian_split_dims(self.max_sh_degree)
+    per_layer_dims = gaussian_split_dims(self.max_sh_degree, self.predict_mean_offset)
     n_fields = len(per_layer_dims)
     parts = x.split(per_layer_dims * self.num_layers, dim=1)
 
-    field_names = ["opacity", "scale", "rotation", "sh_dc"]
-    if self.max_sh_degree != 0:
-      field_names.append("sh_rest")
+    field_names = gaussian_field_names(self.max_sh_degree, self.predict_mean_offset)
     per_field = {name: [] for name in field_names}
     for l in range(self.num_layers):
       layer_parts = parts[l * n_fields:(l + 1) * n_fields]
@@ -203,6 +235,8 @@ class GaussianResnetDecoder(nn.Module):
     }
     if self.max_sh_degree != 0:
       out["sh_rest"] = stack_layers(per_field["sh_rest"])
+    if self.predict_mean_offset:
+      out["offset"] = stack_layers(per_field["offset"])
     return out
 
 
