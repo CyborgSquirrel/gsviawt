@@ -173,6 +173,30 @@ class WarmupCosineAnnealingLR(torch.optim.lr_scheduler.SequentialLR):
     )
 
 
+class WarmupLR(torch.optim.lr_scheduler.LinearLR):
+  """Linear warmup only -- LR holds flat at the optimizer's base LR once
+  warmup_steps is reached (LinearLR's own behavior past total_iters), no
+  decay afterward. Same (optimizer, total_steps, warmup_steps, min_lr)
+  signature as WarmupCosineAnnealingLR so `sched._target_=module.WarmupLR`
+  alone swaps the scheduler on the CLI, no other sched.* override needed;
+  total_steps/min_lr are accepted but unused (no decay phase to shape)."""
+
+  def __init__(
+    self,
+    optimizer: Optimizer,
+    total_steps: int,
+    warmup_steps: int,
+    min_lr: float = 0.0,
+  ) -> None:
+    self.warmup_steps = max(1, int(warmup_steps))
+    super().__init__(
+      optimizer,
+      start_factor=1.0 / self.warmup_steps,
+      end_factor=1.0,
+      total_iters=self.warmup_steps,
+    )
+
+
 # ---------------------------------------------------------------------------
 # losses
 # ---------------------------------------------------------------------------

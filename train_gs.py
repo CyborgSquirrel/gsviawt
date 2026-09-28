@@ -5,9 +5,11 @@ Flash3D-style encoder/decoder (gs_encoder.py / gs_decoder.py): a ResNet-50
 trunk over RGB concatenated with a pixel-aligned multi-layer point cloud
 (gs_dataset.py), decoding per-pixel per-layer Gaussian appearance/shape
 parameters (opacity, scale, rotation, SH-degree-1 color). Gaussian positions
-are NOT predicted -- they're fixed exactly to the input point cloud (see
-gs_dataset.py's dense_unproject_camera), so there's no depth-prediction
-network and no learned offset, unlike Flash3D itself.
+are anchored to the input point cloud (see gs_dataset.py's
+dense_unproject_camera), so there's no depth-prediction network, unlike
+Flash3D itself. By default they're fixed exactly to it; with
+model.predict_mean_offset the decoder also predicts a residual offset on
+top of that anchor (see flatten_gaussians).
 
 Training objective (Flash3D's cross-view photometric setup): encode one
 source view, render the predicted Gaussians into the source view itself
@@ -33,6 +35,7 @@ import contextlib as ctl
 import functools as ft
 import logging
 import os
+import random
 import sys
 
 import gsplat
@@ -70,8 +73,9 @@ class GSModel(nn.Module):
   """Encoder + decoder wrapper: builds the concatenated [RGB, per-layer xyz,
   per-layer validity] input tensor, runs it through the ResNet trunk, and
   returns per-pixel per-layer Gaussian appearance/shape parameters. Positions
-  are not part of this module's output -- see gs_dataset.dense_unproject_camera
-  and flatten_gaussians below."""
+  are anchored to the input point cloud (gs_dataset.dense_unproject_camera);
+  with cfg.model.predict_mean_offset the output also carries a residual
+  camera-space "offset" on top of that anchor -- see flatten_gaussians below."""
 
   def __init__(self, cfg):
     super().__init__()
@@ -93,6 +97,7 @@ class GSModel(nn.Module):
       scale_scale=cfg.model.scale_scale, scale_bias=cfg.model.scale_bias,
       sh_scale=cfg.model.sh_scale, scale_lambda=cfg.model.scale_lambda,
       zero_init_last_conv=cfg.model.zero_init_last_conv,
+      predict_mean_offset=cfg.model.predict_mean_offset,
     )
     self.decoder = GSDecoderStack(
       self.encoder.num_ch_enc,
@@ -185,11 +190,11 @@ def model_forward(
     pred_rgb = []
     pred_alpha = []
 
-    # bg_colors: (B,3) or None -- one random background color per BATCH
-    # item (not per view; every view of a given item composites onto the
-    # same color), used only by _step's train-stage random-bg-compositing
-    # option (see loss.random_bg). None (default): unchanged behavior, no
-    # background passed to gsplat (whatever it renders against internally).
+    # bg_colors: (B,3) or None -- one background color per BATCH item (not
+    # per view; every view of a given item composites onto the same color),
+    # used only by _step's train-stage bg-compositing option (see
+    # loss.background). None (default): unchanged behavior, no background
+    # passed to gsplat (whatever it renders against internally).
     bg_iter = bg_colors if bg_colors is not None else [None] * B
 
     for (
@@ -266,6 +271,11 @@ def flatten_gaussians(b, gauss, xyz_cam, hit):
 
   for idx in range(b):
     means_flat = rearrange(xyz_cam[idx], "l h w c -> (l h w) c")
+    if "offset" in gauss:
+      # model.predict_mean_offset: means = depth-peel position (frozen
+      # anchor, no grad) + predicted residual offset. The one place the two
+      # get resolved -- every render/preview goes through here.
+      means_flat = means_flat + rearrange(gauss["offset"][idx], "l c h w -> (l h w) c")
     valid_flat = rearrange(hit[idx], "l h w -> (l h w)")
 
     opacity_flat  = rearrange(gauss["opacity"] [idx], "l c h w -> (l h w c)") * valid_flat.to(gauss["opacity"].dtype)
@@ -490,6 +500,36 @@ class GSDataModule(pl.LightningDataModule):
         allow_source_as_target=cfg.data.allow_source_as_target,
       )
       self.val_ds = _external_val_dataset(cfg)
+    elif cfg.data.fixed_source_dataset:
+      # HACK (temporary, deliberately separate from every other branch
+      # here): GSPairDataset's row-indexed/mesh-grouped machinery and
+      # data.split_fn both assume a dataset indexed by source row, which
+      # doesn't fit a fixed-source, target-view-indexed dataset at all --
+      # rather than bend that machinery to fit, this just builds ONE plain
+      # shuffled split of the raw view list and hands each half to its own
+      # GSFixedSourceDataset. No mesh grouping, no split_fn, no
+      # GSPairDataset involved on either side.
+      if cfg.data.source_views is None or len(cfg.data.source_views) != 1:
+        raise SystemExit("data.fixed_source_dataset requires exactly one data.source_views entry")
+      catalog = H5Catalog(
+        cfg.data.photom_h5,
+        H5Catalog.path().alias("path"),
+        H5Catalog.index().alias("view_idx"),
+        H5Catalog.dataset("mesh_index").alias("mesh_id"),
+      )
+      source_view = int(catalog.take([cfg.data.source_views[0]]).df["view_idx"][0])
+      views = catalog.df["view_idx"].to_list()
+      random.Random(cfg.seed).shuffle(views)
+      n_val = int(len(views) * cfg.data.fixed_source_val_fraction)
+      val_views, train_views = views[:n_val], views[n_val:]
+      self.train_ds = GSFixedSourceDataset(
+        catalog, source_view=source_view, target_views=train_views,
+        num_layers=cfg.data.num_layers, targets_per_item=cfg.data.num_target_views,
+      )
+      self.val_ds = GSFixedSourceDataset(
+        catalog, source_view=source_view, target_views=val_views,
+        num_layers=cfg.data.num_layers, targets_per_item=cfg.data.val_targets_per_item,
+      )
     elif cfg.data.val_target_views is not None:
       # Single-fixed-source setup (data.source_views == exactly one entry)
       # validated by holding out a set of TARGET views instead of by
@@ -644,11 +684,15 @@ class GSLightningModule(pl.LightningModule):
       self.views_seen += B * len(render_view_idx)
     self.log("views_seen", self.views_seen, reduce_fx="max")
 
-    # Random per-item background compositing (loss.random_bg): train-stage
-    # only, and only affects this render/loss computation -- _preview_entry
+    # Per-item background compositing (loss.background): train-stage only,
+    # and only affects this render/loss computation -- _preview_entry
     # (panels/orbit videos) never calls model_forward, so visualizations are
-    # unaffected regardless of this flag.
-    bg_colors = torch.rand(B, 3, device=device) if (stage == "train" and cfg.loss.random_bg) else None
+    # unaffected regardless of this setting.
+    bg_colors = None
+    if stage == "train" and cfg.loss.background == "random":
+      bg_colors = torch.rand(B, 3, device=device)
+    elif stage == "train" and cfg.loss.background == "white":
+      bg_colors = torch.ones(B, 3, device=device)
 
     # forward pass
     model_pred = model_forward(
@@ -700,8 +744,6 @@ class GSLightningModule(pl.LightningModule):
     def g(a):
       return rearrange(a, "(b v) ... -> b v ...", b=B, v=RV)
 
-    # NOMERGE: Composite GT RGB onto white background
-
     # TODO: Maybe integrate alpha into the loss function somehow? Maybe not?
 
     # TODO: LPIPS loss.
@@ -736,6 +778,23 @@ class GSLightningModule(pl.LightningModule):
 
       loss = loss + cfg.loss.scale_reg_weight * scale_reg
       _log("loss/scale_reg", scale_reg.detach())
+
+    ## mean offset regularization
+    # L2 penalty on the predicted offset itself (not the resolved position),
+    # pulling Gaussians back toward their depth-peel anchor -- same term as
+    # 3dgs-paper-repro's fit_3dgs.py mean_offset_reg_weight. Train stage
+    # only, like there. Averaged over valid (hit) Gaussians only, so the
+    # weight doesn't get diluted by the (many) empty pixels/layers.
+    if (
+      stage == "train"
+      and "offset" in model_pred["gauss"]
+      and cfg.loss.mean_offset_reg_weight > 0
+    ):
+      hit = batch["source"]["hit"].to(device) # (B,L,H,W)
+      offset_sq = model_pred["gauss"]["offset"].pow(2).sum(dim=2) # (B,L,H,W)
+      mean_offset_reg = offset_sq[hit].mean() if hit.any() else torch.zeros((), device=device)
+      loss = loss + cfg.loss.mean_offset_reg_weight * mean_offset_reg
+      _log("loss/mean_offset_reg", mean_offset_reg.detach())
 
     # TODO: skim through this code, fix it up
     # if need_direct:
