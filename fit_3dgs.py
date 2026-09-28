@@ -517,7 +517,7 @@ class Fit3DGSLightningModule(pl.LightningModule):
     self.views_seen = 0
     self.final_loss = float("nan")
     self.step_count = 0
-    self.gaussian_layout = str(cfg.get("gaussian_layout", "set"))
+    self.gaussian_layout = str(cfg.gaussian_layout)
 
     self.params = nn.ParameterDict({k: nn.Parameter(torch.from_numpy(v)) for k, v in g.items()})
     self.dssim = DSSIMLoss()
@@ -755,7 +755,7 @@ def main(cfg: DictConfig) -> None:
   out_h5 = cfg.output_path or f"{default_stem}.fit3dgs.h5"
   stem = out_h5[:-3] if out_h5.endswith(".h5") else out_h5
 
-  gaussian_layout = str(cfg.get("gaussian_layout", "set"))
+  gaussian_layout = str(cfg.gaussian_layout)
   if gaussian_layout not in ("set", "layered"):
     raise SystemExit(f"gaussian_layout={gaussian_layout!r} -- must be \"set\" or \"layered\"")
   if gaussian_layout == "layered" and not use_h5:
