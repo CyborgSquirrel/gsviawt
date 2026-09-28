@@ -30,6 +30,15 @@ depth_height: ${height}
 
 max_peel_layers: 6
 
+# Depth-only re-render: path to an existing render_objaverse h5. When set,
+# the view/mesh strategies and scene settings above are ignored -- meshes,
+# camera poses, lens, normalize_object, depth_scale and peel layer count all
+# come from that file -- and only `depth_peel` (+ `depth_intrinsics`) is
+# re-rendered at depth_width x depth_height; every other dataset is copied
+# through, row-aligned. Pass both depth_width and depth_height explicitly
+# (they otherwise follow ${width}/${height}).
+source_path: null
+
 # --- Objaverse blender_script.py conventions ---
 # Recenter the object on the origin and scale so its longest bbox axis == 1
 # (Objaverse / Shap-E "unit cube" normalisation). With a fixed
