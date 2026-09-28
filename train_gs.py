@@ -185,11 +185,11 @@ def model_forward(
     pred_rgb = []
     pred_alpha = []
 
-    # bg_colors: (B,3) or None -- one random background color per BATCH
-    # item (not per view; every view of a given item composites onto the
-    # same color), used only by _step's train-stage random-bg-compositing
-    # option (see loss.random_bg). None (default): unchanged behavior, no
-    # background passed to gsplat (whatever it renders against internally).
+    # bg_colors: (B,3) or None -- one background color per BATCH item (not
+    # per view; every view of a given item composites onto the same color),
+    # used only by _step's train-stage bg-compositing option (see
+    # loss.background). None (default): unchanged behavior, no background
+    # passed to gsplat (whatever it renders against internally).
     bg_iter = bg_colors if bg_colors is not None else [None] * B
 
     for (
@@ -644,11 +644,15 @@ class GSLightningModule(pl.LightningModule):
       self.views_seen += B * len(render_view_idx)
     self.log("views_seen", self.views_seen, reduce_fx="max")
 
-    # Random per-item background compositing (loss.random_bg): train-stage
-    # only, and only affects this render/loss computation -- _preview_entry
+    # Per-item background compositing (loss.background): train-stage only,
+    # and only affects this render/loss computation -- _preview_entry
     # (panels/orbit videos) never calls model_forward, so visualizations are
-    # unaffected regardless of this flag.
-    bg_colors = torch.rand(B, 3, device=device) if (stage == "train" and cfg.loss.random_bg) else None
+    # unaffected regardless of this setting.
+    bg_colors = None
+    if stage == "train" and cfg.loss.background == "random":
+      bg_colors = torch.rand(B, 3, device=device)
+    elif stage == "train" and cfg.loss.background == "white":
+      bg_colors = torch.ones(B, 3, device=device)
 
     # forward pass
     model_pred = model_forward(
@@ -699,8 +703,6 @@ class GSLightningModule(pl.LightningModule):
       return rearrange(a, "b v ... -> (b v) ...")
     def g(a):
       return rearrange(a, "(b v) ... -> b v ...", b=B, v=RV)
-
-    # NOMERGE: Composite GT RGB onto white background
 
     # TODO: Maybe integrate alpha into the loss function somehow? Maybe not?
 
