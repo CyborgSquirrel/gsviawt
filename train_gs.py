@@ -50,7 +50,7 @@ from torch.utils.data import DataLoader
 import wandb
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
-from fit_gsplat import SH_C0  # noqa: E402
+from module import SH_C0  # noqa: E402
 from gs_dataset import (OPENGL_TO_OPENCV, GaussH5ValDataset,  # noqa: E402
                         GSFixedSourceDataset, GSFixedViewsDataset,
                         GSPairDataset, H5Catalog, _EmptyDataset,

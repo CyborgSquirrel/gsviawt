@@ -2,8 +2,8 @@
 """Faithful 3D Gaussian Splatting optimization on a COLMAP scene (same format
 as gaussian-splatting/ -- images/ + sparse/0/, e.g. data/tandt/truck), ported
 onto this repo's Hydra + Lightning + wandb-logging + shared-callback shape
-(fit_gsplat.py's, via module.py) instead of the reference's argparse + raw
-training loop.
+(module.py's, originally fit_gsplat.py's) instead of the reference's
+argparse + raw training loop.
 
 Unlike fit_gsplat.py (which seeds one Gaussian per depth-peel pixel, from a
 synthetic render, and never adds to that set), `gaussian_layout: set`
@@ -339,9 +339,9 @@ def init_gaussians(pcd, max_sh_degree, init_opacity, knn_k):
 # that 1:1 correspondence is also exactly why densification (which adds/
 # removes Gaussians) is incompatible with this mode and must stay off.
 #
-# Reuses fit_gsplat.init_gaussians() verbatim for the actual unprojection/
+# Reuses module.init_gaussians() verbatim for the actual unprojection/
 # KNN-scale/front-pixel-colour work (same quantity, same seeding scene) --
-# only the colour representation differs downstream: fit_gsplat's is flat
+# only the colour representation differs downstream: fit_gsplat's was flat
 # sigmoid (colors_logit), this file trains full SH (sh0/shN, degree
 # ramped), so the seed colour is converted logit->sigmoid->RGB2SH into sh0
 # with shN left at zero, exactly like init_gaussians()'s own pcd-colour
@@ -364,7 +364,7 @@ def init_gaussians_layered(hdf5_path, primary_view_idx, max_sh_degree, init_opac
       mp = f["mesh_paths"][mesh_index]
       mesh_path = mp.decode() if isinstance(mp, bytes) else str(mp)
 
-  from fit_gsplat import init_gaussians as _seed_from_depth_peel
+  from module import init_gaussians as _seed_from_depth_peel
   seed = _seed_from_depth_peel(depth, K, pose, image, knn_k, init_opacity)
   n = len(seed["means"])
   log.info("layered seed: %d Gaussians from the primary view's %dx%d, %d-layer depth peel",
@@ -449,7 +449,7 @@ def save_output_layered(path, params_np, meta):
   has no SH slot at all (flat colour), so any learned view-dependent shN
   this file trained is dropped for this specific output; the full-SH
   colour survives in the flat .h5/.ply from save_output()/write_ply()."""
-  from fit_gsplat import SH_C0, _scatter_grid
+  from module import SH_C0, _scatter_grid
   means = params_np["means"]
   scales = np.exp(params_np["scales"])
   quats = params_np["quats"] / np.linalg.norm(params_np["quats"], axis=-1, keepdims=True)

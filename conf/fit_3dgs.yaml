@@ -6,7 +6,7 @@
 defaults:
   # Only used when hdf5_path (below) is set -- picks load_scene_h5()'s
   # train/val split instead of COLMAP's llffhold=8. Same option group /
-  # override syntax as conf/gsplat.yaml (data/split_fn=by_indices etc).
+  # override syntax train_gs.py's conf/train_gs.yaml uses (data/split_fn=by_indices etc).
   - data/split_fn: by_view
   - _self_
 

@@ -53,10 +53,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# fit_gsplat wires up the pip CUDA toolchain for gsplat's JIT build on import,
-# and gives us the camera-convention helper, SSIM, and the SH constant.
-from fit_gsplat import make_viewmats, SH_C0  # noqa: E402
-from module import DSSIMLoss, write_mp4  # noqa: E402
+from module import DSSIMLoss, SH_C0, make_viewmats, write_mp4  # noqa: E402
 
 import h5py  # noqa: E402
 import hydra  # noqa: E402

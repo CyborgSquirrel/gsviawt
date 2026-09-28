@@ -40,7 +40,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from fit_gsplat import SH_C0
+from module import SH_C0
 
 
 def upsample(x, mode="nearest"):

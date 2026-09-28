@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Shared PyTorch Lightning building blocks for train_gs.py and fit_gsplat.py.
+"""Shared PyTorch Lightning building blocks for train_gs.py and fit_3dgs.py.
 
 Both scripts optimize Gaussian-splat parameters against gsplat photometric
 renders under a `pl.Trainer` (train_gs.py: a network's predicted Gaussians
-over a dataset; fit_gsplat.py: one scene's own Gaussians, directly). That's
+over a dataset; fit_3dgs.py: one scene's own Gaussians, directly). That's
 where the overlap actually is -- the loss/schedule/OOM-handling plumbing,
 plus the PanelCallback/OrbitCallback pair below, which each PULL a
 normalized snapshot from the LightningModule (get_preview_source(), one
@@ -20,6 +20,10 @@ OrbitCallback fully shared below: one world-frame turntable formula
 (WORLD_UP/look_at_c2w), no per-script pose method at all -- it only needs
 a distance (each get_preview_source() includes its own "scene_scale") and
 the already-world-space Gaussians.
+
+Also holds the depth-peel Gaussian-seeding helpers (SH_C0/init_gaussians/
+make_viewmats/_scatter_grid) that used to live in fit_gsplat.py, now used
+by fit_3dgs.py's layered mode, orbit_video.py and gs_decoder.py.
 """
 
 import contextlib as ctl
@@ -33,18 +37,20 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import pack, rearrange, repeat
+from einops import pack, rearrange, reduce, repeat
 from omegaconf import OmegaConf
 from torch.optim import Optimizer
 
 import wandb
+
+from debug_pointcloud import unproject_depth_peel
 
 log = logging.getLogger(__name__)
 
 # Both scripts' conf/*.yaml lean on this for callback/trainer fields that are
 # a small expression over another field rather than a literal (e.g.
 # "${eval:'${iters} // 50'}") -- registered here, once, so importing either
-# script (train_gs.py imports fit_gsplat.py imports this module) can't
+# script (both import this module, directly or via gs_decoder.py) can't
 # double-register it and raise.
 if not OmegaConf.has_resolver("eval"):
   OmegaConf.register_new_resolver("eval", eval)
@@ -69,6 +75,72 @@ def look_at_c2w(eye, target, up=WORLD_UP):
   c2w = np.eye(4, dtype=np.float32)
   c2w[:3, 0], c2w[:3, 1], c2w[:3, 2], c2w[:3, 3] = x, y, z, eye
   return c2w
+
+
+# ---------------------------------------------------------------------------
+# depth-peel Gaussian seeding -- shared by fit_3dgs.py's layered mode,
+# orbit_video.py and gs_decoder.py (formerly fit_gsplat.py's own, moved here
+# when that script was deleted)
+# ---------------------------------------------------------------------------
+
+SH_C0 = 0.28209479177387814  # SH band-0 constant, for RGB <-> sh0 in the .ply
+
+
+def _logit(x, eps=1e-4):
+  x = np.clip(x, eps, 1.0 - eps)
+  return np.log(x / (1.0 - x))
+
+
+def init_gaussians(depth_primary, K_primary, pose_primary, image_primary,
+                   knn_k, init_opacity):
+  """Seed one Gaussian per depth-peel hit in the primary view. Returns numpy
+  arrays; `u/v/layer` record each Gaussian's pixel + peel-layer of origin (in
+  depth-peel pixels). `image_primary` may be a different resolution than the
+  depth peel -- the seed colour is nearest-sampled at the scaled location."""
+  pts, u, v, layer = unproject_depth_peel(
+    depth_primary, K_primary, pose_primary, space="world")          # (P,3), (P,), (P,), (P,)
+  if len(pts) == 0:
+    raise SystemExit("primary view has no depth-peel hits -- nothing to seed")
+
+  dh, dw = depth_primary.shape[:2]
+  ih, iw = image_primary.shape[:2]
+  iv = np.clip(np.round(v * (ih / dh)), 0, ih - 1).astype(np.int64)
+  iu = np.clip(np.round(u * (iw / dw)), 0, iw - 1).astype(np.int64)
+  colors = image_primary[iv, iu, :3].astype(np.float32) / 255.0      # front-pixel colour
+
+  # isotropic initial scale = mean distance to the knn_k nearest neighbours
+  from scipy.spatial import cKDTree
+  k = min(knn_k + 1, len(pts))
+  dist, _ = cKDTree(pts).query(pts, k=k)                    # (P, k), or (P,) when k == 1
+  dist = rearrange(dist, "p -> p 1") if dist.ndim == 1 else dist
+  neighbours = dist[:, 1:] if k > 1 else dist               # column 0 is the point itself
+  nn = reduce(neighbours, "p k -> p", "mean")
+  nn = np.clip(nn, 1e-6, None).astype(np.float32)
+
+  return {
+    "means": pts.astype(np.float32),
+    "scales_log": repeat(np.log(nn), "p -> p xyz", xyz=3).astype(np.float32),
+    "quats": np.tile([1.0, 0.0, 0.0, 0.0], (len(pts), 1)).astype(np.float32),
+    "opac_logit": np.full(len(pts), _logit(np.float32(init_opacity)), np.float32),
+    "colors_logit": _logit(colors).astype(np.float32),
+    "u": u.astype(np.int64), "v": v.astype(np.int64), "layer": layer.astype(np.int64),
+  }
+
+
+def make_viewmats(poses):
+  """poses: (V,4,4) camera-to-world, OpenGL cam axes. Returns (V,4,4)
+  world-to-camera in OpenCV convention -- what gsplat wants."""
+  c2w_cv = poses @ OPENGL_TO_OPENCV
+  return np.linalg.inv(c2w_cv).astype(np.float32)
+
+
+def _scatter_grid(flat, v, u, layer, H, W, L):
+  """flat: (G,) or (G,C). Returns (H,W,L) or (H,W,L,C) float32 with NaN in
+  every slot that has no Gaussian."""
+  shape = (H, W, L) if flat.ndim == 1 else (H, W, L, flat.shape[1])
+  grid = np.full(shape, np.nan, np.float32)
+  grid[v, u, layer] = flat
+  return grid
 
 
 class WarmupCosineAnnealingLR(torch.optim.lr_scheduler.SequentialLR):
