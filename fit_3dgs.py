@@ -69,6 +69,7 @@ import json
 import logging
 import os
 import sys
+import warnings
 
 import h5py
 import hydra
@@ -99,8 +100,6 @@ from utils.general_utils import get_expon_lr_func  # noqa: E402
 
 log = logging.getLogger(__name__)
 
-WARN_RESOLUTION = {"done": False}  # loadCam's >1600px warning, once, matching the reference
-
 
 # ---------------------------------------------------------------------------
 # scene loading -- COLMAP parsing reused from gaussian-splatting/ verbatim
@@ -112,22 +111,28 @@ WARN_RESOLUTION = {"done": False}  # loadCam's >1600px warning, once, matching t
 
 def _resolution_for(orig_w, orig_h, resolution):
   """Mirrors gaussian-splatting/utils/camera_utils.py's loadCam exactly for
-  resolution in {-1, 1, 2, 4, 8}: -1 auto-halves down to <=1600px width
-  (warns once), {1,2,4,8} divide directly. No resolution_scale (this repo
-  never uses multi-resolution-scale training) and no arbitrary-float branch
-  (the reference's "else: global_down = orig_w / args.resolution", for a
-  literal target width -- not used by any of our configs)."""
+  resolution in {"auto", 1, 2, 4, 8}: "auto" (the reference's -1) auto-halves
+  down to <=1600px width (warns once per call site -- Python's default
+  warnings filter already does that, no manual bookkeeping needed),
+  {1,2,4,8} divide directly. No resolution_scale (this repo never uses
+  multi-resolution-scale training) and no arbitrary-float branch (the
+  reference's "else: global_down = orig_w / args.resolution", for a literal
+  target width -- not used by any of our configs)."""
   if resolution in (1, 2, 4, 8):
     return round(orig_w / resolution), round(orig_h / resolution)
-  assert resolution == -1, f"unsupported resolution {resolution!r} (use -1, 1, 2, 4, or 8)"
+  assert resolution == "auto", f"unsupported resolution {resolution!r} (use \"auto\", 1, 2, 4, or 8)"
   if orig_w > 1600:
-    if not WARN_RESOLUTION["done"]:
-      log.info("Encountered quite large input images (>1.6K pixels width), rescaling to 1.6K.")
-      WARN_RESOLUTION["done"] = True
+    warnings.warn("Encountered quite large input images (>1.6K pixels width), rescaling to 1.6K.")
     global_down = orig_w / 1600
   else:
     global_down = 1
   return int(orig_w / global_down), int(orig_h / global_down)
+
+
+def _coerce_resolution(x):
+  """Hydra hands this through as either the string "auto" or a number
+  (1/2/4/8) -- only the latter should be int()-cast."""
+  return x if str(x) == "auto" else int(x)
 
 
 def _load_camera(cam_info, resolution):
@@ -619,7 +624,7 @@ def main(cfg: DictConfig) -> None:
         cfg.hdf5_path, float(cfg.data.split_fn.val_fraction), int(cfg.seed))
     else:
       pcd, scene_extent, train_cams, test_cams = load_scene(
-        cfg.source_path, cfg.images, bool(cfg.eval), int(cfg.resolution))
+        cfg.source_path, cfg.images, bool(cfg.eval), _coerce_resolution(cfg.resolution))
   log.info("%d train views, %d test views (llffhold), scene_extent=%.4f",
            len(train_cams), len(test_cams), scene_extent)
 
