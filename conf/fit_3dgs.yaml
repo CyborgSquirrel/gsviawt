@@ -25,6 +25,14 @@ hdf5_path: null
 
 output_path: null                     # null -> <source_path-or-hdf5_path>.fit3dgs.h5
 
+# set: free xyz, real growing/shrinking densification (what fit_3dgs.py has
+# always done). layered: one Gaussian per depth-peel hit in the primary
+# train view (like fit_gsplat.py), Gaussian COUNT fixed for the whole run
+# (densify/prune below forced off regardless of their own settings) -- only
+# valid with hdf5_path set to an h5 that actually has depth_peel. See
+# init_gaussians_layered/save_output_layered in fit_3dgs.py.
+gaussian_layout: set                  # set | layered
+
 # --- optimization (== arguments/OptimizationParams' defaults, verbatim) ---
 iters: 30000
 seed: 42

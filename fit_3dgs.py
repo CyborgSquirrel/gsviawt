@@ -6,15 +6,28 @@ onto this repo's Hydra + Lightning + wandb-logging + shared-callback shape
 training loop.
 
 Unlike fit_gsplat.py (which seeds one Gaussian per depth-peel pixel, from a
-synthetic render, and never adds to that set), this ports the REAL algorithm:
-free `xyz`, the COLMAP sparse point cloud as the seed, and full growing/
-shrinking densification via gsplat.strategy.DefaultStrategy -- gsplat's own
-reimplementation of gaussian-splatting/scene/gaussian_model.py's
-densify_and_prune/reset_opacity, verified line-by-line against it (matching
-grad/scale thresholds, split/duplicate/prune conditions, opacity-reset
-value). Empirically cross-checked too: an early-run Gaussian-count
-trajectory (iters 600-1600) landed within ~1% of an instrumented copy of the
-reference train.py on this exact scene at every checkpoint.
+synthetic render, and never adds to that set), `gaussian_layout: set`
+(the default) ports the REAL algorithm: free `xyz`, the COLMAP sparse point
+cloud as the seed, and full growing/shrinking densification via
+gsplat.strategy.DefaultStrategy -- gsplat's own reimplementation of
+gaussian-splatting/scene/gaussian_model.py's densify_and_prune/
+reset_opacity, verified line-by-line against it (matching grad/scale
+thresholds, split/duplicate/prune conditions, opacity-reset value).
+Empirically cross-checked too: an early-run Gaussian-count trajectory
+(iters 600-1600) landed within ~1% of an instrumented copy of the reference
+train.py on this exact scene at every checkpoint.
+
+`gaussian_layout: layered` is the other option, for an h5 scene only (see
+load_scene_h5/init_gaussians_layered): seeds one Gaussian per depth-peel
+hit in the primary train view instead, same as fit_gsplat.py's own
+seeding (reused verbatim), and disables densification entirely -- the
+Gaussian count stays fixed all run, its (u, v, layer) origin in that
+view's depth grid tracked throughout, so the final params can be scattered
+back into a fit_gsplat.py-schema grid .h5 (save_output_layered) alongside
+the usual flat output. Everything else (loss, optimizers, training loop,
+SH color) is unchanged from `set` mode -- the params stay a plain flat
+ParameterDict either way; "layered" only changes how they're seeded, that
+densify/prune never runs, and one extra file gets written at the end.
 
 DefaultStrategy ships with one real bug in the exact pinned version this
 repo vendors (v1.5.3 + one commit, see gsplat-src/'s own comments): its
@@ -230,7 +243,12 @@ def load_scene_h5(hdf5_path, val_fraction, seed):
     image = np.ascontiguousarray(rgb * alpha)  # premultiplied over black
     viewmat = np.linalg.inv(pose[i] @ OPENGL_TO_OPENCV).astype(np.float32)
     h, w = image.shape[:2]
-    return {"image": image, "viewmat": viewmat, "K": K[i], "name": f"view{i:03d}", "width": w, "height": h}
+    # view_idx: this view's row in the h5 (not just its position within the
+    # split) -- gaussian_layout="layered" (init_gaussians_layered) needs it
+    # to re-read this same view's raw depth_peel, which load_scene_h5 itself
+    # never loads (COLMAP cameras have no equivalent field).
+    return {"image": image, "viewmat": viewmat, "K": K[i], "name": f"view{i:03d}",
+            "width": w, "height": h, "view_idx": i}
 
   train_cams = [_cam(i) for i in train_idx]
   test_cams = [_cam(i) for i in val_idx]
@@ -291,6 +309,67 @@ def init_gaussians(pcd, max_sh_degree, init_opacity, knn_k):
 
 
 # ---------------------------------------------------------------------------
+# gaussian init -- LAYERED alternative to init_gaussians() above, for
+# gaussian_layout="layered" (h5 scenes with depth_peel only -- see
+# load_scene_h5's own guard in main()). One Gaussian per depth-peel hit in
+# the PRIMARY train view's 6-layer peel (fit_gsplat.py's own convention:
+# "whichever [view] sorts first in the (already-split) catalog" --
+# train_cams[0]["view_idx"], since load_scene_h5 already sorts train_idx).
+# Every Gaussian keeps a fixed (u, v, layer) origin in that view's depth
+# grid, so the final flat param set can be scattered back into a
+# fit_gsplat.py-schema (H, W, L, .) grid (see save_output_layered) --
+# that 1:1 correspondence is also exactly why densification (which adds/
+# removes Gaussians) is incompatible with this mode and must stay off.
+#
+# Reuses fit_gsplat.init_gaussians() verbatim for the actual unprojection/
+# KNN-scale/front-pixel-colour work (same quantity, same seeding scene) --
+# only the colour representation differs downstream: fit_gsplat's is flat
+# sigmoid (colors_logit), this file trains full SH (sh0/shN, degree
+# ramped), so the seed colour is converted logit->sigmoid->RGB2SH into sh0
+# with shN left at zero, exactly like init_gaussians()'s own pcd-colour
+# conversion above.
+# ---------------------------------------------------------------------------
+
+def init_gaussians_layered(hdf5_path, primary_view_idx, max_sh_degree, init_opacity, knn_k):
+  with h5py.File(hdf5_path, "r") as f:
+    if "depth_peel" not in f or "depth_intrinsics" not in f:
+      raise SystemExit(
+        f"{hdf5_path}: no depth_peel/depth_intrinsics -- gaussian_layout=layered "
+        "needs a render_objaverse.py h5 with depth data, not just images")
+    depth = np.asarray(f["depth_peel"][primary_view_idx]).astype(np.float32)   # (H,W,L)
+    K = np.asarray(f["depth_intrinsics"][primary_view_idx]).astype(np.float32)  # (3,3)
+    pose = np.asarray(f["camera_pose"][primary_view_idx]).astype(np.float32)    # (4,4) c2w
+    image = np.asarray(f["images"][primary_view_idx])                          # (IH,IW,3|4) u8
+    mesh_index = int(f["mesh_index"][primary_view_idx]) if "mesh_index" in f else -1
+    mesh_path = ""
+    if "mesh_paths" in f and 0 <= mesh_index < f["mesh_paths"].shape[0]:
+      mp = f["mesh_paths"][mesh_index]
+      mesh_path = mp.decode() if isinstance(mp, bytes) else str(mp)
+
+  from fit_gsplat import init_gaussians as _seed_from_depth_peel
+  seed = _seed_from_depth_peel(depth, K, pose, image, knn_k, init_opacity)
+  n = len(seed["means"])
+  log.info("layered seed: %d Gaussians from the primary view's %dx%d, %d-layer depth peel",
+           n, depth.shape[1], depth.shape[0], depth.shape[2])
+
+  num_sh = (int(max_sh_degree) + 1) ** 2
+  colors = 1.0 / (1.0 + np.exp(-seed["colors_logit"]))  # logit -> flat RGB in [0,1]
+  sh0 = RGB2SH(torch.from_numpy(colors)).numpy()[:, None, :].astype(np.float32)
+  shN = np.zeros((n, num_sh - 1, 3), np.float32)
+
+  g = {
+    "means": seed["means"], "scales": seed["scales_log"], "quats": seed["quats"],
+    "opacities": seed["opac_logit"], "sh0": sh0, "shN": shN,
+  }
+  meta = {
+    "u": seed["u"], "v": seed["v"], "layer": seed["layer"],
+    "H": depth.shape[0], "W": depth.shape[1], "L": depth.shape[2],
+    "mesh_index": mesh_index, "mesh_path": mesh_path,
+  }
+  return g, meta
+
+
+# ---------------------------------------------------------------------------
 # rendering
 # ---------------------------------------------------------------------------
 
@@ -339,6 +418,46 @@ def save_output(path, cfg, params_np, scene_extent, final_loss, n_seeded):
       f.create_dataset(k, data=v, compression="gzip", compression_opts=4)
 
 
+def save_output_layered(path, params_np, meta):
+  """gaussian_layout="layered" only: an ADDITIONAL fit_gsplat.py-schema
+  (H, W, L, .) grid .h5 (gaussian_means/scales/quats/opacities/colors +
+  layer_valid), scattered from the same flat params save_output() also
+  wrote flat -- written alongside, never instead of, that flat .h5/.ply
+  (which stay format-agnostic and are what the Chamfer/disparity tooling
+  already consumes). Lets orbit_video.py and anything else built for
+  fit_gsplat.py's own output consume a layered fit_3dgs.py run unmodified.
+
+  colors here is DC-only (SH_C0*sh0 + 0.5) -- fit_gsplat.py's grid schema
+  has no SH slot at all (flat colour), so any learned view-dependent shN
+  this file trained is dropped for this specific output; the full-SH
+  colour survives in the flat .h5/.ply from save_output()/write_ply()."""
+  from fit_gsplat import SH_C0, _scatter_grid
+  means = params_np["means"]
+  scales = np.exp(params_np["scales"])
+  quats = params_np["quats"] / np.linalg.norm(params_np["quats"], axis=-1, keepdims=True)
+  opac = 1.0 / (1.0 + np.exp(-params_np["opacities"]))
+  colors = np.clip(SH_C0 * params_np["sh0"][:, 0, :] + 0.5, 0.0, 1.0)
+
+  v, u, layer = meta["v"], meta["u"], meta["layer"]
+  H, W, L = meta["H"], meta["W"], meta["L"]
+  with h5py.File(path, "w") as f:
+    f.attrs["mesh_index"] = meta["mesh_index"]
+    f.attrs["mesh_path"] = meta["mesh_path"]
+    f.attrs["layer_layout"] = "(H, W, 6) like depth_peel; NaN = empty slot"
+
+    def _scene_dataset(name, data):
+      f.create_dataset(name, data=data, chunks=data.shape, compression="gzip", compression_opts=4)
+
+    _scene_dataset("gaussian_means", _scatter_grid(means, v, u, layer, H, W, L))
+    _scene_dataset("gaussian_scales", _scatter_grid(scales, v, u, layer, H, W, L))
+    _scene_dataset("gaussian_quats", _scatter_grid(quats, v, u, layer, H, W, L))
+    _scene_dataset("gaussian_opacities", _scatter_grid(opac, v, u, layer, H, W, L))
+    _scene_dataset("gaussian_colors", _scatter_grid(colors, v, u, layer, H, W, L))
+    valid = np.zeros((H, W, L), bool)
+    valid[v, u, layer] = True
+    f.create_dataset("layer_valid", data=valid)
+
+
 # ---------------------------------------------------------------------------
 # dataset / lightning module
 # ---------------------------------------------------------------------------
@@ -383,7 +502,7 @@ class Fit3DGSDataModule(pl.LightningDataModule):
 class Fit3DGSLightningModule(pl.LightningModule):
   automatic_optimization = False
 
-  def __init__(self, cfg, g, scene_extent, preview_cams):
+  def __init__(self, cfg, g, scene_extent, preview_cams, layered=False):
     super().__init__()
     self.cfg = cfg
     self.scene_extent = scene_extent
@@ -392,23 +511,32 @@ class Fit3DGSLightningModule(pl.LightningModule):
     self.views_seen = 0
     self.final_loss = float("nan")
     self.step_count = 0
+    self.layered = layered
 
     self.params = nn.ParameterDict({k: nn.Parameter(torch.from_numpy(v)) for k, v in g.items()})
     self.dssim = DSSIMLoss()
 
-    import gsplat.strategy as gsstrat
-    self.strategy = gsstrat.DefaultStrategy(
-      prune_opa=float(cfg.densify.prune_opacity), grow_grad2d=float(cfg.densify.grad_threshold),
-      grow_scale3d=float(cfg.percent_dense), prune_scale3d=float(cfg.densify.prune_scale3d),
-      refine_start_iter=int(cfg.densify.from_iter), refine_stop_iter=int(cfg.densify.until_iter),
-      refine_every=int(cfg.densify.interval), reset_every=int(cfg.opacity_reset_interval),
-      absgrad=False, revised_opacity=False,
-    )
-    # initialize_state()'s tensors are created lazily (None until the first
-    # step_post_backward call, then allocated directly on whatever device
-    # the render `info` is on) -- no manual device placement needed here,
-    # unlike a plain dict of eagerly-created tensors would.
-    self.strategy_state = self.strategy.initialize_state(scene_scale=scene_extent)
+    # gaussian_layout="layered" keeps a fixed 1:1 Gaussian<->(u,v,layer)
+    # correspondence (see init_gaussians_layered/save_output_layered) --
+    # DefaultStrategy adds/removes Gaussians (grow/split/prune), which
+    # would break that correspondence, so it's skipped entirely here
+    # (self.strategy stays None; training_step below guards every call on
+    # it), matching fit_gsplat.py's own plain-Adam-only loop exactly.
+    self.strategy, self.strategy_state = None, None
+    if not layered:
+      import gsplat.strategy as gsstrat
+      self.strategy = gsstrat.DefaultStrategy(
+        prune_opa=float(cfg.densify.prune_opacity), grow_grad2d=float(cfg.densify.grad_threshold),
+        grow_scale3d=float(cfg.percent_dense), prune_scale3d=float(cfg.densify.prune_scale3d),
+        refine_start_iter=int(cfg.densify.from_iter), refine_stop_iter=int(cfg.densify.until_iter),
+        refine_every=int(cfg.densify.interval), reset_every=int(cfg.opacity_reset_interval),
+        absgrad=False, revised_opacity=False,
+      )
+      # initialize_state()'s tensors are created lazily (None until the first
+      # step_post_backward call, then allocated directly on whatever device
+      # the render `info` is on) -- no manual device placement needed here,
+      # unlike a plain dict of eagerly-created tensors would.
+      self.strategy_state = self.strategy.initialize_state(scene_scale=scene_extent)
 
     # A fixed handful of preview cameras (module.PanelCallback/OrbitCallback,
     # via get_preview_source() below) -- not the full train/val split (that's
@@ -444,7 +572,8 @@ class Fit3DGSLightningModule(pl.LightningModule):
       "scales": torch.optim.Adam([self.params["scales"]], lr=float(cfg.lr.scales), eps=1e-15),
       "quats": torch.optim.Adam([self.params["quats"]], lr=float(cfg.lr.quats), eps=1e-15),
     }
-    self.strategy.check_sanity(self.params, self.optimizers_dict)
+    if self.strategy is not None:
+      self.strategy.check_sanity(self.params, self.optimizers_dict)
     return list(self.optimizers_dict.values())
 
   def _photom_loss(self, rgb, gt_rgb):
@@ -480,7 +609,12 @@ class Fit3DGSLightningModule(pl.LightningModule):
     rgb, alpha, info = render(self.params, self.active_sh_degree, viewmat, K, W, H)
     # step_pre_backward calls info["means2d"].retain_grad() -- must run
     # before backward for a non-leaf tensor to keep its .grad populated.
-    self.strategy.step_pre_backward(self.params, self.optimizers_dict, self.strategy_state, it, info)
+    # Skipped in layered mode along with step_post_backward below (no
+    # strategy at all there -- see __init__'s comment): retain_grad() is
+    # otherwise harmless to skip, means2d's gradient just isn't needed by
+    # anything when there's no grow/prune decision to feed it into.
+    if self.strategy is not None:
+      self.strategy.step_pre_backward(self.params, self.optimizers_dict, self.strategy_state, it, info)
     loss, parts = self._photom_loss(rgb, gt_rgb)
 
     for opt in self.optimizers_dict.values():
@@ -490,12 +624,13 @@ class Fit3DGSLightningModule(pl.LightningModule):
     for opt in self.optimizers_dict.values():
       opt.step()
 
-    # Post-backward, post-step (matches gsplat's own reference trainer's
-    # ordering, examples/simple_trainer.py -- grow/prune happens AFTER this
-    # step's gradient update is applied, using the gradient info accumulated
-    # THIS step, so it acts on next step's population, not this one's).
-    self.strategy.step_post_backward(
-      self.params, self.optimizers_dict, self.strategy_state, it, info, packed=True)
+    if self.strategy is not None:
+      # Post-backward, post-step (matches gsplat's own reference trainer's
+      # ordering, examples/simple_trainer.py -- grow/prune happens AFTER this
+      # step's gradient update is applied, using the gradient info accumulated
+      # THIS step, so it acts on next step's population, not this one's).
+      self.strategy.step_post_backward(
+        self.params, self.optimizers_dict, self.strategy_state, it, info, packed=True)
 
     self.views_seen += gt_rgb.shape[0]
     self.final_loss = loss.item()
@@ -610,6 +745,13 @@ def main(cfg: DictConfig) -> None:
   out_h5 = cfg.output_path or f"{default_stem}.fit3dgs.h5"
   stem = out_h5[:-3] if out_h5.endswith(".h5") else out_h5
 
+  gaussian_layout = str(cfg.get("gaussian_layout", "set"))
+  if gaussian_layout not in ("set", "layered"):
+    raise SystemExit(f"gaussian_layout={gaussian_layout!r} -- must be \"set\" or \"layered\"")
+  if gaussian_layout == "layered" and not use_h5:
+    raise SystemExit("gaussian_layout=layered needs hdf5_path (a render_objaverse.py h5 with "
+                     "depth_peel) -- COLMAP scenes have no depth peel to seed a fixed layer stack from")
+
   wandb_run, logger = None, False
   if cfg.wandb.mode != "disabled":
     wandb_run = wandb.init(
@@ -628,15 +770,21 @@ def main(cfg: DictConfig) -> None:
   log.info("%d train views, %d test views (llffhold), scene_extent=%.4f",
            len(train_cams), len(test_cams), scene_extent)
 
+  layered_meta = None
   with timed("init"):
-    g = init_gaussians(pcd, int(cfg.sh_degree), float(cfg.init_opacity), int(cfg.knn_k))
+    if gaussian_layout == "layered":
+      primary_view_idx = train_cams[0]["view_idx"]
+      g, layered_meta = init_gaussians_layered(
+        cfg.hdf5_path, primary_view_idx, int(cfg.sh_degree), float(cfg.init_opacity), int(cfg.knn_k))
+    else:
+      g = init_gaussians(pcd, int(cfg.sh_degree), float(cfg.init_opacity), int(cfg.knn_k))
   n_seeded = len(g["means"])
 
   preview_cams = {
     "train": train_cams[:4],
     "val": test_cams[:4] if test_cams else [],
   }
-  model = Fit3DGSLightningModule(cfg, g, scene_extent, preview_cams)
+  model = Fit3DGSLightningModule(cfg, g, scene_extent, preview_cams, layered=(gaussian_layout == "layered"))
   datamodule = Fit3DGSDataModule(cfg, train_cams, test_cams)
 
   callbacks = list(hydra.utils.instantiate(cfg.callbacks).values())
@@ -650,6 +798,10 @@ def main(cfg: DictConfig) -> None:
   with timed("write"):
     save_output(out_h5, cfg, params_np, scene_extent, model.final_loss, n_seeded)
     write_ply(f"{stem}.ply", params_np)
+    if layered_meta is not None:
+      grid_h5 = f"{stem}.grid.h5"
+      save_output_layered(grid_h5, params_np, layered_meta)
+      log.info("layered grid: %s", grid_h5)
 
   results = None
   if bool(cfg.final_eval) and test_cams:
