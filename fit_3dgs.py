@@ -35,6 +35,18 @@ from `set` mode -- the params stay a plain flat
 ParameterDict either way; "layered" only changes how they're seeded, that
 densify/prune never runs, and one extra file gets written at the end.
 
+One more layered-only difference: means is means_original (frozen, the
+depth-peel-seeded position) + an optimizable offset (zero-initialized --
+training starts exactly at the seed), not a single free tensor like
+`set` mode's. self.params["means"] holds the offset itself (still
+trainable, still what gsplat.strategy's optimizer/check_sanity plumbing
+expects at that key); Fit3DGSLightningModule._active_means() is the one
+place that resolves means_original + offset into the actual position
+every render/preview/eval/output call needs. cfg.mean_offset_reg_weight
+adds an L2 penalty on the offset (not the resolved position) to the
+train loss, pulling Gaussians back toward their seeded origin instead of
+letting the offset drift unconstrained.
+
 DefaultStrategy ships with one real bug in the exact pinned version this
 repo vendors (v1.5.3 + one commit, see gsplat-src/'s own comments): its
 opacity-reset scheduling condition was dead code from a `&`/`and`
@@ -519,7 +531,29 @@ class Fit3DGSLightningModule(pl.LightningModule):
     self.step_count = 0
     self.gaussian_layout = str(cfg.gaussian_layout)
 
-    self.params = nn.ParameterDict({k: nn.Parameter(torch.from_numpy(v)) for k, v in g.items()})
+    # gaussian_layout="layered": means = means_original (frozen, the
+    # depth-peel-seeded position -- see init_gaussians_layered) + an
+    # optimizable offset (means_original.zeros_like init, so training
+    # starts exactly at the seed). means_original is a buffer, not a
+    # Parameter -- never touched by any optimizer, no .grad, moved to
+    # the right device automatically by Lightning's own .to() (like
+    # self.params already is) since register_buffer participates in
+    # that the same way parameters do. self.params["means"] keeps its
+    # key name (gsplat.strategy.DefaultStrategy.check_sanity asserts
+    # "means" is present in both params and optimizers_dict; densify/
+    # prune never touches it in this mode anyway -- see the
+    # refine_start_iter comment below) but now holds the OFFSET, not
+    # the position -- _active_means() is the one place that resolves
+    # the two into the actual position every render call needs; nothing
+    # else should read self.params["means"] directly as if it were one.
+    self.mean_offset_reg_weight = float(cfg.mean_offset_reg_weight)
+    self.params = nn.ParameterDict()
+    for k, v in g.items():
+      if k == "means" and self.gaussian_layout == "layered":
+        self.register_buffer("means_original", torch.from_numpy(v), persistent=False)
+        self.params["means"] = nn.Parameter(torch.zeros_like(self.means_original))
+      else:
+        self.params[k] = nn.Parameter(torch.from_numpy(v))
     self.dssim = DSSIMLoss()
 
     # gaussian_layout="layered" keeps a fixed 1:1 Gaussian<->(u,v,layer)
@@ -575,6 +609,17 @@ class Fit3DGSLightningModule(pl.LightningModule):
       }
       for k, cams in preview_cams.items() if cams
     }
+
+  def _active_means(self):
+    """The actual world-space Gaussian positions -- self.params["means"]
+    directly in "set" mode, means_original + self.params["means"] (now an
+    offset) in "layered" mode. The only place that resolves the two;
+    render()/get_preview_source()/run_final_eval()/params_np() all go
+    through this instead of reading self.params["means"] as if it were
+    always a position."""
+    if self.gaussian_layout == "layered":
+      return self.means_original + self.params["means"]
+    return self.params["means"]
 
   def configure_optimizers(self):
     cfg = self.cfg
@@ -653,13 +698,28 @@ class Fit3DGSLightningModule(pl.LightningModule):
       self.optimizers_dict["means"].param_groups[0]["lr"] = self.means_lr_fn(it)
 
     with torch.set_grad_enabled(stage == "train"):
-      rgb, alpha, info = render(self.params, self.active_sh_degree, viewmat, K, W, H)
+      # render_params: self.params with "means" resolved to the actual
+      # position (_active_means()) -- a shallow dict, so every other key
+      # is still the exact same Parameter tensor render()/gsplat read
+      # elsewhere. self.params itself (offset still at "means" in
+      # layered mode) is what goes to the strategy/optimizers below --
+      # they operate on the trainable leaf, not the resolved position.
+      render_params = {**self.params, "means": self._active_means()}
+      rgb, alpha, info = render(render_params, self.active_sh_degree, viewmat, K, W, H)
       if stage == "train":
         # step_pre_backward calls info["means2d"].retain_grad() -- must
         # run before backward for a non-leaf tensor to keep its .grad
         # populated.
         self.strategy.step_pre_backward(self.params, self.optimizers_dict, self.strategy_state, it, info)
       loss, parts = self._photom_loss(rgb, gt_rgb)
+      if stage == "train" and self.gaussian_layout == "layered" and self.mean_offset_reg_weight > 0:
+        # L2 penalty on the offset itself (not the resolved position) --
+        # pulls Gaussians back toward their depth-peel-seeded origin,
+        # the whole point of splitting means into a frozen original +
+        # an optimizable offset instead of leaving means fully free.
+        offset_reg = self.params["means"].pow(2).sum(-1).mean()
+        loss = loss + self.mean_offset_reg_weight * offset_reg
+        parts = {**parts, "mean_offset_reg": offset_reg}
 
     if stage == "train":
       for opt in self.optimizers_dict.values():
@@ -699,7 +759,13 @@ class Fit3DGSLightningModule(pl.LightningModule):
     return loss
 
   def params_np(self):
-    return {k: v.detach().cpu().numpy() for k, v in self.params.items()}
+    out = {k: v.detach().cpu().numpy() for k, v in self.params.items()}
+    # save_output/write_ply/save_output_layered all expect "means" to be
+    # the actual position -- resolve the offset here, once, rather than
+    # leak the offset/original split to every output writer.
+    if self.gaussian_layout == "layered":
+      out["means"] = self._active_means().detach().cpu().numpy()
+    return out
 
   def get_preview_source(self, mode):
     """See module.py's PanelCallback/OrbitCallback contract. COLMAP means
@@ -722,7 +788,7 @@ class Fit3DGSLightningModule(pl.LightningModule):
 
     with torch.no_grad():
       gauss = {
-        "means": self.params["means"], "quats": F.normalize(self.params["quats"], dim=-1),
+        "means": self._active_means(), "quats": F.normalize(self.params["quats"], dim=-1),
         "scales": torch.exp(self.params["scales"]), "opacities": torch.sigmoid(self.params["opacities"]),
         "colors": torch.cat([self.params["sh0"], self.params["shN"]], dim=1),
         "sh_degree": self.active_sh_degree,
@@ -773,7 +839,8 @@ def run_final_eval(model, test_cams, device):
       gt = torch.from_numpy(c["image"])[None].to(device)
       K = torch.from_numpy(c["K"])[None].to(device)
       vm = torch.from_numpy(c["viewmat"])[None].to(device)
-      rgb, _, _ = render(model.params, model.active_sh_degree, vm, K, c["width"], c["height"])
+      render_params = {**model.params, "means": model._active_means()}
+      rgb, _, _ = render(render_params, model.active_sh_degree, vm, K, c["width"], c["height"])
       mse = (rgb - gt).pow(2).mean()
       psnrs.append(float(-10 * torch.log10(mse)))
       ssims.append(float(1.0 - model.dssim(rgb.permute(0, 3, 1, 2), gt.permute(0, 3, 1, 2))))

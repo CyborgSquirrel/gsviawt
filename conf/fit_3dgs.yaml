@@ -33,6 +33,16 @@ output_path: null                     # null -> <source_path-or-hdf5_path>.fit3d
 # init_gaussians_layered/save_output_layered in fit_3dgs.py.
 gaussian_layout: set                  # set | layered
 
+# layered mode only: means = means_original (frozen, the depth-peel seed)
+# + this optimizable offset -- see Fit3DGSLightningModule._active_means.
+# Weight on an L2 penalty (offset.pow(2).sum(-1).mean()) added to the
+# train loss, pulling Gaussians back toward their seeded origin instead
+# of letting the offset drift unconstrained. 0 disables the penalty term
+# (offset still optimizable, just unregularized). No effect in "set" mode
+# (means has no offset split there at all). Untuned default -- adjust to
+# taste.
+mean_offset_reg_weight: 0.01
+
 # --- optimization (== arguments/OptimizationParams' defaults, verbatim) ---
 iters: 30000
 seed: 42
