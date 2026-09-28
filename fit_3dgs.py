@@ -672,8 +672,18 @@ class Fit3DGSLightningModule(pl.LightningModule):
     """See module.py's PanelCallback/OrbitCallback contract. COLMAP means
     are natively world-space already (no per-view camera-relative frame to
     undo, unlike train_gs.py's), so this is a direct activation + the fixed
-    preview cameras from __init__."""
-    key = (mode, self.current_epoch if mode == "epoch" else self.trainer.global_step)
+    preview cameras from __init__.
+
+    self.step_count, not self.trainer.global_step: manual optimization
+    (this file's whole reason for MANUAL optimization -- gsplat needs to
+    run between backward() and each optimizer's own .step(), and there
+    are several separate optimizers, one per param group) means Lightning
+    never sees any of our raw torch.optim.Adam.step() calls, so
+    trainer.global_step stays frozen at 0 for the entire run (see
+    module._completed_steps' own comment) -- every "step"-mode preview
+    would otherwise cache-hit on the FIRST call forever, logging the same
+    frame every time cadence fires instead of a fresh one."""
+    key = (mode, self.current_epoch if mode == "epoch" else self.step_count)
     if getattr(self, "_preview_cache_key", None) == key:
       return self._preview_cache
 

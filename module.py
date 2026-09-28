@@ -179,6 +179,27 @@ def guarded_render(tag):
     torch.cuda.empty_cache()
 
 
+def _completed_steps(trainer, pl_module):
+  """trainer.global_step, except for a LightningModule using MANUAL
+  optimization (pl_module.automatic_optimization == False) that steps its
+  own raw torch.optim.Optimizer objects directly rather than through
+  Lightning's LightningOptimizer proxies (fit_3dgs.py does this
+  deliberately -- gsplat's grow/prune/reset tensor surgery needs the real
+  optimizers, not a proxy, and it manages several of them at once, which
+  would inflate Lightning's own per-.step()-call counter anyway).
+  trainer.global_step is driven ENTIRELY by hooks Lightning injects onto
+  those proxies' own .step() method -- bypass the proxies and it silently
+  stays 0 forever (confirmed directly: instrumented a run and watched it
+  sit at 0 for 10/10 steps). A module built that way must expose its own
+  accurate step_count instead (fit_3dgs.py already tracks one, for its own
+  should_stop/LR-schedule/SH-degree-ramp bookkeeping) -- this reads that
+  when present, trainer.global_step otherwise. fit_gsplat.py/train_gs.py
+  both use plain automatic optimization and are unaffected either way."""
+  if not pl_module.automatic_optimization:
+    return int(pl_module.step_count)
+  return trainer.global_step
+
+
 # ---------------------------------------------------------------------------
 # preview_source / PanelCallback
 #
@@ -292,7 +313,7 @@ class PanelCallback(pl.Callback):
     else:
       if self.every_n_steps is None:
         return
-      n = trainer.global_step  # count of COMPLETED optimizer steps
+      n = _completed_steps(trainer, pl_module)  # count of COMPLETED optimizer steps
       if n == 0 or n % self.every_n_steps != 0:
         return
       stages = ("train", "val")
@@ -403,7 +424,7 @@ class ScaleLayersCallback(pl.Callback):
     else:
       if self.every_n_steps is None:
         return
-      n = trainer.global_step  # count of COMPLETED optimizer steps
+      n = _completed_steps(trainer, pl_module)  # count of COMPLETED optimizer steps
       if n == 0 or n % self.every_n_steps != 0:
         return
       stages = ("train", "val")
@@ -522,7 +543,7 @@ class OrbitCallback(pl.Callback):
     else:
       if self.every_n_steps is None:
         return
-      n = trainer.global_step  # count of COMPLETED optimizer steps
+      n = _completed_steps(trainer, pl_module)  # count of COMPLETED optimizer steps
       if n == 0 or n % self.every_n_steps != 0:
         return
       stages = ("train", "val")
