@@ -539,11 +539,23 @@ class Fit3DGSLightningModule(pl.LightningModule):
     import gsplat.strategy as gsstrat
     refine_start_iter = (int(cfg.iters) if self.gaussian_layout == "layered"
                         else int(cfg.densify.from_iter))
+    # opacity_reset_interval: null (conf/fit_3dgs.yaml) disables periodic
+    # reset entirely. DefaultStrategy itself has no boolean "off" for this
+    # -- reset_every is a plain int, gated only by `step % reset_every ==
+    # 0 and step > 0` (checked against gsplat-src directly: no disable
+    # flag anywhere in the library or its own examples) -- so "disabled"
+    # is expressed as a reset_every value that provably can't be hit by
+    # any step in this run: cfg.iters + 1 exceeds every step < iters, and
+    # step 0 is already excluded by the strategy's own `step > 0` guard.
+    # This conversion lives here, once, so callers say what they mean
+    # (null) instead of having to know/pass that sentinel themselves.
+    reset_every = (int(cfg.iters) + 1 if cfg.opacity_reset_interval is None
+                  else int(cfg.opacity_reset_interval))
     self.strategy = gsstrat.DefaultStrategy(
       prune_opa=float(cfg.densify.prune_opacity), grow_grad2d=float(cfg.densify.grad_threshold),
       grow_scale3d=float(cfg.percent_dense), prune_scale3d=float(cfg.densify.prune_scale3d),
       refine_start_iter=refine_start_iter, refine_stop_iter=int(cfg.densify.until_iter),
-      refine_every=int(cfg.densify.interval), reset_every=int(cfg.opacity_reset_interval),
+      refine_every=int(cfg.densify.interval), reset_every=reset_every,
       absgrad=False, revised_opacity=False,
     )
     # initialize_state()'s tensors are created lazily (None until the first

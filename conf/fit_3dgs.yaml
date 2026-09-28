@@ -69,7 +69,7 @@ densify:
   interval: 100                       # -> refine_every
   prune_opacity: 0.005                # -> prune_opa
   prune_scale3d: 0.1                  # -> prune_scale3d (world-size prune; == 0.1 * scene_extent, hardcoded in the reference too)
-opacity_reset_interval: 3000          # -> reset_every
+opacity_reset_interval: 3000          # -> reset_every; null disables periodic reset entirely
 
 # --- views per training step (batch_size=1 matches the paper's one-random-
 # camera-per-step loop; the reference's viewpoint_stack, reshuffled every
@@ -106,7 +106,7 @@ callbacks:
     every_n_steps: ${eval:'${iters} // 20'}
     num_frames: 24
     fps: 12
-    crf: 28
+    crf: 18
     elevation_deg: 20.0
 
 trainer:
