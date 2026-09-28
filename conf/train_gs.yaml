@@ -60,6 +60,18 @@ data:
   # GSFixedSourceDataset. Only used when val_target_views is set.
   val_targets_per_item: 1
 
+  # HACK (temporary): switches BOTH train_ds and val_ds to
+  # GSFixedSourceDataset, built off one plain shuffled split of the raw
+  # view list -- no mesh grouping, no data.split_fn, no GSPairDataset on
+  # either side (unlike val_target_views above, which still uses
+  # GSPairDataset for train_ds). Requires data.source_views to have
+  # exactly one entry. Takes priority over val_target_views if both are
+  # set. false (default): unchanged behavior.
+  fixed_source_dataset: false
+  # Fraction of the raw view list held out for val_ds, only used when
+  # fixed_source_dataset=true. Split once with a plain seeded shuffle.
+  fixed_source_val_fraction: 0.1
+
   # Train/val split for ordinary multi-scene training (ignored when
   # fixed_source_view or photom_h5_val is set -- see their own comments
   # below). A config group (conf/data/split_fn/*.yaml, picked via the

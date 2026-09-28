@@ -33,6 +33,7 @@ import contextlib as ctl
 import functools as ft
 import logging
 import os
+import random
 import sys
 
 import gsplat
@@ -490,6 +491,36 @@ class GSDataModule(pl.LightningDataModule):
         allow_source_as_target=cfg.data.allow_source_as_target,
       )
       self.val_ds = _external_val_dataset(cfg)
+    elif cfg.data.fixed_source_dataset:
+      # HACK (temporary, deliberately separate from every other branch
+      # here): GSPairDataset's row-indexed/mesh-grouped machinery and
+      # data.split_fn both assume a dataset indexed by source row, which
+      # doesn't fit a fixed-source, target-view-indexed dataset at all --
+      # rather than bend that machinery to fit, this just builds ONE plain
+      # shuffled split of the raw view list and hands each half to its own
+      # GSFixedSourceDataset. No mesh grouping, no split_fn, no
+      # GSPairDataset involved on either side.
+      if cfg.data.source_views is None or len(cfg.data.source_views) != 1:
+        raise SystemExit("data.fixed_source_dataset requires exactly one data.source_views entry")
+      catalog = H5Catalog(
+        cfg.data.photom_h5,
+        H5Catalog.path().alias("path"),
+        H5Catalog.index().alias("view_idx"),
+        H5Catalog.dataset("mesh_index").alias("mesh_id"),
+      )
+      source_view = int(catalog.take([cfg.data.source_views[0]]).df["view_idx"][0])
+      views = catalog.df["view_idx"].to_list()
+      random.Random(cfg.seed).shuffle(views)
+      n_val = int(len(views) * cfg.data.fixed_source_val_fraction)
+      val_views, train_views = views[:n_val], views[n_val:]
+      self.train_ds = GSFixedSourceDataset(
+        catalog, source_view=source_view, target_views=train_views,
+        num_layers=cfg.data.num_layers, targets_per_item=cfg.data.num_target_views,
+      )
+      self.val_ds = GSFixedSourceDataset(
+        catalog, source_view=source_view, target_views=val_views,
+        num_layers=cfg.data.num_layers, targets_per_item=cfg.data.val_targets_per_item,
+      )
     elif cfg.data.val_target_views is not None:
       # Single-fixed-source setup (data.source_views == exactly one entry)
       # validated by holding out a set of TARGET views instead of by
