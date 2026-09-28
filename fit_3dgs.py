@@ -711,15 +711,23 @@ class Fit3DGSLightningModule(pl.LightningModule):
         # run before backward for a non-leaf tensor to keep its .grad
         # populated.
         self.strategy.step_pre_backward(self.params, self.optimizers_dict, self.strategy_state, it, info)
-      loss, parts = self._photom_loss(rgb, gt_rgb)
+      # photom_loss: the L1+D-SSIM combo alone, logged as its own metric
+      # (loss/photom below) so it stays readable independent of whatever
+      # non-photometric terms (currently just mean_offset_reg) get folded
+      # into the full `loss` that's actually optimized -- fold additional
+      # terms into `loss` here, never back into photom_loss itself.
+      photom_loss, parts = self._photom_loss(rgb, gt_rgb)
+      loss = photom_loss
+      offset_reg = None
       if stage == "train" and self.gaussian_layout == "layered" and self.mean_offset_reg_weight > 0:
         # L2 penalty on the offset itself (not the resolved position) --
         # pulls Gaussians back toward their depth-peel-seeded origin,
         # the whole point of splitting means into a frozen original +
         # an optimizable offset instead of leaving means fully free.
+        # NOT folded into `parts` (that loop below logs everything in it
+        # under "loss/photom_*" -- this isn't a photometric term).
         offset_reg = self.params["means"].pow(2).sum(-1).mean()
         loss = loss + self.mean_offset_reg_weight * offset_reg
-        parts = {**parts, "mean_offset_reg": offset_reg}
 
     if stage == "train":
       for opt in self.optimizers_dict.values():
@@ -746,8 +754,11 @@ class Fit3DGSLightningModule(pl.LightningModule):
         log.info("iter %d: loss=%.5f  %d Gaussians", iteration, loss.item(), len(self.params["means"]))
 
     _log("loss", loss, prog_bar=(stage == "train"))
+    _log("loss/photom", photom_loss.detach())
     for k, v in parts.items():
       _log(f"loss/photom_{k}", v.detach())
+    if offset_reg is not None:
+      _log("loss/mean_offset_reg", offset_reg.detach())
     if stage == "train":
       self.log("train/num_gaussians", float(len(self.params["means"])), batch_size=B)
       self.log("train/active_sh_degree", float(self.active_sh_degree), batch_size=B)
