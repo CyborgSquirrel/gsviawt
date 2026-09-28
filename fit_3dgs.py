@@ -608,73 +608,94 @@ class Fit3DGSLightningModule(pl.LightningModule):
     return (1 - ld) * l1 + ld * dssim, {"l1": l1, "dssim": dssim}
 
   def training_step(self, batch, batch_idx):
-    it = self.step_count
-    self.step_count += 1
-    iteration = it + 1
-
-    # trainer.max_steps is NOT enforced under manual optimization (Lightning
-    # ties it to the automatic-optimization step-counting path, which we
-    # bypass entirely) -- with trainer.max_epochs=-1 as the only other stop
-    # condition, an unguarded run here is unbounded (confirmed the hard way:
-    # a 300-iters config ran ~700 epochs before OOM-thrashing on a runaway
-    # Gaussian count). Signal stop explicitly once our own 1-indexed
-    # `iteration` reaches cfg.iters -- Lightning checks should_stop within
-    # the epoch loop, not just between epochs, so this still stops promptly
-    # mid-epoch rather than running to that epoch's end.
-    if iteration >= int(self.cfg.iters):
-      self.trainer.should_stop = True
-
-    if iteration % 1000 == 0 and self.active_sh_degree < self.max_sh_degree:
-      self.active_sh_degree += 1
-    self.optimizers_dict["means"].param_groups[0]["lr"] = self.means_lr_fn(it)
-
-    gt_rgb, K, viewmat = batch["gt_rgb"], batch["K"], batch["viewmat"]
-    H, W = gt_rgb.shape[1:3]
-
-    rgb, alpha, info = render(self.params, self.active_sh_degree, viewmat, K, W, H)
-    # step_pre_backward calls info["means2d"].retain_grad() -- must run
-    # before backward for a non-leaf tensor to keep its .grad populated.
-    self.strategy.step_pre_backward(self.params, self.optimizers_dict, self.strategy_state, it, info)
-    loss, parts = self._photom_loss(rgb, gt_rgb)
-
-    for opt in self.optimizers_dict.values():
-      opt.zero_grad(set_to_none=True)
-    self.manual_backward(loss)
-
-    for opt in self.optimizers_dict.values():
-      opt.step()
-
-    # Post-backward, post-step (matches gsplat's own reference trainer's
-    # ordering, examples/simple_trainer.py -- grow/prune happens AFTER this
-    # step's gradient update is applied, using the gradient info accumulated
-    # THIS step, so it acts on next step's population, not this one's).
-    # Always called, in both gaussian_layout modes: __init__ is what
-    # actually disables grow/prune for "layered" (refine_start_iter pushed
-    # past cfg.iters), not a guard here -- opacity reset still needs to run.
-    self.strategy.step_post_backward(
-      self.params, self.optimizers_dict, self.strategy_state, it, info, packed=True)
-
-    self.views_seen += gt_rgb.shape[0]
-    self.final_loss = loss.item()
-    if iteration % int(self.cfg.densify.interval) == 0:
-      log.info("iter %d: loss=%.5f  %d Gaussians", iteration, loss.item(), len(self.params["means"]))
-    self.log("train/loss", loss, prog_bar=True, batch_size=gt_rgb.shape[0])
-    for k, v in parts.items():
-      self.log(f"train/loss/photom_{k}", v.detach(), batch_size=gt_rgb.shape[0])
-    self.log("train/num_gaussians", float(len(self.params["means"])), batch_size=gt_rgb.shape[0])
-    self.log("train/active_sh_degree", float(self.active_sh_degree), batch_size=gt_rgb.shape[0])
-    self.log("views_seen", self.views_seen, reduce_fx="max", batch_size=gt_rgb.shape[0])
-    return loss
+    return self._step("train", batch, batch_idx)
 
   def validation_step(self, batch, batch_idx):
+    return self._step("val", batch, batch_idx)
+
+  def _step(self, stage, batch, batch_idx):
+    """Shared by training_step/validation_step (fit_gsplat.py/train_gs.py's
+    own convention -- one _step, not two near-identical copies: that's how
+    views_seen ended up logged for train but silently never for val, a
+    literal duplicated-code bug, not a deliberate omission). Everything
+    that mutates optimizer/strategy state (backward, the 6 optimizers'
+    .step(), gsplat's grow/prune/reset, the means-LR/SH-degree schedule,
+    should_stop) stays train-only -- gated by `stage == "train"` inline,
+    same as fit_gsplat.py gates its own train-only bits (random_bg,
+    final_loss) inside its shared _step."""
+    def _log(key, *args, **kwargs):
+      self.log(f"{stage}/{key}", *args, **kwargs, batch_size=B)
+
     gt_rgb, K, viewmat = batch["gt_rgb"], batch["K"], batch["viewmat"]
+    B = gt_rgb.shape[0]
     H, W = gt_rgb.shape[1:3]
-    with torch.no_grad():
-      rgb, _, _ = render(self.params, self.active_sh_degree, viewmat, K, W, H)
+    it = self.step_count
+
+    if stage == "train":
+      self.step_count += 1
+      iteration = it + 1
+
+      # trainer.max_steps is NOT enforced under manual optimization
+      # (Lightning ties it to the automatic-optimization step-counting
+      # path, which we bypass entirely) -- with trainer.max_epochs=-1 as
+      # the only other stop condition, an unguarded run here is unbounded
+      # (confirmed the hard way: a 300-iters config ran ~700 epochs
+      # before OOM-thrashing on a runaway Gaussian count). Signal stop
+      # explicitly once our own 1-indexed `iteration` reaches cfg.iters
+      # -- Lightning checks should_stop within the epoch loop, not just
+      # between epochs, so this still stops promptly mid-epoch rather
+      # than running to that epoch's end.
+      if iteration >= int(self.cfg.iters):
+        self.trainer.should_stop = True
+
+      if iteration % 1000 == 0 and self.active_sh_degree < self.max_sh_degree:
+        self.active_sh_degree += 1
+      self.optimizers_dict["means"].param_groups[0]["lr"] = self.means_lr_fn(it)
+
+    with torch.set_grad_enabled(stage == "train"):
+      rgb, alpha, info = render(self.params, self.active_sh_degree, viewmat, K, W, H)
+      if stage == "train":
+        # step_pre_backward calls info["means2d"].retain_grad() -- must
+        # run before backward for a non-leaf tensor to keep its .grad
+        # populated.
+        self.strategy.step_pre_backward(self.params, self.optimizers_dict, self.strategy_state, it, info)
       loss, parts = self._photom_loss(rgb, gt_rgb)
-    self.log("val/loss", loss, batch_size=gt_rgb.shape[0])
+
+    if stage == "train":
+      for opt in self.optimizers_dict.values():
+        opt.zero_grad(set_to_none=True)
+      self.manual_backward(loss)
+
+      for opt in self.optimizers_dict.values():
+        opt.step()
+
+      # Post-backward, post-step (matches gsplat's own reference trainer's
+      # ordering, examples/simple_trainer.py -- grow/prune happens AFTER
+      # this step's gradient update is applied, using the gradient info
+      # accumulated THIS step, so it acts on next step's population, not
+      # this one's). Always called, in both gaussian_layout modes:
+      # __init__ is what actually disables grow/prune for "layered"
+      # (refine_start_iter pushed past cfg.iters), not a guard here --
+      # opacity reset still needs to run.
+      self.strategy.step_post_backward(
+        self.params, self.optimizers_dict, self.strategy_state, it, info, packed=True)
+
+      self.views_seen += B
+      self.final_loss = loss.item()
+      if iteration % int(self.cfg.densify.interval) == 0:
+        log.info("iter %d: loss=%.5f  %d Gaussians", iteration, loss.item(), len(self.params["means"]))
+
+    _log("loss", loss, prog_bar=(stage == "train"))
     for k, v in parts.items():
-      self.log(f"val/loss/photom_{k}", v.detach(), batch_size=gt_rgb.shape[0])
+      _log(f"loss/photom_{k}", v.detach())
+    if stage == "train":
+      self.log("train/num_gaussians", float(len(self.params["means"])), batch_size=B)
+      self.log("train/active_sh_degree", float(self.active_sh_degree), batch_size=B)
+    # Bare key, no stage prefix (matches fit_gsplat.py) -- logged every
+    # call, both stages, so the x-axis-like counter has continuous
+    # coverage across train AND val points instead of gaps during
+    # validation-only logging windows. Only train increments it.
+    self.log("views_seen", self.views_seen, reduce_fx="max", batch_size=B)
     return loss
 
   def params_np(self):
