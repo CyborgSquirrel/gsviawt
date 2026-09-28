@@ -24,6 +24,41 @@ data:
   photom_h5: /app/bla/lite_blackbg.h5   # str, list, or glob(s) -- render_objaverse.py-schema
   num_layers: 6                         # must match the file(s)' depth_peel layer count
   num_target_views: 3                   # extra supervision views per step, alongside self-render
+  # Which catalog rows are eligible to be a SOURCE view for train_ds ONLY
+  # (GSPairDataset.source_views; not applied to val_ds -- an empty/small val
+  # split has no guarantee of overlapping whatever's restricted here, and
+  # val is a separate concern from what the model trains to encode). Row
+  # positions (H5Catalog.take()'s index space), not raw view_idx values --
+  # they coincide for an unsplit single-file catalog (e.g. omit
+  # data/split_fn=by_view, which reorders rows via random_split even at
+  # val_fraction=0) but NOT after any split that reorders/subsets rows.
+  # Target-view sampling is unaffected, still drawn from every view of the
+  # source's mesh. null (default): every view is eligible, unchanged
+  # behavior.
+  source_views: null
+
+  # Whether a source view is also eligible to land in its own target_views
+  # list (GSPairDataset.allow_source_as_target). false (default, unchanged
+  # behavior): source_view is always excluded, so every sampled target is a
+  # genuinely different view. true: source_view is just another member of
+  # the mesh's view pool, same odds as any other view.
+  allow_source_as_target: false
+
+  # Held-out TARGET views for validating a single-fixed-source setup
+  # (requires data.source_views to have EXACTLY one entry) -- GSFixedSourceDataset,
+  # indexed by held-out view instead of by source row, so val_ds isn't
+  # collapsed to 0/1 rows the way GSPairDataset's own row-indexed val would
+  # be with only one eligible source. Raw view_idx values (GSFixedSourceDataset's
+  # own domain, not H5Catalog.take()'s row-position space like source_views
+  # above). Bypasses data.split_fn entirely (assumes a single-mesh catalog).
+  # train_ds's own target-sampling pool automatically excludes these views
+  # (via GSPairDataset.target_views), so train/val targets stay disjoint.
+  # null (default): unchanged behavior, no fixed-source validation split.
+  val_target_views: null
+  # How many of val_target_views one validation row renders/supervises at
+  # once, through a single encoder pass on the shared source -- see
+  # GSFixedSourceDataset. Only used when val_target_views is set.
+  val_targets_per_item: 1
 
   # Train/val split for ordinary multi-scene training (ignored when
   # fixed_source_view or photom_h5_val is set -- see their own comments
@@ -122,6 +157,13 @@ model:
   scale_lambda: 0.01
   min_scale_mult: 1.0
   sh_scale: 1.0
+  # Zero-init the decoder's final 1x1 conv WEIGHT (bias still gets the
+  # per-group values above, e.g. log(scale_bias)) instead of the
+  # Xavier-uniform per-group init. At step 0 every pixel/layer then predicts
+  # the exact same constant Gaussian (whatever the biases encode), with the
+  # encoder features contributing nothing until gradients grow the weight
+  # away from zero. false (default): unchanged Xavier-uniform init.
+  zero_init_last_conv: false
   # Which Gaussian fields the network is trained/trusted to predict; the rest
   # are overwritten with data.gauss_h5 values before
   # flattening/rendering. E.g. [scale] isolates scale's own learning signal
@@ -136,8 +178,20 @@ model:
 
 loss:
   photom:
+    for: [source, target]
     l1_weight: 1.0
     dssim_weight: 0.85
+
+  # Composite both the predicted render AND the ground truth onto a random
+  # background color before computing the photometric losses above --
+  # train stage only (module.GSLightningModule._step), never val, and never
+  # visualizations (_preview_entry/panels/orbit videos don't call
+  # model_forward at all, so they're unaffected regardless of this flag). A
+  # different random color per BATCH ITEM (not per view -- every view of a
+  # given item shares one color), uniform in [0,1]^3. false (default):
+  # unchanged behavior, whatever background gsplat/render_objaverse.py
+  # already use.
+  random_bg: false
 
   scale_reg_weight: 0.001    # 0 disables; penalizes scale > scale_reg_thresh
   scale_reg_thresh: 0.05     # ~5% of a unit-cube object -- already a big single Gaussian.
@@ -185,6 +239,10 @@ callbacks:
 
   panel:
     _target_: module.PanelCallback
+    every_n_epochs: ${eval:'${trainer.max_epochs} // 50'}
+
+  scale_layers:
+    _target_: module.ScaleLayersCallback
     every_n_epochs: ${eval:'${trainer.max_epochs} // 50'}
 
 loader:

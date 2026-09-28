@@ -1,0 +1,137 @@
+# Config for fit_3dgs.py -- faithful 3D Gaussian Splatting optimization on a
+# COLMAP scene (same format/folders as our gaussian-splatting/ reproduction:
+# data/tandt/truck etc), Hydra + Lightning-shaped like fit_gsplat.py. See
+# fit_3dgs.py's module docstring for what "faithful" covers here.
+
+defaults:
+  # Only used when hdf5_path (below) is set -- picks load_scene_h5()'s
+  # train/val split instead of COLMAP's llffhold=8. Same option group /
+  # override syntax train_gs.py's conf/train_gs.yaml uses (data/split_fn=by_indices etc).
+  - data/split_fn: by_view
+  - _self_
+
+# --- input: exactly ONE of these two ---
+source_path: /app/data/tandt/truck   # COLMAP scene root: images/ + sparse/0/
+images: images                        # image subfolder name (readColmapSceneInfo's `images` arg)
+resolution: auto                      # auto = original's own auto-halve-if->1600px-wide default (the reference's -1); or 1/2/4/8 to divide directly
+eval: true                            # llffhold=8 train/test split, same as our repro run
+
+# render_objaverse.py-schema HDF5 (one object, no COLMAP data) instead of
+# source_path -- e.g. /app/bla/porsche_50views_rgb512_depth224.h5. Sets
+# load_scene_h5() instead of load_scene(); see its own docstring for the
+# point-cloud-seed / background / split differences from the COLMAP path.
+# null (default) -> use source_path/images/eval above instead.
+hdf5_path: null
+
+output_path: null                     # null -> <source_path-or-hdf5_path>.fit3dgs.h5
+
+# set: free xyz, real growing/shrinking densification (what fit_3dgs.py has
+# always done). layered: one Gaussian per depth-peel hit in the primary
+# train view (like fit_gsplat.py), Gaussian COUNT fixed for the whole run
+# (densify/prune below forced off regardless of their own settings) -- only
+# valid with hdf5_path set to an h5 that actually has depth_peel. See
+# init_gaussians_layered/save_output_layered in fit_3dgs.py.
+gaussian_layout: set                  # set | layered
+
+# layered mode only: means = means_original (frozen, the depth-peel seed)
+# + this optimizable offset -- see Fit3DGSLightningModule._active_means.
+# Weight on an L2 penalty (offset.pow(2).sum(-1).mean()) added to the
+# train loss, pulling Gaussians back toward their seeded origin instead
+# of letting the offset drift unconstrained. 0 disables the penalty term
+# (offset still optimizable, just unregularized). No effect in "set" mode
+# (means has no offset split there at all). Untuned default -- adjust to
+# taste.
+mean_offset_reg_weight: 0.01
+
+# --- optimization (== arguments/OptimizationParams' defaults, verbatim) ---
+iters: 30000
+seed: 42
+sh_degree: 3                          # max SH degree; active degree ramps up by 1 every 1000 iters
+
+lr:
+  means_init: 0.00016                 # x spatial_lr_scale (== scene_extent, the NerfppNorm radius)
+  means_final: 0.0000016              # x spatial_lr_scale
+  means_delay_mult: 0.01
+  means_max_steps: 30000              # reference's position_lr_max_steps -- an INDEPENDENT
+                                       # hyperparameter, not tied to `iters` (a short debug run
+                                       # with a lower `iters` is then just the first part of a
+                                       # real run's LR schedule, not a fully-decayed short one)
+  features_dc: 0.0025
+  features_rest: 0.000125             # == features_dc / 20
+  opacities: 0.025
+  scales: 0.005
+  quats: 0.001
+
+lambda_dssim: 0.2
+percent_dense: 0.01                   # -> gsplat DefaultStrategy's grow_scale3d
+init_opacity: 0.1
+knn_k: 3                              # nearest neighbours for initial scale (matches simple_knn's distCUDA2 default k)
+
+# --- densification (== gsplat.strategy.DefaultStrategy, see fit_3dgs.py's
+# own comment on why DefaultStrategy itself isn't used directly -- v1.5.3's
+# opacity-reset scheduling is dead code from an operator-precedence bug,
+# fixed in our vendored gsplat-src/ but we still drive the ops ourselves so
+# the schedule is auditable against arguments/OptimizationParams verbatim) ---
+densify:
+  grad_threshold: 0.0002              # -> grow_grad2d
+  from_iter: 500                      # -> refine_start_iter
+  until_iter: 15000                   # -> refine_stop_iter
+  interval: 100                       # -> refine_every
+  prune_opacity: 0.005                # -> prune_opa
+  prune_scale3d: 0.1                  # -> prune_scale3d (world-size prune; == 0.1 * scene_extent, hardcoded in the reference too)
+opacity_reset_interval: 3000          # -> reset_every; null disables periodic reset entirely
+
+# --- views per training step (batch_size=1 matches the paper's one-random-
+# camera-per-step loop; the reference's viewpoint_stack, reshuffled every
+# epoch, is exactly DataLoader(shuffle=True) over one epoch == one pass) ---
+loader:
+  batch_size: 1
+  num_workers: 0
+
+# --- final eval-within-script: llffhold test split, PSNR/SSIM/LPIPS(vgg),
+# same methodology as gaussian-splatting/metrics.py -- logged to wandb
+# summary and written next to the output .ply/.h5 as results.json, directly
+# comparable to our manual full_eval.py-style reproduction's own output. ---
+final_eval: true
+
+wandb:
+  project: gsviawt
+  mode: online
+  tags: [fit-3dgs]
+  name: null
+
+# Same wandb train/val [GT | render | |diff|] panel + orbit turntable
+# fit_gsplat.py/train_gs.py log -- module.{Panel,Orbit}Callback, shared, see
+# their own docstrings. Cadence in STEPS (not epochs): one epoch here is one
+# pass over the (small, ~100-300 image) train split, so step cadence is the
+# only one worth using -- an every_n_epochs=1 panel would fire many times a
+# minute early on.
+callbacks:
+  panel:
+    _target_: module.PanelCallback
+    every_n_steps: ${eval:'${iters} // 100'}
+
+  orbit:
+    _target_: module.OrbitCallback
+    every_n_steps: ${eval:'${iters} // 20'}
+    num_frames: 24
+    fps: 12
+    crf: 18
+    elevation_deg: 20.0
+
+trainer:
+  max_steps: ${iters}
+  max_epochs: -1
+  accelerator: auto
+  devices: 1
+  enable_checkpointing: false
+  num_sanity_val_steps: 0             # skip: val render before any training step is pure overhead here
+  check_val_every_n_epoch: 5          # train split is many epochs long at batch_size=1; don't val every single one
+  log_every_n_steps: 10
+  gradient_clip_val: null             # unset: not part of the reference algorithm, don't add it silently
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: outputs/fit_3dgs/${now:%Y-%m-%d_%H-%M-%S}

@@ -227,6 +227,37 @@ EOF
 # gsplat: point torch.utils.cpp_extension at the pip CUDA toolchain.
 ENV CUDA_HOME="/home/user/venv/lib/python3.13/site-packages/nvidia/cu13"
 ENV PATH="/home/user/venv/lib/python3.13/site-packages/nvidia/cu13/bin:$PATH"
+ENV TORCH_CUDA_ARCH_LIST="8.6;8.9+PTX"
+
+# gsplat/ -- vendored (like gaussian-splatting/) at commit 6e8c837f, past the
+# v1.5.3 PyPI release (still gsplat's latest release) but before main's
+# unrelated ~674-commit GaussianScene/Stage namespace refactor. 6e8c837f is
+# the smallest step past v1.5.3 that fixes strategy/default.py's
+# `step % reset_every == 0 & step > 0` -- `&` binds tighter than `==`/`>` in
+# Python, and `0 & step` is always 0, so that condition chains to
+# `... and (0 > 0)` and NEVER fires: DefaultStrategy's periodic opacity reset
+# silently never runs in v1.5.3. Fixed upstream in PR #776, 4 commits after
+# v1.5.3, touching only that one line (verified: `git diff v1.5.3..6e8c837f --
+# gsplat/strategy/ops.py gsplat/rasterize.py gsplat/cuda/` is empty).
+#
+# Vendored rather than `pip install git+...@6e8c837f` because building from
+# source (no wheel for a git ref) needs one more local patch: this commit's
+# setup.py still hardcodes `-std=c++17`, which predates gsplat's later,
+# much-larger move to c++20 (upstream commit a8d88d38) -- our torch (2.14+)
+# needs C++20 (std::strong_ordering / weak_intrusive_ptr's spaceship
+# operator in its c10/ATen headers) and fails to compile under c++17.
+# Bumping just that flag, standalone (see gsplat-src/setup.py's own
+# comment), gets the one-line fix without the large unrelated commit.
+#
+# Also needs --no-build-isolation (torch already installed above): its
+# setup.py imports torch at build time, unlike requirements.txt's normal
+# isolated compile/install (see that file's own comment on this).
+COPY --chown=$XUID:$XGID gsplat-src gsplat-src
+RUN \
+  --mount=type=cache,uid=$XUID,gid=$XGID,dst=$UV_PYTHON_CACHE_DIR,id=uv \
+<<EOF
+  uv pip install --no-build-isolation ./gsplat-src
+EOF
 
 # Pre-compile gsplat's CUDA kernels into the image so no container ever
 # JIT-compiles them on first use (that's a ~2-4 min stall, and ~/.cache isn't
@@ -235,12 +266,21 @@ ENV PATH="/home/user/venv/lib/python3.13/site-packages/nvidia/cu13/bin:$PATH"
 # 3080 (local dev), 8.9 = L4 (Modal); +PTX lets newer cards JIT from PTX. The
 # compiled .so lands in ~/.cache/torch_extensions and is loaded as-is at
 # runtime. This layer only rebuilds when requirements.txt changes.
-ENV TORCH_CUDA_ARCH_LIST="8.6;8.9+PTX"
 RUN python -c "import gsplat; print('gsplat', gsplat.__version__, '- CUDA kernels prebuilt')"
 
 # Copy everything (this is the only place world-tracing's actual source
 # lands in the image)
 COPY --chown=$XUID:$XGID . .
+
+# gaussian-splatting/ used to be a full vendor of the Inria reference
+# implementation (including diff-gaussian-rasterization/simple-knn/
+# fused-ssim CUDA extensions, built here) -- trimmed down to just the
+# handful of pure-Python files fit_3dgs.py actually imports at runtime
+# (COLMAP parsing + a few math utils; see gaussian-splatting/scene/
+# dataset_readers.py's own comment on the one import patched to drop the
+# simple_knn dependency). fit_3dgs.py renders with gsplat, not
+# diff-gaussian-rasterization, so none of those extensions are needed here
+# any more -- nothing to build.
 
 # Register world tracing itself now that its source exists. Cheap: all of
 # its dependencies were already installed above, so this just builds/links

@@ -1,3 +1,5 @@
+name: gsviawt-3dgs-repro
+
 services:
   app-base:
     profiles: ["_base"]
@@ -18,6 +20,12 @@ services:
       - ./.venv:/mounts/venv:rw
 
       # - ./data:/mounts/data
+
+      # This worktree's own tree has no bla/ (gitignored, worktree-local) --
+      # read-only mount of the main checkout's bla/ so render .h5 datasets
+      # (e.g. the porsche renders) are reachable at /app/bla/... same as in
+      # the main gsviawt-app-gpu container.
+      - ../../../bla:/app/bla:ro
 
       - ./mounts/huggingface:/home/user/.cache/huggingface:rw
       - ./mounts/objaverse:/home/user/.objaverse:rw
@@ -49,7 +57,7 @@ services:
     profiles: ["cpu"]
     build:
       x-bake:
-        output: ["type=docker,name=gsviawt-app-cpu:latest,compression=zstd,compression-level=3,force-compression=true"]
+        output: ["type=docker,name=gsviawt-3dgs-repro-app-cpu:latest,compression=zstd,compression-level=3,force-compression=true"]
 
   app-gpu:
     extends:
@@ -57,7 +65,7 @@ services:
     profiles: ["gpu"]
     build:
       x-bake:
-        output: ["type=docker,name=gsviawt-app-gpu:latest,compression=zstd,compression-level=3,force-compression=true"]
+        output: ["type=docker,name=gsviawt-3dgs-repro-app-gpu:latest,compression=zstd,compression-level=3,force-compression=true"]
     deploy:
       resources:
         reservations:

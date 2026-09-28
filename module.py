@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Shared PyTorch Lightning building blocks for train_gs.py and fit_gsplat.py.
+"""Shared PyTorch Lightning building blocks for train_gs.py and fit_3dgs.py.
 
 Both scripts optimize Gaussian-splat parameters against gsplat photometric
 renders under a `pl.Trainer` (train_gs.py: a network's predicted Gaussians
-over a dataset; fit_gsplat.py: one scene's own Gaussians, directly). That's
+over a dataset; fit_3dgs.py: one scene's own Gaussians, directly). That's
 where the overlap actually is -- the loss/schedule/OOM-handling plumbing,
 plus the PanelCallback/OrbitCallback pair below, which each PULL a
 normalized snapshot from the LightningModule (get_preview_source(), one
@@ -20,6 +20,10 @@ OrbitCallback fully shared below: one world-frame turntable formula
 (WORLD_UP/look_at_c2w), no per-script pose method at all -- it only needs
 a distance (each get_preview_source() includes its own "scene_scale") and
 the already-world-space Gaussians.
+
+Also holds the depth-peel Gaussian-seeding helpers (SH_C0/init_gaussians/
+make_viewmats/_scatter_grid) that used to live in fit_gsplat.py, now used
+by fit_3dgs.py's layered mode, orbit_video.py and gs_decoder.py.
 """
 
 import contextlib as ctl
@@ -33,18 +37,20 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import pack, rearrange, repeat
+from einops import pack, rearrange, reduce, repeat
 from omegaconf import OmegaConf
 from torch.optim import Optimizer
 
 import wandb
+
+from debug_pointcloud import unproject_depth_peel
 
 log = logging.getLogger(__name__)
 
 # Both scripts' conf/*.yaml lean on this for callback/trainer fields that are
 # a small expression over another field rather than a literal (e.g.
 # "${eval:'${iters} // 50'}") -- registered here, once, so importing either
-# script (train_gs.py imports fit_gsplat.py imports this module) can't
+# script (both import this module, directly or via gs_decoder.py) can't
 # double-register it and raise.
 if not OmegaConf.has_resolver("eval"):
   OmegaConf.register_new_resolver("eval", eval)
@@ -69,6 +75,72 @@ def look_at_c2w(eye, target, up=WORLD_UP):
   c2w = np.eye(4, dtype=np.float32)
   c2w[:3, 0], c2w[:3, 1], c2w[:3, 2], c2w[:3, 3] = x, y, z, eye
   return c2w
+
+
+# ---------------------------------------------------------------------------
+# depth-peel Gaussian seeding -- shared by fit_3dgs.py's layered mode,
+# orbit_video.py and gs_decoder.py (formerly fit_gsplat.py's own, moved here
+# when that script was deleted)
+# ---------------------------------------------------------------------------
+
+SH_C0 = 0.28209479177387814  # SH band-0 constant, for RGB <-> sh0 in the .ply
+
+
+def _logit(x, eps=1e-4):
+  x = np.clip(x, eps, 1.0 - eps)
+  return np.log(x / (1.0 - x))
+
+
+def init_gaussians(depth_primary, K_primary, pose_primary, image_primary,
+                   knn_k, init_opacity):
+  """Seed one Gaussian per depth-peel hit in the primary view. Returns numpy
+  arrays; `u/v/layer` record each Gaussian's pixel + peel-layer of origin (in
+  depth-peel pixels). `image_primary` may be a different resolution than the
+  depth peel -- the seed colour is nearest-sampled at the scaled location."""
+  pts, u, v, layer = unproject_depth_peel(
+    depth_primary, K_primary, pose_primary, space="world")          # (P,3), (P,), (P,), (P,)
+  if len(pts) == 0:
+    raise SystemExit("primary view has no depth-peel hits -- nothing to seed")
+
+  dh, dw = depth_primary.shape[:2]
+  ih, iw = image_primary.shape[:2]
+  iv = np.clip(np.round(v * (ih / dh)), 0, ih - 1).astype(np.int64)
+  iu = np.clip(np.round(u * (iw / dw)), 0, iw - 1).astype(np.int64)
+  colors = image_primary[iv, iu, :3].astype(np.float32) / 255.0      # front-pixel colour
+
+  # isotropic initial scale = mean distance to the knn_k nearest neighbours
+  from scipy.spatial import cKDTree
+  k = min(knn_k + 1, len(pts))
+  dist, _ = cKDTree(pts).query(pts, k=k)                    # (P, k), or (P,) when k == 1
+  dist = rearrange(dist, "p -> p 1") if dist.ndim == 1 else dist
+  neighbours = dist[:, 1:] if k > 1 else dist               # column 0 is the point itself
+  nn = reduce(neighbours, "p k -> p", "mean")
+  nn = np.clip(nn, 1e-6, None).astype(np.float32)
+
+  return {
+    "means": pts.astype(np.float32),
+    "scales_log": repeat(np.log(nn), "p -> p xyz", xyz=3).astype(np.float32),
+    "quats": np.tile([1.0, 0.0, 0.0, 0.0], (len(pts), 1)).astype(np.float32),
+    "opac_logit": np.full(len(pts), _logit(np.float32(init_opacity)), np.float32),
+    "colors_logit": _logit(colors).astype(np.float32),
+    "u": u.astype(np.int64), "v": v.astype(np.int64), "layer": layer.astype(np.int64),
+  }
+
+
+def make_viewmats(poses):
+  """poses: (V,4,4) camera-to-world, OpenGL cam axes. Returns (V,4,4)
+  world-to-camera in OpenCV convention -- what gsplat wants."""
+  c2w_cv = poses @ OPENGL_TO_OPENCV
+  return np.linalg.inv(c2w_cv).astype(np.float32)
+
+
+def _scatter_grid(flat, v, u, layer, H, W, L):
+  """flat: (G,) or (G,C). Returns (H,W,L) or (H,W,L,C) float32 with NaN in
+  every slot that has no Gaussian."""
+  shape = (H, W, L) if flat.ndim == 1 else (H, W, L, flat.shape[1])
+  grid = np.full(shape, np.nan, np.float32)
+  grid[v, u, layer] = flat
+  return grid
 
 
 class WarmupCosineAnnealingLR(torch.optim.lr_scheduler.SequentialLR):
@@ -179,6 +251,27 @@ def guarded_render(tag):
     torch.cuda.empty_cache()
 
 
+def _completed_steps(trainer, pl_module):
+  """trainer.global_step, except for a LightningModule using MANUAL
+  optimization (pl_module.automatic_optimization == False) that steps its
+  own raw torch.optim.Optimizer objects directly rather than through
+  Lightning's LightningOptimizer proxies (fit_3dgs.py does this
+  deliberately -- gsplat's grow/prune/reset tensor surgery needs the real
+  optimizers, not a proxy, and it manages several of them at once, which
+  would inflate Lightning's own per-.step()-call counter anyway).
+  trainer.global_step is driven ENTIRELY by hooks Lightning injects onto
+  those proxies' own .step() method -- bypass the proxies and it silently
+  stays 0 forever (confirmed directly: instrumented a run and watched it
+  sit at 0 for 10/10 steps). A module built that way must expose its own
+  accurate step_count instead (fit_3dgs.py already tracks one, for its own
+  should_stop/LR-schedule/SH-degree-ramp bookkeeping) -- this reads that
+  when present, trainer.global_step otherwise. fit_gsplat.py/train_gs.py
+  both use plain automatic optimization and are unaffected either way."""
+  if not pl_module.automatic_optimization:
+    return int(pl_module.step_count)
+  return trainer.global_step
+
+
 # ---------------------------------------------------------------------------
 # preview_source / PanelCallback
 #
@@ -200,7 +293,8 @@ def guarded_render(tag):
 # taking mode ("epoch" | "step", matching which cadence fired) and
 # returning
 #   {"train": {"gauss": {...}, "scene_scale": float,
-#              "views": {"viewmat","K","width","height","gt_rgb"}},
+#              "views": {"viewmat","K","width","height","gt_rgb"},
+#              "gauss_layers": {...} (optional)},
 #    "val": same shape, or None}
 # (gauss arrays already flattened/activated -- exactly what render() already
 # needs in fit_gsplat.py, or one flatten_gaussians() yield in train_gs.py;
@@ -208,6 +302,13 @@ def guarded_render(tag):
 # (mode, epoch-or-step) (see either implementation) so a second caller at
 # the same point doesn't redundantly redo the forward pass. No callback
 # ordering to get right, no cost on ticks the panel isn't even logged.
+#
+# gauss_layers (optional, only train_gs.py's GSLightningModule populates
+# it): the PRE-flatten_gaussians per-layer decoder output -- {"scale":
+# (L,3,H,W), "hit": (L,H,W) bool, ...the rest of the raw gauss dict} --
+# ScaleLayersCallback below reads this instead of "gauss" specifically so a
+# single exploded pixel doesn't disappear into flatten_gaussians' ~14k-point
+# mean/render.
 #
 # "val" is only ever populated in step mode (mode == "step"): epoch mode
 # stays train-only, same as it always has been (on_train_epoch_end is the
@@ -284,7 +385,7 @@ class PanelCallback(pl.Callback):
     else:
       if self.every_n_steps is None:
         return
-      n = trainer.global_step  # count of COMPLETED optimizer steps
+      n = _completed_steps(trainer, pl_module)  # count of COMPLETED optimizer steps
       if n == 0 or n % self.every_n_steps != 0:
         return
       stages = ("train", "val")
@@ -313,6 +414,110 @@ class PanelCallback(pl.Callback):
         panel = _build_panel(views["gt_rgb"], pred_rgb)
         log_payload[f"{stage}/panel"] = wandb.Image(
           panel, caption="GT | render | |diff|, one row per view")
+    if not log_payload:
+      return
+
+    log_payload["views_seen"] = pl_module.views_seen  # TODO: better way to handle this
+    wandb_run.log(log_payload)
+
+
+def _colorize_scale_layers(scale, hit):
+  """scale: (L,3,H,W) tensor -- the raw per-axis scale MULTIPLIER for each
+  depth-peel layer, straight from the decoder (train_gs.py's GSModel
+  output), before flatten_gaussians collapses layers/pixels into one point
+  list. hit: (L,H,W) bool -- which grid cells hold an actual Gaussian
+  (the rest is empty depth-peel padding).
+
+  Returns one uint8 (H, L*W, 3) array: log10(max-axis scale) colorized
+  (inferno) per layer side by side, invalid cells rendered flat gray so
+  "no Gaussian here" reads differently from "small Gaussian here" under
+  the colormap. Normalized against this call's OWN min/max (not a fixed
+  range) -- the point is spotting a relative outlier, and the value can
+  span many orders of magnitude (an exp() activation with no upper
+  clamp -- see loss.scale_reg's own docstring in conf/train_gs.yaml)."""
+  import matplotlib
+
+  scale_np = scale.detach().float().cpu().numpy()       # (L,3,H,W)
+  hit_np = hit.detach().cpu().numpy().astype(bool)       # (L,H,W)
+  mag = scale_np.max(axis=1)                             # (L,H,W) -- worst axis per pixel
+
+  log_mag = np.log10(np.clip(mag, 1e-8, None))
+  valid = log_mag[hit_np]
+  lo, hi = (float(valid.min()), float(valid.max())) if valid.size else (0.0, 1.0)
+  if hi <= lo:
+    hi = lo + 1.0
+  norm = np.clip((log_mag - lo) / (hi - lo), 0.0, 1.0)
+
+  cmap = matplotlib.colormaps["inferno"]
+  rgb = (cmap(norm)[..., :3] * 255).astype(np.uint8)     # (L,H,W,3)
+  rgb[~hit_np] = 60
+
+  image = np.concatenate([rgb[l] for l in range(rgb.shape[0])], axis=1)  # (H, L*W, 3)
+  return image
+
+
+class ScaleLayersCallback(pl.Callback):
+  """Per-depth-peel-layer visualization of the model's predicted Gaussian
+  `scale`, pulled from the UNFLATTENED gauss_layers entry
+  get_preview_source() puts alongside its usual flattened "gauss" (see
+  train_gs.py's _preview_entry) -- flatten_gaussians concatenates every
+  layer/pixel into one ~14k-point cloud for PanelCallback/OrbitCallback,
+  which is exactly where a single exploded pixel goes invisible (buried in
+  the mean/the render). This reads the pre-flatten (L,C,H,W) grid straight
+  from the decoder instead, so one bad pixel in one layer stays visually
+  and numerically identifiable.
+
+  Same pull/cadence contract as PanelCallback/OrbitCallback (see this
+  module's own top-of-file comment block): every_n_epochs XOR
+  every_n_steps, pulls pl_module.get_preview_source(mode) (same call,
+  same cache). Stages whose entry has no "gauss_layers" key (an
+  implementation that doesn't populate it) are skipped, same as a stage
+  with no entry at all."""
+
+  def __init__(self, *, every_n_epochs: int | None = None, every_n_steps: int | None = None):
+    _cadence_check(every_n_epochs, every_n_steps, "ScaleLayersCallback")
+    self.every_n_epochs = every_n_epochs
+    self.every_n_steps = every_n_steps
+
+  def on_train_epoch_end(self, trainer, pl_module):
+    self._step("epoch", trainer, pl_module)
+
+  def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+    self._step("step", trainer, pl_module)
+
+  def _step(self, mode, trainer, pl_module):
+    if mode == "epoch":
+      if self.every_n_epochs is None:
+        return
+      n = trainer.current_epoch + 1  # count of COMPLETED epochs
+      if n % self.every_n_epochs != 0:
+        return
+      stages = ("train",)
+    else:
+      if self.every_n_steps is None:
+        return
+      n = _completed_steps(trainer, pl_module)  # count of COMPLETED optimizer steps
+      if n == 0 or n % self.every_n_steps != 0:
+        return
+      stages = ("train", "val")
+
+    wandb_run = pl_module.logger.experiment if pl_module.logger is not None else None
+    if wandb_run is None:
+      return
+
+    log_payload = {}
+    with guarded_render(f"{mode}/scale_layers"), torch.no_grad():
+      source = pl_module.get_preview_source(mode)
+      for stage in stages:
+        entry = source.get(stage)
+        if entry is None:
+          continue
+        layers = entry.get("gauss_layers")
+        if layers is None:
+          continue
+        image = _colorize_scale_layers(layers["scale"], layers["hit"])
+        log_payload[f"{stage}/scale_layers"] = wandb.Image(
+          image, caption="log10(max-axis scale) per depth-peel layer, left to right")
     if not log_payload:
       return
 
@@ -410,7 +615,7 @@ class OrbitCallback(pl.Callback):
     else:
       if self.every_n_steps is None:
         return
-      n = trainer.global_step  # count of COMPLETED optimizer steps
+      n = _completed_steps(trainer, pl_module)  # count of COMPLETED optimizer steps
       if n == 0 or n % self.every_n_steps != 0:
         return
       stages = ("train", "val")

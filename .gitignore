@@ -31,10 +31,15 @@ Thumbs.db
 secret.env
 
 /data/
+/eval/
 
 # Hydra
 outputs/
 multirun/
+
+# Compiled CUDA extension build artifacts (diff-gaussian-rasterization etc.)
+build/
+*.egg-info/
 
 # wandb
 wandb/

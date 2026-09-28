@@ -40,7 +40,12 @@ hdf5plugin  # compression filters
 # torch's cu130 build -- a newer nvcc (13.3) mismatches torch's bundled CCCL
 # headers. fit_gsplat._setup_cuda_toolchain() wires CUDA_HOME/PATH + the
 # libcudart.so dev symlink at runtime.
-gsplat
+#
+# gsplat itself is NOT listed here -- it's pinned to a specific git commit
+# (see Dockerfile) rather than the PyPI wheel, and building it from source
+# needs torch already present (its setup.py imports torch at build time,
+# which `uv pip compile`'s isolated build env can't satisfy) -- so it's
+# installed --no-build-isolation, after this block, once torch exists.
 nvidia-cuda-nvcc==13.0.88
 nvidia-cuda-crt==13.0.88
 nvidia-nvvm==13.0.88
@@ -58,4 +63,13 @@ objaverse
 requests  # download_objaverse_sketchfab.py: fetch the TRELLIS-500K CSV (already an objaverse transitive dep, listed since we import it directly)
 trimesh
 # bpy
+
+# gaussian-splatting/ (vendored Inria reference implementation): train.py,
+# render.py, metrics.py deps not already covered above. diff-gaussian-
+# rasterization/simple-knn/fused-ssim are legacy setup.py packages (no
+# pyproject.toml) built with --no-build-isolation against this venv, so they
+# need setuptools present here rather than in an isolated build env.
+opencv-python
+joblib
+setuptools
 
