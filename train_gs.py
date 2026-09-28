@@ -707,16 +707,20 @@ class GSLightningModule(pl.LightningModule):
     # TODO: LPIPS loss.
 
     ## L1 loss
+    photom_loss = torch.zeros((), device=device)
     if cfg.loss.photom.l1_weight > 0:
       _photom_l1 = g((f(pred_rgb) - f(gt_rgb)).abs()) # (B,V,C,H,W)
       _splatter_metric("loss/photom_l1", _photom_l1)
-      loss = loss + cfg.loss.photom.l1_weight * _photom_l1.mean()
+      photom_loss = photom_loss + cfg.loss.photom.l1_weight * _photom_l1.mean()
 
     ## D-SSIM Loss
     if cfg.loss.photom.dssim_weight > 0:
       _photom_dssim = g(self.dssim(f(pred_rgb), f(gt_rgb))) # (B,V,C,H,W)
       _splatter_metric("loss/photom_dssim", _photom_dssim)
-      loss = loss + cfg.loss.photom.dssim_weight * _photom_dssim.mean()
+      photom_loss = photom_loss + cfg.loss.photom.dssim_weight * _photom_dssim.mean()
+
+    _log("loss/photom", photom_loss.detach())
+    loss = loss + photom_loss
 
     # regularization
 
