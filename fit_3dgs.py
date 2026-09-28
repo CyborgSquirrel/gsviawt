@@ -508,7 +508,7 @@ class Fit3DGSDataModule(pl.LightningDataModule):
 class Fit3DGSLightningModule(pl.LightningModule):
   automatic_optimization = False
 
-  def __init__(self, cfg, g, scene_extent, preview_cams, layered=False):
+  def __init__(self, cfg, g, scene_extent, preview_cams):
     super().__init__()
     self.cfg = cfg
     self.scene_extent = scene_extent
@@ -517,7 +517,7 @@ class Fit3DGSLightningModule(pl.LightningModule):
     self.views_seen = 0
     self.final_loss = float("nan")
     self.step_count = 0
-    self.layered = layered
+    self.gaussian_layout = str(cfg.get("gaussian_layout", "set"))
 
     self.params = nn.ParameterDict({k: nn.Parameter(torch.from_numpy(v)) for k, v in g.items()})
     self.dssim = DSSIMLoss()
@@ -537,7 +537,8 @@ class Fit3DGSLightningModule(pl.LightningModule):
     # (opacity reset, the per-step grad2d/count bookkeeping) runs exactly
     # as it would in "set" mode.
     import gsplat.strategy as gsstrat
-    refine_start_iter = int(cfg.iters) if layered else int(cfg.densify.from_iter)
+    refine_start_iter = (int(cfg.iters) if self.gaussian_layout == "layered"
+                        else int(cfg.densify.from_iter))
     self.strategy = gsstrat.DefaultStrategy(
       prune_opa=float(cfg.densify.prune_opacity), grow_grad2d=float(cfg.densify.grad_threshold),
       grow_scale3d=float(cfg.percent_dense), prune_scale3d=float(cfg.densify.prune_scale3d),
@@ -793,7 +794,7 @@ def main(cfg: DictConfig) -> None:
     "train": train_cams[:4],
     "val": test_cams[:4] if test_cams else [],
   }
-  model = Fit3DGSLightningModule(cfg, g, scene_extent, preview_cams, layered=(gaussian_layout == "layered"))
+  model = Fit3DGSLightningModule(cfg, g, scene_extent, preview_cams)
   datamodule = Fit3DGSDataModule(cfg, train_cams, test_cams)
 
   callbacks = list(hydra.utils.instantiate(cfg.callbacks).values())
