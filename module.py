@@ -125,7 +125,9 @@ def init_gaussians(depth_primary, K_primary, pose_primary, image_primary,
     "scales_log": repeat(np.log(nn), "p -> p xyz", xyz=3).astype(np.float32),
     "quats": np.tile([1.0, 0.0, 0.0, 0.0], (len(pts), 1)).astype(np.float32),
     "opac_logit": np.full(len(pts), _logit(np.float32(init_opacity)), np.float32),
-    "colors_logit": _logit(colors).astype(np.float32),
+    "colors": colors.astype(np.float32),  # [0,1] RGB, not logit -- fit_3dgs.py converts
+                                           # straight to SH0 (RGB2SH), no flat-colour model
+                                           # here to justify a logit representation at all
     "u": u.astype(np.int64), "v": v.astype(np.int64), "layer": layer.astype(np.int64),
   }
 

@@ -353,11 +353,12 @@ def init_gaussians(pcd, max_sh_degree, init_opacity, knn_k):
 #
 # Reuses module.init_gaussians() verbatim for the actual unprojection/
 # KNN-scale/front-pixel-colour work (same quantity, same seeding scene) --
-# only the colour representation differs downstream: fit_gsplat's was flat
-# sigmoid (colors_logit), this file trains full SH (sh0/shN, degree
-# ramped), so the seed colour is converted logit->sigmoid->RGB2SH into sh0
-# with shN left at zero, exactly like init_gaussians()'s own pcd-colour
-# conversion above.
+# only the colour representation differs downstream: this file trains full
+# SH (sh0/shN, degree ramped), so the seed colour (already plain [0,1]
+# RGB -- no logit representation to round-trip through, unlike the old
+# fit_gsplat.py's own flat-sigmoid colour model) is converted straight to
+# sh0 (RGB2SH) with shN left at zero, exactly like init_gaussians()'s own
+# pcd-colour conversion above.
 # ---------------------------------------------------------------------------
 
 def init_gaussians_layered(hdf5_path, primary_view_idx, max_sh_degree, init_opacity, knn_k):
@@ -383,8 +384,7 @@ def init_gaussians_layered(hdf5_path, primary_view_idx, max_sh_degree, init_opac
            n, depth.shape[1], depth.shape[0], depth.shape[2])
 
   num_sh = (int(max_sh_degree) + 1) ** 2
-  colors = 1.0 / (1.0 + np.exp(-seed["colors_logit"]))  # logit -> flat RGB in [0,1]
-  sh0 = RGB2SH(torch.from_numpy(colors)).numpy()[:, None, :].astype(np.float32)
+  sh0 = RGB2SH(torch.from_numpy(seed["colors"])).numpy()[:, None, :].astype(np.float32)
   shN = np.zeros((n, num_sh - 1, 3), np.float32)
 
   g = {
