@@ -721,7 +721,7 @@ class Fit3DGSLightningModule(pl.LightningModule):
       # gt_rgb is already alpha-premultiplied over BLACK -- recompositing
       # onto a different background is just += bg*(1-alpha), no
       # un-premultiply needed (same identity train_gs.py's _step uses).
-      gt_rgb = gt_rgb + bg[None, None, None, :] * (1.0 - gt_alpha)
+      gt_rgb = gt_rgb + rearrange(bg, "c -> 1 1 1 c") * (1.0 - gt_alpha)
 
     if stage == "train":
       self.step_count += 1
