@@ -708,12 +708,15 @@ class Fit3DGSLightningModule(pl.LightningModule):
     # this file's default loader.batch_size=1 that's one random colour
     # per step anyway, same granularity train_gs.py's per-item loop gets.
     bg_mode = str(self.cfg.background)
-    if bg_mode == "white":
-      bg = torch.ones(3, device=gt_rgb.device)
-    elif bg_mode == "random" and stage == "train":
-      bg = torch.rand(3, device=gt_rgb.device)
-    else:
-      bg = None
+    match (bg_mode, stage):
+      case ("white", _):
+        bg = torch.ones(3, device=gt_rgb.device)
+      case ("random", "train"):
+        bg = torch.rand(3, device=gt_rgb.device)
+      case ("random", "val"):
+        bg = torch.ones(3, device=gt_rgb.device)
+      case _:
+        bg = None
     if bg is not None:
       # gt_rgb is already alpha-premultiplied over BLACK -- recompositing
       # onto a different background is just += bg*(1-alpha), no
