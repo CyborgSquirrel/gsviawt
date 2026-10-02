@@ -47,6 +47,12 @@ adds an L2 penalty on the offset (not the resolved position) to the
 train loss, pulling Gaussians back toward their seeded origin instead of
 letting the offset drift unconstrained.
 
+cfg.background (none/white/random) picks what's composited under the
+render and, wherever real alpha exists (hdf5_path; COLMAP photos have
+none), recomposited into gt_rgb to match -- see conf/fit_3dgs.yaml's own
+comment for the none/white/random split and why "random" only applies to
+the train stage.
+
 DefaultStrategy ships with one real bug in the exact pinned version this
 repo vendors (v1.5.3 + one commit, see gsplat-src/'s own comments): its
 opacity-reset scheduling condition was dead code from a `&`/`and`
@@ -169,11 +175,12 @@ def _coerce_resolution(x):
 def _load_camera(cam_info, resolution):
   """cam_info: a gaussian-splatting CameraInfo (R, T, FovX, FovY, image_path,
   width/height at COLMAP's original resolution). Returns a dict: 'image'
-  (H,W,3) float32 in [0,1] at the resolution actually used, 'viewmat' (4,4)
-  world-to-camera (OpenCV convention, straight from getWorld2View2 -- COLMAP's
-  R/T already ARE this, unlike fit_gsplat.py's OpenGL renders), 'K' (3,3)
-  (assumes centered principal point, same as the reference's FoV-only camera
-  model), 'name' (for results.json / logging)."""
+  (H,W,3) float32 in [0,1] at the resolution actually used, 'alpha' (H,W,1)
+  float32, always 1 (real photos have no matte -- see cfg.background), 'viewmat'
+  (4,4) world-to-camera (OpenCV convention, straight from getWorld2View2 --
+  COLMAP's R/T already ARE this, unlike fit_gsplat.py's OpenGL renders), 'K'
+  (3,3) (assumes centered principal point, same as the reference's FoV-only
+  camera model), 'name' (for results.json / logging)."""
   w, h = _resolution_for(cam_info.width, cam_info.height, resolution)
   # Plain .resize(), no explicit resample filter -- matches
   # utils/general_utils.py's PILtoTorch exactly (PIL's own default), so
@@ -181,12 +188,14 @@ def _load_camera(cam_info, resolution):
   # reference trains/evaluates against.
   image = np.asarray(Image.open(cam_info.image_path).convert("RGB").resize((w, h)))
   image = image.astype(np.float32) / 255.0
+  alpha = np.ones_like(image[..., :1])  # COLMAP captures have no matte -- always fully opaque
 
   viewmat = getWorld2View2(cam_info.R, cam_info.T)
   fx, fy = fov2focal(cam_info.FovX, w), fov2focal(cam_info.FovY, h)
   K = np.array([[fx, 0, w / 2], [0, fy, h / 2], [0, 0, 1]], np.float32)
 
-  return {"image": image, "viewmat": viewmat, "K": K, "name": cam_info.image_name, "width": w, "height": h}
+  return {"image": image, "alpha": alpha, "viewmat": viewmat, "K": K,
+          "name": cam_info.image_name, "width": w, "height": h}
 
 
 def load_scene(source_path, images, eval_split, resolution):
@@ -223,9 +232,12 @@ def load_scene_h5(hdf5_path, val_fraction, seed):
   gaussian-splatting's own readCamerasFromTransforms (`c2w[:3,1:3] *= -1`)
   applied to exactly this kind of Blender-synthetic camera.
 
-  Background: black, alpha-premultiplied -- matches ModelParams'
-  `white_background` DEFAULT (False), and this file's own render(), which
-  never passes `backgrounds=` to gsplat.rasterization (implicitly black).
+  Background: 'image' is alpha-premultiplied over BLACK regardless of
+  cfg.background ('alpha' is kept alongside it, raw, unpremultiplied) --
+  cfg.background != "none" recomposites gt_rgb onto the chosen colour, and
+  passes the same colour as `backgrounds=` to gsplat.rasterization, inside
+  Fit3DGSLightningModule._step/run_final_eval, not here. Default matches
+  ModelParams' `white_background` DEFAULT (False) == cfg.background=none.
 
   Point cloud seed: no SfM points exist for a synthetic render, so this
   mirrors gaussian-splatting/scene/dataset_readers.readNerfSyntheticInfo's
@@ -265,7 +277,7 @@ def load_scene_h5(hdf5_path, val_fraction, seed):
     # split) -- gaussian_layout="layered" (init_gaussians_layered) needs it
     # to re-read this same view's raw depth_peel, which load_scene_h5 itself
     # never loads (COLMAP cameras have no equivalent field).
-    return {"image": image, "viewmat": viewmat, "K": K[i], "name": f"view{i:03d}",
+    return {"image": image, "alpha": alpha, "viewmat": viewmat, "K": K[i], "name": f"view{i:03d}",
             "width": w, "height": h, "view_idx": i}
 
   train_cams = [_cam(i) for i in train_idx]
@@ -341,11 +353,12 @@ def init_gaussians(pcd, max_sh_degree, init_opacity, knn_k):
 #
 # Reuses module.init_gaussians() verbatim for the actual unprojection/
 # KNN-scale/front-pixel-colour work (same quantity, same seeding scene) --
-# only the colour representation differs downstream: fit_gsplat's was flat
-# sigmoid (colors_logit), this file trains full SH (sh0/shN, degree
-# ramped), so the seed colour is converted logit->sigmoid->RGB2SH into sh0
-# with shN left at zero, exactly like init_gaussians()'s own pcd-colour
-# conversion above.
+# only the colour representation differs downstream: this file trains full
+# SH (sh0/shN, degree ramped), so the seed colour (already plain [0,1]
+# RGB -- no logit representation to round-trip through, unlike the old
+# fit_gsplat.py's own flat-sigmoid colour model) is converted straight to
+# sh0 (RGB2SH) with shN left at zero, exactly like init_gaussians()'s own
+# pcd-colour conversion above.
 # ---------------------------------------------------------------------------
 
 def init_gaussians_layered(hdf5_path, primary_view_idx, max_sh_degree, init_opacity, knn_k):
@@ -371,8 +384,7 @@ def init_gaussians_layered(hdf5_path, primary_view_idx, max_sh_degree, init_opac
            n, depth.shape[1], depth.shape[0], depth.shape[2])
 
   num_sh = (int(max_sh_degree) + 1) ** 2
-  colors = 1.0 / (1.0 + np.exp(-seed["colors_logit"]))  # logit -> flat RGB in [0,1]
-  sh0 = RGB2SH(torch.from_numpy(colors)).numpy()[:, None, :].astype(np.float32)
+  sh0 = RGB2SH(torch.from_numpy(seed["colors"])).numpy()[:, None, :].astype(np.float32)
   shN = np.zeros((n, num_sh - 1, 3), np.float32)
 
   g = {
@@ -391,7 +403,14 @@ def init_gaussians_layered(hdf5_path, primary_view_idx, max_sh_degree, init_opac
 # rendering
 # ---------------------------------------------------------------------------
 
-def render(params, active_sh_degree, viewmats, Ks, width, height, packed=True):
+def render(params, active_sh_degree, viewmats, Ks, width, height, packed=True, backgrounds=None):
+  """backgrounds: None (default) -- un-composited, i.e. premultiplied by the
+  rendered alpha (== rendered over black), matching gt_rgb under
+  cfg.background="none". (3,) otherwise -- ONE colour shared by every
+  camera in this call (gsplat's packed=True constraint, see
+  Fit3DGSLightningModule._step's own comment) -- gsplat composites it in
+  directly; the caller is responsible for recompositing gt_rgb onto the
+  SAME colour first (see Fit3DGSLightningModule._step/run_final_eval)."""
   import gsplat
   colors = torch.cat([params["sh0"], params["shN"]], dim=1)  # (P,K,3)
   rgb, alpha, info = gsplat.rasterization(
@@ -399,7 +418,7 @@ def render(params, active_sh_degree, viewmats, Ks, width, height, packed=True):
     scales=torch.exp(params["scales"]), opacities=torch.sigmoid(params["opacities"]),
     colors=colors, sh_degree=active_sh_degree,
     viewmats=viewmats, Ks=Ks, width=width, height=height,
-    render_mode="RGB", packed=packed,
+    render_mode="RGB", packed=packed, backgrounds=backgrounds,
   )
   return rgb.clamp(0.0, 1.0), alpha.clamp(0.0, 1.0), info
 
@@ -481,12 +500,11 @@ def save_output_layered(path, params_np, meta):
 # ---------------------------------------------------------------------------
 
 class Fit3DGSViewDataset(Dataset):
-  """One item = one COLMAP camera's photometric target -- image already
-  loaded/resized by load_scene(), viewmat/K precomputed. No alpha channel
-  (COLMAP captures have no matte): gt_alpha is always 1, matching the
-  reference's rasterizer, which has no background compositing of its own
-  either (renders straight onto whatever background colour the config
-  picks -- see Fit3DGSLightningModule._step)."""
+  """One item = one camera's photometric target -- image/alpha already
+  loaded/resized by load_scene()/load_scene_h5(), viewmat/K precomputed.
+  gt_alpha is always 1 for COLMAP captures (no matte); cfg.background !=
+  "none" recomposites gt_rgb onto the configured colour using it (see
+  Fit3DGSLightningModule._step) -- a no-op wherever alpha is all-1."""
 
   def __init__(self, cams):
     self.cams = cams
@@ -498,6 +516,7 @@ class Fit3DGSViewDataset(Dataset):
     c = self.cams[i]
     return {
       "gt_rgb": torch.from_numpy(c["image"]),
+      "gt_alpha": torch.from_numpy(c["alpha"]),
       "K": torch.from_numpy(c["K"]),
       "viewmat": torch.from_numpy(c["viewmat"]),
     }
@@ -671,10 +690,38 @@ class Fit3DGSLightningModule(pl.LightningModule):
     def _log(key, *args, **kwargs):
       self.log(f"{stage}/{key}", *args, **kwargs, batch_size=B)
 
-    gt_rgb, K, viewmat = batch["gt_rgb"], batch["K"], batch["viewmat"]
+    gt_rgb, gt_alpha, K, viewmat = batch["gt_rgb"], batch["gt_alpha"], batch["K"], batch["viewmat"]
     B = gt_rgb.shape[0]
     H, W = gt_rgb.shape[1:3]
     it = self.step_count
+
+    # cfg.background: see conf/fit_3dgs.yaml's own comment. "random" is
+    # train-only (an augmentation, like train_gs.py's loss.random_bg) --
+    # val/final_eval stay on bg=None so metrics are comparable run over
+    # run; "white" applies to every stage, a scene convention not an
+    # augmentation, like the reference's own white_background flag.
+    #
+    # bg is a single (3,) colour, not (B,3) -- gsplat's packed=True
+    # rasterizer wants backgrounds shaped just (channels,), ONE colour
+    # shared by every camera in the call (verified against train_gs.py's
+    # own render(), which hits the exact same gsplat constraint); with
+    # this file's default loader.batch_size=1 that's one random colour
+    # per step anyway, same granularity train_gs.py's per-item loop gets.
+    bg_mode = str(self.cfg.background)
+    match (bg_mode, stage):
+      case ("white", _):
+        bg = torch.ones(3, device=gt_rgb.device)
+      case ("random", "train"):
+        bg = torch.rand(3, device=gt_rgb.device)
+      case ("random", "val"):
+        bg = torch.ones(3, device=gt_rgb.device)
+      case _:
+        bg = None
+    if bg is not None:
+      # gt_rgb is already alpha-premultiplied over BLACK -- recompositing
+      # onto a different background is just += bg*(1-alpha), no
+      # un-premultiply needed (same identity train_gs.py's _step uses).
+      gt_rgb = gt_rgb + rearrange(bg, "c -> 1 1 1 c") * (1.0 - gt_alpha)
 
     if stage == "train":
       self.step_count += 1
@@ -705,7 +752,7 @@ class Fit3DGSLightningModule(pl.LightningModule):
       # layered mode) is what goes to the strategy/optimizers below --
       # they operate on the trainable leaf, not the resolved position.
       render_params = {**self.params, "means": self._active_means()}
-      rgb, alpha, info = render(render_params, self.active_sh_degree, viewmat, K, W, H)
+      rgb, alpha, info = render(render_params, self.active_sh_degree, viewmat, K, W, H, backgrounds=bg)
       if stage == "train":
         # step_pre_backward calls info["means2d"].retain_grad() -- must
         # run before backward for a non-leaf tensor to keep its .grad
@@ -843,6 +890,13 @@ class Fit3DGSLightningModule(pl.LightningModule):
 def run_final_eval(model, test_cams, device):
   from lpipsPyTorch import lpips
 
+  # Same rule _step uses for val: "white" applies here too (a scene
+  # convention, not an augmentation), "random"/"none" don't (no single
+  # "the" random colour to eval against -- stay on the comparable bg=None
+  # everything else uses). (3,), not (1,3) -- see _step's own comment on
+  # gsplat's packed=True backgrounds shape constraint.
+  bg = torch.ones(3, device=device) if str(model.cfg.background) == "white" else None
+
   psnrs, ssims, lpipss = [], [], []
   model.eval()
   with torch.no_grad():
@@ -850,8 +904,11 @@ def run_final_eval(model, test_cams, device):
       gt = torch.from_numpy(c["image"])[None].to(device)
       K = torch.from_numpy(c["K"])[None].to(device)
       vm = torch.from_numpy(c["viewmat"])[None].to(device)
+      if bg is not None:
+        alpha_gt = torch.from_numpy(c["alpha"])[None].to(device)
+        gt = gt + bg[None, None, None, :] * (1.0 - alpha_gt)
       render_params = {**model.params, "means": model._active_means()}
-      rgb, _, _ = render(render_params, model.active_sh_degree, vm, K, c["width"], c["height"])
+      rgb, _, _ = render(render_params, model.active_sh_degree, vm, K, c["width"], c["height"], backgrounds=bg)
       mse = (rgb - gt).pow(2).mean()
       psnrs.append(float(-10 * torch.log10(mse)))
       ssims.append(float(1.0 - model.dssim(rgb.permute(0, 3, 1, 2), gt.permute(0, 3, 1, 2))))
@@ -882,6 +939,10 @@ def main(cfg: DictConfig) -> None:
   if gaussian_layout == "layered" and not use_h5:
     raise SystemExit("gaussian_layout=layered needs hdf5_path (a render_objaverse.py h5 with "
                      "depth_peel) -- COLMAP scenes have no depth peel to seed a fixed layer stack from")
+
+  background = str(cfg.background)
+  if background not in ("none", "white", "random"):
+    raise SystemExit(f"background={background!r} -- must be \"none\", \"white\" or \"random\"")
 
   wandb_run, logger = None, False
   if cfg.wandb.mode != "disabled":

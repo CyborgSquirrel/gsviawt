@@ -37,7 +37,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import pack, rearrange, reduce, repeat
+from einops import pack, rearrange, repeat
 from omegaconf import OmegaConf
 from torch.optim import Optimizer
 
@@ -108,21 +108,26 @@ def init_gaussians(depth_primary, K_primary, pose_primary, image_primary,
   iu = np.clip(np.round(u * (iw / dw)), 0, iw - 1).astype(np.int64)
   colors = image_primary[iv, iu, :3].astype(np.float32) / 255.0      # front-pixel colour
 
-  # isotropic initial scale = mean distance to the knn_k nearest neighbours
+  # isotropic initial scale = RMS distance to the knn_k nearest neighbours
+  # (sqrt(mean(d^2)), not mean(d) -- matches simple_knn's distCUDA2 exactly,
+  # same formula fit_3dgs.py's own init_gaussians() uses for "set" mode;
+  # this used to be a plain mean here, a leftover from fit_gsplat.py's own
+  # less careful version, before this function moved into module.py).
   from scipy.spatial import cKDTree
   k = min(knn_k + 1, len(pts))
   dist, _ = cKDTree(pts).query(pts, k=k)                    # (P, k), or (P,) when k == 1
   dist = rearrange(dist, "p -> p 1") if dist.ndim == 1 else dist
   neighbours = dist[:, 1:] if k > 1 else dist               # column 0 is the point itself
-  nn = reduce(neighbours, "p k -> p", "mean")
-  nn = np.clip(nn, 1e-6, None).astype(np.float32)
+  nn = np.sqrt(np.clip((neighbours ** 2).mean(axis=1), 1e-7, None)).astype(np.float32)
 
   return {
     "means": pts.astype(np.float32),
     "scales_log": repeat(np.log(nn), "p -> p xyz", xyz=3).astype(np.float32),
     "quats": np.tile([1.0, 0.0, 0.0, 0.0], (len(pts), 1)).astype(np.float32),
     "opac_logit": np.full(len(pts), _logit(np.float32(init_opacity)), np.float32),
-    "colors_logit": _logit(colors).astype(np.float32),
+    "colors": colors.astype(np.float32),  # [0,1] RGB, not logit -- fit_3dgs.py converts
+                                           # straight to SH0 (RGB2SH), no flat-colour model
+                                           # here to justify a logit representation at all
     "u": u.astype(np.int64), "v": v.astype(np.int64), "layer": layer.astype(np.int64),
   }
 
