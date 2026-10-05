@@ -1,26 +1,31 @@
 #!/usr/bin/env python3
-"""Train a point-cloud-anchored 3D Gaussian Splatting prediction model.
+"""Train a point-cloud-anchored 3D Gaussian Splatting prediction model on
+cached World Tracing decoder tokens.
 
-Flash3D-style encoder/decoder (gs_encoder.py / gs_decoder.py): a ResNet-50
-trunk over RGB concatenated with a pixel-aligned multi-layer point cloud
-(gs_dataset.py), decoding per-pixel per-layer Gaussian appearance/shape
-parameters (opacity, scale, rotation, SH-degree-1 color). Gaussian positions
-are anchored to the input point cloud (see gs_dataset.py's
-dense_unproject_camera), so there's no depth-prediction network, unlike
-Flash3D itself. By default they're fixed exactly to it; with
-model.predict_mean_offset the decoder also predicts a residual offset on
-top of that anchor (see flatten_gaussians).
+Input is a wt_features.py output h5 (the (layers, patches, dim) token volume
+World Tracing's decoder produced for one view, from a noised GT layered
+point cloud). A per-patch linear layer (gs_decoder.PatchLinearGaussianHead)
+maps each token to per-pixel per-layer Gaussian appearance/shape parameters
+(opacity, scale, rotation, SH color), with the same activations/init as the
+Flash3D-style decoder this script used to train. Gaussian positions are
+anchored to the source view's own depth-peel point cloud (see gs_dataset.py's
+dense_unproject_camera); with model.predict_mean_offset the head also
+predicts a residual offset on top of that anchor (see flatten_gaussians).
 
-Training objective (Flash3D's cross-view photometric setup): encode one
-source view, render the predicted Gaussians into the source view itself
-(self-reconstruction) plus several other views of the same object, and
-supervise with L1 + D-SSIM (+ optional LPIPS) against the real renders.
-Rendering uses gsplat, with all geometry kept in the source camera's own
-frame (see gs_dataset.relative_viewmats) -- no world coordinates involved.
+For now this is overfitting only: data.item picks ONE row of the features h5
+(gs_dataset.WTFeatureDataset) and the model trains on it alone.
+
+Training objective (Flash3D's cross-view photometric setup): decode the
+source view's Gaussians, render them into the source view itself
+(self-reconstruction) plus other views of the same mesh, and supervise with
+L1 + D-SSIM against the real renders. Rendering uses gsplat, with all
+geometry kept in the source camera's own frame (see
+gs_dataset.relative_viewmats) -- no world coordinates involved.
 
 Usage:
     docker exec -w /app gsviawt-app-gpu-1 /home/user/venv/bin/python train_gs.py \\
-        data.photom_h5=/app/bla/lite_blackbg.h5 train.max_epochs=1000
+        data.features_h5=/app/bla/porsche_250views.wt_features.5views10seeds.h5 \\
+        data.item=0 trainer.max_epochs=1000
 
     # Resume from an earlier run's checkpoint (model/optimizer/scheduler +
     # epoch/step state; continues into a fresh output_dir):
@@ -35,7 +40,6 @@ import contextlib as ctl
 import functools as ft
 import logging
 import os
-import random
 import sys
 
 import gsplat
@@ -44,8 +48,7 @@ import lightning.pytorch as pl
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from einops import pack, rearrange, repeat
+from einops import pack, rearrange
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import DictConfig, OmegaConf, open_dict
 from torch.utils.data import DataLoader
@@ -53,14 +56,10 @@ from torch.utils.data import DataLoader
 import wandb
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
-from module import SH_C0  # noqa: E402
-from gs_dataset import (OPENGL_TO_OPENCV, GaussH5ValDataset,  # noqa: E402
-                        GSFixedSourceDataset, GSFixedViewsDataset,
-                        GSPairDataset, H5Catalog, _EmptyDataset,
-                        rotate_quats_wxyz)
-from gs_decoder import GaussianResnetDecoder, GSDecoderStack  # noqa: E402
-from gs_encoder import GSResnetEncoder  # noqa: E402
-from module import DSSIMLoss, WarmupCosineAnnealingLR  # noqa: E402
+from gs_dataset import (OPENGL_TO_OPENCV, WTFeatureDataset,  # noqa: E402
+                        _EmptyDataset, rotate_quats_wxyz)
+from gs_decoder import PatchLinearGaussianHead  # noqa: E402
+from module import DSSIMLoss  # noqa: E402
 from util import collate_with_batch_size, pipe, set_mode, timed  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -70,11 +69,11 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 class GSModel(nn.Module):
-  """Encoder + decoder wrapper: builds the concatenated [RGB, per-layer xyz,
-  per-layer validity] input tensor, runs it through the ResNet trunk, and
-  returns per-pixel per-layer Gaussian appearance/shape parameters. Positions
-  are anchored to the input point cloud (gs_dataset.dense_unproject_camera);
-  with cfg.model.predict_mean_offset the output also carries a residual
+  """Per-patch linear head over cached World Tracing decoder tokens: maps the
+  (B, L, P, D) token volume of the source view to per-pixel per-layer
+  Gaussian appearance/shape parameters. Positions are anchored to the input
+  point cloud (gs_dataset.dense_unproject_camera); with
+  cfg.model.predict_mean_offset the output also carries a residual
   camera-space "offset" on top of that anchor -- see flatten_gaussians below."""
 
   def __init__(self, cfg):
@@ -82,76 +81,38 @@ class GSModel(nn.Module):
     self.num_layers = int(cfg.data.num_layers)
     self.max_sh_degree = int(cfg.model.max_sh_degree)
     self.min_scale_mult = float(cfg.model.min_scale_mult)
-    in_channels = 3 + 3 * self.num_layers
+    self.feature_dim = int(cfg.model.feature_dim)
 
-    # TODO: Option to configure which layers we train decoder heads for
-
-    self.encoder = GSResnetEncoder(
-      num_layers=cfg.model.backbone.num_layers, pretrained=cfg.model.backbone.pretrained,
-      bn_order=cfg.model.backbone.bn_order, in_channels=in_channels,
-    )
-    decoder_kwargs = dict(
-      num_ch_dec=tuple(cfg.model.backbone.num_ch_dec),
-      upsample_mode=cfg.model.backbone.upsample_mode,
+    self.head = PatchLinearGaussianHead(
+      feature_dim=self.feature_dim,
+      num_layers=self.num_layers,
+      max_sh_degree=self.max_sh_degree,
+      patch_size=int(cfg.model.patch_size),
       opacity_scale=cfg.model.opacity_scale, opacity_bias=cfg.model.opacity_bias,
       scale_scale=cfg.model.scale_scale, scale_bias=cfg.model.scale_bias,
       sh_scale=cfg.model.sh_scale, scale_lambda=cfg.model.scale_lambda,
       zero_init_last_conv=cfg.model.zero_init_last_conv,
       predict_mean_offset=cfg.model.predict_mean_offset,
     )
-    self.decoder = GSDecoderStack(
-      self.encoder.num_ch_enc,
-      num_layers=self.num_layers,
-      max_sh_degree=self.max_sh_degree,
-      **decoder_kwargs,
-    )
 
-    self.register_buffer("xyz_mean", torch.tensor(list(cfg.model.xyz_mean), dtype=torch.float32))
-    self.register_buffer("xyz_std", torch.tensor(list(cfg.model.xyz_std), dtype=torch.float32))
+  def forward(self, features):
+    """features: (B, L, P, D) -> dict of (B, L, C, H, W) Gaussian parameters,
+    H = W = sqrt(P) * patch_size."""
+    if features.shape[-1] != self.feature_dim:
+      raise ValueError(
+        f"features have dim {features.shape[-1]}, model.feature_dim={self.feature_dim}")
+    return self.head(features)
 
-  def build_input(self, rgb, xyz_cam):
-    """
-    rgb: (B,3,IH,IW) in [0,1]
-    xyz_cam: (B,L,DH,DW,3) NaN-invalid
-    Returns (B,3+4L,DH,DW), resizing rgb to the depth-peel resolution if they differ.
-    """
-    _, _, dh, dw, _ = xyz_cam.shape
-    if rgb.shape[-2:] != (dh, dw):
-      rgb = F.interpolate(rgb, size=(dh, dw), mode="bilinear", align_corners=False)
-    rgb_norm = (rgb - 0.45) / 0.225
 
-    xyz_filled = torch.nan_to_num(xyz_cam, nan=0.0)
-    xyz_norm = (xyz_filled - self.xyz_mean) / self.xyz_std
-    xyz_norm = rearrange(xyz_norm, "b l h w c -> b (l c) h w")
-
-    inp, _ = pack([rgb_norm, xyz_norm], "b * h w")
-    return inp
-
-  def forward(self, rgb, xyz_cam):
-    x = self.build_input(rgb, xyz_cam)
-    _, _, dh, dw, _ = xyz_cam.shape
-    # NOTE: The 5-level U-Net halves spatial dims 4x (conv1 + maxpool + 2 more
-    # strided stages) then doubles back up 5x via nearest-neighbor upsample;
-    # that only round-trips exactly when H/W are multiples of 32 (Flash3D's own
-    # inputs are; render_objaverse.py's 504x504 renders aren't), so pad up to
-    # the next multiple of 32 before the encoder and crop the decoder's output
-    # back to (dh, dw) -- same fix Flash3D applies via its pad_border_aug, just
-    # replicate-padded to the exact multiple instead of a fixed border.
-
-    # Pad if necessary
-    pad_h, pad_w = (-dh) % 32, (-dw) % 32
-    if pad_h or pad_w:
-      x = F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")
-    feats = self.encoder(x)
-    out = self.decoder(feats)
-
-    # Ensure padding is stripped out
-    out = {
-      k: v[..., :dh, :dw] # (B,L,C,H,W)
-      for k, v in out.items()
-    }
-
-    return out
+def _check_grid(gauss, xyz_cam):
+  """The head's pixel grid must be exactly the depth-peel grid -- everything
+  downstream indexes gauss and xyz_cam/hit pixel-for-pixel."""
+  gh, gw = gauss["opacity"].shape[-2:]
+  _, _, dh, dw, _ = xyz_cam.shape
+  if (gh, gw) != (dh, dw):
+    raise ValueError(
+      f"head output grid {gh}x{gw} != depth-peel grid {dh}x{dw}; the features "
+      "must come from a render at the model's input size (504x504 for r75b)")
 
 
 def model_forward(
@@ -170,10 +131,8 @@ def model_forward(
   B = batch["batch_size"]
 
   out = {}
-  out["gauss"] = model(
-    batch["views"]["rgb"][:, 0].to(device),
-    batch["source"]["xyz_cam"].to(device),
-  )
+  out["gauss"] = model(batch["features"].to(device))
+  _check_grid(out["gauss"], batch["source"]["xyz_cam"])
 
   # render 3DGS if necessary
   if need_render:
@@ -301,149 +260,14 @@ def flatten_gaussians(b, gauss, xyz_cam, hit):
     }
 
 
-PREDICTABLE_PARAMS = ("opacity", "scale", "rotation", "color")
-
-
-def apply_ground_truth_overrides(gauss, gt, hit, predict_params, device):
-  """Overwrites gauss's fields NOT listed in `predict_params` with values
-  taken directly from `gt` (gs_dataset._load_ground_truth's output),
-  converted to gauss's own units/shape. Only overrides where hit &
-  gt["valid"] agree -- elsewhere keeps the model's own prediction."""
-  out = dict(gauss)
-  mask = (hit & gt["valid"].to(device)).unsqueeze(1)   # (L,1,H,W)
-
-  if "opacity" not in predict_params:
-    gt_opacity = gt["opacity"].to(device).unsqueeze(1)   # (L,1,H,W)
-    out["opacity"] = torch.where(mask, gt_opacity, gauss["opacity"])
-
-  if "scale" not in predict_params:
-    gt_scale = rearrange(gt["scale"].to(device), "l h w c -> l c h w")
-    m3 = repeat(mask, "l 1 h w -> l c h w", c=3)
-    out["scale"] = torch.where(m3, gt_scale, gauss["scale"])
-    if "raw_scale" in gauss:
-      out["raw_scale"] = torch.where(m3, torch.log(gt_scale.clamp(min=1e-8)), gauss["raw_scale"])
-
-  if "rotation" not in predict_params:
-    gt_rotation = rearrange(gt["rotation"].to(device), "l h w c -> l c h w")
-    m4 = repeat(mask, "l 1 h w -> l c h w", c=4)
-    out["rotation"] = torch.where(m4, gt_rotation, gauss["rotation"])
-
-  if "color" not in predict_params:
-    gt_color = rearrange(gt["color"].to(device), "l h w c -> l c h w")
-    gt_sh_dc = (gt_color - 0.5) / SH_C0
-    m3 = repeat(mask, "l 1 h w -> l c h w", c=3)
-    out["sh_dc"] = torch.where(m3, gt_sh_dc, gauss["sh_dc"])
-    if "sh_rest" in gauss:
-      # No ground-truth signal exists for view-dependent shading at all
-      # (fit_gsplat.py has no SH>0) -- zero it rather than leave an
-      # untrained network output riding on top of a now-fixed flat color.
-      m_rest = repeat(mask, "l 1 h w -> l c h w", c=gauss["sh_rest"].shape[1])
-      out["sh_rest"] = torch.where(m_rest, torch.zeros_like(gauss["sh_rest"]), gauss["sh_rest"])
-
-  return out
-
-
-# ---------------------------------------------------------------------------
-# losses (DSSIMLoss now lives in module.py, shared with fit_gsplat.py)
-# ---------------------------------------------------------------------------
-
-
-def compute_direct_loss(gauss, gt, hit, cfg_loss, device):
-  """Direct per-pixel supervision of the model's own predicted Gaussian
-  params against a fit_gsplat.py ground-truth grid (gs_dataset's
-  _load_ground_truth output -- rotation already converted into the source
-  camera's own frame, positions never compared since they're fixed to the
-  same point cloud by construction). `gauss`: raw decoder output, each
-  (L,C,H,W). `hit`: (L,H,W) bool. Returns (total, parts) -- `parts` only has
-  keys for fields whose weight is actually nonzero (omit-if-skipped, same
-  convention as the rest of this file's metrics dicts). cfg_loss.supervised_layers
-  (None or a list of layer indices), when set, restricts which depth-peel
-  layers actually contribute to this loss -- everything else about the
-  model (input point cloud, predicted/rendered layers) is unchanged, only
-  which layers get gradient from THIS loss."""
-  mask = hit & gt["valid"].to(device)
-  if cfg_loss.supervised_layers is not None:
-    layer_mask = torch.zeros(hit.shape[0], dtype=torch.bool, device=device)
-    layer_mask[list(cfg_loss.supervised_layers)] = True
-    mask = mask & layer_mask[:, None, None]
-  parts = {}
-  total = torch.zeros((), device=device)
-  if not mask.any():
-    return total, parts
-
-  eps = 1e-6
-  if cfg_loss.direct_opacity_weight > 0:
-    opacity_pred = rearrange(gauss["opacity"], "l c h w -> l h w c")[..., 0]
-    # nan_to_num: outside `mask` (invalid/padding grid cells) gt_opacity is
-    # NaN-filled at the source, same as gt_scale -- those cells are excluded
-    # from the loss value via [mask] below, but pow(2)'s backward (2*x) still
-    # propagates NaN through the unselected positions' local Jacobian even
-    # though their incoming gradient is zero (0*NaN=NaN). abs()'s backward
-    # (sign(x)) never had this problem; L2 does, so the guard is required now.
-    gt_opacity = torch.nan_to_num(gt["opacity"].to(device), nan=0.0)
-    parts["opacity"] = (opacity_pred - gt_opacity).pow(2)[mask].mean()
-    total = total + cfg_loss.direct_opacity_weight * parts["opacity"]
-
-  if cfg_loss.direct_scale_weight > 0:
-    # Log-space L2 against gauss["raw_scale"] (pre-floor/pixel_scale logit,
-    # not the activated "scale" -- units must match gt after log()). L2 over
-    # L1 concentrates gradient on the worst-residual pixels instead of
-    # applying equal pressure everywhere. gt_scale is NaN-padded outside
-    # `mask`; nan_to_num guards pow(2)'s backward (2*x) from propagating
-    # that NaN even though the incoming gradient there is zero.
-    scale_pred = rearrange(gauss["raw_scale"], "l c h w -> l h w c")
-    gt_scale = torch.nan_to_num(gt["scale"].to(device), nan=eps).clamp(min=eps)
-    log_diff = scale_pred - torch.log(gt_scale)
-    parts["scale"] = log_diff.pow(2)[mask].mean()
-    total = total + cfg_loss.direct_scale_weight * parts["scale"]
-
-  if cfg_loss.direct_rotation_weight > 0:
-    # Sign-invariant: q and -q represent the same rotation (quaternion
-    # double-cover), a naive L1/L2 would be wrong on that half of cases.
-    rot_pred = rearrange(gauss["rotation"], "l c h w -> l h w c")
-    dot = (rot_pred * gt["rotation"].to(device)).sum(-1).abs().clamp(max=1.0)
-    parts["rotation"] = (1.0 - dot)[mask].mean()
-    total = total + cfg_loss.direct_rotation_weight * parts["rotation"]
-
-  if cfg_loss.direct_color_weight > 0:
-    # fit_gsplat.py has no SH>0 -- its ground truth is flat RGB, comparable
-    # to our sh_dc via SH degree-0 evaluation. Only sh_dc gets a gradient
-    # from this; sh_rest has no ground-truth signal in this source at all.
-    # L1 (not L2, unlike opacity/scale above): abs()'s backward (sign(x))
-    # never propagates NaN through masked-out positions the way pow(2)'s
-    # backward (2*x) does, so no nan_to_num guard is needed here.
-    shdc_pred = rearrange(gauss["sh_dc"], "l c h w -> l h w c")
-    color_pred = SH_C0 * shdc_pred + 0.5
-    parts["color"] = (color_pred - gt["color"].to(device)).abs()[mask].mean()
-    total = total + cfg_loss.direct_color_weight * parts["color"]
-
-  return total, parts
-
-
 # ---------------------------------------------------------------------------
 # training loop
 # ---------------------------------------------------------------------------
 
-def _external_val_dataset(cfg):
-  """Builds val_ds as a standalone GSPairDataset over its OWN H5Catalog
-  (data.photom_h5_val), completely independent of whatever train_ds is doing
-  -- source AND target views are both drawn from this corpus itself
-  (deterministic_targets=True, exactly like today's multi-scene val split),
-  not from data.photom_h5 / data.fixed_source_view. See conf/train_gs.yaml's
-  data.photom_h5_val comment for why this is the deliberate design."""
-  catalog = H5Catalog(
-    cfg.data.photom_h5_val,
-    H5Catalog.path().alias("path"),
-    H5Catalog.index().alias("view_idx"),
-    H5Catalog.dataset("mesh_index").alias("mesh_id"),
-  )
-  return GSPairDataset(
-    catalog, num_layers=cfg.data.num_layers, num_target_views=cfg.data.num_target_views,
-    seed=cfg.seed, deterministic_targets=True, allow_source_as_target=cfg.data.allow_source_as_target,
-  )
-
-
 class GSDataModule(pl.LightningDataModule):
+  """Overfitting setup: ONE item (data.item, a row of data.features_h5) is the
+  whole train set; there's no validation split."""
+
   def __init__(self, cfg):
     super().__init__()
     self.cfg = cfg
@@ -453,136 +277,13 @@ class GSDataModule(pl.LightningDataModule):
   def setup(self, stage=None):
     if self.train_ds is not None:
       return
-    cfg = self.cfg
-    if cfg.data.fixed_source_view is not None:
-      # Single-batch overfit mode (fit_gsplat.py's primary/secondary terms
-      # applied here): the exact same source+target views every step, no
-      # resampling at all -- nothing to hold out, so val is empty. photom_h5
-      # is optional here (mutually exclusive with gauss_h5, see main()'s
-      # config-validation block) -- when unset, GSFixedViewsDataset builds
-      # the source view straight from gauss_h5's own embedded primary view.
-      photom_h5 = None
-      if cfg.data.photom_h5 is not None:
-        photom_h5 = cfg.data.photom_h5 if isinstance(cfg.data.photom_h5, str) else cfg.data.photom_h5[0]
-      self.train_ds = GSFixedViewsDataset(
-        source_view=cfg.data.fixed_source_view,
-        target_views=list(cfg.data.fixed_target_views) if cfg.data.fixed_target_views is not None else [],
-        num_layers=cfg.data.num_layers,
-        photom_h5=photom_h5, gauss_h5=cfg.data.gauss_h5,
-      )
-      # data.photom_h5_val is orthogonal to this mode's own view selection --
-      # if set, val still comes from that wholly separate corpus (source AND
-      # targets both drawn from it), not from fixed_source_view/targets.
-      # Otherwise, when data.gauss_h5 is set, fall back to ITS OWN embedded
-      # views (GaussH5ValDataset) -- gives real photometric val numbers for
-      # a direct-supervision-only run without needing any separate render
-      # corpus on disk.
-      if cfg.data.photom_h5_val is not None:
-        self.val_ds = _external_val_dataset(cfg)
-      elif cfg.data.gauss_h5 is not None:
-        self.val_ds = GaussH5ValDataset(cfg.data.gauss_h5, num_layers=cfg.data.num_layers)
-      else:
-        self.val_ds = _EmptyDataset()
-    elif cfg.data.photom_h5_val is not None:
-      # Multi-scene training with an external validation corpus: bypass
-      # data.split_fn entirely and use the WHOLE photom_h5 catalog for
-      # train_ds -- data.split_fn becomes a no-op here (logged in main()'s
-      # config-validation block, not silently swallowed).
-      catalog = H5Catalog(
-        cfg.data.photom_h5,
-        H5Catalog.path().alias("path"),
-        H5Catalog.index().alias("view_idx"),
-        H5Catalog.dataset("mesh_index").alias("mesh_id"),
-      )
-      self.train_ds = GSPairDataset(
-        catalog, num_layers=cfg.data.num_layers, num_target_views=cfg.data.num_target_views,
-        seed=cfg.seed, deterministic_targets=False, source_views=cfg.data.source_views,
-        allow_source_as_target=cfg.data.allow_source_as_target,
-      )
-      self.val_ds = _external_val_dataset(cfg)
-    elif cfg.data.fixed_source_dataset:
-      # HACK (temporary, deliberately separate from every other branch
-      # here): GSPairDataset's row-indexed/mesh-grouped machinery and
-      # data.split_fn both assume a dataset indexed by source row, which
-      # doesn't fit a fixed-source, target-view-indexed dataset at all --
-      # rather than bend that machinery to fit, this just builds ONE plain
-      # shuffled split of the raw view list and hands each half to its own
-      # GSFixedSourceDataset. No mesh grouping, no split_fn, no
-      # GSPairDataset involved on either side.
-      if cfg.data.source_views is None or len(cfg.data.source_views) != 1:
-        raise SystemExit("data.fixed_source_dataset requires exactly one data.source_views entry")
-      catalog = H5Catalog(
-        cfg.data.photom_h5,
-        H5Catalog.path().alias("path"),
-        H5Catalog.index().alias("view_idx"),
-        H5Catalog.dataset("mesh_index").alias("mesh_id"),
-      )
-      source_view = int(catalog.take([cfg.data.source_views[0]]).df["view_idx"][0])
-      views = catalog.df["view_idx"].to_list()
-      random.Random(cfg.seed).shuffle(views)
-      n_val = int(len(views) * cfg.data.fixed_source_val_fraction)
-      val_views, train_views = views[:n_val], views[n_val:]
-      self.train_ds = GSFixedSourceDataset(
-        catalog, source_view=source_view, target_views=train_views,
-        num_layers=cfg.data.num_layers, targets_per_item=cfg.data.num_target_views,
-      )
-      self.val_ds = GSFixedSourceDataset(
-        catalog, source_view=source_view, target_views=val_views,
-        num_layers=cfg.data.num_layers, targets_per_item=cfg.data.val_targets_per_item,
-      )
-    elif cfg.data.val_target_views is not None:
-      # Single-fixed-source setup (data.source_views == exactly one entry)
-      # validated by holding out a set of TARGET views instead of by
-      # mesh/view split -- GSPairDataset's own row-indexed val collapses to
-      # 1 row (or 0, across a mesh-level split_fn) when there's only one
-      # eligible source, giving no real per-epoch validation signal (see
-      # GSFixedSourceDataset's own docstring). Bypasses data.split_fn
-      # entirely, same rationale as the photom_h5_val branch above --
-      # assumes a single-mesh catalog, since target_views/val_target_views
-      # are raw view_idx values with no mesh_id qualifier.
-      if cfg.data.source_views is None or len(cfg.data.source_views) != 1:
-        raise SystemExit("data.val_target_views requires exactly one data.source_views entry")
-      catalog = H5Catalog(
-        cfg.data.photom_h5,
-        H5Catalog.path().alias("path"),
-        H5Catalog.index().alias("view_idx"),
-        H5Catalog.dataset("mesh_index").alias("mesh_id"),
-      )
-      source_view = int(catalog.take([cfg.data.source_views[0]]).df["view_idx"][0])
-      val_targets = [int(v) for v in cfg.data.val_target_views]
-      val_targets_set = set(val_targets)
-      self.train_ds = GSPairDataset(
-        catalog, num_layers=cfg.data.num_layers, num_target_views=cfg.data.num_target_views,
-        seed=cfg.seed, deterministic_targets=False, source_views=cfg.data.source_views,
-        allow_source_as_target=cfg.data.allow_source_as_target,
-        target_views=[v for v in catalog.df["view_idx"].to_list() if v not in val_targets_set],
-      )
-      self.val_ds = GSFixedSourceDataset(
-        catalog, source_view=source_view, target_views=val_targets,
-        num_layers=cfg.data.num_layers, targets_per_item=cfg.data.val_targets_per_item,
-      )
-    else:
-      catalog = H5Catalog(
-        cfg.data.photom_h5,
-        H5Catalog.path().alias("path"),
-        H5Catalog.index().alias("view_idx"),
-        H5Catalog.dataset("mesh_index").alias("mesh_id"),
-      )
-
-      split_fn = hydra.utils.instantiate(cfg.data.split_fn)
-      train_catalog, val_catalog = split_fn(catalog, seed=cfg.seed)
-
-      self.train_ds = GSPairDataset(
-        train_catalog, num_layers=cfg.data.num_layers, num_target_views=cfg.data.num_target_views,
-        seed=cfg.seed, deterministic_targets=False, source_views=cfg.data.source_views,
-        allow_source_as_target=cfg.data.allow_source_as_target,
-      )
-      self.val_ds = GSPairDataset(
-        val_catalog, num_layers=cfg.data.num_layers, num_target_views=cfg.data.num_target_views,
-        seed=cfg.seed, deterministic_targets=True, allow_source_as_target=cfg.data.allow_source_as_target,
-      )
-    if len(self.train_ds) == 0:
-      raise SystemExit("train split is empty -- check data.photom_h5 / data.split_fn")
+    d = self.cfg.data
+    self.train_ds = WTFeatureDataset(
+      d.features_h5, int(d.item), num_layers=d.num_layers,
+      num_target_views=d.num_target_views,
+      target_views=list(d.target_views) if d.target_views is not None else None,
+    )
+    self.val_ds = _EmptyDataset()
 
   def train_dataloader(self):
     return DataLoader(
@@ -851,10 +552,7 @@ class GSLightningModule(pl.LightningModule):
     batch = collate_with_batch_size([item])
     device = self.device
     with set_mode(self.model, "eval"), torch.no_grad():
-      gauss = self.model(
-        batch["views"]["rgb"][:, 0].to(device),
-        batch["source"]["xyz_cam"].to(device),
-      )
+      gauss = self.model(batch["features"].to(device))
       flat = next(flatten_gaussians(
         batch["batch_size"], gauss,
         batch["source"]["xyz_cam"].to(device), batch["source"]["hit"].to(device),
@@ -937,85 +635,6 @@ def main(cfg: DictConfig) -> None:
   logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
   torch.manual_seed(int(cfg.seed))
   torch.autograd.set_detect_anomaly(cfg.torch_detect_anomaly)
-
-  # ---- config validation (unchanged SystemExit checks, plus the new
-  # grad_accum_steps==1 assertion for GSFixedViewsDataset -- see
-  # train_gs_lightning_plan.md) ----
-  if cfg.data.photom_h5 is not None and cfg.data.gauss_h5 is not None:
-    raise SystemExit(
-      "data.photom_h5 and data.gauss_h5 can't both be set (for now) -- gauss_h5 "
-      "is self-sufficient as a training source (it embeds its own primary "
-      "view's image/depth/pose, see gs_dataset._read_primary_from_gauss_h5), "
-      "so set data.photom_h5=null for direct-supervision-only training, or "
-      "data.gauss_h5=null for ordinary photometric training")
-  if cfg.data.gauss_h5 is not None and cfg.data.fixed_source_view is None:
-    raise SystemExit("data.gauss_h5 requires data.fixed_source_view (single-fixed-view scope only)")
-  if (cfg.data.fixed_source_view is not None and cfg.data.photom_h5 is None
-      and cfg.data.gauss_h5 is None):
-    raise SystemExit("data.fixed_source_view requires at least one of data.photom_h5/data.gauss_h5")
-  direct_enabled = any(cfg.loss[k] > 0 for k in (
-    "direct_opacity_weight", "direct_scale_weight", "direct_rotation_weight", "direct_color_weight"))
-  if direct_enabled and cfg.data.gauss_h5 is None:
-    raise SystemExit("loss.direct_*_weight > 0 requires data.gauss_h5 to be set")
-
-  if cfg.data.photom_h5_val is not None and cfg.data.fixed_source_view is None:
-    log.info(
-      "data.photom_h5_val set -- data.split_fn is ignored, the full "
-      "training corpus is used for train_ds.")
-  # A real (nonempty, force_render=True) val_ds gets built either from
-  # data.photom_h5_val directly, or -- when that's unset -- as a fallback
-  # from data.gauss_h5's own embedded views (GaussH5ValDataset, see
-  # GSDataModule.setup). val/rec_loss is 0-by-construction when all
-  # photometric weights are 0 UNLESS it's the GaussH5ValDataset fallback AND
-  # a direct_*_weight is nonzero -- that val_ds's items carry "ground_truth"
-  # (unlike a photom_h5_val corpus, which never does), so compute_loss's
-  # direct-supervision terms fire during validation too and val/rec_loss
-  # picks those up instead of reading 0.
-  has_real_val_ds = cfg.data.photom_h5_val is not None or (
-    cfg.data.fixed_source_view is not None and cfg.data.gauss_h5 is not None)
-  uses_gauss_h5_val_fallback = (
-    cfg.data.photom_h5_val is None and cfg.data.fixed_source_view is not None
-    and cfg.data.gauss_h5 is not None)
-
-  predict_params = set(cfg.model.predict_params)
-  unknown = predict_params - set(PREDICTABLE_PARAMS)
-  if unknown:
-    raise SystemExit(
-      f"model.predict_params has unknown entries {sorted(unknown)} -- "
-      f"must be a subset of {PREDICTABLE_PARAMS}")
-  if predict_params != set(PREDICTABLE_PARAMS) and cfg.data.gauss_h5 is None:
-    raise SystemExit(
-      "model.predict_params (restricting which fields the network predicts) "
-      "requires data.gauss_h5 to supply the rest")
-  for field in PREDICTABLE_PARAMS:
-    if field not in predict_params and cfg.loss[f"direct_{field}_weight"] > 0:
-      log.warning(
-        "model.predict_params excludes '%s' but loss.direct_%s_weight > 0 -- "
-        "that field is forced to ground truth everywhere it's used, so this "
-        "loss term trains a head with no effect on rendering/output", field, field)
-
-  if cfg.data.fixed_source_view is not None:
-    # Single-batch overfit mode (fit_gsplat.py's primary/secondary terms
-    # applied here): the exact same source+target views every step, no
-    # resampling at all -- nothing to hold out, so val is empty.
-    # fixed_target_views only matters when there's a photom_h5 to draw them
-    # from -- gauss_h5-only mode has no photom corpus, targets are forced
-    # empty (GSDataModule.setup / GSFixedViewsDataset).
-    if cfg.data.photom_h5 is not None and cfg.data.fixed_target_views is None:
-      raise SystemExit(
-        "data.fixed_target_views must be set when data.fixed_source_view + "
-        "data.photom_h5 are set")
-    if int(cfg.train.grad_accum_steps) != 1:
-      # Under Lightning, "epoch" == "optimizer step" for this length-1
-      # dataset only when grad_accum_steps == 1 (otherwise it takes
-      # grad_accum_steps Lightning-epochs to complete one optimizer step,
-      # since the length-1 loader yields exactly one batch per epoch) -- see
-      # train_gs_lightning_plan.md. Every fixed-view run this session already
-      # used grad_accum_steps=1 anyway (accumulating over the same repeated
-      # example is pure wasted compute), so this should never actually fire.
-      raise SystemExit(
-        "data.fixed_source_view (GSFixedViewsDataset) requires "
-        "train.grad_accum_steps == 1 -- see train_gs_lightning_plan.md")
 
   datamodule = GSDataModule(cfg)
   datamodule.setup()

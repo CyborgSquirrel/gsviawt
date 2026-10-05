@@ -1,0 +1,87 @@
+output_dirname: 3dgs-model-${now:%Y-%m-%d_%H-%M-%S}
+output_dir: /tmp/wtgs_smoke_true
+seed: 42
+torch_detect_anomaly: false
+ckpt_path: null
+data:
+  features_h5: /app/bla/porsche_250views.wt_features.5views10seeds.h5
+  item: 0
+  num_layers: 6
+  num_target_views: 3
+  target_views: null
+model:
+  patch_size: 14
+  feature_dim: 1536
+  max_sh_degree: 0
+  opacity_scale: 0.001
+  opacity_bias: 0.0
+  scale_scale: 0.1
+  scale_bias: 1.0
+  scale_lambda: 0.01
+  min_scale_mult: 1.0
+  sh_scale: 1.0
+  zero_init_last_conv: true
+  predict_mean_offset: false
+loss:
+  photom:
+    for:
+    - source
+    - target
+    l1_weight: 1.0
+    dssim_weight: 0.85
+  background: null
+  scale_reg_weight: 0.001
+  scale_reg_thresh: 0.05
+  mean_offset_reg_weight: 0.01
+callbacks:
+  lr_monitor:
+    _target_: lightning.pytorch.callbacks.LearningRateMonitor
+  checkpoint:
+    _target_: lightning.pytorch.callbacks.ModelCheckpoint
+    dirpath: ${output_dir}
+    filename: model-{epoch}-{step}
+    every_n_epochs: ${eval:'${trainer.max_epochs} // 10'}
+    save_last: true
+    save_on_exception: true
+    save_weights_only: false
+  orbit:
+    _target_: module.OrbitCallback
+    every_n_epochs: ${eval:'${trainer.max_epochs} // 50'}
+    num_frames: 24
+    fps: 12
+    crf: 28
+    elevation_deg: 20.0
+  panel:
+    _target_: module.PanelCallback
+    every_n_epochs: ${eval:'${trainer.max_epochs} // 50'}
+  scale_layers:
+    _target_: module.ScaleLayersCallback
+    every_n_epochs: ${eval:'${trainer.max_epochs} // 50'}
+loader:
+  batch_size: 1
+  num_workers: 4
+  persistent_workers: true
+trainer:
+  max_epochs: 100
+  accelerator: auto
+  devices: 1
+  check_val_every_n_epoch: 1
+  log_every_n_steps: 1
+  default_root_dir: ${output_dir}
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+optim:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: 0.0001
+sched:
+  _target_: module.WarmupCosineAnnealingLR
+  _partial_: true
+  total_steps: ${total_steps}
+  warmup_steps: ${eval:'int(${total_steps} * 0.05)'}
+  min_lr: 1.0e-06
+wandb:
+  project: gsviawt
+  mode: offline
+  tags: []
+  name: ${output_dirname}

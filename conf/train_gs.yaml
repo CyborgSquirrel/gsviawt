@@ -1,10 +1,7 @@
 # Config for train_gs.py -- train a point-cloud-anchored 3D Gaussian
-# Splatting prediction model (Flash3D-style encoder/decoder) on
-# render_objaverse.py-schema HDF5 files. See train_gs.py's module docstring.
-
-defaults:
-  - data/split_fn: by_mesh
-  - _self_
+# Splatting prediction model (a per-patch linear head over cached World
+# Tracing decoder tokens) on a wt_features.py output h5. See train_gs.py's
+# module docstring.
 
 # Directory for everything a single run produces.
 output_dirname: 3dgs-model-${now:%Y-%m-%d_%H-%M-%S}
@@ -21,111 +18,23 @@ torch_detect_anomaly: false
 ckpt_path: null
 
 data:
-  photom_h5: /app/bla/lite_blackbg.h5   # str, list, or glob(s) -- render_objaverse.py-schema
-  num_layers: 6                         # must match the file(s)' depth_peel layer count
-  num_target_views: 3                   # extra supervision views per step, alongside self-render
-  # Which catalog rows are eligible to be a SOURCE view for train_ds ONLY
-  # (GSPairDataset.source_views; not applied to val_ds -- an empty/small val
-  # split has no guarantee of overlapping whatever's restricted here, and
-  # val is a separate concern from what the model trains to encode). Row
-  # positions (H5Catalog.take()'s index space), not raw view_idx values --
-  # they coincide for an unsplit single-file catalog (e.g. omit
-  # data/split_fn=by_view, which reorders rows via random_split even at
-  # val_fraction=0) but NOT after any split that reorders/subsets rows.
-  # Target-view sampling is unaffected, still drawn from every view of the
-  # source's mesh. null (default): every view is eligible, unchanged
-  # behavior.
-  source_views: null
-
-  # Whether a source view is also eligible to land in its own target_views
-  # list (GSPairDataset.allow_source_as_target). false (default, unchanged
-  # behavior): source_view is always excluded, so every sampled target is a
-  # genuinely different view. true: source_view is just another member of
-  # the mesh's view pool, same odds as any other view.
-  allow_source_as_target: false
-
-  # Held-out TARGET views for validating a single-fixed-source setup
-  # (requires data.source_views to have EXACTLY one entry) -- GSFixedSourceDataset,
-  # indexed by held-out view instead of by source row, so val_ds isn't
-  # collapsed to 0/1 rows the way GSPairDataset's own row-indexed val would
-  # be with only one eligible source. Raw view_idx values (GSFixedSourceDataset's
-  # own domain, not H5Catalog.take()'s row-position space like source_views
-  # above). Bypasses data.split_fn entirely (assumes a single-mesh catalog).
-  # train_ds's own target-sampling pool automatically excludes these views
-  # (via GSPairDataset.target_views), so train/val targets stay disjoint.
-  # null (default): unchanged behavior, no fixed-source validation split.
-  val_target_views: null
-  # How many of val_target_views one validation row renders/supervises at
-  # once, through a single encoder pass on the shared source -- see
-  # GSFixedSourceDataset. Only used when val_target_views is set.
-  val_targets_per_item: 1
-
-  # HACK (temporary): switches BOTH train_ds and val_ds to
-  # GSFixedSourceDataset, built off one plain shuffled split of the raw
-  # view list -- no mesh grouping, no data.split_fn, no GSPairDataset on
-  # either side (unlike val_target_views above, which still uses
-  # GSPairDataset for train_ds). Requires data.source_views to have
-  # exactly one entry. Takes priority over val_target_views if both are
-  # set. false (default): unchanged behavior.
-  fixed_source_dataset: false
-  # Fraction of the raw view list held out for val_ds, only used when
-  # fixed_source_dataset=true. Split once with a plain seeded shuffle.
-  fixed_source_val_fraction: 0.1
-
-  # Train/val split for ordinary multi-scene training (ignored when
-  # fixed_source_view or photom_h5_val is set -- see their own comments
-  # below). A config group (conf/data/split_fn/*.yaml, picked via the
-  # `defaults:` list up top) rather than inline here, so the strategy is a
-  # one-token CLI override instead of rewriting _target_ by hand, e.g.:
-  #   data/split_fn=by_view data.split_fn.val_fraction=0.2
-  #   data/split_fn=by_indices data.split_fn.train_idx='[0,1,2]' data.split_fn.val_idx='[3,4]'
-  # See conf/data/split_fn/*.yaml for what each option takes.
-
-  # Single-batch overfit mode (fit_gsplat.py's primary/secondary terms
-  # applied here): if set, train on this EXACT source+target view set every
-  # step, no resampling at all (ignores num_target_views/split_fn).
-  # fixed_target_views is required when fixed_source_view + photom_h5 are
-  # both set (irrelevant/ignored in gauss_h5-only mode -- see gauss_h5 below).
-  fixed_source_view: null    # int, e.g. 0
-  fixed_target_views: null   # list of ints, e.g. [1, 2, 3]
-  # A SEPARATE render_objaverse.py-schema corpus (str/list/glob(s)) used
-  # EXCLUSIVELY for validation, decoupled from data.photom_h5 -- for the
-  # "train on direct Gaussian-parameter supervision, validate
-  # photometrically" mode: pair this with fixed_source_view + gauss_h5 +
-  # direct_*_weight training. Every val item's source AND target views are
-  # drawn from this corpus itself (a GSPairDataset over its own H5Catalog),
-  # independent of whatever view train.fixed_source_view points at --
-  # validation genuinely tests the trained network as a normal single-image
-  # encoder on a different image, not a held-out subset of the training
-  # corpus. Also usable (optionally) with ordinary multi-scene training,
-  # replacing the split_fn mesh-holdout split with a wholly
-  # separate corpus. null (default): when fixed_source_view + gauss_h5 are
-  # set and this is left null, val_ds instead falls back to gauss_h5's OWN
-  # embedded secondary views (GaussH5ValDataset, gs_dataset.py) -- the exact
-  # views fit_gsplat.py fit its ground truth against, with scale/rotation
-  # etc. ground-truth-pinned for whichever fields aren't in
-  # model.predict_params. Set this explicitly to validate against a
-  # genuinely different corpus/image instead.
-  photom_h5_val: null
-  # fit_gsplat.py output .h5 (per-pixel ground-truth Gaussian params for ONE
-  # view). Only used when set, and only together with fixed_source_view --
-  # its config_json "primary" must equal fixed_source_view (checked at
-  # startup, see gs_dataset._check_ground_truth_consistency). Enables
-  # loss.direct_*_weight below. Mutually exclusive with photom_h5 (for now):
-  # a gauss_h5 already embeds everything needed to rebuild its own primary
-  # view (image/depth/pose, see gs_dataset._read_primary_from_gauss_h5), so
-  # it's a fully self-sufficient training source on its own -- set
-  # photom_h5=null when using this. photom_h5_val may still be set alongside
-  # it to add photometric validation against a separate corpus.
-  gauss_h5: null
+  features_h5: ???          # required -- a wt_features.py output h5
+  # Row of features_h5 to overfit on (indexes its `features` / `view_indices` /
+  # `mesh_index` / `seed` datasets). The render h5 it came from is read from
+  # the file's `source_h5` attr. With seeds_per_view > 1 a view appears in
+  # several rows, one per noise seed.
+  item: 0
+  num_layers: 6             # must match the file(s)' depth_peel layer count
+  num_target_views: 3       # extra supervision views per step, alongside self-render
+  # Which views of the SAME mesh are eligible as extra supervision views
+  # (raw view indices into the source render h5; must not include the source
+  # view). null (default): every other view of the source view's mesh, a
+  # random subset of num_target_views per step when there are more.
+  target_views: null
 
 model:
-  backbone:
-    num_layers: 50           # ResNet depth (18 or 50)
-    pretrained: true         # ImageNet-pretrained trunk
-    bn_order: pre_bn         # pre_bn | monodepth -- see gs_encoder.py
-    num_ch_dec: [32, 32, 64, 128, 256]
-    upsample_mode: nearest
+  patch_size: 14            # WT's patch size; head output grid = sqrt(P) * patch_size per side
+  feature_dim: 1536         # WT decoder_embed_dim (r75b)
   max_sh_degree: 0           # 0 = plain RGB, 1 = DC + 1 SH band (9 extra channels).
                               # Default 0 for now: fit_gsplat.py's ground truth is flat
                               # RGB with no SH>0 at all, so direct_color_weight only ever
@@ -186,17 +95,6 @@ model:
   # unchanged behavior, and the decoder's output conv keeps its old shape, so
   # existing checkpoints still load.
   predict_mean_offset: false
-  # Which Gaussian fields the network is trained/trusted to predict; the rest
-  # are overwritten with data.gauss_h5 values before
-  # flattening/rendering. E.g. [scale] isolates scale's own learning signal
-  # and pins everything else to ground truth, so an unsupervised field can't
-  # silently drift via the shared decoder trunk.
-  predict_params: [opacity, scale, rotation, color]
-  # z-score constants for the input point cloud's camera-space xyz channels
-  # (WT's own training-distribution stats; derived from render_objaverse.py's
-  # convention -- unit-cube-normalized objects, camera_distance~=1.9).
-  xyz_mean: [-0.0024, -0.0040, 1.9043]
-  xyz_std: [0.281, 0.316, 0.706]
 
 loss:
   photom:
@@ -227,22 +125,6 @@ loss:
   # predict_mean_offset=false. Same untuned default as 3dgs-paper-repro's
   # conf/fit_3dgs.yaml -- adjust to taste.
   mean_offset_reg_weight: 0.01
-
-  # Direct per-pixel supervision of the model's own predicted Gaussian
-  # params against a fit_gsplat.py ground-truth .h5 (data.gauss_h5),
-  # as an alternative/complement to the photometric losses above. All
-  # default 0 (opt-in); when ALL of l1_weight/ssim_weight/mask_weight AND
-  # these are left at their defaults, behavior is unchanged from today. When
-  # all photometric weights are 0 and at least one of these is nonzero, the
-  # per-step gsplat rasterization call is skipped entirely (see
-  # train_gs.compute_loss); render panels/orbit videos still work regardless
-  # (force_render=True at those call sites).
-  direct_opacity_weight: 0.0
-  direct_scale_weight: 0.0     # compared in log-space (both sides are
-                                 # already absolute world-unit sizes)
-  direct_rotation_weight: 0.0  # sign-invariant (1 - |dot(q_pred, q_gt)|)
-  direct_color_weight: 0.0     # only touches sh_dc's gradient (SH_C0*sh_dc+0.5
-                                 # vs. gt's flat RGB) -- sh_rest has no GT signal
 
 callbacks:
   # https://pytorch-lightning.readthedocs.io/en/2.6.1/pytorch/api/lightning.pytorch.callbacks.LearningRateMonitor.html
@@ -288,7 +170,7 @@ trainer:
   devices: 1
   # enable_checkpointing: false
   check_val_every_n_epoch: 1
-  log_every_n_steps: 50
+  log_every_n_steps: 1
   default_root_dir: ${output_dir}
   gradient_clip_val: 1.0
   gradient_clip_algorithm: norm
