@@ -27,11 +27,10 @@ plan calls out explicitly):
                                                  different viewing distance, etc.) exceeds that
                                                  floor.
     rotation = normalize(raw_quat, dim=channel) unit quaternion, wxyz, no sign constraint
-    sh_dc    = (sigmoid(raw)-0.5) / SH_C0       SH band-0 color coeff, chosen so that the
-                                                 rendered color (SH_C0*sh_dc+0.5, evaluated by
-                                                 gsplat/compute_direct_loss) works out to exactly
-                                                 sigmoid(raw) -- bounded in (0,1), same pattern as
-                                                 opacity above.
+    sh_dc    = raw                              SH band-0 color coeff, unconstrained: the rendered
+                                                 color is SH_C0*sh_dc + 0.5 (degree-0 SH, as gsplat
+                                                 and compute_direct_loss evaluate it), clamped only
+                                                 at render time.
     sh_rest  = raw                              unconstrained, SH band-1+ coeffs (only if max_sh_degree>0)
     offset   = raw                              unconstrained camera-space xyz residual added to the
                                                  depth-peel position (only if predict_mean_offset)
@@ -45,7 +44,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from module import SH_C0
 
 
 def upsample(x, mode="nearest"):
@@ -226,12 +224,10 @@ class GaussianResnetDecoder(nn.Module):
       # denominator, so a true zero vector normalizes to itself (still zero,
       # not a unit quaternion). Negligible next to any real trained value.
       "rotation": F.normalize(stack_layers(per_field["rotation"]) + 1e-6, dim=2),
-      # sigmoid-bounded color: gsplat/compute_direct_loss both evaluate
-      # rendered color as SH_C0*sh_dc + 0.5 (degree-0 SH), so expressing
-      # sh_dc as (sigmoid(raw)-0.5)/SH_C0 here makes that evaluate back out
-      # to exactly sigmoid(raw) -- bounded in (0,1), same pattern as opacity
-      # above, instead of the previous fully-unconstrained raw value.
-      "sh_dc": (torch.sigmoid(stack_layers(per_field["sh_dc"])) - 0.5) / SH_C0,
+      # unconstrained color: gsplat/compute_direct_loss both evaluate rendered
+      # color as SH_C0*sh_dc + 0.5 (degree-0 SH), so the raw value is used
+      # as-is (no sigmoid bounding it to (0,1)).
+      "sh_dc": stack_layers(per_field["sh_dc"]),
     }
     if self.max_sh_degree != 0:
       out["sh_rest"] = stack_layers(per_field["sh_rest"])
