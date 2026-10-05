@@ -1,0 +1,6 @@
+- data.features_h5=/app/bla/porsche_250views.wt_features.5views10seeds.h5
+- data.item=0
+- wandb.mode=offline
+- trainer.max_epochs=100
+- model.zero_init_last_conv=true
+- output_dir=/tmp/wtgs_smoke_true
