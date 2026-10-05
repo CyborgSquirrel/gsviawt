@@ -1,0 +1,45 @@
+# Config for wt_features.py -- one World Tracing forward pass per view on a
+# *noised* GT layered point cloud, saving the decoder token volume that feeds
+# the prediction head. See the module docstring.
+
+# --- input: a render_objaverse.py h5 (images, depth_peel, *_intrinsics) ---
+input: ???                # required -- pass input=/app/bla/....h5
+
+# Explicit view indices into the h5 (`images` / `depth_peel` row numbers).
+views: ???                # required -- pass 'views=[0,5,12]'
+
+# null -> "<input>.wt_features.h5" next to the input
+output: null
+
+# --- model ---
+config: r75b              # wt.checkpoint.CONFIGS key (r75b / r69e / r76 ...)
+ckpt: r75b                # config name | hf://repo[/file.pt] | local .pt path
+# Cast the stored weights to bf16 after loading (autocast is bf16 regardless).
+# Needed for r75b on the 10GB RTX 3080, else OOM -- see wt_infer_layers.py.
+bf16_weights_hack: true
+
+# --- noising ---
+# Flow-matching time t in [0, 1]: x_t = (1 - t) * x0 + t * eps. 0 = clean GT
+# point cloud, 1 = pure noise. Also the timestep the model is called with.
+noise_level: 0.5
+# Main seed. Each view gets its own sub-seed derived from (seed, view index),
+# which seeds torch's global RNG right before that view -- so eps and the
+# model's own internal randn (invalid-pixel fill) are reproducible, differ
+# across views, and don't depend on which other views are listed. The sub-seeds
+# are saved in the output's `seed` dataset; this one in the `main_seed` attr.
+seed: 42
+
+# --- conditioning image (same knobs as wt_infer_layers.py) ---
+bg_color: [0, 0, 0]       # RGB the masked-out region is composited to
+hard_alpha: false         # ignore a stored soft alpha; use the layer-0 depth hit
+
+# --- output h5 ---
+# gzip level for `features`. One chunk == one view's whole [L, P, D] volume.
+compression_level: 4
+
+hydra:
+  job:
+    chdir: false          # stay in cwd; paths are absolute / input-relative
+  output_subdir: null     # no .hydra/ dir
+  run:
+    dir: .                # no outputs/ dir
