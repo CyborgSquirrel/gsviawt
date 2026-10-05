@@ -37,7 +37,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import pack, rearrange, reduce, repeat
+from einops import pack, rearrange, repeat
 from omegaconf import OmegaConf
 from torch.optim import Optimizer
 
@@ -108,21 +108,26 @@ def init_gaussians(depth_primary, K_primary, pose_primary, image_primary,
   iu = np.clip(np.round(u * (iw / dw)), 0, iw - 1).astype(np.int64)
   colors = image_primary[iv, iu, :3].astype(np.float32) / 255.0      # front-pixel colour
 
-  # isotropic initial scale = mean distance to the knn_k nearest neighbours
+  # isotropic initial scale = RMS distance to the knn_k nearest neighbours
+  # (sqrt(mean(d^2)), not mean(d) -- matches simple_knn's distCUDA2 exactly,
+  # same formula fit_3dgs.py's own init_gaussians() uses for "set" mode;
+  # this used to be a plain mean here, a leftover from fit_gsplat.py's own
+  # less careful version, before this function moved into module.py).
   from scipy.spatial import cKDTree
   k = min(knn_k + 1, len(pts))
   dist, _ = cKDTree(pts).query(pts, k=k)                    # (P, k), or (P,) when k == 1
   dist = rearrange(dist, "p -> p 1") if dist.ndim == 1 else dist
   neighbours = dist[:, 1:] if k > 1 else dist               # column 0 is the point itself
-  nn = reduce(neighbours, "p k -> p", "mean")
-  nn = np.clip(nn, 1e-6, None).astype(np.float32)
+  nn = np.sqrt(np.clip((neighbours ** 2).mean(axis=1), 1e-7, None)).astype(np.float32)
 
   return {
     "means": pts.astype(np.float32),
     "scales_log": repeat(np.log(nn), "p -> p xyz", xyz=3).astype(np.float32),
     "quats": np.tile([1.0, 0.0, 0.0, 0.0], (len(pts), 1)).astype(np.float32),
     "opac_logit": np.full(len(pts), _logit(np.float32(init_opacity)), np.float32),
-    "colors_logit": _logit(colors).astype(np.float32),
+    "colors": colors.astype(np.float32),  # [0,1] RGB, not logit -- fit_3dgs.py converts
+                                           # straight to SH0 (RGB2SH), no flat-colour model
+                                           # here to justify a logit representation at all
     "u": u.astype(np.int64), "v": v.astype(np.int64), "layer": layer.astype(np.int64),
   }
 
@@ -601,10 +606,18 @@ class OrbitCallback(pl.Callback):
 
   every_n_epochs XOR every_n_steps picks which cadence this instance
   fires on -- see PanelCallback's own docstring, same contract exactly
-  (epoch cadence == train only; step cadence == train + val together)."""
+  (epoch cadence == train only; step cadence == train + val together).
+
+  path_format: where each mp4 is written, as a str.format() template over
+  {stage} ("train"/"val"), {mode} ("epoch"/"step") and {n} (completed
+  epochs/steps; format specs like {n:06d} work). Parent directories are
+  created and the files are kept. None (default): a throwaway temp dir,
+  named "{stage}_orbit_{mode}{n}.mp4" and deleted when fit ends -- the
+  videos then only survive as the wandb.Video uploads."""
 
   def __init__(self, *, every_n_epochs: int | None = None, every_n_steps: int | None = None,
-              num_frames: int = 24, fps: int = 12, crf: int = 28, elevation_deg: float = 20.0):
+              num_frames: int = 24, fps: int = 12, crf: int = 28, elevation_deg: float = 20.0,
+              path_format: str | None = None):
     _cadence_check(every_n_epochs, every_n_steps, "OrbitCallback")
     self.every_n_epochs = every_n_epochs
     self.every_n_steps = every_n_steps
@@ -612,10 +625,12 @@ class OrbitCallback(pl.Callback):
     self.fps = fps
     self.crf = crf
     self.elevation_deg = elevation_deg
+    self.path_format = path_format
     self.workdir = None
 
   def on_fit_start(self, trainer, pl_module):
-    self.workdir = tempfile.mkdtemp(prefix="orbit_")
+    if self.path_format is None:
+      self.workdir = tempfile.mkdtemp(prefix="orbit_")
 
   def on_fit_end(self, trainer, pl_module):
     if self.workdir is not None:
@@ -670,7 +685,11 @@ class OrbitCallback(pl.Callback):
         )
         rgb_np = (rgb.clamp(0.0, 1.0).cpu().numpy() * 255).astype("uint8")
         frames = [rgb_np[i] for i in range(rgb_np.shape[0])]
-        path = os.path.join(self.workdir, f"{stage}_orbit_{mode}{n}.mp4")
+        if self.path_format is None:
+          path = os.path.join(self.workdir, f"{stage}_orbit_{mode}{n}.mp4")
+        else:
+          path = self.path_format.format(stage=stage, mode=mode, n=n)
+          os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         write_mp4(frames, path, self.fps, self.crf)
         log_payload[f"{stage}/orbit"] = wandb.Video(path, caption=f"{mode} {n}", format="mp4")
     if not log_payload:

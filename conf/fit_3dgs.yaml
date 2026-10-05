@@ -23,7 +23,36 @@ eval: true                            # llffhold=8 train/test split, same as our
 # null (default) -> use source_path/images/eval above instead.
 hdf5_path: null
 
-output_path: null                     # null -> <source_path-or-hdf5_path>.fit3dgs.h5
+# Which h5 views play which role (hdf5_path only; row indices into the file).
+# Train = primary_view + secondary_views; primary_view is also the view
+# gaussian_layout=layered seeds its Gaussians from. Anything left null is
+# computed from the views NOT named in any of the three (split with
+# data.split_fn.val_fraction/seed) and written back here, so the saved
+# config always shows the full split that ran. See fit_3dgs.resolve_views.
+data:
+  primary_view: null                  # int
+  secondary_views: null               # list[int]
+  validation_views: null              # list[int]
+
+# Directory for everything a single run produces: gaussians.h5, gaussians.ply,
+# results.json (+ gaussians.grid.h5 in layered mode). The script itself has no
+# fallback -- this config is the only place a default lives.
+output_dirname: 3dgs-fit-${now:%Y-%m-%d_%H-%M-%S}
+output_dir: outputs/${output_dirname}
+
+# Background composited under the render (gsplat.rasterization's own
+# `backgrounds=`) and, wherever real alpha exists (the hdf5_path path;
+# COLMAP photos have none, alpha is always 1 there so this is a no-op on
+# gt_rgb but still affects the render), recomposited into gt_rgb to match.
+#   none:   implicit black, unchanged default behaviour.
+#   white:  fixed white, every stage (train/val/final_eval) -- a scene
+#           convention, not an augmentation, like the reference's own
+#           white_background flag.
+#   random: a fresh uniform random colour per TRAIN batch only (matches
+#           train_gs.py's loss.random_bg) -- val/final_eval stay black so
+#           metrics are comparable run over run, same as train_gs.py never
+#           applies random_bg outside the train stage.
+background: none                      # none | white | random
 
 # set: free xyz, real growing/shrinking densification (what fit_3dgs.py has
 # always done). layered: one Gaussian per depth-peel hit in the primary
@@ -98,7 +127,7 @@ wandb:
   project: gsviawt
   mode: online
   tags: [fit-3dgs]
-  name: null
+  name: ${output_dirname}
 
 # Same wandb train/val [GT | render | |diff|] panel + orbit turntable
 # fit_gsplat.py/train_gs.py log -- module.{Panel,Orbit}Callback, shared, see
@@ -118,6 +147,7 @@ callbacks:
     fps: 12
     crf: 18
     elevation_deg: 20.0
+    path_format: ${output_dir}/orbits/{stage}_orbit_{mode}{n:06d}.mp4   # null -> temp dir, deleted at fit end
 
 trainer:
   max_steps: ${iters}
@@ -134,4 +164,4 @@ hydra:
   job:
     chdir: false
   run:
-    dir: outputs/fit_3dgs/${now:%Y-%m-%d_%H-%M-%S}
+    dir: ${output_dir}
