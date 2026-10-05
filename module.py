@@ -606,10 +606,18 @@ class OrbitCallback(pl.Callback):
 
   every_n_epochs XOR every_n_steps picks which cadence this instance
   fires on -- see PanelCallback's own docstring, same contract exactly
-  (epoch cadence == train only; step cadence == train + val together)."""
+  (epoch cadence == train only; step cadence == train + val together).
+
+  path_format: where each mp4 is written, as a str.format() template over
+  {stage} ("train"/"val"), {mode} ("epoch"/"step") and {n} (completed
+  epochs/steps; format specs like {n:06d} work). Parent directories are
+  created and the files are kept. None (default): a throwaway temp dir,
+  named "{stage}_orbit_{mode}{n}.mp4" and deleted when fit ends -- the
+  videos then only survive as the wandb.Video uploads."""
 
   def __init__(self, *, every_n_epochs: int | None = None, every_n_steps: int | None = None,
-              num_frames: int = 24, fps: int = 12, crf: int = 28, elevation_deg: float = 20.0):
+              num_frames: int = 24, fps: int = 12, crf: int = 28, elevation_deg: float = 20.0,
+              path_format: str | None = None):
     _cadence_check(every_n_epochs, every_n_steps, "OrbitCallback")
     self.every_n_epochs = every_n_epochs
     self.every_n_steps = every_n_steps
@@ -617,10 +625,12 @@ class OrbitCallback(pl.Callback):
     self.fps = fps
     self.crf = crf
     self.elevation_deg = elevation_deg
+    self.path_format = path_format
     self.workdir = None
 
   def on_fit_start(self, trainer, pl_module):
-    self.workdir = tempfile.mkdtemp(prefix="orbit_")
+    if self.path_format is None:
+      self.workdir = tempfile.mkdtemp(prefix="orbit_")
 
   def on_fit_end(self, trainer, pl_module):
     if self.workdir is not None:
@@ -675,7 +685,11 @@ class OrbitCallback(pl.Callback):
         )
         rgb_np = (rgb.clamp(0.0, 1.0).cpu().numpy() * 255).astype("uint8")
         frames = [rgb_np[i] for i in range(rgb_np.shape[0])]
-        path = os.path.join(self.workdir, f"{stage}_orbit_{mode}{n}.mp4")
+        if self.path_format is None:
+          path = os.path.join(self.workdir, f"{stage}_orbit_{mode}{n}.mp4")
+        else:
+          path = self.path_format.format(stage=stage, mode=mode, n=n)
+          os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         write_mp4(frames, path, self.fps, self.crf)
         log_payload[f"{stage}/orbit"] = wandb.Video(path, caption=f"{mode} {n}", format="mp4")
     if not log_payload:
