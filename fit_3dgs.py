@@ -88,7 +88,7 @@ fit_gsplat.py/train_gs.py via module.py -- see that module's docstring.
 Held-out test views (llffhold=8, same as the reference's --eval) are used
 both as periodic val/loss* metrics during training AND for a final
 PSNR/SSIM/LPIPS(vgg) pass at the end (cfg.final_eval), logged to wandb and
-written as results.json next to the output -- the same methodology
+written as results.json in cfg.output_dir -- the same methodology
 gaussian-splatting/metrics.py uses, so a run is self-checking against the
 numbers we already reproduced manually.
 
@@ -212,7 +212,70 @@ def load_scene(source_path, images, eval_split, resolution):
   return info.point_cloud, float(info.nerf_normalization["radius"]) or 1.0, train_cams, test_cams
 
 
-def load_scene_h5(hdf5_path, val_fraction, seed):
+def resolve_views(hdf5_path, primary, secondary, validation, val_fraction, seed):
+  """Resolves cfg.data.primary_view / secondary_views / validation_views
+  (each None == unset) into a full (primary: int, secondary: list[int],
+  validation: list[int]) of h5 row indices. Train = primary + secondary;
+  primary is also the view gaussian_layout="layered" seeds from.
+
+  Whatever IS set is taken as given. The rest of the catalog (every view in
+  none of the three groups) is the "inverse dataset", and anything unset
+  comes from it:
+    - secondary AND validation (and/or primary) unset: the inverse dataset
+      is split with gs_dataset.split_by_view(val_fraction, seed) -- its
+      train side is the train pool, its val side is validation.
+    - only secondary/primary unset: the whole inverse dataset is the train
+      pool. Only validation unset: it is all validation.
+    - primary unset: the smallest view index in the train pool (a pool
+      derived from the inverse dataset, never carved out of an explicit
+      secondary_views), removed from the pool; secondary gets the rest.
+  With all three unset this is exactly the old behaviour: split_by_view
+  over the whole catalog, primary == its smallest train index.
+  Views in the inverse dataset that end up in no group are just unused."""
+  catalog = H5Catalog(
+    hdf5_path, H5Catalog.path().alias("path"), H5Catalog.index().alias("view_idx"),
+    H5Catalog.dataset("mesh_index").alias("mesh_id"))
+  all_idx = [int(i) for i in catalog.df["view_idx"]]
+
+  primary = None if primary is None else int(primary)
+  secondary = None if secondary is None else sorted(int(i) for i in secondary)
+  validation = None if validation is None else sorted(int(i) for i in validation)
+
+  given = ([primary] if primary is not None else []) + (secondary or []) + (validation or [])
+  if len(given) != len(set(given)):
+    raise SystemExit(f"data.primary_view/secondary_views/validation_views overlap or repeat a view: {sorted(given)}")
+  unknown = sorted(set(given) - set(all_idx))
+  if unknown:
+    raise SystemExit(f"views {unknown} are not in {hdf5_path} (it has {len(all_idx)} views)")
+
+  def _ids(c):
+    return sorted(int(i) for i in c.df["view_idx"])
+
+  needs_train = primary is None or secondary is None
+  needs_val = validation is None
+  train_pool = []
+  if needs_train or needs_val:
+    given_set = set(given)
+    inverse = catalog if not given_set else catalog.take(
+      [pos for pos, i in enumerate(all_idx) if i not in given_set])
+    if needs_train and needs_val:
+      train_side, val_side = split_by_view(inverse, val_fraction=val_fraction, seed=seed)
+      train_pool, validation = _ids(train_side), _ids(val_side)
+    elif needs_train:
+      train_pool = _ids(inverse)
+    else:
+      validation = _ids(inverse)
+
+  if primary is None:
+    if not train_pool:
+      raise SystemExit("data.primary_view is unset and no views are left over to pick one from")
+    primary = train_pool.pop(0)
+  if secondary is None:
+    secondary = train_pool
+  return primary, secondary, validation
+
+
+def load_scene_h5(hdf5_path, train_idx, val_idx, seed):
   """Alternative to load_scene() for a render_objaverse.py-schema HDF5
   (`images`, `image_intrinsics`, `camera_pose` -- one object, no COLMAP/SfM
   point cloud) instead of a real COLMAP capture. Returns the exact same
@@ -220,10 +283,10 @@ def load_scene_h5(hdf5_path, val_fraction, seed):
   nothing downstream (init_gaussians, Fit3DGSViewDataset, training loop,
   run_final_eval) needs to know which loader ran.
 
-  Split: H5Catalog + gs_dataset.split_by_view (this project's own train/val
-  convention, same one fit_gsplat.py/train_gs.py use) in place of COLMAP's
-  llffhold=8 -- there's no `images` folder / sorted filenames to hold out
-  every 8th of here, just a flat view axis.
+  Split: caller-given h5 row indices (see resolve_views, which turns
+  cfg.data.primary_view/secondary_views/validation_views into them) in
+  place of COLMAP's llffhold=8 -- there's no `images` folder / sorted
+  filenames to hold out every 8th of here, just a flat view axis.
 
   Camera convention: `camera_pose` is camera-to-world in Blender/OpenGL
   axes (X right, Y up, Z back), same as gs_dataset.py's/fit_gsplat.py's
@@ -252,12 +315,7 @@ def load_scene_h5(hdf5_path, val_fraction, seed):
   1.0 (the object itself sits inside [-0.5, 0.5]^3): 0.75 gives the same
   kind of generous margin around the actual object that 1.3 gives around
   the reference's own scenes, for the optimizer to grow/prune into."""
-  catalog = H5Catalog(
-    hdf5_path, H5Catalog.path().alias("path"), H5Catalog.index().alias("view_idx"),
-    H5Catalog.dataset("mesh_index").alias("mesh_id"))
-  train_catalog, val_catalog = split_by_view(catalog, val_fraction=val_fraction, seed=seed)
-  train_idx = sorted(int(r["view_idx"]) for r in train_catalog.df.iter_rows(named=True))
-  val_idx = sorted(int(r["view_idx"]) for r in val_catalog.df.iter_rows(named=True))
+  train_idx, val_idx = sorted(train_idx), sorted(val_idx)
 
   with h5py.File(hdf5_path, "r") as f:
     images = np.asarray(f["images"])                          # (V,H,W,3|4) u8
@@ -342,9 +400,8 @@ def init_gaussians(pcd, max_sh_degree, init_opacity, knn_k):
 # gaussian init -- LAYERED alternative to init_gaussians() above, for
 # gaussian_layout="layered" (h5 scenes with depth_peel only -- see
 # load_scene_h5's own guard in main()). One Gaussian per depth-peel hit in
-# the PRIMARY train view's 6-layer peel (fit_gsplat.py's own convention:
-# "whichever [view] sorts first in the (already-split) catalog" --
-# train_cams[0]["view_idx"], since load_scene_h5 already sorts train_idx).
+# the PRIMARY train view's 6-layer peel (cfg.data.primary_view, resolved by
+# resolve_views -- explicit if set, else the smallest train index).
 # Every Gaussian keeps a fixed (u, v, layer) origin in that view's depth
 # grid, so the final flat param set can be scattered back into a
 # fit_gsplat.py-schema (H, W, L, .) grid (see save_output_layered) --
@@ -667,7 +724,7 @@ class Fit3DGSLightningModule(pl.LightningModule):
 
   def _photom_loss(self, rgb, gt_rgb):
     l1 = (rgb - gt_rgb).abs().mean()
-    dssim = self.dssim(rgb.permute(0, 3, 1, 2), gt_rgb.permute(0, 3, 1, 2))
+    dssim = self.dssim(rearrange(rgb, "b h w c -> b c h w"), rearrange(gt_rgb, "b h w c -> b c h w"))
     ld = float(self.cfg.lambda_dssim)
     return (1 - ld) * l1 + ld * dssim, {"l1": l1, "dssim": dssim}
 
@@ -678,15 +735,22 @@ class Fit3DGSLightningModule(pl.LightningModule):
     return self._step("val", batch, batch_idx)
 
   def _step(self, stage, batch, batch_idx):
-    """Shared by training_step/validation_step (fit_gsplat.py/train_gs.py's
-    own convention -- one _step, not two near-identical copies: that's how
+    """Shared by training_step/validation_step/run_final_eval (stage ==
+    "train"/"val"/"final_eval") -- fit_gsplat.py/train_gs.py's own
+    convention -- one _step, not near-identical copies: that's how
     views_seen ended up logged for train but silently never for val, a
-    literal duplicated-code bug, not a deliberate omission). Everything
+    literal duplicated-code bug, not a deliberate omission. Everything
     that mutates optimizer/strategy state (backward, the 6 optimizers'
     .step(), gsplat's grow/prune/reset, the means-LR/SH-degree schedule,
     should_stop) stays train-only -- gated by `stage == "train"` inline,
     same as fit_gsplat.py gates its own train-only bits (random_bg,
-    final_loss) inside its shared _step."""
+    final_loss) inside its shared _step.
+
+    final_eval returns a {"PSNR"/"SSIM"/"LPIPS": float} dict instead of
+    the usual loss tensor -- it has no Trainer loop driving it (run_final_
+    eval calls this directly, after trainer.fit() has already returned),
+    so it returns before the self.log(...) tail below, which assumes an
+    active Trainer."""
     def _log(key, *args, **kwargs):
       self.log(f"{stage}/{key}", *args, **kwargs, batch_size=B)
 
@@ -775,6 +839,18 @@ class Fit3DGSLightningModule(pl.LightningModule):
         # under "loss/photom_*" -- this isn't a photometric term).
         offset_reg = self.params["means"].pow(2).sum(-1).mean()
         loss = loss + self.mean_offset_reg_weight * offset_reg
+
+    if stage == "final_eval":
+      # Same methodology as gaussian-splatting/metrics.py: per-image
+      # PSNR/SSIM/LPIPS(vgg), averaged over the test split by the caller.
+      # dssim == 1-SSIM already (DSSIMLoss), so parts["dssim"] from the
+      # photom_loss computed above IS the SSIM term here, not recomputed.
+      from lpipsPyTorch import lpips
+      mse = (rgb - gt_rgb).pow(2).mean()
+      lpips_val = lpips(rearrange(rgb, "b h w c -> b c h w"), rearrange(gt_rgb, "b h w c -> b c h w"), net_type="vgg")
+      return {
+        "PSNR": float(-10 * torch.log10(mse)), "SSIM": float(1.0 - parts["dssim"]), "LPIPS": float(lpips_val),
+      }
 
     if stage == "train":
       for opt in self.optimizers_dict.values():
@@ -888,31 +964,22 @@ class Fit3DGSLightningModule(pl.LightningModule):
 # ---------------------------------------------------------------------------
 
 def run_final_eval(model, test_cams, device):
-  from lpipsPyTorch import lpips
-
-  # Same rule _step uses for val: "white" applies here too (a scene
-  # convention, not an augmentation), "random"/"none" don't (no single
-  # "the" random colour to eval against -- stay on the comparable bg=None
-  # everything else uses). (3,), not (1,3) -- see _step's own comment on
-  # gsplat's packed=True backgrounds shape constraint.
-  bg = torch.ones(3, device=device) if str(model.cfg.background) == "white" else None
-
+  """Drives Fit3DGSLightningModule._step(stage="final_eval") one test view
+  at a time -- same bg-select/composite/render/photom_loss pipeline train/
+  val already go through, just fed from test_cams instead of a DataLoader
+  epoch, and a plain Python loop instead of a Trainer loop. _step itself
+  returns the per-view {"PSNR"/"SSIM"/"LPIPS"} dict for this stage; this
+  function only averages them over the split."""
+  loader = DataLoader(Fit3DGSViewDataset(test_cams), batch_size=1, shuffle=False)
   psnrs, ssims, lpipss = [], [], []
   model.eval()
   with torch.no_grad():
-    for c in test_cams:
-      gt = torch.from_numpy(c["image"])[None].to(device)
-      K = torch.from_numpy(c["K"])[None].to(device)
-      vm = torch.from_numpy(c["viewmat"])[None].to(device)
-      if bg is not None:
-        alpha_gt = torch.from_numpy(c["alpha"])[None].to(device)
-        gt = gt + bg[None, None, None, :] * (1.0 - alpha_gt)
-      render_params = {**model.params, "means": model._active_means()}
-      rgb, _, _ = render(render_params, model.active_sh_degree, vm, K, c["width"], c["height"], backgrounds=bg)
-      mse = (rgb - gt).pow(2).mean()
-      psnrs.append(float(-10 * torch.log10(mse)))
-      ssims.append(float(1.0 - model.dssim(rgb.permute(0, 3, 1, 2), gt.permute(0, 3, 1, 2))))
-      lpipss.append(float(lpips(rgb.permute(0, 3, 1, 2), gt.permute(0, 3, 1, 2), net_type="vgg")))
+    for i, batch in enumerate(loader):
+      batch = {k: v.to(device) for k, v in batch.items()}
+      out = model._step("final_eval", batch, i)
+      psnrs.append(out["PSNR"])
+      ssims.append(out["SSIM"])
+      lpipss.append(out["LPIPS"])
   return {
     "PSNR": float(np.mean(psnrs)), "SSIM": float(np.mean(ssims)), "LPIPS": float(np.mean(lpipss)),
     "num_test_views": len(test_cams),
@@ -929,9 +996,10 @@ def main(cfg: DictConfig) -> None:
   torch.manual_seed(int(cfg.seed))
 
   use_h5 = bool(cfg.get("hdf5_path"))
-  default_stem = cfg.hdf5_path if use_h5 else cfg.source_path.rstrip("/")
-  out_h5 = cfg.output_path or f"{default_stem}.fit3dgs.h5"
-  stem = out_h5[:-3] if out_h5.endswith(".h5") else out_h5
+  output_dir = cfg.output_dir
+  os.makedirs(output_dir, exist_ok=True)
+  out_h5 = os.path.join(output_dir, "gaussians.h5")
+  out_ply = os.path.join(output_dir, "gaussians.ply")
 
   gaussian_layout = str(cfg.gaussian_layout)
   if gaussian_layout not in ("set", "layered"):
@@ -944,6 +1012,17 @@ def main(cfg: DictConfig) -> None:
   if background not in ("none", "white", "random"):
     raise SystemExit(f"background={background!r} -- must be \"none\", \"white\" or \"random\"")
 
+  # Resolve the view groups BEFORE wandb.init/save_output snapshot cfg, and
+  # write what had to be computed back into cfg.data, so the logged/saved
+  # config always records the exact split that ran.
+  data_views = (cfg.data.primary_view, cfg.data.secondary_views, cfg.data.validation_views)
+  if use_h5:
+    cfg.data.primary_view, cfg.data.secondary_views, cfg.data.validation_views = resolve_views(
+      cfg.hdf5_path, *data_views, float(cfg.data.split_fn.val_fraction), int(cfg.seed))
+  elif any(v is not None for v in data_views):
+    raise SystemExit("data.primary_view/secondary_views/validation_views need hdf5_path "
+                     "(COLMAP scenes split by llffhold, not by view index)")
+
   wandb_run, logger = None, False
   if cfg.wandb.mode != "disabled":
     wandb_run = wandb.init(
@@ -955,7 +1034,8 @@ def main(cfg: DictConfig) -> None:
   with timed("load"):
     if use_h5:
       pcd, scene_extent, train_cams, test_cams = load_scene_h5(
-        cfg.hdf5_path, float(cfg.data.split_fn.val_fraction), int(cfg.seed))
+        cfg.hdf5_path, [cfg.data.primary_view, *cfg.data.secondary_views],
+        list(cfg.data.validation_views), int(cfg.seed))
     else:
       pcd, scene_extent, train_cams, test_cams = load_scene(
         cfg.source_path, cfg.images, bool(cfg.eval), _coerce_resolution(cfg.resolution))
@@ -965,9 +1045,8 @@ def main(cfg: DictConfig) -> None:
   layered_meta = None
   with timed("init"):
     if gaussian_layout == "layered":
-      primary_view_idx = train_cams[0]["view_idx"]
       g, layered_meta = init_gaussians_layered(
-        cfg.hdf5_path, primary_view_idx, int(cfg.sh_degree), float(cfg.init_opacity), int(cfg.knn_k))
+        cfg.hdf5_path, int(cfg.data.primary_view), int(cfg.sh_degree), float(cfg.init_opacity), int(cfg.knn_k))
     else:
       g = init_gaussians(pcd, int(cfg.sh_degree), float(cfg.init_opacity), int(cfg.knn_k))
   n_seeded = len(g["means"])
@@ -989,9 +1068,9 @@ def main(cfg: DictConfig) -> None:
   params_np = model.params_np()
   with timed("write"):
     save_output(out_h5, cfg, params_np, scene_extent, model.final_loss, n_seeded)
-    write_ply(f"{stem}.ply", params_np)
+    write_ply(out_ply, params_np)
     if layered_meta is not None:
-      grid_h5 = f"{stem}.grid.h5"
+      grid_h5 = os.path.join(output_dir, "gaussians.grid.h5")
       save_output_layered(grid_h5, params_np, layered_meta)
       log.info("layered grid: %s", grid_h5)
 
@@ -1007,10 +1086,10 @@ def main(cfg: DictConfig) -> None:
       results = run_final_eval(model, test_cams, device)
     log.info("final eval (test split, llffhold=8): PSNR %.4f  SSIM %.4f  LPIPS %.4f  (%d views)",
              results["PSNR"], results["SSIM"], results["LPIPS"], results["num_test_views"])
-    with open(f"{stem}.results.json", "w") as f:
+    with open(os.path.join(output_dir, "results.json"), "w") as f:
       json.dump({"ours_final": results}, f, indent=1)
 
-  log.info("final loss %.5f  ->  %s  %s.ply", model.final_loss, out_h5, stem)
+  log.info("final loss %.5f  ->  %s", model.final_loss, output_dir)
   if wandb_run is not None:
     wandb_run.summary["final_loss"] = model.final_loss
     wandb_run.summary["num_gaussians"] = len(params_np["means"])

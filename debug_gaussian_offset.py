@@ -7,7 +7,7 @@ scalar per Gaussian, pale (near-zero) -> saturated (moved a lot).
 
 means_original is never saved anywhere (the flat .h5 only has the final,
 resolved means) -- this script REPRODUCES it by replaying the training
-run's own seeding (load_scene_h5 + init_gaussians_layered) with the exact
+run's own seeding (resolve_views + init_gaussians_layered) with the exact
 config the run itself saved to its output .h5 (attrs["config_json"]).
 That replay is deterministic (same hdf5_path/seed/split_fn -> same
 primary_view_idx -> same depth-peel unprojection), so no extra metadata
@@ -59,9 +59,9 @@ def main():
                      "means_original (the depth-peel seed) only exists in layered mode")
 
   # Replay the exact seeding the training run did.
-  _pcd, _scene_extent, train_cams, _test_cams = fit_3dgs.load_scene_h5(
-    cfg.hdf5_path, float(cfg.data.split_fn.val_fraction), int(cfg.seed))
-  primary_view_idx = train_cams[0]["view_idx"]
+  primary_view_idx, _secondary, _validation = fit_3dgs.resolve_views(
+    cfg.hdf5_path, cfg.data.get("primary_view"), cfg.data.get("secondary_views"),
+    cfg.data.get("validation_views"), float(cfg.data.split_fn.val_fraction), int(cfg.seed))
   seed, _meta = fit_3dgs.init_gaussians_layered(
     cfg.hdf5_path, primary_view_idx, int(cfg.sh_degree), float(cfg.init_opacity), int(cfg.knn_k))
   means_original = seed["means"]
