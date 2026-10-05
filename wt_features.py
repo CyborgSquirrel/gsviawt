@@ -24,9 +24,9 @@ Output h5:
                                `torch_dtype` attr). gzip, one chunk per view.
     view_indices (N,) int64    row index into the input h5
     noise_level  (N,) float32  t used for that view
-    seed         (N,) int64    sub-seed used to noise that view, derived from the
-                               main `seed` and the view index (see `view_seed`);
-                               the main seed is in the `main_seed` attr
+    seed         (N,) int64    sub-seed used to noise that view: the n-th value
+                               generated from SeedSequence(`seed`), n = position
+                               in `views`; the main seed is in the `main_seed` attr
     attrs: config_json, input, config, ckpt, features layout/dtype.
 
 Only xyz_norm_mode="zscore" configs (r75b, r76) are supported: the release
@@ -92,14 +92,6 @@ def noised_input(xyz, valid, t, norm_mean, norm_std):
     return x_t, mask.reshape(1, -1, 1).float()
 
 
-def view_seed(main_seed, view_index):
-    """Sub-seed for one view, derived from the main seed and the view's h5 row
-    index (not its position in `views`), so a view gets the same noise no matter
-    which other views are listed alongside it. Fits torch.manual_seed / int64."""
-    state = np.random.SeedSequence([main_seed, view_index]).generate_state(1, dtype=np.uint64)
-    return int(state[0] >> np.uint64(1))
-
-
 def to_h5_array(tokens):
     """-> (numpy array, torch dtype string). bfloat16 has no numpy dtype, so it
     is stored as its raw uint16 bit pattern."""
@@ -146,8 +138,13 @@ def main(cfg: DictConfig) -> None:
     def one_chunk_per_view(ds, *, shape, dtype):
         ds.dataset_kwargs = {"chunks": (1, *shape), **ds.dataset_kwargs}
 
+    # One SeedSequence off the main seed; view n's sub-seed is the n-th draw.
+    # (>> 1 keeps it inside torch.manual_seed's / int64's range.)
+    seeds = [
+        int(x >> np.uint64(1))
+        for x in np.random.SeedSequence(cfg.seed).generate_state(len(views), dtype=np.uint64)
+    ]
     feat_dtype = None
-    seeds = []
     with (
         h5py.File(cfg.input, "r") as hf,
         h5py.File(output, "w") as out,
@@ -185,8 +182,7 @@ def main(cfg: DictConfig) -> None:
             )
             rgb_t = rgb_t.to(device)
 
-            seed = view_seed(cfg.seed, index)
-            seeds.append(seed)
+            seed = seeds[n]
             torch.manual_seed(seed)
             if device.type == "cuda":
                 torch.cuda.manual_seed(seed)
