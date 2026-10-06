@@ -19,10 +19,11 @@ ckpt_path: null
 
 data:
   features_h5: ???          # required -- a wt_features.py output h5
-  # Row of features_h5 to overfit on (indexes its `features` / `view_indices` /
-  # `mesh_index` / `seed` datasets). The render h5 it came from is read from
-  # the file's `source_h5` attr. With seeds_per_view > 1 a view appears in
-  # several rows, one per noise seed.
+  # Row of features_h5 to overfit on, or a list of rows, e.g. [0,1,2] (indexes
+  # its `features` / `view_indices` / `mesh_index` / `seed` / `noise_level`
+  # datasets). The render h5 it came from is read from the file's `source_h5`
+  # attr. A view appears in several rows when the file has several noise
+  # seeds / levels. An epoch is one pass over the listed rows.
   item: 0
   num_layers: 6             # must match the file(s)' depth_peel layer count
   num_target_views: 3       # extra supervision views per step, alongside self-render
