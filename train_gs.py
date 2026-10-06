@@ -289,10 +289,13 @@ class GSDataModule(pl.LightningDataModule):
     )
     train_views, val_views = split_views_per_mesh(views, d.val_fraction, seed=self.cfg.seed)
     rows = None if d.item is None else ([d.item] if isinstance(d.item, int) else list(d.item))
-    kwargs = dict(rows=rows, num_layers=d.num_layers, num_views=d.num_views, seed=self.cfg.seed)
+    kwargs = dict(
+      rows=rows, num_layers=d.num_layers, num_views=d.num_views,
+      allow_source_as_target=d.allow_source_as_target,
+    )
     self.train_ds = WTFeatureDataset(d.features_h5, train_views, **kwargs)
     self.val_ds = (
-      WTFeatureDataset(d.features_h5, val_views, deterministic=True, **kwargs)
+      WTFeatureDataset(d.features_h5, val_views, **kwargs)
       if len(val_views) else _EmptyDataset()
     )
 

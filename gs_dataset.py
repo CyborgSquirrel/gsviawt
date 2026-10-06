@@ -719,15 +719,18 @@ class WTFeatureDataset(Dataset):
 
   `rows`: which volumes (row indices of the features h5) the dataset holds;
   None = all of them. len(dataset) == the number of volumes.
-  `deterministic`: seed the view sampling off the item index, so the same
-  views come back every time (for validation), instead of fresh each access.
+
+  `allow_source_as_target`: whether the volume's own source view can also be
+  drawn into its sampled views. False (default): it never is, so every
+  sampled view is a genuinely different one. True: it is just another member
+  of the mesh's pool.
 
   Volumes are read from the features h5 on access (one gzip chunk each), so
   memory use doesn't grow with the number of volumes.
   """
 
   def __init__(self, features_h5, views, rows=None, num_layers=6, num_views=1,
-               deterministic=False, seed=42):
+               allow_source_as_target=False):
     with h5py.File(features_h5, "r") as f:
       if "mesh_index" not in f:
         raise ValueError(f"{features_h5!r} has no per-row `mesh_index`; re-run wt_features.py")
@@ -748,14 +751,14 @@ class WTFeatureDataset(Dataset):
     self.volumes = volumes
     self.num_layers = num_layers
     self.num_views = num_views
-    self.deterministic = deterministic
-    self.seed = seed
+    self.allow_source_as_target = allow_source_as_target
 
     groups = (
       views.df.filter(pl.col("path") == self.source_h5)
       .group_by("mesh_id", maintain_order=True).agg(pl.col("view_idx"))
     )
     self.pool = {row["mesh_id"]: row["view_idx"] for row in groups.iter_rows(named=True)}
+    self.pool_sets = {mesh_id: set(vs) for mesh_id, vs in self.pool.items()}
     missing = sorted(set(volumes.df["mesh_id"].unique().to_list()) - set(self.pool))
     if missing:
       raise ValueError(
@@ -773,10 +776,24 @@ class WTFeatureDataset(Dataset):
   def __getitem__(self, idx):
     vol = self.volumes[idx]
     pool = self.pool[vol["mesh_id"]]
-    rng = random.Random(f"{self.seed}_{idx}") if self.deterministic else random.Random()
-    targets = rng.sample(pool, min(self.num_views, len(pool)))
+    source_view = vol["view_idx"]
+    if self.allow_source_as_target:
+      k = min(self.num_views, len(pool))
+      targets = random.sample(pool, k) if k > 0 else []
+    else:
+      # Sample k+1 candidates and drop the source from that small sample
+      # instead of filtering it out of the whole pool every call (same trick
+      # as GSPairDataset). k+1 never exceeds len(pool): k is capped at the
+      # number of non-source views.
+      in_pool = source_view in self.pool_sets[vol["mesh_id"]]
+      k = min(self.num_views, len(pool) - in_pool)
+      if k <= 0:
+        targets = []
+      else:
+        sampled = random.sample(pool, min(k + 1, len(pool)))
+        targets = [v for v in sampled if v != source_view][:k]
     out = _build_item(
-      _get_h5(self.source_h5), self.source_h5, vol["view_idx"], targets, self.num_layers, vol["mesh_id"])
+      _get_h5(self.source_h5), self.source_h5, source_view, targets, self.num_layers, vol["mesh_id"])
 
     feats = _get_h5(self.features_h5)["features"][vol["row"]]
     if self.bits:
