@@ -27,6 +27,9 @@ data:
   # Random views of the volume's mesh sampled per access and supervised on
   # ("target" in loss.photom.for), in addition to the volume's own source view.
   num_views: 1
+  # Whether the volume's own source view can be one of the sampled views.
+  # false: it never is (it's dropped from the draw).
+  allow_source_as_target: false
   # Per-mesh train/val view split: this fraction of each mesh's views (at
   # least one) is held out for val. Train and val hold the same volumes but
   # sample from disjoint views. 0 = no validation.
@@ -98,7 +101,7 @@ model:
 
 loss:
   photom:
-    for: [source, target]
+    for: [target]
     l1_weight: 1.0
     dssim_weight: 0.85
 
