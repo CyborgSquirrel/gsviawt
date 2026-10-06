@@ -29,12 +29,12 @@ noise_level: 0.5
 # view-major: N = len(views) * seeds_per_view * len(noise_level list), `view_indices`
 # repeats each view.
 seeds_per_view: 1
-# Main seed. One SeedSequence(seed) generates one sub-seed per output row (n-th draw for
-# row n = view_pos * seeds_per_view + k); each seeds torch's global RNG right before that
-# view -- so eps and the model's own internal randn (invalid-pixel fill) are
-# reproducible and differ across views. Note a row's sub-seed depends on its
-# position in `views` and on seeds_per_view. Sub-seeds are saved in the output's `seed` dataset; the
-# main seed in the `main_seed` attr.
+# Main seed. One SeedSequence(seed); each (view, draw) pair spawns the next child as its
+# sub-seed, which seeds torch's global RNG right before every noise level of that pair --
+# so eps and the model's own internal randn (invalid-pixel fill) are reproducible and
+# differ across views and draws. Note a sub-seed depends on the pair's position in `views`
+# and on seeds_per_view. Sub-seeds are saved in the output's `seed` dataset; the main seed
+# in the `main_seed` attr.
 seed: 42
 
 # --- conditioning image (same knobs as wt_infer_layers.py) ---
