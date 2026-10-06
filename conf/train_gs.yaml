@@ -19,19 +19,18 @@ ckpt_path: null
 
 data:
   features_h5: ???          # required -- a wt_features.py output h5
-  # Row of features_h5 to overfit on, or a list of rows, e.g. [0,1,2] (indexes
-  # its `features` / `view_indices` / `mesh_index` / `seed` / `noise_level`
-  # datasets). The render h5 it came from is read from the file's `source_h5`
-  # attr. A view appears in several rows when the file has several noise
-  # seeds / levels. An epoch is one pass over the listed rows.
+  # Which feature volumes (rows of features_h5) the datasets hold: one row, a
+  # list like [0,1,2], or null for all. The render h5 they came from is read
+  # from the file's `source_h5` attr. An epoch is one pass over these volumes.
   item: 0
   num_layers: 6             # must match the file(s)' depth_peel layer count
-  num_target_views: 3       # extra supervision views per step, alongside self-render
-  # Which views of the SAME mesh are eligible as extra supervision views
-  # (raw view indices into the source render h5; must not include the source
-  # view). null (default): every other view of the source view's mesh, a
-  # random subset of num_target_views per step when there are more.
-  target_views: null
+  # Random views of the volume's mesh sampled per access and supervised on
+  # ("target" in loss.photom.for), in addition to the volume's own source view.
+  num_views: 1
+  # Per-mesh train/val view split: this fraction of each mesh's views (at
+  # least one) is held out for val. Train and val hold the same volumes but
+  # sample from disjoint views. 0 = no validation.
+  val_fraction: 0.1
 
 model:
   patch_size: 14            # WT's patch size; head output grid = sqrt(P) * patch_size per side

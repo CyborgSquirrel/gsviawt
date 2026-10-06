@@ -677,91 +677,113 @@ class GSFixedSourceDataset(Dataset):
     return _build_item(f, self.path, self.source_view, chunk, self.num_layers, self.mesh_id)
 
 
+def split_views_per_mesh(catalog: H5Catalog, val_fraction=0.1, seed=42):
+  """Splits `catalog` (one row per view, with "path"/"mesh_id" columns) into
+  train/val H5Catalogs at the VIEW level, independently inside every
+  (path, mesh_id) group: every mesh appears in both splits, but
+  `round(val_fraction * n_views)` of its views (at least 1, never all of
+  them) go to val and the rest to train -- so the two halves cover the same
+  meshes with disjoint views. A mesh with a single view can't be split: it
+  stays in train only. val_fraction=0 puts every view in train."""
+  rng = np.random.default_rng(seed)
+  df = catalog.df.with_row_index("__pos")
+  val_pos = []
+  for _, group in df.group_by(["path", "mesh_id"], maintain_order=True):
+    pos = group["__pos"].to_numpy()
+    n_val = min(max(1, round(len(pos) * val_fraction)), len(pos) - 1) if val_fraction > 0 else 0
+    val_pos.extend(rng.choice(pos, size=n_val, replace=False).tolist())
+  val_mask = np.zeros(len(catalog), dtype=bool)
+  val_mask[val_pos] = True
+  return (H5Catalog._from_df(catalog.df.filter(pl.Series(~val_mask))),
+          H5Catalog._from_df(catalog.df.filter(pl.Series(val_mask))))
+
+
 class WTFeatureDataset(Dataset):
-  """Items built from rows of a wt_features.py output h5: each row's cached
-  World Tracing decoder tokens as the model input, plus the usual render item
-  (source point cloud / hit mask / RGB views) for the source view it was
-  computed from and some other views of the same mesh.
+  """One item per cached World Tracing feature volume (row of a
+  wt_features.py output h5): that volume's decoder tokens as the model input,
+  plus the render item built from it.
 
-  `item` is a row index into the features h5, or a list of them (its
-  `features`/`view_indices`/`mesh_index`/`seed`/`noise_level` datasets are all
-  row-aligned; a view can appear in several rows, one per noise seed / level).
-  The render h5 is read from the features h5's `source_h5` attr (older files:
-  `input`). Only the selected rows are ever loaded (once, up front), so
-  len(dataset) == the number of rows, in the order given.
+  A volume knows its source view (`view_indices`) and mesh (`mesh_index`).
+  Gaussians are anchored to the SOURCE view's own depth-peel point cloud and
+  every other camera is expressed relative to it (see _assemble_item), so the
+  item always contains the source view (supervised iff `loss.photom.for`
+  includes "source"). On top of that, each access samples `num_views` random
+  views of the volume's mesh from `views` and supervises on those
+  ("targets").
 
-  Targets are other views of the SAME mesh (the source view's own
-  `mesh_index` in the render h5), never the source itself: `target_views`
-  (raw view indices) when given, else every other view of the mesh, capped at
-  `num_target_views` by drawing a fresh random subset per __getitem__ (so
-  there's nothing random when the mesh has <= num_target_views other views).
-  An explicit `target_views` must be valid for every selected row.
+  `views`: H5Catalog over the render h5 with "path"/"mesh_id"/"view_idx"
+  columns -- typically one half of split_views_per_mesh, so a train and a val
+  dataset share the same volumes but draw from disjoint views. Only rows of
+  `views` whose path is the features h5's `source_h5` attr (older files:
+  `input`) are used. Every volume's mesh needs at least one view in `views`.
 
-  Each item has everything GSPairDataset's would, plus "features": the
-  (L, P, D) float32 token volume.
+  `rows`: which volumes (row indices of the features h5) the dataset holds;
+  None = all of them. len(dataset) == the number of volumes.
+  `deterministic`: seed the view sampling off the item index, so the same
+  views come back every time (for validation), instead of fresh each access.
+
+  Volumes are read from the features h5 on access (one gzip chunk each), so
+  memory use doesn't grow with the number of volumes.
   """
 
-  def __init__(self, features_h5, item, num_layers=6, num_target_views=3, target_views=None):
-    rows = [int(item)] if isinstance(item, (int, np.integer)) else [int(i) for i in item]
-    if not rows:
-      raise ValueError("data.item is an empty list")
-    if target_views is not None:
-      target_views = [int(v) for v in target_views]
-    self.num_layers = num_layers
-    self.entries = []
+  def __init__(self, features_h5, views, rows=None, num_layers=6, num_views=1,
+               deterministic=False, seed=42):
     with h5py.File(features_h5, "r") as f:
-      n = f["features"].shape[0]
-      source_h5 = str(f.attrs.get("source_h5", f.attrs["input"]))
-      bits = f["features"].attrs.get("stored_as_uint16_bits", False)
-      src = _get_h5(source_h5)
-      mesh_of_view = np.asarray(src["mesh_index"][:])
-      for row in rows:
-        if not 0 <= row < n:
-          raise IndexError(f"data.item={row} out of range for {features_h5!r} ({n} rows)")
-        view = int(f["view_indices"][row])
-        mesh_id = int(mesh_of_view[view])
-        if "mesh_index" in f and int(f["mesh_index"][row]) != mesh_id:
-          raise ValueError(
-            f"{features_h5!r} row {row} says mesh {int(f['mesh_index'][row])}, but view {view} of "
-            f"{source_h5!r} is mesh {mesh_id} -- source h5 changed since the features were written?")
-        feats = f["features"][row]
-        if bits:
-          feats = torch.from_numpy(feats.view(np.int16)).view(torch.bfloat16)
-        else:
-          feats = torch.from_numpy(feats)
-        mesh_views = np.flatnonzero(mesh_of_view == mesh_id).tolist()
-        if target_views is not None:
-          bad = [v for v in target_views if v not in mesh_views or v == view]
-          if bad:
-            raise ValueError(
-              f"data.target_views {bad} are not other views of mesh {mesh_id} "
-              f"(its views: {mesh_views}, source view {view}, row {row})")
-          pool = target_views
-        else:
-          pool = [v for v in mesh_views if v != view]
-        entry = dict(
-          row=row, view=view, mesh_id=mesh_id, pool=pool,
-          features=feats.float().contiguous(),   # (L, P, D)
-          num_targets=min(num_target_views, len(pool)),
-        )
-        self.entries.append(entry)
-        log.info(
-          "WTFeatureDataset: row %d -> %s view %d (mesh %d), noise_level=%g seed=%d, "
-          "targets drawn from %s (%d per step)",
-          row, source_h5, view, mesh_id, float(f["noise_level"][row]), int(f["seed"][row]),
-          pool, entry["num_targets"],
-        )
-    self.source_h5 = source_h5
+      if "mesh_index" not in f:
+        raise ValueError(f"{features_h5!r} has no per-row `mesh_index`; re-run wt_features.py")
+      self.source_h5 = str(f.attrs.get("source_h5", f.attrs["input"]))
+      self.bits = bool(f["features"].attrs.get("stored_as_uint16_bits", False))
+    volumes = H5Catalog(
+      features_h5, H5Catalog.index().alias("row"),
+      H5Catalog.dataset("view_indices").alias("view_idx"),
+      H5Catalog.dataset("mesh_index").alias("mesh_id"),
+    )
+    if rows is not None:
+      rows = [int(r) for r in rows]
+      bad = [r for r in rows if not 0 <= r < len(volumes)]
+      if bad:
+        raise IndexError(f"rows {bad} out of range for {features_h5!r} ({len(volumes)} volumes)")
+      volumes = volumes.take(rows)
+    self.features_h5 = features_h5
+    self.volumes = volumes
+    self.num_layers = num_layers
+    self.num_views = num_views
+    self.deterministic = deterministic
+    self.seed = seed
+
+    groups = (
+      views.df.filter(pl.col("path") == self.source_h5)
+      .group_by("mesh_id", maintain_order=True).agg(pl.col("view_idx"))
+    )
+    self.pool = {row["mesh_id"]: row["view_idx"] for row in groups.iter_rows(named=True)}
+    missing = sorted(set(volumes.df["mesh_id"].unique().to_list()) - set(self.pool))
+    if missing:
+      raise ValueError(
+        f"meshes {missing} have feature volumes but no views in `views` "
+        f"(source h5 {self.source_h5!r})")
+
+    log.info(
+      "WTFeatureDataset: %d volumes of %s over %d meshes, %d views to sample from, %d sampled per item",
+      len(self), features_h5, len(self.pool), sum(len(v) for v in self.pool.values()), num_views,
+    )
 
   def __len__(self):
-    return len(self.entries)
+    return len(self.volumes)
 
   def __getitem__(self, idx):
-    e = self.entries[idx]
-    targets = random.sample(e["pool"], e["num_targets"])
+    vol = self.volumes[idx]
+    pool = self.pool[vol["mesh_id"]]
+    rng = random.Random(f"{self.seed}_{idx}") if self.deterministic else random.Random()
+    targets = rng.sample(pool, min(self.num_views, len(pool)))
     out = _build_item(
-      _get_h5(self.source_h5), self.source_h5, e["view"], targets, self.num_layers, e["mesh_id"])
-    out["features"] = e["features"]
+      _get_h5(self.source_h5), self.source_h5, vol["view_idx"], targets, self.num_layers, vol["mesh_id"])
+
+    feats = _get_h5(self.features_h5)["features"][vol["row"]]
+    if self.bits:
+      feats = torch.from_numpy(feats.view(np.int16)).view(torch.bfloat16)
+    else:
+      feats = torch.from_numpy(feats)
+    out["features"] = feats.float().contiguous()   # (L, P, D)
     return out
 
 

@@ -21,9 +21,13 @@ bf16_weights_hack: true
 # --- noising ---
 # Flow-matching time t in [0, 1]: x_t = (1 - t) * x0 + t * eps. 0 = clean GT
 # point cloud, 1 = pure noise. Also the timestep the model is called with.
+# A list (e.g. [0.25,0.5,0.75]) runs every level for each seed: rows go view,
+# then seed, then noise level, and all levels of a (view, seed) share the same
+# sub-seed, i.e. the same eps.
 noise_level: 0.5
 # Independent noise draws per view. The output has one row per (view, draw),
-# view-major: N = len(views) * seeds_per_view, `view_indices` repeats each view.
+# view-major: N = len(views) * seeds_per_view * len(noise_level list), `view_indices`
+# repeats each view.
 seeds_per_view: 1
 # Main seed. One SeedSequence(seed) generates one sub-seed per output row (n-th draw for
 # row n = view_pos * seeds_per_view + k); each seeds torch's global RNG right before that

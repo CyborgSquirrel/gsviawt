@@ -43,6 +43,7 @@ import os
 import sys
 
 import gsplat
+import h5py
 import hydra
 import lightning.pytorch as pl
 import numpy as np
@@ -56,8 +57,8 @@ from torch.utils.data import DataLoader
 import wandb
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
-from gs_dataset import (OPENGL_TO_OPENCV, WTFeatureDataset,  # noqa: E402
-                        _EmptyDataset, rotate_quats_wxyz)
+from gs_dataset import (OPENGL_TO_OPENCV, H5Catalog, WTFeatureDataset,  # noqa: E402
+                        _EmptyDataset, rotate_quats_wxyz, split_views_per_mesh)
 from gs_decoder import PatchLinearGaussianHead  # noqa: E402
 from module import DSSIMLoss  # noqa: E402
 from util import collate_with_batch_size, pipe, set_mode, timed  # noqa: E402
@@ -265,8 +266,10 @@ def flatten_gaussians(b, gauss, xyz_cam, hit):
 # ---------------------------------------------------------------------------
 
 class GSDataModule(pl.LightningDataModule):
-  """Overfitting setup: the row(s) of data.features_h5 named by data.item (one
-  index or a list) are the whole train set; there's no validation split."""
+  """Train/val over cached feature volumes: both datasets hold the same
+  volumes (data.item: one row, a list of rows, or null for all of them), but
+  sample their supervision views from disjoint per-mesh view splits
+  (data.val_fraction of each mesh's views go to val; 0 = no validation)."""
 
   def __init__(self, cfg):
     super().__init__()
@@ -278,12 +281,20 @@ class GSDataModule(pl.LightningDataModule):
     if self.train_ds is not None:
       return
     d = self.cfg.data
-    self.train_ds = WTFeatureDataset(
-      d.features_h5, d.item if isinstance(d.item, int) else list(d.item), num_layers=d.num_layers,
-      num_target_views=d.num_target_views,
-      target_views=list(d.target_views) if d.target_views is not None else None,
+    with h5py.File(d.features_h5, "r") as f:
+      source_h5 = str(f.attrs.get("source_h5", f.attrs["input"]))
+    views = H5Catalog(
+      source_h5, H5Catalog.path(), H5Catalog.index().alias("view_idx"),
+      H5Catalog.dataset("mesh_index").alias("mesh_id"),
     )
-    self.val_ds = _EmptyDataset()
+    train_views, val_views = split_views_per_mesh(views, d.val_fraction, seed=self.cfg.seed)
+    rows = None if d.item is None else ([d.item] if isinstance(d.item, int) else list(d.item))
+    kwargs = dict(rows=rows, num_layers=d.num_layers, num_views=d.num_views, seed=self.cfg.seed)
+    self.train_ds = WTFeatureDataset(d.features_h5, train_views, **kwargs)
+    self.val_ds = (
+      WTFeatureDataset(d.features_h5, val_views, deterministic=True, **kwargs)
+      if len(val_views) else _EmptyDataset()
+    )
 
   def train_dataloader(self):
     return DataLoader(
