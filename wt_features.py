@@ -22,11 +22,18 @@ Output h5:
                                (bfloat16 is stored as its uint16 bit pattern,
                                since h5py/numpy have no bf16 -- see the
                                `torch_dtype` attr). gzip, one chunk per view.
-    view_indices (N,) int64    row index into the input h5
-    noise_level  (N,) float32  t used for that view
-    seed         (N,) int64    sub-seed used to noise that view: the n-th value
-                               generated from SeedSequence(`seed`), n = position
-                               in `views`; the main seed is in the `main_seed` attr
+    source_h5    attr          absolute path of the render h5 the views come from
+    mesh_index   (N,) int64    the source h5's `mesh_index` of each row's view
+                               (which mesh it is; `mesh_paths` in the source h5)
+    view_indices (N,) int64    row index into the input h5 (each view repeated
+                               `seeds_per_view` * len(noise levels) times;
+                               N = len(views) * seeds_per_view * len(noise levels),
+                               ordered view, then seed, then noise level)
+    noise_level  (N,) float32  t used for that row
+    seed         (N,) int64    sub-seed used to noise that row: one child spawned from
+                               SeedSequence(`seed`) per (view, k) pair, in loop order.
+                               Every noise level of a pair reuses the same sub-seed
+                               (same eps); the main seed is in the `main_seed` attr
     attrs: config_json, input, config, ckpt, features layout/dtype.
 
 Only xyz_norm_mode="zscore" configs (r75b, r76) are supported: the release
@@ -108,9 +115,19 @@ def main(cfg: DictConfig) -> None:
     from wt.data import preprocess_rgba_for_model
     from wt.inference import XYZ_MEAN, XYZ_STD, _bypass_activation_checkpointing
 
-    if not 0.0 <= cfg.noise_level <= 1.0:
-        raise ValueError(f"noise_level must be in [0, 1], got {cfg.noise_level}")
+    noise_levels = (
+        [float(t) for t in cfg.noise_level]
+        if OmegaConf.is_list(cfg.noise_level)
+        else [float(cfg.noise_level)]
+    )
+    if not noise_levels:
+        raise ValueError("noise_level must not be an empty list")
+    for t in noise_levels:
+        if not 0.0 <= t <= 1.0:
+            raise ValueError(f"noise_level must be in [0, 1], got {t}")
     views = [int(v) for v in cfg.views]
+    if cfg.seeds_per_view < 1:
+        raise ValueError(f"seeds_per_view must be >= 1, got {cfg.seeds_per_view}")
     output = cfg.output or f"{cfg.input}.wt_features.h5"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -138,12 +155,11 @@ def main(cfg: DictConfig) -> None:
     def one_chunk_per_view(ds, *, shape, dtype):
         ds.dataset_kwargs = {"chunks": (1, *shape), **ds.dataset_kwargs}
 
-    # One SeedSequence off the main seed; view n's sub-seed is the n-th draw.
-    # (>> 1 keeps it inside torch.manual_seed's / int64's range.)
-    seeds = [
-        int(x >> np.uint64(1))
-        for x in np.random.SeedSequence(cfg.seed).generate_state(len(views), dtype=np.uint64)
-    ]
+    # One SeedSequence off the main seed; every (view, k) pair spawns the next
+    # child of it, shared by all noise levels of that pair.
+    seeds_per_view = int(cfg.seeds_per_view)
+    seed_sequence = np.random.SeedSequence(cfg.seed)
+    row_seeds = []  # per output row
     feat_dtype = None
     with (
         h5py.File(cfg.input, "r") as hf,
@@ -156,7 +172,7 @@ def main(cfg: DictConfig) -> None:
         ) as features,
     ):
         k_name = intrinsics_name(hf, "depth")
-        for n, index in enumerate(views):
+        for index in views:
             depth_peel = hf["depth_peel"][index]  # (H, W, L)
             if depth_peel.shape[:2] != (image_size, image_size):
                 raise ValueError(
@@ -182,50 +198,62 @@ def main(cfg: DictConfig) -> None:
             )
             rgb_t = rgb_t.to(device)
 
-            seed = seeds[n]
-            torch.manual_seed(seed)
-            if device.type == "cuda":
-                torch.cuda.manual_seed(seed)
-            x_t, valid_mask = noised_input(xyz, valid, cfg.noise_level, norm_mean, norm_std)
-            x_t, valid_mask = x_t.to(device), valid_mask.to(device)
+            for _ in range(seeds_per_view):
+                # (>> 1 keeps it inside torch.manual_seed's / int64's range.)
+                seed = int(seed_sequence.spawn(1)[0].generate_state(1, dtype=np.uint64)[0] >> np.uint64(1))
+                for noise_level in noise_levels:
+                    row_seeds.append(seed)
+                    # re-seeded per noise level so every level sees the same eps
+                    # (and the same internal invalid-pixel fill noise)
+                    torch.manual_seed(seed)
+                    if device.type == "cuda":
+                        torch.cuda.manual_seed(seed)
+                    x_t, valid_mask = noised_input(xyz, valid, noise_level, norm_mean, norm_std)
+                    x_t, valid_mask = x_t.to(device), valid_mask.to(device)
 
-            conditioning = {
-                "rgb": rgb_t[:, None].repeat(1, num_layers, 1, 1, 1),
-                "noise_height": image_size,
-                "noise_width": image_size,
-                "noise_nview": num_layers,
-                "batch_size": 1,
-                "valid_mask": valid_mask,
-                "invalid_fill_mode": "noise",
-                "_context_only": True,  # return decoder tokens, skip the head
-            }
-            t = torch.full((1,), cfg.noise_level, device=device)
-            with (
-                torch.no_grad(),
-                autocast_ctx,
-                _bypass_activation_checkpointing(model),
-            ):
-                tokens = model(x_t, t, conditioning)["decoder_tokens"][0]  # (L, P, D)
+                    conditioning = {
+                        "rgb": rgb_t[:, None].repeat(1, num_layers, 1, 1, 1),
+                        "noise_height": image_size,
+                        "noise_width": image_size,
+                        "noise_nview": num_layers,
+                        "batch_size": 1,
+                        "valid_mask": valid_mask,
+                        "invalid_fill_mode": "noise",
+                        "_context_only": True,  # return decoder tokens, skip the head
+                    }
+                    t = torch.full((1,), noise_level, device=device)
+                    with (
+                        torch.no_grad(),
+                        autocast_ctx,
+                        _bypass_activation_checkpointing(model),
+                    ):
+                        tokens = model(x_t, t, conditioning)["decoder_tokens"][0]  # (L, P, D)
 
-            arr, torch_dtype = to_h5_array(tokens)
-            features.append(arr)
-            if n == 0:
-                feat_dtype = torch_dtype
-                features.dataset.attrs["layout"] = "N, L (layers), P (patches, row-major HxW grid), D"
-                features.dataset.attrs["torch_dtype"] = torch_dtype
-                features.dataset.attrs["stored_as_uint16_bits"] = torch_dtype == "torch.bfloat16"
-            log.info(
-                "view %d: tokens %s %s, noise_level=%g seed=%d, %d/%d valid px",
-                index, tuple(tokens.shape), torch_dtype, cfg.noise_level, seed,
-                int(valid.sum()), valid.size,
-            )
+                    arr, torch_dtype = to_h5_array(tokens)
+                    features.append(arr)
+                    if feat_dtype is None:
+                        feat_dtype = torch_dtype
+                        features.dataset.attrs["layout"] = "N, L (layers), P (patches, row-major HxW grid), D"
+                        features.dataset.attrs["torch_dtype"] = torch_dtype
+                        features.dataset.attrs["stored_as_uint16_bits"] = torch_dtype == "torch.bfloat16"
+                    log.info(
+                        "view %d: tokens %s %s, noise_level=%g seed=%d, %d/%d valid px",
+                        index, tuple(tokens.shape), torch_dtype, noise_level, seed,
+                        int(valid.sum()), valid.size,
+                    )
 
-        out.create_dataset("view_indices", data=np.array(views, dtype=np.int64))
-        out.create_dataset("noise_level", data=np.full(len(views), cfg.noise_level, np.float32))
-        out.create_dataset("seed", data=np.array(seeds, dtype=np.int64))
+        rows_per_view = seeds_per_view * len(noise_levels)
+        mesh_of_view = {v: int(hf["mesh_index"][v]) for v in views}
+        out.create_dataset(
+            "mesh_index", data=np.repeat(np.array([mesh_of_view[v] for v in views], dtype=np.int64), rows_per_view)
+        )
+        out.create_dataset("view_indices", data=np.repeat(np.array(views, dtype=np.int64), rows_per_view))
+        out.create_dataset("noise_level", data=np.tile(np.array(noise_levels, np.float32), len(views) * seeds_per_view))
+        out.create_dataset("seed", data=np.array(row_seeds, dtype=np.int64))
         out.attrs["config_json"] = json.dumps(OmegaConf.to_container(cfg, resolve=True))
         out.attrs["main_seed"] = int(cfg.seed)
         out.attrs["input"] = str(cfg.input)
+        out.attrs["source_h5"] = os.path.abspath(str(cfg.input))
         out.attrs["wt_config"] = cfg.config
         out.attrs["ckpt"] = cfg.ckpt
         out.attrs["image_size"] = image_size

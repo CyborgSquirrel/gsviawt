@@ -677,6 +677,133 @@ class GSFixedSourceDataset(Dataset):
     return _build_item(f, self.path, self.source_view, chunk, self.num_layers, self.mesh_id)
 
 
+def split_views_per_mesh(catalog: H5Catalog, val_fraction=0.1, seed=42):
+  """Splits `catalog` (one row per view, with "path"/"mesh_id" columns) into
+  train/val H5Catalogs at the VIEW level, independently inside every
+  (path, mesh_id) group: every mesh appears in both splits, but
+  `round(val_fraction * n_views)` of its views (at least 1, never all of
+  them) go to val and the rest to train -- so the two halves cover the same
+  meshes with disjoint views. A mesh with a single view can't be split: it
+  stays in train only. val_fraction=0 puts every view in train."""
+  rng = np.random.default_rng(seed)
+  df = catalog.df.with_row_index("__pos")
+  val_pos = []
+  for _, group in df.group_by(["path", "mesh_id"], maintain_order=True):
+    pos = group["__pos"].to_numpy()
+    n_val = min(max(1, round(len(pos) * val_fraction)), len(pos) - 1) if val_fraction > 0 else 0
+    val_pos.extend(rng.choice(pos, size=n_val, replace=False).tolist())
+  val_mask = np.zeros(len(catalog), dtype=bool)
+  val_mask[val_pos] = True
+  return (H5Catalog._from_df(catalog.df.filter(pl.Series(~val_mask))),
+          H5Catalog._from_df(catalog.df.filter(pl.Series(val_mask))))
+
+
+class WTFeatureDataset(Dataset):
+  """One item per cached World Tracing feature volume (row of a
+  wt_features.py output h5): that volume's decoder tokens as the model input,
+  plus the render item built from it.
+
+  A volume knows its source view (`view_indices`) and mesh (`mesh_index`).
+  Gaussians are anchored to the SOURCE view's own depth-peel point cloud and
+  every other camera is expressed relative to it (see _assemble_item), so the
+  item always contains the source view (supervised iff `loss.photom.for`
+  includes "source"). On top of that, each access samples `num_views` random
+  views of the volume's mesh from `views` and supervises on those
+  ("targets").
+
+  `views`: H5Catalog over the render h5 with "path"/"mesh_id"/"view_idx"
+  columns -- typically one half of split_views_per_mesh, so a train and a val
+  dataset share the same volumes but draw from disjoint views. Only rows of
+  `views` whose path is the features h5's `source_h5` attr (older files:
+  `input`) are used. Every volume's mesh needs at least one view in `views`.
+
+  `rows`: which volumes (row indices of the features h5) the dataset holds;
+  None = all of them. len(dataset) == the number of volumes.
+
+  `allow_source_as_target`: whether the volume's own source view can also be
+  drawn into its sampled views. False (default): it never is, so every
+  sampled view is a genuinely different one. True: it is just another member
+  of the mesh's pool.
+
+  Volumes are read from the features h5 on access (one gzip chunk each), so
+  memory use doesn't grow with the number of volumes.
+  """
+
+  def __init__(self, features_h5, views, rows=None, num_layers=6, num_views=1,
+               allow_source_as_target=False):
+    with h5py.File(features_h5, "r") as f:
+      if "mesh_index" not in f:
+        raise ValueError(f"{features_h5!r} has no per-row `mesh_index`; re-run wt_features.py")
+      self.source_h5 = str(f.attrs.get("source_h5", f.attrs["input"]))
+      self.bits = bool(f["features"].attrs.get("stored_as_uint16_bits", False))
+    volumes = H5Catalog(
+      features_h5, H5Catalog.index().alias("row"),
+      H5Catalog.dataset("view_indices").alias("view_idx"),
+      H5Catalog.dataset("mesh_index").alias("mesh_id"),
+    )
+    if rows is not None:
+      rows = [int(r) for r in rows]
+      bad = [r for r in rows if not 0 <= r < len(volumes)]
+      if bad:
+        raise IndexError(f"rows {bad} out of range for {features_h5!r} ({len(volumes)} volumes)")
+      volumes = volumes.take(rows)
+    self.features_h5 = features_h5
+    self.volumes = volumes
+    self.num_layers = num_layers
+    self.num_views = num_views
+    self.allow_source_as_target = allow_source_as_target
+
+    groups = (
+      views.df.filter(pl.col("path") == self.source_h5)
+      .group_by("mesh_id", maintain_order=True).agg(pl.col("view_idx"))
+    )
+    self.pool = {row["mesh_id"]: row["view_idx"] for row in groups.iter_rows(named=True)}
+    self.pool_sets = {mesh_id: set(vs) for mesh_id, vs in self.pool.items()}
+    missing = sorted(set(volumes.df["mesh_id"].unique().to_list()) - set(self.pool))
+    if missing:
+      raise ValueError(
+        f"meshes {missing} have feature volumes but no views in `views` "
+        f"(source h5 {self.source_h5!r})")
+
+    log.info(
+      "WTFeatureDataset: %d volumes of %s over %d meshes, %d views to sample from, %d sampled per item",
+      len(self), features_h5, len(self.pool), sum(len(v) for v in self.pool.values()), num_views,
+    )
+
+  def __len__(self):
+    return len(self.volumes)
+
+  def __getitem__(self, idx):
+    vol = self.volumes[idx]
+    pool = self.pool[vol["mesh_id"]]
+    source_view = vol["view_idx"]
+    if self.allow_source_as_target:
+      k = min(self.num_views, len(pool))
+      targets = random.sample(pool, k) if k > 0 else []
+    else:
+      # Sample k+1 candidates and drop the source from that small sample
+      # instead of filtering it out of the whole pool every call (same trick
+      # as GSPairDataset). k+1 never exceeds len(pool): k is capped at the
+      # number of non-source views.
+      in_pool = source_view in self.pool_sets[vol["mesh_id"]]
+      k = min(self.num_views, len(pool) - in_pool)
+      if k <= 0:
+        targets = []
+      else:
+        sampled = random.sample(pool, min(k + 1, len(pool)))
+        targets = [v for v in sampled if v != source_view][:k]
+    out = _build_item(
+      _get_h5(self.source_h5), self.source_h5, source_view, targets, self.num_layers, vol["mesh_id"])
+
+    feats = _get_h5(self.features_h5)["features"][vol["row"]]
+    if self.bits:
+      feats = torch.from_numpy(feats.view(np.int16)).view(torch.bfloat16)
+    else:
+      feats = torch.from_numpy(feats)
+    out["features"] = feats.float().contiguous()   # (L, P, D)
+    return out
+
+
 class GSFixedViewsDataset(Dataset):
   """Always returns the exact same (source, targets) item, no resampling at
   all -- fit_gsplat.py's primary/secondary terminology applied to train_gs.py,

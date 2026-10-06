@@ -21,13 +21,20 @@ bf16_weights_hack: true
 # --- noising ---
 # Flow-matching time t in [0, 1]: x_t = (1 - t) * x0 + t * eps. 0 = clean GT
 # point cloud, 1 = pure noise. Also the timestep the model is called with.
+# A list (e.g. [0.25,0.5,0.75]) runs every level for each seed: rows go view,
+# then seed, then noise level, and all levels of a (view, seed) share the same
+# sub-seed, i.e. the same eps.
 noise_level: 0.5
-# Main seed. One SeedSequence(seed) generates a sub-seed per view (n-th draw for
-# the n-th entry of `views`); each seeds torch's global RNG right before that
-# view -- so eps and the model's own internal randn (invalid-pixel fill) are
-# reproducible and differ across views. Note a view's sub-seed depends on its
-# position in `views`. Sub-seeds are saved in the output's `seed` dataset; the
-# main seed in the `main_seed` attr.
+# Independent noise draws per view. The output has one row per (view, draw),
+# view-major: N = len(views) * seeds_per_view * len(noise_level list), `view_indices`
+# repeats each view.
+seeds_per_view: 1
+# Main seed. One SeedSequence(seed); each (view, draw) pair spawns the next child as its
+# sub-seed, which seeds torch's global RNG right before every noise level of that pair --
+# so eps and the model's own internal randn (invalid-pixel fill) are reproducible and
+# differ across views and draws. Note a sub-seed depends on the pair's position in `views`
+# and on seeds_per_view. Sub-seeds are saved in the output's `seed` dataset; the main seed
+# in the `main_seed` attr.
 seed: 42
 
 # --- conditioning image (same knobs as wt_infer_layers.py) ---
