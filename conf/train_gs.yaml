@@ -267,7 +267,8 @@ callbacks:
     crf: 28                    # x264 quality (higher = smaller/faster; fine for monitoring)
     elevation_deg: 20.0        # camera distance = the actual source view's own capture distance,
                                 # not a re-fit bounding-sphere framing -- see GSLightningModule.get_preview_source
-    path_format: ${output_dir}/orbits/{stage}_orbit_{mode}{n:06d}.mp4   # null -> temp dir, deleted at fit end
+    path_format: null   # null -> temp dir, deleted at fit end (wandb upload only); or e.g. ${output_dir}/orbits/{stage}_orbit_{mode}{n:06d}.mp4
+    resolution: [1024, 1024]    # [width, height]; null -> the preview cameras' own size
 
   panel:
     _target_: module.PanelCallback

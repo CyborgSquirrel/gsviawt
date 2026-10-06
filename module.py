@@ -613,11 +613,15 @@ class OrbitCallback(pl.Callback):
   epochs/steps; format specs like {n:06d} work). Parent directories are
   created and the files are kept. None (default): a throwaway temp dir,
   named "{stage}_orbit_{mode}{n}.mp4" and deleted when fit ends -- the
-  videos then only survive as the wandb.Video uploads."""
+  videos then only survive as the wandb.Video uploads.
+
+  resolution: [width, height] to render the orbit at, or None (default) to
+  render at the preview cameras' own size. Intrinsics are scaled per axis,
+  so the field of view is unchanged."""
 
   def __init__(self, *, every_n_epochs: int | None = None, every_n_steps: int | None = None,
               num_frames: int = 24, fps: int = 12, crf: int = 28, elevation_deg: float = 20.0,
-              path_format: str | None = None):
+              path_format: str | None = None, resolution: tuple[int, int] | None = None):
     _cadence_check(every_n_epochs, every_n_steps, "OrbitCallback")
     self.every_n_epochs = every_n_epochs
     self.every_n_steps = every_n_steps
@@ -626,6 +630,7 @@ class OrbitCallback(pl.Callback):
     self.crf = crf
     self.elevation_deg = elevation_deg
     self.path_format = path_format
+    self.resolution = None if resolution is None else tuple(int(x) for x in resolution)
     self.workdir = None
 
   def on_fit_start(self, trainer, pl_module):
@@ -675,12 +680,18 @@ class OrbitCallback(pl.Callback):
         device = gauss["means"].device
         viewmats = torch.from_numpy(
           _orbit_viewmats(entry["scene_scale"], self.num_frames, self.elevation_deg)).to(device)
-        Ks = repeat(views["K"][0], "... -> b ...", b=viewmats.shape[0])
+        width, height = int(views["width"]), int(views["height"])
+        K = views["K"][0].clone()
+        if self.resolution is not None:
+          K[0] *= self.resolution[0] / width
+          K[1] *= self.resolution[1] / height
+          width, height = self.resolution
+        Ks = repeat(K, "... -> b ...", b=viewmats.shape[0])
         rgb, _, _ = gsplat.rasterization(
           means=gauss["means"], quats=gauss["quats"], scales=gauss["scales"],
           opacities=gauss["opacities"], colors=gauss["colors"],
           viewmats=viewmats, Ks=Ks,
-          width=int(views["width"]), height=int(views["height"]),
+          width=width, height=height,
           sh_degree=gauss["sh_degree"], render_mode="RGB", packed=True,
         )
         rgb_np = (rgb.clamp(0.0, 1.0).cpu().numpy() * 255).astype("uint8")
