@@ -678,82 +678,90 @@ class GSFixedSourceDataset(Dataset):
 
 
 class WTFeatureDataset(Dataset):
-  """A single item built from ONE row of a wt_features.py output h5: that
-  row's cached World Tracing decoder tokens as the model input, plus the
-  usual render item (source point cloud / hit mask / RGB views) for the
-  source view it was computed from and some other views of the same mesh.
+  """Items built from rows of a wt_features.py output h5: each row's cached
+  World Tracing decoder tokens as the model input, plus the usual render item
+  (source point cloud / hit mask / RGB views) for the source view it was
+  computed from and some other views of the same mesh.
 
-  `item` is the row index into the features h5 (its `features`/`view_indices`/
-  `mesh_index`/`seed` datasets are all row-aligned; with seeds_per_view > 1 a
-  view appears several times, one row per noise seed). The render h5 is read
-  from the features h5's `source_h5` attr (older files: `input`). Only this
-  one row is ever loaded (once, up front), so len(dataset) == 1.
+  `item` is a row index into the features h5, or a list of them (its
+  `features`/`view_indices`/`mesh_index`/`seed`/`noise_level` datasets are all
+  row-aligned; a view can appear in several rows, one per noise seed / level).
+  The render h5 is read from the features h5's `source_h5` attr (older files:
+  `input`). Only the selected rows are ever loaded (once, up front), so
+  len(dataset) == the number of rows, in the order given.
 
   Targets are other views of the SAME mesh (the source view's own
   `mesh_index` in the render h5), never the source itself: `target_views`
   (raw view indices) when given, else every other view of the mesh, capped at
   `num_target_views` by drawing a fresh random subset per __getitem__ (so
   there's nothing random when the mesh has <= num_target_views other views).
+  An explicit `target_views` must be valid for every selected row.
 
-  The item has everything GSPairDataset's would, plus "features": the
+  Each item has everything GSPairDataset's would, plus "features": the
   (L, P, D) float32 token volume.
   """
 
   def __init__(self, features_h5, item, num_layers=6, num_target_views=3, target_views=None):
-    with h5py.File(features_h5, "r") as f:
-      n = f["features"].shape[0]
-      if not 0 <= item < n:
-        raise IndexError(f"data.item={item} out of range for {features_h5!r} ({n} rows)")
-      self.view = int(f["view_indices"][item])
-      self.noise_level = float(f["noise_level"][item])
-      self.seed = int(f["seed"][item])
-      self.source_h5 = str(f.attrs.get("source_h5", f.attrs["input"]))
-      stored_mesh = int(f["mesh_index"][item]) if "mesh_index" in f else None
-      feats = f["features"][item]
-      if f["features"].attrs.get("stored_as_uint16_bits", False):
-        feats = torch.from_numpy(feats.view(np.int16)).view(torch.bfloat16)
-      else:
-        feats = torch.from_numpy(feats)
-      self.features = feats.float().contiguous()   # (L, P, D)
-
-    src = _get_h5(self.source_h5)
-    mesh_of_view = np.asarray(src["mesh_index"][:])
-    self.mesh_id = int(mesh_of_view[self.view])
-    if stored_mesh is not None and stored_mesh != self.mesh_id:
-      raise ValueError(
-        f"{features_h5!r} row {item} says mesh {stored_mesh}, but view {self.view} of "
-        f"{self.source_h5!r} is mesh {self.mesh_id} -- source h5 changed since the features were written?")
-    mesh_views = np.flatnonzero(mesh_of_view == self.mesh_id).tolist()
+    rows = [int(item)] if isinstance(item, (int, np.integer)) else [int(i) for i in item]
+    if not rows:
+      raise ValueError("data.item is an empty list")
     if target_views is not None:
       target_views = [int(v) for v in target_views]
-      bad = [v for v in target_views if v not in mesh_views or v == self.view]
-      if bad:
-        raise ValueError(
-          f"data.target_views {bad} are not other views of mesh {self.mesh_id} "
-          f"(its views: {mesh_views}, source view {self.view})")
-      self.pool = target_views
-    else:
-      self.pool = [v for v in mesh_views if v != self.view]
     self.num_layers = num_layers
-    self.num_target_views = min(num_target_views, len(self.pool))
-
-    log.info(
-      "WTFeatureDataset: row %d -> %s view %d (mesh %d), noise_level=%g seed=%d, "
-      "targets drawn from %s (%d per step)",
-      item, self.source_h5, self.view, self.mesh_id, self.noise_level, self.seed,
-      self.pool, self.num_target_views,
-    )
+    self.entries = []
+    with h5py.File(features_h5, "r") as f:
+      n = f["features"].shape[0]
+      source_h5 = str(f.attrs.get("source_h5", f.attrs["input"]))
+      bits = f["features"].attrs.get("stored_as_uint16_bits", False)
+      src = _get_h5(source_h5)
+      mesh_of_view = np.asarray(src["mesh_index"][:])
+      for row in rows:
+        if not 0 <= row < n:
+          raise IndexError(f"data.item={row} out of range for {features_h5!r} ({n} rows)")
+        view = int(f["view_indices"][row])
+        mesh_id = int(mesh_of_view[view])
+        if "mesh_index" in f and int(f["mesh_index"][row]) != mesh_id:
+          raise ValueError(
+            f"{features_h5!r} row {row} says mesh {int(f['mesh_index'][row])}, but view {view} of "
+            f"{source_h5!r} is mesh {mesh_id} -- source h5 changed since the features were written?")
+        feats = f["features"][row]
+        if bits:
+          feats = torch.from_numpy(feats.view(np.int16)).view(torch.bfloat16)
+        else:
+          feats = torch.from_numpy(feats)
+        mesh_views = np.flatnonzero(mesh_of_view == mesh_id).tolist()
+        if target_views is not None:
+          bad = [v for v in target_views if v not in mesh_views or v == view]
+          if bad:
+            raise ValueError(
+              f"data.target_views {bad} are not other views of mesh {mesh_id} "
+              f"(its views: {mesh_views}, source view {view}, row {row})")
+          pool = target_views
+        else:
+          pool = [v for v in mesh_views if v != view]
+        entry = dict(
+          row=row, view=view, mesh_id=mesh_id, pool=pool,
+          features=feats.float().contiguous(),   # (L, P, D)
+          num_targets=min(num_target_views, len(pool)),
+        )
+        self.entries.append(entry)
+        log.info(
+          "WTFeatureDataset: row %d -> %s view %d (mesh %d), noise_level=%g seed=%d, "
+          "targets drawn from %s (%d per step)",
+          row, source_h5, view, mesh_id, float(f["noise_level"][row]), int(f["seed"][row]),
+          pool, entry["num_targets"],
+        )
+    self.source_h5 = source_h5
 
   def __len__(self):
-    return 1
+    return len(self.entries)
 
   def __getitem__(self, idx):
-    if idx != 0:
-      raise IndexError(idx)
-    targets = random.sample(self.pool, self.num_target_views)
+    e = self.entries[idx]
+    targets = random.sample(e["pool"], e["num_targets"])
     out = _build_item(
-      _get_h5(self.source_h5), self.source_h5, self.view, targets, self.num_layers, self.mesh_id)
-    out["features"] = self.features
+      _get_h5(self.source_h5), self.source_h5, e["view"], targets, self.num_layers, e["mesh_id"])
+    out["features"] = e["features"]
     return out
 
 

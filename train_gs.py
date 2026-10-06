@@ -265,8 +265,8 @@ def flatten_gaussians(b, gauss, xyz_cam, hit):
 # ---------------------------------------------------------------------------
 
 class GSDataModule(pl.LightningDataModule):
-  """Overfitting setup: ONE item (data.item, a row of data.features_h5) is the
-  whole train set; there's no validation split."""
+  """Overfitting setup: the row(s) of data.features_h5 named by data.item (one
+  index or a list) are the whole train set; there's no validation split."""
 
   def __init__(self, cfg):
     super().__init__()
@@ -279,7 +279,7 @@ class GSDataModule(pl.LightningDataModule):
       return
     d = self.cfg.data
     self.train_ds = WTFeatureDataset(
-      d.features_h5, int(d.item), num_layers=d.num_layers,
+      d.features_h5, d.item if isinstance(d.item, int) else list(d.item), num_layers=d.num_layers,
       num_target_views=d.num_target_views,
       target_views=list(d.target_views) if d.target_views is not None else None,
     )
