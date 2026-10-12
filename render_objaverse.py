@@ -14,6 +14,17 @@ Runs *inside* Blender (no rpyc server):
         view_strategy=turntable-lite mesh_strategy=random \\
         output_path=/app/bla/obj.h5
 
+To render the RGB pass with EEVEE instead of Cycles add
+`render_engine=BLENDER_EEVEE_NEXT` (the depth peel stays on Cycles). To A/B the
+engines on the *same* meshes + camera poses, re-render an existing h5:
+
+    ... -- source_path=/app/bla/obj.h5 source_rerender_rgb=true \\
+        render_engine=BLENDER_EEVEE_NEXT output_path=/app/bla/obj_eevee.h5
+
+and diff the two with compare_renders.py. EEVEE needs a GPU EGL context; the
+Dockerfile registers the NVIDIA EGL vendor for that (without it Blender falls
+back to Mesa software GL and EEVEE takes minutes per frame).
+
 Needs h5py + hydra-core in Blender's Python. Install once:
 
     /opt/blender/4.2/python/bin/python3.11 -m pip install \\
@@ -265,6 +276,10 @@ def depth_peel(mesh_objs, peel_mat, peel_tex, peel_eps, rl, comp,
   scene = bpy.context.scene
   cyc = scene.cycles
   ims = scene.render.image_settings
+  # The peel needs Cycles' exact transparent-BSDF ray continuation; the RGB
+  # pass may be EEVEE, so switch for the duration and restore afterwards.
+  saved_engine = scene.render.engine
+  scene.render.engine = "CYCLES"
   saved_fp, saved_ff, saved_cd, saved_cm = (
     scene.render.filepath, ims.file_format, ims.color_depth, ims.color_mode)
   saved_res = (scene.render.resolution_x, scene.render.resolution_y)
@@ -323,6 +338,7 @@ def depth_peel(mesh_objs, peel_mat, peel_tex, peel_eps, rl, comp,
         mats.pop(index=len(mats) - 1)
     for k, v in saved_cyc.items():
       setattr(cyc, k, v)
+    scene.render.engine = saved_engine
     scene.node_tree.links.new(rl.outputs["Image"], comp.inputs["Image"])
     scene.render.filepath = saved_fp
     ims.file_format, ims.color_depth, ims.color_mode = saved_ff, saved_cd, saved_cm
@@ -363,14 +379,24 @@ def render_rgba(path, width, height):
   return np.clip(rgba * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
 
+def apply_props(target, props):
+  """setattr every key of the (Omega)dict `props` on a bpy struct; nested
+  dicts recurse into the sub-struct (e.g. ray_tracing_options)."""
+  for k, v in props.items():
+    if hasattr(v, "items"):
+      apply_props(getattr(target, k), v)
+    else:
+      setattr(target, k, v)
+
+
 # ---------------------------------------------------------------------------
 # device
 # ---------------------------------------------------------------------------
 
 def configure_device(device):
+  # Cycles is configured whatever the RGB engine is: the depth peel always
+  # runs on it. (EEVEE itself has no device to select; it uses the EGL GPU.)
   scene = bpy.context.scene
-  if scene.render.engine != "CYCLES":
-    return  # EEVEE has no device selection to make
   if device == "cpu":
     scene.cycles.device = "CPU"
     return
@@ -418,15 +444,22 @@ def run(cfg):
       cfg = OmegaConf.merge(
         json.loads(src.attrs["config_json"]),
         {k: cfg[k] for k in ("depth_width", "depth_height", "device",
-                             "output_path", "source_path")})
+                             "output_path", "source_path", "render_engine",
+                             "eevee", "eevee_materials", "source_rerender_rgb",
+                             "source_max_meshes")})
+      if cfg.source_max_meshes is not None and not cfg.source_rerender_rgb:
+        raise ValueError("source_max_meshes needs source_rerender_rgb=true "
+                         "(copied images can't be subset)")
 
     scene = bpy.context.scene
+    # Per-engine settings are all set up front; _render_mesh switches
+    # scene.render.engine per pass (RGB: cfg.render_engine, depth: Cycles).
     scene.render.engine = str(cfg.render_engine)
     scene.render.resolution_percentage = 100
     scene.render.film_transparent = bool(cfg.film_transparent)
-    if scene.render.engine == "CYCLES":
-      scene.cycles.samples = int(cfg.cycles_samples)
-      scene.cycles.use_denoising = True
+    scene.cycles.samples = int(cfg.cycles_samples)
+    scene.cycles.use_denoising = True
+    apply_props(scene.eevee, cfg.eevee)
     configure_device(str(cfg.device))
 
     W, H = int(cfg.width), int(cfg.height)
@@ -441,6 +474,8 @@ def run(cfg):
       mesh_views = lambda mi: _strategy_views(cfg, view_strategy)
     else:
       meshes = list(src["mesh_paths"].asstr()[()])
+      if cfg.source_max_meshes is not None:
+        meshes = meshes[:int(cfg.source_max_meshes)]
       Lmax = int(src["depth_peel"].shape[-1])
       mesh_views = lambda mi: _source_views(src, mi)
     logger.info("RGB %dx%d, depth-peel %dx%d", W, H, DW, DH)
@@ -454,8 +489,8 @@ def run(cfg):
     hf.attrs["config_json"] = json.dumps(OmegaConf.to_container(cfg, resolve=True))
     hf.create_dataset("mesh_paths", data=meshes, dtype=h5py.string_dtype("utf-8"))
 
-    # when re-rendering, the RGB images are copied from the source, not rendered
-    render_rgb = cfg.render and src is None
+    # when re-rendering depth only, the RGB images are copied from the source
+    render_rgb = cfg.render and (src is None or cfg.source_rerender_rgb)
     ds_img = stack.enter_context(LazyDataset(hf, "images", dataset_kwargs=img_kw)) if render_rgb else None
     ds_pose = stack.enter_context(LazyDataset(hf, "camera_pose"))
     # two intrinsics datasets, both always written (identical when the RGB and
@@ -482,7 +517,7 @@ def run(cfg):
         failed.append(mi)
 
     if src is not None:
-      if "images" in src:
+      if "images" in src and not render_rgb:
         src.copy("images", hf)
       if "failed_mesh_indices" in src.attrs:
         hf.attrs["failed_mesh_indices"] = src.attrs["failed_mesh_indices"]
@@ -537,6 +572,9 @@ def _render_mesh(cfg, scene, mi, mesh_path, views, W, H, DW, DH, Lmax, tmp,
   load_object(mesh_path)
   if cfg.normalize_object:
     normalize_object()
+  if cfg.render_engine != "CYCLES":  # Cycles output must not depend on these
+    for mat in bpy.data.materials:
+      apply_props(mat, cfg.eevee_materials)
   cam = setup_camera(cfg)
   setup_lighting(str(cfg.lighting))
   rl, comp = setup_depth_compositor(scene, bpy.context.view_layer)
@@ -548,9 +586,11 @@ def _render_mesh(cfg, scene, mi, mesh_path, views, W, H, DW, DH, Lmax, tmp,
     bpy.context.view_layer.update()
     label = f"mesh={mi} {view_label}"
 
-    with timed(f"{label} render"):
-      if ds_img is not None:
+    if ds_img is not None:
+      scene.render.engine = str(cfg.render_engine)
+      with timed(f"{label} rgb ({scene.render.engine})"):
         rgba = render_rgba(os.path.join(tmp, "rgb.png"), W, H)
+    with timed(f"{label} depth peel"):
       depth_vol, _ = depth_peel(mesh_objs, peel_mat, peel_tex, peel_eps,
                                 rl, comp, DW, DH, Lmax, tmp)
 

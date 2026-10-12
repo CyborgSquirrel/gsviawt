@@ -122,6 +122,15 @@ RUN \
   apt-get install -y --no-install-recommends "${pkgs[@]}"
 EOF
 
+# Register the NVIDIA EGL driver with glvnd. The NVIDIA container runtime
+# injects libEGL_nvidia.so.0 but not its glvnd vendor file, so without this
+# Blender's headless EGL context lands on Mesa's software rasteriser: EEVEE
+# then runs on the CPU (minutes per frame instead of seconds) and logs
+# "EGL Error (0x3009): EGL_BAD_MATCH". Harmless when the lib is absent
+# (glvnd skips vendors it cannot load), e.g. on the CPU-only image.
+RUN echo '{"file_format_version":"1.0.0","ICD":{"library_path":"libEGL_nvidia.so.0"}}' \
+  > /usr/share/glvnd/egl_vendor.d/10_nvidia.json
+
 # Official tarball, not apt's `blender` package: apt's build is stale and
 # frequently lacks CUDA/OptiX device support and a working EGL path.
 RUN \
