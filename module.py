@@ -447,6 +447,8 @@ class PanelCallback(pl.Callback):
       return
 
     log_payload["views_seen"] = pl_module.views_seen  # TODO: better way to handle this
+    if hasattr(pl_module, "pixels_seen"):  # not every consumer of these callbacks tracks it
+      log_payload["pixels_seen"] = pl_module.pixels_seen
     wandb_run.log(log_payload)
 
 
@@ -551,6 +553,8 @@ class ScaleLayersCallback(pl.Callback):
       return
 
     log_payload["views_seen"] = pl_module.views_seen  # TODO: better way to handle this
+    if hasattr(pl_module, "pixels_seen"):  # not every consumer of these callbacks tracks it
+      log_payload["pixels_seen"] = pl_module.pixels_seen
     wandb_run.log(log_payload)
 
 
@@ -696,4 +700,6 @@ class OrbitCallback(pl.Callback):
       return
 
     log_payload["views_seen"] = pl_module.views_seen  # TODO: better way to handle this
+    if hasattr(pl_module, "pixels_seen"):  # not every consumer of these callbacks tracks it
+      log_payload["pixels_seen"] = pl_module.pixels_seen
     wandb_run.log(log_payload)
