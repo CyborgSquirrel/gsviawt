@@ -66,8 +66,8 @@ class RandomViews(ViewStrategy):
   calls this once per mesh each mesh gets fresh viewpoints (still
   reproducible from `seed`) rather than an identical repeated draw. That
   makes a mesh's views depend on the meshes rendered before it. That is
-  `rng_mode="shared"` (the default). With `rng_mode="per_mesh"` every mesh
-  instead gets its own generator, seeded from
+  `rng_mode="shared"`, and the mode must be given explicitly. With
+  `rng_mode="per_mesh"` every mesh instead gets its own generator, seeded from
   `seed` plus a stable hash of the mesh's file stem (the UID for Objaverse /
   TRELLIS glbs; two meshes with the same filename in different folders get
   the same views), so view k of a mesh depends only on (seed, mesh, k):
@@ -75,6 +75,7 @@ class RandomViews(ViewStrategy):
   reproduces the earlier views as the prefix, so a dataset can be extended.
   `per_mesh` needs a `seed`.
   """
+  rng_mode: Literal["shared", "per_mesh"]
   num_views: int = 12
   seed: Optional[int] = 0
   only_northern_hemisphere: bool = False
@@ -82,7 +83,6 @@ class RandomViews(ViewStrategy):
   minz: float = -2.2
   radius_min: Optional[float] = None
   radius_max: Optional[float] = None
-  rng_mode: Literal["shared", "per_mesh"] = "shared"
 
   def __post_init__(self):
     if self.rng_mode not in ("shared", "per_mesh"):
