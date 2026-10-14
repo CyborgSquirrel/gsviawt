@@ -16,6 +16,12 @@ images: images                        # image subfolder name (readColmapSceneInf
 resolution: auto                      # auto = original's own auto-halve-if->1600px-wide default (the reference's -1); or 1/2/4/8 to divide directly
 eval: true                            # llffhold=8 train/test split, same as our repro run
 
+# Scale factor applied to the TRAIN views' size (image, alpha and K are resized together,
+# antialiased), e.g. 0.5 trains on half-resolution views. The validation and final-eval
+# views are never touched, so quality is always measured at the full resolution. 1.0 = off.
+# Applies on top of `resolution` on the COLMAP path.
+train_scale: 1.0
+
 # render_objaverse.py-schema HDF5 (one object, no COLMAP data) instead of
 # source_path -- e.g. /app/bla/porsche_50views_rgb512_depth224.h5. Sets
 # load_scene_h5() instead of load_scene(); see its own docstring for the
