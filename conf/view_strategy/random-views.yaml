@@ -6,6 +6,14 @@ num_views: 12
 seed: 0
 only_northern_hemisphere: false
 
+# true: each mesh gets its own RNG, seeded from `seed` + a stable
+# hash of the mesh's file stem (the UID for Objaverse / TRELLIS glbs). View k of a mesh then
+# depends only on (seed, mesh, k) -- not on mesh order or num_views -- so raising num_views
+# later reproduces the earlier views as the prefix and a dataset can be extended.
+# false: one RNG stream shared by all meshes (a mesh's views depend on the meshes
+# rendered before it).
+per_mesh_rng: true
+
 # Per-view camera-distance jitter (upstream: 1.5 / 2.2). null on both keeps
 # every view_dir unit length so render_objaverse.py uses cfg.camera_distance
 # -- consistent framing for the WT comparison. Set both to reproduce the

@@ -2,7 +2,9 @@
 `_target_` from conf/view_strategy/*.yaml.
 """
 
+import hashlib
 import math
+import os
 from dataclasses import dataclass
 from typing import Iterator, List, Optional, Tuple
 
@@ -18,8 +20,9 @@ def view_dir_for(azimuth_rad: float, tilt_rad: float) -> Tuple[float, float, flo
 
 
 class ViewStrategy:
-  def views(self) -> Iterator[Tuple[float, float, Tuple[float, float, float]]]:
-    """Yields (tilt_deg, azimuth_deg, view_dir) tuples."""
+  def views(self, mesh_path: Optional[str] = None) -> Iterator[Tuple[float, float, Tuple[float, float, float]]]:
+    """Yields (tilt_deg, azimuth_deg, view_dir) tuples for the mesh at `mesh_path`
+    (most strategies ignore it)."""
     raise NotImplementedError
 
 
@@ -32,7 +35,7 @@ class SingleView(ViewStrategy):
   tilt_deg: float = 0.0
   azimuth_deg: float = 0.0
 
-  def views(self):
+  def views(self, mesh_path=None):
     tilt_rad = math.radians(self.tilt_deg)
     azimuth_rad = math.radians(self.azimuth_deg)
     yield self.tilt_deg, self.azimuth_deg, view_dir_for(azimuth_rad, tilt_rad)
@@ -61,7 +64,15 @@ class RandomViews(ViewStrategy):
 
   The RNG stream is shared across `views()` calls, so when a renderer
   calls this once per mesh each mesh gets fresh viewpoints (still
-  reproducible from `seed`) rather than an identical repeated draw.
+  reproducible from `seed`) rather than an identical repeated draw. That
+  makes a mesh's views depend on the meshes rendered before it. With
+  `per_mesh_rng` every mesh instead gets its own generator, seeded from
+  `seed` plus a stable hash of the mesh's file stem (the UID for Objaverse /
+  TRELLIS glbs; two meshes with the same filename in different folders get
+  the same views), so view k of a mesh depends only on (seed, mesh, k):
+  independent of mesh order and of `num_views`. Raising `num_views` later
+  reproduces the earlier views as the prefix, so a dataset can be extended.
+  Needs a `seed`.
   """
   num_views: int = 12
   seed: Optional[int] = 0
@@ -70,12 +81,23 @@ class RandomViews(ViewStrategy):
   minz: float = -2.2
   radius_min: Optional[float] = None
   radius_max: Optional[float] = None
+  per_mesh_rng: bool = False
 
   def __post_init__(self):
+    if self.per_mesh_rng and self.seed is None:
+      raise ValueError("per_mesh_rng needs a seed")
     self._rng = np.random.default_rng(self.seed) if self.seed is not None else np.random
 
-  def views(self):
-    rng = self._rng
+  def _mesh_rng(self, mesh_path):
+    if mesh_path is None:
+      raise ValueError("per_mesh_rng needs the mesh path")
+    stem = os.path.splitext(os.path.basename(str(mesh_path)))[0]
+    digest = hashlib.sha256(stem.encode("utf-8")).digest()  # not hash(): that is salted per process
+    words = [int.from_bytes(digest[i:i + 4], "little") for i in range(0, 16, 4)]
+    return np.random.default_rng(np.random.SeedSequence([int(self.seed), *words]))
+
+  def views(self, mesh_path=None):
+    rng = self._mesh_rng(mesh_path) if self.per_mesh_rng else self._rng
     jitter = self.radius_min is not None and self.radius_max is not None
 
     produced = 0
@@ -103,7 +125,7 @@ class Turntable(ViewStrategy):
   tilts_deg: List[float]
   num_azi: int
 
-  def views(self):
+  def views(self, mesh_path=None):
     for tilt_deg in self.tilts_deg:
       tilt_rad = math.radians(tilt_deg)
       for az_idx in range(self.num_azi):

@@ -438,7 +438,7 @@ def run(cfg):
       view_strategy = hydra.utils.instantiate(cfg.view_strategy)
       meshes = list(hydra.utils.instantiate(cfg.mesh_strategy).meshes())
       Lmax = int(cfg.max_peel_layers)
-      mesh_views = lambda mi: _strategy_views(cfg, view_strategy)
+      mesh_views = lambda mi: _strategy_views(cfg, view_strategy, meshes[mi])
     else:
       meshes = list(src["mesh_paths"].asstr()[()])
       Lmax = int(src["depth_peel"].shape[-1])
@@ -493,9 +493,9 @@ def run(cfg):
   logger.info("wrote %s", cfg.output_path)
 
 
-def _strategy_views(cfg, view_strategy):
+def _strategy_views(cfg, view_strategy, mesh_path):
   """(label, place(cam)) per view the strategy yields for one mesh."""
-  for tilt_deg, az_deg, view_dir in view_strategy.views():
+  for tilt_deg, az_deg, view_dir in view_strategy.views(mesh_path):
     vd = np.asarray(view_dir, np.float64)
     r = float(np.linalg.norm(vd)) or 1.0
     # A view strategy may encode a per-view camera distance as the view_dir
