@@ -446,6 +446,10 @@ class H5Catalog(Dataset):
     self.df = df
     return self
 
+  def empty(self) -> "H5Catalog":
+    """A zero-row catalog with this one's columns."""
+    return self._from_df(self.df.clear())
+
   def filter(self, predicate: pl.Expr) -> "H5Catalog":
     return self._from_df(self.df.filter(predicate))
 
@@ -475,7 +479,7 @@ def split_by_mesh(catalog: H5Catalog, val_fraction=0.1, seed=42):
   keys_df = catalog.df.select(["path", "mesh_id"]).unique().sort(["path", "mesh_id"])
   n_keys = keys_df.height
   if n_keys <= 1:
-    return catalog, H5Catalog._from_df(catalog.df.clear())
+    return catalog, catalog.empty()
 
   n_val = max(1, round(n_keys * val_fraction)) if val_fraction > 0 else 0
   n_train = n_keys - n_val
@@ -548,10 +552,6 @@ def _name_rng(seed, name):
   return np.random.default_rng(np.random.SeedSequence([int(seed), *words]))
 
 
-def _empty_like(catalog: H5Catalog) -> H5Catalog:
-  return H5Catalog._from_df(catalog.df.clear())
-
-
 def with_mesh_columns(catalog: H5Catalog) -> H5Catalog:
   """Adds the two columns the data.mesh_split / data.view_split functions
   key on:
@@ -594,7 +594,7 @@ def split_meshes_by_fraction(catalog: H5Catalog, val_fraction=0.1, seed=42):
   (catalog, <empty>); val_fraction: 0 disables the split the same way."""
   names = _mesh_names(catalog)
   if len(names) <= 1 or val_fraction <= 0:
-    return catalog, _empty_like(catalog)
+    return catalog, catalog.empty()
   n_val = min(max(1, round(len(names) * val_fraction)), len(names) - 1)
   ranked = sorted(names, key=lambda n: _name_rng(seed, n).random())
   val = set(ranked[:n_val])
@@ -626,7 +626,7 @@ def split_views_by_fraction(catalog: H5Catalog, val_fraction=0.0, seed=42):
   (seed, mesh_name), so it is a function of that mesh alone. val_fraction: 0
   disables the split (train_views is everything, val_views empty)."""
   if val_fraction <= 0:
-    return catalog, _empty_like(catalog)
+    return catalog, catalog.empty()
   df = catalog.df.with_row_index("__row")
   per_mesh = df.group_by("mesh_name").agg(pl.col("__row").sort_by("view_num"))
   val_rows = []
