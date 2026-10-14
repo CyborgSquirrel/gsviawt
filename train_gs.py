@@ -607,6 +607,7 @@ class GSLightningModule(pl.LightningModule):
     super().__init__()
     self.cfg = cfg
     self.views_seen = 0
+    self.pixels_seen = 0  # pixels of the supervised target images seen so far (views x H x W)
 
     with timed("build_model"):
       self.model = GSModel(cfg)
@@ -636,10 +637,12 @@ class GSLightningModule(pl.LightningModule):
     # views_seen is a plain Python int, not part of state_dict() -- persist
     # it explicitly so it keeps climbing (not resetting to 0) across resume.
     checkpoint["views_seen"] = self.views_seen
+    checkpoint["pixels_seen"] = self.pixels_seen
 
   def on_load_checkpoint(self, checkpoint):
     # .get: checkpoints written before this hook existed have no such key.
     self.views_seen = checkpoint.get("views_seen", 0)
+    self.pixels_seen = checkpoint.get("pixels_seen", 0)
 
   def training_step(self, batch, batch_idx):
     return self._step("train", batch, batch_idx)
@@ -650,6 +653,7 @@ class GSLightningModule(pl.LightningModule):
   def _step(self, stage, batch, batch_idx):
     B = batch["batch_size"]
     _, V, *_ = batch["views"]["rgb"].shape
+    H, W = batch["views"]["rgb"].shape[-2:]
 
     @ft.wraps(self.log)
     def _log(key, *args, **kwargs):
@@ -682,7 +686,9 @@ class GSLightningModule(pl.LightningModule):
 
     if stage == "train":
       self.views_seen += B * len(render_view_idx)
+      self.pixels_seen += B * len(render_view_idx) * H * W
     self.log("views_seen", self.views_seen, reduce_fx="max")
+    self.log("pixels_seen", self.pixels_seen, reduce_fx="max")
 
     # Per-item background compositing (loss.background): train-stage only,
     # and only affects this render/loss computation -- _preview_entry

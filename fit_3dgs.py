@@ -626,6 +626,7 @@ class Fit3DGSLightningModule(pl.LightningModule):
     self.max_sh_degree = int(cfg.sh_degree)
     self.active_sh_degree = 0
     self.views_seen = 0
+    self.pixels_seen = 0  # total pixels of the train-view targets supervised on so far (B * H * W per step)
     self.final_loss = float("nan")
     self.step_count = 0
     self.gaussian_layout = str(cfg.gaussian_layout)
@@ -895,6 +896,7 @@ class Fit3DGSLightningModule(pl.LightningModule):
         self.params, self.optimizers_dict, self.strategy_state, it, info, packed=True)
 
       self.views_seen += B
+      self.pixels_seen += B * H * W
       self.final_loss = loss.item()
       if iteration % int(self.cfg.densify.interval) == 0:
         log.info("iter %d: loss=%.5f  %d Gaussians", iteration, loss.item(), len(self.params["means"]))
@@ -913,6 +915,7 @@ class Fit3DGSLightningModule(pl.LightningModule):
     # coverage across train AND val points instead of gaps during
     # validation-only logging windows. Only train increments it.
     self.log("views_seen", self.views_seen, reduce_fx="max", batch_size=B)
+    self.log("pixels_seen", self.pixels_seen, reduce_fx="max", batch_size=B)  # same convention as views_seen
     return loss
 
   def params_np(self):
