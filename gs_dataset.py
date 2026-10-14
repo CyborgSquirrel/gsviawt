@@ -17,7 +17,7 @@ Reads render_objaverse.py-schema HDF5 files (`images`, `depth_peel`,
     groups (whole meshes, never split across); the newer two-stage pair
     (split_meshes_by_*, then split_views_by_* on the train meshes) is what
     train_gs.py's data.mesh_split / data.view_split use -- see their
-    docstrings and with_mesh_columns.
+    docstrings and render_catalog.
   - GSPairDataset: wraps an H5Catalog (e.g. one half of a split_by_mesh
     result), grouping its rows by mesh on the fly, and yielding items of
     one source view + up to `num_target_views` other views of the same
@@ -268,12 +268,30 @@ def _expand_h5_paths(h5_paths):
 
 
 def _read_view(f, path, view_idx, k_depth_name, k_image_name):
-  images = np.asarray(f["images"][view_idx])
-  depth_peel = np.asarray(f["depth_peel"][view_idx]).astype(np.float32)
-  K_depth = np.asarray(f[k_depth_name][view_idx]).astype(np.float32)
-  K_image = (np.asarray(f[k_image_name][view_idx]).astype(np.float32)
-             if k_image_name is not None else K_depth)
-  pose = np.asarray(f["camera_pose"][view_idx]).astype(np.float32)
+  """One view straight out of an open h5py.File `f` (for the datasets that
+  have no H5Catalog -- see _read_catalog_view for the catalog path)."""
+  return _decode_view(
+    path, view_idx, f["images"][view_idx], f["depth_peel"][view_idx], f[k_depth_name][view_idx],
+    f[k_image_name][view_idx] if k_image_name is not None else None, f["camera_pose"][view_idx])
+
+
+def _read_catalog_view(catalog, pos):
+  """(view dict, view_idx) for row `pos` of a render_catalog(), via row()."""
+  r = catalog.row(pos, "path", "view_idx", "images", "depth_peel", "depth_intrinsics",
+                  "image_intrinsics", "camera_pose")
+  view = _decode_view(r["path"], r["view_idx"], r["images"], r["depth_peel"], r["depth_intrinsics"],
+                      r["image_intrinsics"], r["camera_pose"])
+  return view, int(r["view_idx"])
+
+
+def _decode_view(path, view_idx, images, depth_peel, K_depth, K_image, pose):
+  """The raw h5 arrays of one view -> the float32 view dict _assemble_item
+  takes. K_image None: same as K_depth."""
+  images = np.asarray(images)
+  depth_peel = np.asarray(depth_peel).astype(np.float32)
+  K_depth = np.asarray(K_depth).astype(np.float32)
+  K_image = np.asarray(K_image).astype(np.float32) if K_image is not None else K_depth
+  pose = np.asarray(pose).astype(np.float32)
 
   if images.shape[-1] == 4:
     rgb = images[..., :3].astype(np.float32) / 255.0
@@ -364,9 +382,24 @@ def _assemble_item(src, targets, num_layers, mesh_id, source_view, target_views)
   }
 
 
+def _build_catalog_item(source_catalog, source_pos, target_catalog, target_pos, num_layers):
+  """_assemble_item, reading the source view (row `source_pos` of
+  source_catalog) and the target views (rows `target_pos` of target_catalog)
+  through H5Catalog.row()."""
+  src, source_view = _read_catalog_view(source_catalog, source_pos)
+  targets, target_views = [], []
+  for pos in target_pos:
+    view, view_idx = _read_catalog_view(target_catalog, pos)
+    targets.append(view)
+    target_views.append(view_idx)
+  mesh_id = source_catalog.df["mesh_id"][source_pos]
+  return _assemble_item(src, targets, num_layers, mesh_id, source_view, target_views)
+
+
 def _build_item(f, path, source_view, target_views, num_layers, mesh_id):
   """_assemble_item, reading src/targets from an open render_objaverse.py-
-  schema h5py.File (f) at path -- see _assemble_item for the shared part."""
+  schema h5py.File (f) at path -- for datasets without an H5Catalog
+  (GSFixedViewsDataset); see _assemble_item for the shared part."""
   k_depth_name = intrinsics_name(f, "depth")
   k_image_name = intrinsics_name(f, "image", None)
   src = _read_view(f, path, source_view, k_depth_name, k_image_name)
@@ -374,16 +407,59 @@ def _build_item(f, path, source_view, target_views, num_layers, mesh_id):
   return _assemble_item(src, targets, num_layers, mesh_id, source_view, target_views)
 
 
+class _FileColumns:
+  """What an H5Catalog build function receives (`c`) for ONE h5 file: a
+  polars-flavoured view of it. Everything comes back as a pl.Series, read
+  from the file the first time it's asked for and cached for the rest of the
+  call:
+    c.path()          -- this file's path, once per row           ("path")
+    c.index()         -- each row's index within the file, 0..n-1 ("view_idx")
+    c.dataset(name)   -- an h5 dataset, string datasets decoded    (name)
+  Series are named by those defaults; the build function is free to
+  rename/combine them."""
+
+  def __init__(self, path, f, n):
+    self._path, self._f, self.n = path, f, n
+    self._cache = {}
+
+  def path(self) -> pl.Series:
+    return pl.Series("path", [self._path] * self.n)
+
+  def index(self) -> pl.Series:
+    return pl.Series("view_idx", np.arange(self.n))
+
+  def dataset(self, name) -> pl.Series:
+    if name not in self._cache:
+      if name not in self._f:
+        raise KeyError(f"{self._path!r}: no dataset {name!r}")
+      ds = self._f[name]
+      values = ds.asstr()[()] if h5py.check_string_dtype(ds.dtype) is not None else ds[()]
+      self._cache[name] = pl.Series(name, values)
+    return self._cache[name]
+
+
 class H5Catalog(Dataset):
-  """A flat, declarative catalog over one or more h5 files, not specific to
-  this project's schema at all. Each column argument is a plain `pl.Expr`
-  (or a bare string, shorthand for `pl.col(name)`):
-    H5Catalog.path()                            -- this row's file path
-    H5Catalog.index()                            -- this row's index within its file
-    H5Catalog.dataset("mesh_index").alias("mesh_id")  -- an h5 dataset, renamed
-    "mesh_index"                                  -- same, unaliased
-  `.alias(...)` is just `pl.Expr.alias` -- these are real expressions, not a
-  custom DSL, so anything else `pl.Expr` supports works too.
+  """A flat, polars-backed catalog over one or more h5 files, not specific to
+  this project's schema at all: one table row per row of the files, plus the
+  ability to read h5 data for a row. Two things are handed in:
+
+    datasets: names of the h5 datasets that `row()` will read (e.g.
+      ["images", "depth_peel"]). Every file must have all of them, with the
+      same first-dimension length n -- that is the file's row count. Checked
+      at construction, so a missing dataset or a mismatch fails there, naming
+      the file, not at some later read. They are NOT loaded: row() fetches one
+      row at a time, on demand.
+    build: `build(c) -> pl.DataFrame`, called once per file with a
+      _FileColumns `c` (see its docstring), returning that file's table rows
+      (exactly n of them). This is where small per-row columns come from, and
+      where a lookup across datasets of different lengths is just polars, e.g.
+        lambda c: pl.DataFrame({
+          "path": c.path(), "view_idx": c.index(),
+          "mesh_name": c.dataset("mesh_paths").gather(c.dataset("mesh_index"))})
+      The per-file tables are concatenated.
+
+  row() needs the columns "path" and "view_idx" (the file and the row in it);
+  construction checks for them.
 
   Subsetting (.filter()/.take()) returns another H5Catalog built directly
   from the filtered/selected rows. Since every row already carries its own
@@ -393,58 +469,51 @@ class H5Catalog(Dataset):
   itself owned.
   """
 
-  _PATH_COL = "__h5_path"    # reserved: this row's file path, broadcast per file
-  _INDEX_COL = "__h5_index"  # reserved: this row's index within its file
-
-  @classmethod
-  def path(cls) -> pl.Expr:
-    return pl.col(cls._PATH_COL).alias("path")
-
-  @classmethod
-  def index(cls) -> pl.Expr:
-    return pl.col(cls._INDEX_COL).alias("index")
-
-  @staticmethod
-  def dataset(name: str) -> pl.Expr:
-    return pl.col(name)
-
-  def __init__(self, h5_paths, *columns):
-    exprs = [pl.col(c) if isinstance(c, str) else c for c in columns]
-
-    # Which real h5 datasets do these expressions actually need to be read
-    # from each file? (root column names, minus the two synthetic ones we
-    # always provide ourselves -- never read from the file.)
-    needed = set()
-    for e in exprs:
-      needed.update(e.meta.root_names())
-    needed -= {self._PATH_COL, self._INDEX_COL}
-    if not needed:
-      raise ValueError(
-        "H5Catalog needs at least one column backed by a real per-view h5 "
-        'dataset (e.g. H5Catalog.dataset("mesh_index")) to know how many '
-        "rows each file has -- path()/index() alone aren't enough.")
-    needed = sorted(needed)
-
+  def __init__(self, h5_paths, datasets, build):
+    self.datasets = tuple(datasets)
     frames = []
     for path in _expand_h5_paths(h5_paths):
       with h5py.File(path, "r") as f:
-        n = f[needed[0]].shape[0]
-        raw = {
-          # pl.repeat(..., eager=True): a Series filled by polars itself,
-          # not a materialized n-long Python list -- matters once n (views
-          # per file) gets large.
-          self._PATH_COL: pl.repeat(path, n, eager=True),
-          self._INDEX_COL: np.arange(n),
-          **{name: np.asarray(f[name][:]) for name in needed},
-        }
-      frames.append(pl.DataFrame(raw).select(exprs))
+        lengths = {}
+        for name in self.datasets:
+          if name not in f:
+            raise KeyError(f"{path!r}: no dataset {name!r}")
+          lengths[name] = f[name].shape[0]
+        if len(set(lengths.values())) != 1:
+          raise ValueError(f"{path!r}: datasets differ in length: {lengths}")
+        n = next(iter(lengths.values()))
+        df = build(_FileColumns(path, f, n))
+      if df.height != n:
+        raise ValueError(f"{path!r}: build() returned {df.height} rows, the file has {n}")
+      frames.append(df)
     self.df = pl.concat(frames)
+    missing = {"path", "view_idx"} - set(self.df.columns)
+    if missing:
+      raise ValueError(f"build() must return the columns 'path' and 'view_idx', missing {sorted(missing)}")
 
-  @classmethod
-  def _from_df(cls, df: pl.DataFrame) -> "H5Catalog":
-    self = cls.__new__(cls)
-    self.df = df
-    return self
+  def _from_df(self, df: pl.DataFrame) -> "H5Catalog":
+    """Another catalog over the same datasets, with `df` as its table."""
+    new = H5Catalog.__new__(H5Catalog)
+    new.datasets = self.datasets
+    new.df = df
+    return new
+
+  def row(self, pos, *columns, strict=True):
+    """{column: value} for the row at position `pos`. Each column is looked up
+    in the table first, then read from the row's h5 file (the row `view_idx`
+    of dataset `column`), as it is, with no conversion. strict=True (default)
+    only accepts table columns and the `datasets` this catalog was built with;
+    strict=False reads any dataset the file has, unchecked."""
+    row = self.df.row(pos, named=True)
+    out = {}
+    for name in columns:
+      if name in row:
+        out[name] = row[name]
+        continue
+      if strict and name not in self.datasets:
+        raise KeyError(f"{name!r} is neither a table column nor one of the catalog's datasets {self.datasets}")
+      out[name] = _get_h5(row["path"])[name][row["view_idx"]]
+    return out
 
   def empty(self) -> "H5Catalog":
     """A zero-row catalog with this one's columns."""
@@ -490,7 +559,7 @@ def split_by_mesh(catalog: H5Catalog, val_fraction=0.1, seed=42):
   val_keys_df = keys_df[np.array(val_pos.indices)]
   train_df = catalog.df.join(train_keys_df, on=["path", "mesh_id"], how="semi")
   val_df = catalog.df.join(val_keys_df, on=["path", "mesh_id"], how="semi")
-  return H5Catalog._from_df(train_df), H5Catalog._from_df(val_df)
+  return catalog._from_df(train_df), catalog._from_df(val_df)
 
 
 def split_by_view(catalog: H5Catalog, val_fraction=0.1, seed=42):
@@ -507,7 +576,7 @@ def split_by_view(catalog: H5Catalog, val_fraction=0.1, seed=42):
     print("Train idx", list(train_idx))
     print("Val idx", list(val_idx))
 
-  return H5Catalog._from_df(catalog.df[train_idx]), H5Catalog._from_df(catalog.df[val_idx])
+  return catalog._from_df(catalog.df[train_idx]), catalog._from_df(catalog.df[val_idx])
 
 
 def split_by_indices(catalog: H5Catalog, train_idx, val_idx, seed=42, strict=True):
@@ -535,7 +604,7 @@ def split_by_indices(catalog: H5Catalog, train_idx, val_idx, seed=42, strict=Tru
       raise ValueError(
         f"split_by_indices: strict=True requires train_idx+val_idx to cover every row "
         f"in [0, {len(catalog)}) -- missing {missing}")
-  return H5Catalog._from_df(catalog.df[train_idx]), H5Catalog._from_df(catalog.df[val_idx])
+  return catalog._from_df(catalog.df[train_idx]), catalog._from_df(catalog.df[val_idx])
 
 
 # ---------------------------------------------------------------------------
@@ -552,29 +621,31 @@ def _name_rng(seed, name):
   return np.random.default_rng(np.random.SeedSequence([int(seed), *words]))
 
 
-def with_mesh_columns(catalog: H5Catalog) -> H5Catalog:
-  """Adds the two columns the data.mesh_split / data.view_split functions
-  key on:
-    mesh_name: the mesh's own path, `mesh_paths[mesh_id]` of its h5 file
-      (render_objaverse.py writes it). Files without `mesh_paths` fall back
-      to f"{h5_path}#{mesh_id}", unique but tied to that file.
-    view_num: the view's number WITHIN its mesh, 0..n-1 in row order. Not
-      `view_idx` -- that is the row index in the h5 file, which only
-      coincides with it for a single-mesh file."""
-  names = []
-  for path in catalog.df["path"].unique().sort().to_list():
-    with h5py.File(path, "r") as f:
-      mesh_paths = list(f["mesh_paths"].asstr()[()]) if "mesh_paths" in f else None
-    for mesh_id in catalog.df.filter(pl.col("path") == path)["mesh_id"].unique().sort().to_list():
-      names.append({
-        "path": path, "mesh_id": mesh_id,
-        "mesh_name": mesh_paths[mesh_id] if mesh_paths is not None else f"{path}#{mesh_id}",
-      })
-  df = catalog.df.join(pl.DataFrame(names, schema_overrides={"mesh_id": catalog.df.schema["mesh_id"]}),
-                       on=["path", "mesh_id"], how="left")
-  df = df.with_columns(
-    (pl.col("view_idx").rank("ordinal").over(["path", "mesh_id"]).cast(pl.Int64) - 1).alias("view_num"))
-  return H5Catalog._from_df(df)
+# The datasets a render_objaverse.py h5 is read through (see render_catalog).
+RENDER_DATASETS = ("mesh_index", "images", "depth_peel", "camera_pose",
+                   "depth_intrinsics", "image_intrinsics")
+
+
+def _render_columns(c: "_FileColumns") -> pl.DataFrame:
+  mesh_index = c.dataset("mesh_index")
+  return pl.DataFrame({
+    "path": c.path(),
+    "view_idx": c.index(),   # the row in the h5 file, NOT the view's number within its mesh
+    "mesh_id": mesh_index,
+    "mesh_name": c.dataset("mesh_paths").gather(mesh_index),
+  }).with_columns(
+    # the view's number within its mesh, 0..n-1 in row order
+    (pl.col("view_idx").rank("ordinal").over("mesh_id").cast(pl.Int64) - 1).alias("view_num"))
+
+
+def render_catalog(h5_paths) -> H5Catalog:
+  """An H5Catalog over render_objaverse.py-schema h5 files (str, list or
+  glob(s)). Columns: path, view_idx (row in the file), mesh_id (mesh_index),
+  mesh_name (the mesh's own path, `mesh_paths[mesh_index]`), view_num (the
+  view's number within its mesh). Reads images, depth_peel, camera_pose,
+  depth_intrinsics and image_intrinsics via row(). Legacy files with only
+  `camera_intrinsics` are not supported and fail at construction."""
+  return H5Catalog(h5_paths, RENDER_DATASETS, _render_columns)
 
 
 def _mesh_names(catalog: H5Catalog):
@@ -603,7 +674,7 @@ def split_meshes_by_fraction(catalog: H5Catalog, val_fraction=0.1, seed=42):
 
 def split_meshes_by_names(catalog: H5Catalog, val_meshes, train_meshes=None, seed=42):
   """Mesh split, stage 1 of 2, by explicit mesh path (the `mesh_paths` entry,
-  see with_mesh_columns). `val_meshes` is held out; `train_meshes` null means
+  see render_catalog). `val_meshes` is held out; `train_meshes` null means
   every other mesh. Unknown names and train/val overlap are errors. `seed` is
   accepted only so every mesh_split can be called the same way; unused."""
   names = set(_mesh_names(catalog))
@@ -638,13 +709,13 @@ def split_views_by_fraction(catalog: H5Catalog, val_fraction=0.0, seed=42):
     val_rows += [rows[i] for i in _name_rng(seed, name).permutation(len(rows))[:n_val]]
   is_val = df["__row"].is_in(val_rows)
   keep = [c for c in df.columns if c != "__row"]
-  return (H5Catalog._from_df(df.filter(~is_val).select(keep)),
-          H5Catalog._from_df(df.filter(is_val).select(keep)))
+  return (catalog._from_df(df.filter(~is_val).select(keep)),
+          catalog._from_df(df.filter(is_val).select(keep)))
 
 
 def split_views_by_numbers(catalog: H5Catalog, val_views, train_views=None, seed=42):
   """View split, stage 2 of 2, by explicit view numbers (`view_num`, the
-  view's number within its mesh -- see with_mesh_columns), the same list for
+  view's number within its mesh -- see render_catalog), the same list for
   every mesh. `val_views` is held out; `train_views` null means every other
   view. `seed` is accepted only so every view_split can be called the same
   way; unused."""
@@ -672,7 +743,7 @@ def sample_matching_sources(train_views: H5Catalog, val_views: H5Catalog, seed=4
     order = _name_rng(seed, f"sources/{name}").permutation(len(rows))[:n]
     keep += [rows[i] for i in sorted(order)]
   cols = [c for c in df.columns if c != "__row"]
-  return H5Catalog._from_df(df.filter(pl.col("__row").is_in(keep)).select(cols))
+  return train_views._from_df(df.filter(pl.col("__row").is_in(keep)).select(cols))
 
 
 class GSPairDataset(Dataset):
@@ -738,17 +809,24 @@ class GSPairDataset(Dataset):
     # see train_gs.py's main().
     self.deterministic_targets = deterministic_targets
 
-    pool = catalog if target_catalog is None else target_catalog
-    groups_df = pool.df.group_by(["path", "mesh_id"], maintain_order=True).agg(pl.col("view_idx"))
+    # self.groups: (path, mesh_id) -> the ROW POSITIONS (into target_catalog)
+    # of that mesh's views eligible as targets.
+    self.target_catalog = catalog if target_catalog is None else target_catalog
+    groups_df = (
+      self.target_catalog.df.with_row_index("__pos")
+      .group_by(["path", "mesh_id"], maintain_order=True)
+      .agg(pl.col("__pos"), pl.col("view_idx"))
+    )
+    allowed = None if target_views is None else set(target_views)
     self.groups = {
-      (row["path"], row["mesh_id"]): row["view_idx"]
+      (row["path"], row["mesh_id"]): [
+        p for p, v in zip(row["__pos"], row["view_idx"]) if allowed is None or v in allowed]
       for row in groups_df.iter_rows(named=True)
     }
-    if target_views is not None:
-      allowed = set(target_views)
-      self.groups = {k: [v for v in vs if v in allowed] for k, vs in self.groups.items()}
 
     self.source_catalog = catalog if source_views is None else catalog.take(source_views)
+    # each source row's position in `catalog`, to keep it out of its own targets
+    self.source_pos = np.arange(len(catalog)) if source_views is None else np.asarray(source_views, dtype=int)
 
     log.info(
       "GSPairDataset: %d mesh groups / %d views (%d eligible as source)",
@@ -760,9 +838,8 @@ class GSPairDataset(Dataset):
 
   def __getitem__(self, idx):
     row = self.source_catalog[idx]
-    path, mesh_id, source_view = row["path"], row["mesh_id"], row["view_idx"]
-    views = self.groups[(path, mesh_id)]
-    f = _get_h5(path)
+    views = self.groups[(row["path"], row["mesh_id"])]
+    source_pos = int(self.source_pos[idx])
 
     rng = random.Random(f"{self.seed}_{idx}") if self.deterministic_targets else random.Random()
     if self.allow_source_as_target:
@@ -770,7 +847,7 @@ class GSPairDataset(Dataset):
       target_views = rng.sample(views, k) if k > 0 else []
     else:
       # Sample num_target_views+1 candidates (all still <= len(views), since
-      # num_target_views <= len(views)-1) and drop source_view from that small
+      # num_target_views <= len(views)-1) and drop the source from that small
       # sample instead of first filtering it out of the whole (possibly much
       # larger) views list -- avoids an O(len(views)) scan every call.
       k = min(self.num_target_views, len(views) - 1)
@@ -778,9 +855,9 @@ class GSPairDataset(Dataset):
         target_views = []
       else:
         sampled = rng.sample(views, k + 1)
-        target_views = [v for v in sampled if v != source_view][:k]
+        target_views = [v for v in sampled if v != source_pos][:k]
 
-    return _build_item(f, path, source_view, target_views, self.num_layers, mesh_id)
+    return _build_catalog_item(self.source_catalog, idx, self.target_catalog, target_views, self.num_layers)
 
 
 class GSFixedSourceDataset(Dataset):
@@ -804,14 +881,20 @@ class GSFixedSourceDataset(Dataset):
   """
 
   def __init__(self, catalog: H5Catalog, source_view, target_views, num_layers=6, targets_per_item=1):
-    rows = catalog.df.filter(pl.col("view_idx") == source_view)
+    df = catalog.df.with_row_index("__pos")
+    rows = df.filter(pl.col("view_idx") == source_view)
     if len(rows) != 1:
       raise ValueError(
         f"GSFixedSourceDataset: expected exactly one catalog row for "
         f"source_view={source_view}, found {len(rows)}")
     row = rows.row(0, named=True)
+    self.catalog = catalog
+    self.source_pos = row["__pos"]
     self.path = row["path"]
     self.mesh_id = row["mesh_id"]
+    # the target views are looked up in the source's own file
+    pos_of = dict(zip(df.filter(pl.col("path") == self.path)["view_idx"], df.filter(pl.col("path") == self.path)["__pos"]))
+    self.target_pos = [pos_of[int(v)] for v in target_views]
     self.source_view = int(source_view)
     self.target_views = [int(v) for v in target_views]
     self.num_layers = num_layers
@@ -827,9 +910,8 @@ class GSFixedSourceDataset(Dataset):
 
   def __getitem__(self, idx):
     start = idx * self.targets_per_item
-    chunk = self.target_views[start:start + self.targets_per_item]
-    f = _get_h5(self.path)
-    return _build_item(f, self.path, self.source_view, chunk, self.num_layers, self.mesh_id)
+    chunk = self.target_pos[start:start + self.targets_per_item]
+    return _build_catalog_item(self.catalog, self.source_pos, self.catalog, chunk, self.num_layers)
 
 
 class GSFixedViewsDataset(Dataset):

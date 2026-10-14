@@ -56,9 +56,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
 from module import SH_C0  # noqa: E402
 from gs_dataset import (OPENGL_TO_OPENCV, GaussH5ValDataset,  # noqa: E402
                         GSFixedSourceDataset, GSFixedViewsDataset,
-                        GSPairDataset, H5Catalog, _EmptyDataset,
-                        rotate_quats_wxyz, sample_matching_sources,
-                        with_mesh_columns)
+                        GSPairDataset, _EmptyDataset,
+                        rotate_quats_wxyz, render_catalog, sample_matching_sources)
 from gs_decoder import GaussianResnetDecoder, GSDecoderStack  # noqa: E402
 from gs_encoder import GSResnetEncoder  # noqa: E402
 from module import DSSIMLoss, WarmupCosineAnnealingLR  # noqa: E402
@@ -432,12 +431,7 @@ def _external_val_dataset(cfg):
   (deterministic_targets=True, exactly like today's multi-scene val split),
   not from data.photom_h5 / data.fixed_source_view. See conf/train_gs.yaml's
   data.photom_h5_val comment for why this is the deliberate design."""
-  catalog = H5Catalog(
-    cfg.data.photom_h5_val,
-    H5Catalog.path().alias("path"),
-    H5Catalog.index().alias("view_idx"),
-    H5Catalog.dataset("mesh_index").alias("mesh_id"),
-  )
+  catalog = render_catalog(cfg.data.photom_h5_val)
   return GSPairDataset(
     catalog, num_layers=cfg.data.num_layers, num_target_views=cfg.data.num_target_views,
     seed=cfg.seed, deterministic_targets=True, allow_source_as_target=cfg.data.allow_source_as_target,
@@ -455,7 +449,6 @@ def _split_datasets(cfg, catalog):
                       as it has val_views, see sample_matching_sources),
                       targets = val_views
     val_views_sval:   train meshes, sources AND targets = val_views"""
-  catalog = with_mesh_columns(catalog)
   train_meshes, val_meshes = hydra.utils.instantiate(cfg.data.mesh_split)(catalog, seed=cfg.seed)
   train_views, val_views = hydra.utils.instantiate(cfg.data.view_split)(train_meshes, seed=cfg.seed)
 
@@ -538,12 +531,7 @@ class GSDataModule(pl.LightningDataModule):
       # the mesh/view split entirely and use the WHOLE photom_h5 catalog for
       # train_ds -- data.mesh_split/view_split become no-ops here (logged in main()'s
       # config-validation block, not silently swallowed).
-      catalog = H5Catalog(
-        cfg.data.photom_h5,
-        H5Catalog.path().alias("path"),
-        H5Catalog.index().alias("view_idx"),
-        H5Catalog.dataset("mesh_index").alias("mesh_id"),
-      )
+      catalog = render_catalog(cfg.data.photom_h5)
       self.train_ds = GSPairDataset(
         catalog, num_layers=cfg.data.num_layers, num_target_views=cfg.data.num_target_views,
         seed=cfg.seed, deterministic_targets=False, source_views=cfg.data.source_views,
@@ -561,12 +549,7 @@ class GSDataModule(pl.LightningDataModule):
       # GSPairDataset involved on either side.
       if cfg.data.source_views is None or len(cfg.data.source_views) != 1:
         raise SystemExit("data.fixed_source_dataset requires exactly one data.source_views entry")
-      catalog = H5Catalog(
-        cfg.data.photom_h5,
-        H5Catalog.path().alias("path"),
-        H5Catalog.index().alias("view_idx"),
-        H5Catalog.dataset("mesh_index").alias("mesh_id"),
-      )
+      catalog = render_catalog(cfg.data.photom_h5)
       source_view = int(catalog.take([cfg.data.source_views[0]]).df["view_idx"][0])
       views = catalog.df["view_idx"].to_list()
       random.Random(cfg.seed).shuffle(views)
@@ -592,12 +575,7 @@ class GSDataModule(pl.LightningDataModule):
       # are raw view_idx values with no mesh_id qualifier.
       if cfg.data.source_views is None or len(cfg.data.source_views) != 1:
         raise SystemExit("data.val_target_views requires exactly one data.source_views entry")
-      catalog = H5Catalog(
-        cfg.data.photom_h5,
-        H5Catalog.path().alias("path"),
-        H5Catalog.index().alias("view_idx"),
-        H5Catalog.dataset("mesh_index").alias("mesh_id"),
-      )
+      catalog = render_catalog(cfg.data.photom_h5)
       source_view = int(catalog.take([cfg.data.source_views[0]]).df["view_idx"][0])
       val_targets = [int(v) for v in cfg.data.val_target_views]
       val_targets_set = set(val_targets)
@@ -612,12 +590,7 @@ class GSDataModule(pl.LightningDataModule):
         num_layers=cfg.data.num_layers, targets_per_item=cfg.data.val_targets_per_item,
       )}
     else:
-      catalog = H5Catalog(
-        cfg.data.photom_h5,
-        H5Catalog.path().alias("path"),
-        H5Catalog.index().alias("view_idx"),
-        H5Catalog.dataset("mesh_index").alias("mesh_id"),
-      )
+      catalog = render_catalog(cfg.data.photom_h5)
 
       self.train_ds, self.val_datasets = _split_datasets(cfg, catalog)
       if not self.val_datasets:
