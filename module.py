@@ -594,6 +594,19 @@ def _orbit_viewmats(dist, num_frames, elevation_deg):
   return np.linalg.inv(c2w_cv).astype(np.float32)
 
 
+def _orbit_frame_size(width, height, K, resolution):
+  """(width, height, K) an orbit frame is rendered with. resolution None: the
+  preview view's own. Otherwise the longer side becomes `resolution` pixels
+  (aspect kept, both sides rounded to even numbers) and K is scaled by the
+  actual per-axis ratios so the same 3D point lands at the same relative spot."""
+  if resolution is None:
+    return width, height, K
+  scale = resolution / max(width, height)
+  new_w, new_h = max(2, 2 * round(width * scale / 2)), max(2, 2 * round(height * scale / 2))
+  K = K * K.new_tensor([new_w / width, new_h / height, 1.0])[:, None]
+  return new_w, new_h, K
+
+
 class OrbitCallback(pl.Callback):
   """Shared consumer half of the same pull pattern PanelCallback uses.
   Pulls pl_module.get_preview_source(mode) -- same call PanelCallback
@@ -608,6 +621,12 @@ class OrbitCallback(pl.Callback):
   fires on -- see PanelCallback's own docstring, same contract exactly
   (epoch cadence == train only; step cadence == train + val together).
 
+  resolution: size in pixels of the longer side of the rendered frames, e.g.
+  1024. The preview view's aspect ratio is kept (frame sides are rounded to
+  even numbers for the mp4 encoder) and its K is scaled to match, so the
+  framing is unchanged -- only the pixel density. None (default): the
+  preview views' own size.
+
   path_format: where each mp4 is written, as a str.format() template over
   {stage} ("train"/"val"), {mode} ("epoch"/"step") and {n} (completed
   epochs/steps; format specs like {n:06d} work). Parent directories are
@@ -617,7 +636,7 @@ class OrbitCallback(pl.Callback):
 
   def __init__(self, *, every_n_epochs: int | None = None, every_n_steps: int | None = None,
               num_frames: int = 24, fps: int = 12, crf: int = 28, elevation_deg: float = 20.0,
-              path_format: str | None = None):
+              path_format: str | None = None, resolution: int | None = None):
     _cadence_check(every_n_epochs, every_n_steps, "OrbitCallback")
     self.every_n_epochs = every_n_epochs
     self.every_n_steps = every_n_steps
@@ -626,6 +645,7 @@ class OrbitCallback(pl.Callback):
     self.crf = crf
     self.elevation_deg = elevation_deg
     self.path_format = path_format
+    self.resolution = resolution
     self.workdir = None
 
   def on_fit_start(self, trainer, pl_module):
@@ -675,12 +695,14 @@ class OrbitCallback(pl.Callback):
         device = gauss["means"].device
         viewmats = torch.from_numpy(
           _orbit_viewmats(entry["scene_scale"], self.num_frames, self.elevation_deg)).to(device)
-        Ks = repeat(views["K"][0], "... -> b ...", b=viewmats.shape[0])
+        width, height, K = _orbit_frame_size(
+          int(views["width"]), int(views["height"]), views["K"][0], self.resolution)
+        Ks = repeat(K, "... -> b ...", b=viewmats.shape[0])
         rgb, _, _ = gsplat.rasterization(
           means=gauss["means"], quats=gauss["quats"], scales=gauss["scales"],
           opacities=gauss["opacities"], colors=gauss["colors"],
           viewmats=viewmats, Ks=Ks,
-          width=int(views["width"]), height=int(views["height"]),
+          width=width, height=height,
           sh_degree=gauss["sh_degree"], render_mode="RGB", packed=True,
         )
         rgb_np = (rgb.clamp(0.0, 1.0).cpu().numpy() * 255).astype("uint8")
