@@ -224,9 +224,9 @@ def rescale_camera(cam, scale):
   new_w, new_h = max(1, round(w * scale)), max(1, round(h * scale))
 
   def resize(a):
-    t = torch.from_numpy(np.ascontiguousarray(a)).permute(2, 0, 1)[None]
+    t = rearrange(torch.from_numpy(np.ascontiguousarray(a)), "h w c -> 1 c h w")
     t = F.interpolate(t, size=(new_h, new_w), mode="bilinear", antialias=True, align_corners=False)
-    return t[0].permute(1, 2, 0).contiguous().numpy()
+    return rearrange(t, "1 c h w -> h w c").contiguous().numpy()
 
   K = cam["K"].copy()
   K[0] *= new_w / w   # fx, skew, cx
