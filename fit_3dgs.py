@@ -212,6 +212,29 @@ def load_scene(source_path, images, eval_split, resolution):
   return info.point_cloud, float(info.nerf_normalization["radius"]) or 1.0, train_cams, test_cams
 
 
+def rescale_camera(cam, scale):
+  """A copy of one camera dict (load_scene()/load_scene_h5()'s) with its image
+  and alpha resized to round(scale * width) x round(scale * height) and K scaled
+  by the resulting per-axis factors, so the same 3D point still projects to the
+  same place in the resized image. Antialiased bilinear resize (a proper
+  downscale filter for scale < 1; plain bilinear for scale > 1). 'image' is
+  alpha-premultiplied, so resizing it and 'alpha' linearly keeps the pair
+  consistent. viewmat/name/view_idx are untouched."""
+  h, w = cam["height"], cam["width"]
+  new_w, new_h = max(1, round(w * scale)), max(1, round(h * scale))
+
+  def resize(a):
+    t = torch.from_numpy(np.ascontiguousarray(a)).permute(2, 0, 1)[None]
+    t = F.interpolate(t, size=(new_h, new_w), mode="bilinear", antialias=True, align_corners=False)
+    return t[0].permute(1, 2, 0).contiguous().numpy()
+
+  K = cam["K"].copy()
+  K[0] *= new_w / w   # fx, skew, cx
+  K[1] *= new_h / h   # fy, cy
+  return {**cam, "image": resize(cam["image"]), "alpha": resize(cam["alpha"]), "K": K,
+          "width": new_w, "height": new_h}
+
+
 def resolve_views(hdf5_path, primary, secondary, validation, val_fraction, seed):
   """Resolves cfg.data.primary_view / secondary_views / validation_views
   (each None == unset) into a full (primary: int, secondary: list[int],
@@ -1041,6 +1064,15 @@ def main(cfg: DictConfig) -> None:
         cfg.source_path, cfg.images, bool(cfg.eval), _coerce_resolution(cfg.resolution))
   log.info("%d train views, %d test views (llffhold), scene_extent=%.4f",
            len(train_cams), len(test_cams), scene_extent)
+  train_scale = float(cfg.train_scale)
+  if train_scale <= 0:
+    raise SystemExit(f"train_scale={train_scale} -- must be > 0")
+  if train_scale != 1.0:
+    # Training views only: the validation / final-eval views stay at full resolution.
+    train_cams = [rescale_camera(c, train_scale) for c in train_cams]
+    log.info("train views scaled by %g -> %dx%d (validation views stay %dx%d)",
+             train_scale, train_cams[0]["width"], train_cams[0]["height"],
+             test_cams[0]["width"] if test_cams else 0, test_cams[0]["height"] if test_cams else 0)
 
   layered_meta = None
   with timed("init"):
