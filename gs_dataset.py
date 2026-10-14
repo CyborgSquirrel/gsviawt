@@ -423,7 +423,7 @@ class _FileColumns:
     self._cache = {}
 
   def path(self) -> pl.Series:
-    return pl.Series("path", [self._path] * self.n)
+    return pl.repeat(self._path, self.n, eager=True).alias("path")
 
   def index(self) -> pl.Series:
     return pl.Series("view_idx", np.arange(self.n))
