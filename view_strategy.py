@@ -6,7 +6,7 @@ import hashlib
 import math
 import os
 from dataclasses import dataclass
-from typing import Iterator, List, Optional, Tuple
+from typing import Iterator, List, Literal, Optional, Tuple
 
 import numpy as np
 
@@ -65,14 +65,15 @@ class RandomViews(ViewStrategy):
   The RNG stream is shared across `views()` calls, so when a renderer
   calls this once per mesh each mesh gets fresh viewpoints (still
   reproducible from `seed`) rather than an identical repeated draw. That
-  makes a mesh's views depend on the meshes rendered before it. With
-  `per_mesh_rng` every mesh instead gets its own generator, seeded from
+  makes a mesh's views depend on the meshes rendered before it. That is
+  `rng_mode="shared"` (the default). With `rng_mode="per_mesh"` every mesh
+  instead gets its own generator, seeded from
   `seed` plus a stable hash of the mesh's file stem (the UID for Objaverse /
   TRELLIS glbs; two meshes with the same filename in different folders get
   the same views), so view k of a mesh depends only on (seed, mesh, k):
   independent of mesh order and of `num_views`. Raising `num_views` later
   reproduces the earlier views as the prefix, so a dataset can be extended.
-  Needs a `seed`.
+  `per_mesh` needs a `seed`.
   """
   num_views: int = 12
   seed: Optional[int] = 0
@@ -81,23 +82,25 @@ class RandomViews(ViewStrategy):
   minz: float = -2.2
   radius_min: Optional[float] = None
   radius_max: Optional[float] = None
-  per_mesh_rng: bool = False
+  rng_mode: Literal["shared", "per_mesh"] = "shared"
 
   def __post_init__(self):
-    if self.per_mesh_rng and self.seed is None:
-      raise ValueError("per_mesh_rng needs a seed")
+    if self.rng_mode not in ("shared", "per_mesh"):
+      raise ValueError(f"rng_mode must be 'shared' or 'per_mesh', got {self.rng_mode!r}")
+    if self.rng_mode == "per_mesh" and self.seed is None:
+      raise ValueError("rng_mode='per_mesh' needs a seed")
     self._rng = np.random.default_rng(self.seed) if self.seed is not None else np.random
 
   def _mesh_rng(self, mesh_path):
     if mesh_path is None:
-      raise ValueError("per_mesh_rng needs the mesh path")
+      raise ValueError("rng_mode='per_mesh' needs the mesh path")
     stem = os.path.splitext(os.path.basename(str(mesh_path)))[0]
     digest = hashlib.sha256(stem.encode("utf-8")).digest()  # not hash(): that is salted per process
     words = [int.from_bytes(digest[i:i + 4], "little") for i in range(0, 16, 4)]
     return np.random.default_rng(np.random.SeedSequence([int(self.seed), *words]))
 
   def views(self, mesh_path=None):
-    rng = self._mesh_rng(mesh_path) if self.per_mesh_rng else self._rng
+    rng = self._mesh_rng(mesh_path) if self.rng_mode == "per_mesh" else self._rng
     jitter = self.radius_min is not None and self.radius_max is not None
 
     produced = 0
