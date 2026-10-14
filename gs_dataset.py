@@ -11,9 +11,13 @@ Reads render_objaverse.py-schema HDF5 files (`images`, `depth_peel`,
     from the filtered/selected rows, so nothing downstream ever needs to
     unwrap anything to reach a "parent" dataset -- every row already
     carries its own file path.
-  - split_by_mesh: a plain function computing a train/val split over the
-    distinct (path, mesh_id) groups found in an H5Catalog (whole meshes,
-    never split across), returned as a pair of H5Catalogs.
+  - split_by_mesh / split_meshes_by_* / split_views_by_*: plain functions
+    computing train/val splits of an H5Catalog, returned as a pair of
+    H5Catalogs. split_by_mesh splits over the distinct (path, mesh_id)
+    groups (whole meshes, never split across); the newer two-stage pair
+    (split_meshes_by_*, then split_views_by_* on the train meshes) is what
+    train_gs.py's data.mesh_split / data.view_split use -- see their
+    docstrings and with_mesh_columns.
   - GSPairDataset: wraps an H5Catalog (e.g. one half of a split_by_mesh
     result), grouping its rows by mesh on the fly, and yielding items of
     one source view + up to `num_target_views` other views of the same
@@ -30,6 +34,7 @@ view's transform the identity matrix by construction.
 """
 
 import glob as _glob
+import hashlib
 import json
 import logging
 import os
@@ -529,6 +534,147 @@ def split_by_indices(catalog: H5Catalog, train_idx, val_idx, seed=42, strict=Tru
   return H5Catalog._from_df(catalog.df[train_idx]), H5Catalog._from_df(catalog.df[val_idx])
 
 
+# ---------------------------------------------------------------------------
+# two-stage split: meshes first, then views of the train meshes
+# ---------------------------------------------------------------------------
+
+def _name_rng(seed, name):
+  """A numpy Generator seeded from (seed, name) -- same SeedSequence scheme
+  as view_strategy.RandomViews' per-mesh RNG (sha256, not hash(): that is
+  salted per process), so anything derived from it is a function of the
+  mesh's name alone, not of dataset order or size."""
+  digest = hashlib.sha256(name.encode("utf-8")).digest()
+  words = np.frombuffer(digest, dtype="<u4").tolist()
+  return np.random.default_rng(np.random.SeedSequence([int(seed), *words]))
+
+
+def _empty_like(catalog: H5Catalog) -> H5Catalog:
+  return H5Catalog._from_df(catalog.df.clear())
+
+
+def with_mesh_columns(catalog: H5Catalog) -> H5Catalog:
+  """Adds the two columns the data.mesh_split / data.view_split functions
+  key on:
+    mesh_name: the mesh's own path, `mesh_paths[mesh_id]` of its h5 file
+      (render_objaverse.py writes it). Files without `mesh_paths` fall back
+      to f"{h5_path}#{mesh_id}", unique but tied to that file.
+    view_num: the view's number WITHIN its mesh, 0..n-1 in row order. Not
+      `view_idx` -- that is the row index in the h5 file, which only
+      coincides with it for a single-mesh file."""
+  names = []
+  for path in catalog.df["path"].unique().sort().to_list():
+    with h5py.File(path, "r") as f:
+      mesh_paths = list(f["mesh_paths"].asstr()[()]) if "mesh_paths" in f else None
+    for mesh_id in catalog.df.filter(pl.col("path") == path)["mesh_id"].unique().sort().to_list():
+      names.append({
+        "path": path, "mesh_id": mesh_id,
+        "mesh_name": mesh_paths[mesh_id] if mesh_paths is not None else f"{path}#{mesh_id}",
+      })
+  df = catalog.df.join(pl.DataFrame(names, schema_overrides={"mesh_id": catalog.df.schema["mesh_id"]}),
+                       on=["path", "mesh_id"], how="left")
+  df = df.with_columns(
+    (pl.col("view_idx").rank("ordinal").over(["path", "mesh_id"]).cast(pl.Int64) - 1).alias("view_num"))
+  return H5Catalog._from_df(df)
+
+
+def _mesh_names(catalog: H5Catalog):
+  return sorted(catalog.df["mesh_name"].unique().to_list())
+
+
+def _take_meshes(catalog: H5Catalog, names) -> H5Catalog:
+  return catalog.filter(pl.col("mesh_name").is_in(list(names)))
+
+
+def split_meshes_by_fraction(catalog: H5Catalog, val_fraction=0.1, seed=42):
+  """Mesh split, stage 1 of 2: holds out `round(val_fraction * n_meshes)`
+  (at least 1) whole meshes -> (train_meshes, val_meshes). Meshes are ranked
+  by a hash of (seed, mesh_name) and the lowest ranks are held out, so which
+  mesh lands where depends on its name and the seed only, never on dataset
+  order. A corpus with a single mesh can't be split and returns
+  (catalog, <empty>); val_fraction: 0 disables the split the same way."""
+  names = _mesh_names(catalog)
+  if len(names) <= 1 or val_fraction <= 0:
+    return catalog, _empty_like(catalog)
+  n_val = min(max(1, round(len(names) * val_fraction)), len(names) - 1)
+  ranked = sorted(names, key=lambda n: _name_rng(seed, n).random())
+  val = set(ranked[:n_val])
+  return _take_meshes(catalog, set(names) - val), _take_meshes(catalog, val)
+
+
+def split_meshes_by_names(catalog: H5Catalog, val_meshes, train_meshes=None, seed=42):
+  """Mesh split, stage 1 of 2, by explicit mesh path (the `mesh_paths` entry,
+  see with_mesh_columns). `val_meshes` is held out; `train_meshes` null means
+  every other mesh. Unknown names and train/val overlap are errors. `seed` is
+  accepted only so every mesh_split can be called the same way; unused."""
+  names = set(_mesh_names(catalog))
+  val_meshes = list(val_meshes)
+  train_meshes = None if train_meshes is None else list(train_meshes)
+  unknown = sorted(set(val_meshes + (train_meshes or [])) - names)
+  if unknown:
+    raise ValueError(f"split_meshes_by_names: not in the catalog: {unknown[:5]}")
+  overlap = sorted(set(val_meshes) & set(train_meshes or []))
+  if overlap:
+    raise ValueError(f"split_meshes_by_names: in both train_meshes and val_meshes: {overlap[:5]}")
+  train = set(train_meshes) if train_meshes is not None else names - set(val_meshes)
+  return _take_meshes(catalog, train), _take_meshes(catalog, val_meshes)
+
+
+def split_views_by_fraction(catalog: H5Catalog, val_fraction=0.0, seed=42):
+  """View split, stage 2 of 2 (run on the train meshes): inside EVERY mesh,
+  holds out `round(val_fraction * n_views)` (at least 1) views ->
+  (train_views, val_views). Each mesh's pick is a permutation seeded from
+  (seed, mesh_name), so it is a function of that mesh alone. val_fraction: 0
+  disables the split (train_views is everything, val_views empty)."""
+  if val_fraction <= 0:
+    return catalog, _empty_like(catalog)
+  df = catalog.df.with_row_index("__row")
+  per_mesh = df.group_by("mesh_name").agg(pl.col("__row").sort_by("view_num"))
+  val_rows = []
+  for name, rows in per_mesh.iter_rows():
+    n_val = max(1, round(len(rows) * val_fraction))
+    if n_val >= len(rows):
+      raise ValueError(f"split_views_by_fraction: mesh {name!r} has {len(rows)} views, "
+                       f"can't hold out {n_val} and keep one for training")
+    val_rows += [rows[i] for i in _name_rng(seed, name).permutation(len(rows))[:n_val]]
+  is_val = df["__row"].is_in(val_rows)
+  keep = [c for c in df.columns if c != "__row"]
+  return (H5Catalog._from_df(df.filter(~is_val).select(keep)),
+          H5Catalog._from_df(df.filter(is_val).select(keep)))
+
+
+def split_views_by_numbers(catalog: H5Catalog, val_views, train_views=None, seed=42):
+  """View split, stage 2 of 2, by explicit view numbers (`view_num`, the
+  view's number within its mesh -- see with_mesh_columns), the same list for
+  every mesh. `val_views` is held out; `train_views` null means every other
+  view. `seed` is accepted only so every view_split can be called the same
+  way; unused."""
+  val_views = [int(v) for v in val_views]
+  train_views = None if train_views is None else [int(v) for v in train_views]
+  overlap = sorted(set(val_views) & set(train_views or []))
+  if overlap:
+    raise ValueError(f"split_views_by_numbers: in both train_views and val_views: {overlap[:5]}")
+  val = catalog.filter(pl.col("view_num").is_in(val_views))
+  train = (catalog.filter(~pl.col("view_num").is_in(val_views)) if train_views is None
+           else catalog.filter(pl.col("view_num").is_in(train_views)))
+  return train, val
+
+
+def sample_matching_sources(train_views: H5Catalog, val_views: H5Catalog, seed=42):
+  """For each mesh, `n` views drawn without replacement from its train_views,
+  where `n` is how many val_views that mesh has (all of them if it has fewer)
+  -- so a validation set whose sources come from train_views is as big as the
+  one whose sources come from val_views. Seeded per mesh from (seed, name)."""
+  counts = dict(val_views.df.group_by("mesh_name").len().iter_rows())
+  df = train_views.df.with_row_index("__row")
+  keep = []
+  for name, rows in df.group_by("mesh_name").agg(pl.col("__row").sort_by("view_num")).iter_rows():
+    n = min(counts.get(name, 0), len(rows))
+    order = _name_rng(seed, f"sources/{name}").permutation(len(rows))[:n]
+    keep += [rows[i] for i in sorted(order)]
+  cols = [c for c in df.columns if c != "__row"]
+  return H5Catalog._from_df(df.filter(pl.col("__row").is_in(keep)).select(cols))
+
+
 class GSPairDataset(Dataset):
   """Wraps an H5Catalog with "path", "mesh_id", "view_idx" columns (e.g. one
   half of a split_by_mesh result -- this class doesn't split anything
@@ -559,6 +705,14 @@ class GSPairDataset(Dataset):
   different view. True: source_view is just another member of the mesh's
   view pool, same odds as any other view.
 
+  target_catalog: optional second H5Catalog the TARGET views are drawn from
+  instead of `catalog` itself (groups are built from it, matched to a source
+  by (path, mesh_id)) -- e.g. sources from a mesh's train views and targets
+  from its held-out views. Every mesh in `catalog` must appear in it. Since a
+  source then isn't in the target pool, it is never excluded from it
+  (allow_source_as_target has no effect). None (default): targets come from
+  `catalog`, unchanged behavior.
+
   target_views: optional list/set of raw view_idx values (the same domain
   as self.groups' own values -- NOT row positions like source_views above)
   eligible to be sampled as a TARGET, applied per-mesh at construction (once,
@@ -571,12 +725,12 @@ class GSPairDataset(Dataset):
 
   def __init__(self, catalog: H5Catalog, num_layers=6, num_target_views=3, seed=42,
               deterministic_targets=False, source_views=None,
-              allow_source_as_target=False, target_views=None):
+              allow_source_as_target=False, target_views=None, target_catalog=None):
     self.catalog = catalog
     self.num_layers = num_layers
     self.num_target_views = num_target_views
     self.seed = seed
-    self.allow_source_as_target = allow_source_as_target
+    self.allow_source_as_target = allow_source_as_target or target_catalog is not None
     # Whether target-view sampling is reproducible (seeded off idx) or fresh
     # every __getitem__ call -- e.g. stable val visualizations/metrics vs.
     # data variety across train epochs. No default tied to a "split" concept
@@ -584,7 +738,8 @@ class GSPairDataset(Dataset):
     # see train_gs.py's main().
     self.deterministic_targets = deterministic_targets
 
-    groups_df = catalog.df.group_by(["path", "mesh_id"], maintain_order=True).agg(pl.col("view_idx"))
+    pool = catalog if target_catalog is None else target_catalog
+    groups_df = pool.df.group_by(["path", "mesh_id"], maintain_order=True).agg(pl.col("view_idx"))
     self.groups = {
       (row["path"], row["mesh_id"]): row["view_idx"]
       for row in groups_df.iter_rows(named=True)

@@ -1,0 +1,10 @@
+# View split by explicit view numbers, applied to the TRAIN meshes only. A
+# view number is the view's position WITHIN its mesh (0..n-1 in row order),
+# the same list for every mesh:
+#   data/view_split=numbers data.view_split.val_views='[80,81,82,83]'
+# train_views null: every view not in val_views. See
+# gs_dataset.split_views_by_numbers.
+_target_: gs_dataset.split_views_by_numbers
+_partial_: true
+val_views: ???
+train_views: null

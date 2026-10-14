@@ -1,0 +1,8 @@
+# Mesh split by proportion: holds out round(val_fraction * n_meshes) (at
+# least 1) whole meshes as val_meshes; the rest are train_meshes. Which mesh
+# lands where depends on its path and `seed` only, not on dataset order -- see
+# gs_dataset.split_meshes_by_fraction. val_fraction: 0 (or a single-mesh
+# corpus) disables it: no val_meshes set.
+_target_: gs_dataset.split_meshes_by_fraction
+_partial_: true
+val_fraction: 0.1
