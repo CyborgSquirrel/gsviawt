@@ -7,7 +7,7 @@ defaults:
 # W x 4 uint8). Depth peel / pose / intrinsics are captured regardless.
 render: true
 
-# Cycles compute device: "auto" (GPU, fall back to CPU), "gpu", or "cpu".
+# Cycles compute device (also used for the depth peel when RGB is EEVEE): "auto" (GPU, fall back to CPU), "gpu", or "cpu".
 device: auto
 
 output_path: /app/bla/objaverse_renders.h5
@@ -38,6 +38,12 @@ max_peel_layers: 6
 # through, row-aligned. Pass both depth_width and depth_height explicitly
 # (they otherwise follow ${width}/${height}).
 source_path: null
+# With source_path: re-render the RGB too (with this run's render_engine /
+# eevee_samples, at the source's RGB resolution) instead of copying `images`.
+source_rerender_rgb: false
+# With source_path: only the first N meshes of the source (quick tests).
+# Requires source_rerender_rgb, since copied images can't be subset.
+source_max_meshes: null
 
 # --- Objaverse blender_script.py conventions ---
 # Recenter the object on the origin and scale so its longest bbox axis == 1
@@ -54,8 +60,29 @@ camera_distance: 1.9
 camera_lens: 50.0
 camera_sensor_width: 51.2
 
-render_engine: CYCLES        # CYCLES | BLENDER_EEVEE_NEXT
+# Engine for the RGB pass only: CYCLES | BLENDER_EEVEE_NEXT. The depth peel
+# always runs on Cycles (it relies on exact per-pixel Z tests through a
+# transparent BSDF, which EEVEE's dithered transparency doesn't guarantee), so
+# depth_peel is identical whichever engine renders the RGB. EEVEE needs a GPU
+# EGL context (see the Dockerfile); on Mesa's software GL it's ~100x slower.
+render_engine: CYCLES
 cycles_samples: 64
+# Verbatim bpy.types.SceneEEVEE properties (nested dicts recurse, e.g.
+# ray_tracing_options); no effect with render_engine=CYCLES. The defaults are
+# what brought EEVEE closest to Cycles on obj_rand500 (see PR): ray tracing
+# gives the indirect bounce light Cycles has (shadowed sides otherwise go
+# black). Add more with e.g. `+eevee.use_soft_shadows=false`.
+eevee:
+  taa_render_samples: 64
+  use_raytracing: true
+# Verbatim bpy.types.Material properties set on every material loaded from
+# the mesh, to make EEVEE match Cycles on imported assets (e.g. EEVEE honours
+# use_backface_culling from glTF single-sided materials; Cycles ignores it).
+# Applied only for EEVEE; the defaults turn culling off so single-sided glTF
+# surfaces render both faces as in Cycles.
+eevee_materials:
+  use_backface_culling: false
+  use_backface_culling_shadow: false
 film_transparent: true       # RGBA with a real alpha channel
 
 # "objaverse" = blender_script.py's key/fill/rim/bottom SUN rig on black.

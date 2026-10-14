@@ -1,0 +1,20 @@
+# Config for compare_renders.py -- row-by-row comparison of two
+# render_objaverse.py h5 files that share meshes + camera poses (e.g. a Cycles
+# render and its EEVEE re-render made with source_path=...).
+
+a_path: ???            # required, e.g. /app/bla/obj_rand500.h5
+b_path: ???            # required, e.g. /app/bla/obj_rand500_eevee.h5
+a_name: cycles         # labels used in the pictures / report
+b_name: eevee
+out_dir: ???           # required; metrics.csv, summary.json and *.png go here
+
+# Compare only the first N rows of both files (null = all of b's rows).
+max_rows: null
+
+# Pictures: this many worst rows (lowest PSNR) + this many evenly spaced
+# rows, each a raw [a | b | |a-b| x diff_gain] strip. No alignment or
+# normalisation: the point is to see what differs.
+num_worst: 8
+num_spaced: 8
+diff_gain: 4
+thumb: 384             # per-panel size in the pictures
