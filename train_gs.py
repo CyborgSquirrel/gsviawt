@@ -706,6 +706,11 @@ class GSLightningModule(pl.LightningModule):
     if stage == "train":
       self.views_seen += B * len(render_view_idx)
       self.pixels_seen += B * len(render_view_idx) * H * W
+    # DO NOT move these two log calls into the `if stage == "train":` block
+    # above (or anywhere else): only the increments are train-only, the
+    # logging must run in every stage so validation also reports the counters.
+    # Moving them there has broken val logging before -- leave them alone
+    # unless explicitly asked.
     self.log("views_seen", self.views_seen, reduce_fx="max")
     self.log("pixels_seen", self.pixels_seen, reduce_fx="max")
 
