@@ -706,8 +706,8 @@ class GSLightningModule(pl.LightningModule):
     if stage == "train":
       self.views_seen += B * len(render_view_idx)
       self.pixels_seen += B * len(render_view_idx) * H * W
-      self.log("views_seen", self.views_seen, reduce_fx="max")
-      self.log("pixels_seen", self.pixels_seen, reduce_fx="max")
+    self.log("views_seen", self.views_seen, reduce_fx="max")
+    self.log("pixels_seen", self.pixels_seen, reduce_fx="max")
 
     # Per-item background compositing (loss.background): train-stage only,
     # and only affects this render/loss computation -- _preview_entry
