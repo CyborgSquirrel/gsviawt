@@ -417,7 +417,7 @@ class PanelCallback(pl.Callback):
       n = _completed_steps(trainer, pl_module)  # count of COMPLETED optimizer steps
       if n == 0 or n % self.every_n_steps != 0:
         return
-      stages = ("train", "val")
+      stages = None  # every stage get_preview_source returns
 
     wandb_run = pl_module.logger.experiment if pl_module.logger is not None else None
     if wandb_run is None:
@@ -427,7 +427,7 @@ class PanelCallback(pl.Callback):
     with guarded_render(f"{mode}/panel"), torch.no_grad():
       import gsplat
       source = pl_module.get_preview_source(mode)
-      for stage in stages:
+      for stage in (stages or source):
         entry = source.get(stage)
         if entry is None:
           continue
@@ -530,7 +530,7 @@ class ScaleLayersCallback(pl.Callback):
       n = _completed_steps(trainer, pl_module)  # count of COMPLETED optimizer steps
       if n == 0 or n % self.every_n_steps != 0:
         return
-      stages = ("train", "val")
+      stages = None  # every stage get_preview_source returns
 
     wandb_run = pl_module.logger.experiment if pl_module.logger is not None else None
     if wandb_run is None:
@@ -539,7 +539,7 @@ class ScaleLayersCallback(pl.Callback):
     log_payload = {}
     with guarded_render(f"{mode}/scale_layers"), torch.no_grad():
       source = pl_module.get_preview_source(mode)
-      for stage in stages:
+      for stage in (stages or source):
         entry = source.get(stage)
         if entry is None:
           continue
@@ -681,7 +681,7 @@ class OrbitCallback(pl.Callback):
       n = _completed_steps(trainer, pl_module)  # count of COMPLETED optimizer steps
       if n == 0 or n % self.every_n_steps != 0:
         return
-      stages = ("train", "val")
+      stages = None  # every stage get_preview_source returns
 
     wandb_run = pl_module.logger.experiment if pl_module.logger is not None else None
     if wandb_run is None:
@@ -691,7 +691,7 @@ class OrbitCallback(pl.Callback):
     with guarded_render(f"{mode}/orbit"), torch.no_grad():
       import gsplat
       source = pl_module.get_preview_source(mode)
-      for stage in stages:
+      for stage in (stages or source):
         entry = source.get(stage)
         if entry is None:
           continue

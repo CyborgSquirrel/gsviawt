@@ -153,3 +153,17 @@ def set_mode(model, mode):
     yield
   finally:
     model.train(was_training)
+
+
+def resize_depth_nearest(depth_peel, K, size):
+    """depth_peel: (H, W, L), K: (3, 3) for that resolution. Returns the depth resampled to
+    (size, size, L) by nearest neighbour (output pixel i takes the input pixel containing its
+    centre, floor((i + 0.5) * H / size)), and K scaled to match (the first two rows by the width
+    and height ratios, as for a top-left-origin pixel grid like the renderer's)."""
+    height, width, _ = depth_peel.shape
+    rows = np.minimum(((np.arange(size) + 0.5) * height / size).astype(np.int64), height - 1)
+    cols = np.minimum(((np.arange(size) + 0.5) * width / size).astype(np.int64), width - 1)
+    K = K.copy()
+    K[0] *= size / width
+    K[1] *= size / height
+    return depth_peel[rows][:, cols], K
