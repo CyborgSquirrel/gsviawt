@@ -60,6 +60,7 @@ import wandb
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
 from gs_dataset import (OPENGL_TO_OPENCV, H5Catalog, WTFeatureDataset,  # noqa: E402
                         _EmptyDataset, rotate_quats_wxyz, split_views_per_mesh)
+from gs_backbone import MoGeBackbone  # noqa: E402
 from gs_decoder import PatchGaussianHead  # noqa: E402
 from module import DSSIMLoss  # noqa: E402
 from util import collate_with_batch_size, pipe, set_mode, timed  # noqa: E402
@@ -101,11 +102,26 @@ class GSModel(nn.Module):
       mlp_ratio=float(cfg.model.transformer.mlp_ratio),
       layer_scale_init=float(cfg.model.transformer.layer_scale_init),
       layer_embed_dim=cfg.model.layer_embed_dim,
+      input_proj_dim=cfg.model.get("input_proj_dim"),
     )
 
-  def forward(self, features):
-    """features: (B, L, P, D) -> dict of (B, L, C, H, W) Gaussian parameters,
-    H = W = sqrt(P) * patch_size."""
+    # model.backbone.weights set: the encoder is part of the model and trained with the head
+    # (the batch carries the source "image" instead of cached "features")
+    backbone = cfg.model.get("backbone")
+    self.backbone = (
+      MoGeBackbone(backbone.weights, backbone.image_size, backbone.checkpoint_activations)
+      if backbone is not None and backbone.get("weights") else None
+    )
+    self.input_key = "features" if self.backbone is None else "image"
+
+  def inputs(self, batch, device):
+    """The model input of a collated batch: cached features, or the source image."""
+    return batch[self.input_key].to(device)
+
+  def forward(self, x):
+    """x: cached features (B, L, P, D), or with a backbone the source image (B, 3, S, S);
+    -> dict of (B, L, C, H, W) Gaussian parameters, H = W = sqrt(P) * patch_size."""
+    features = x if self.backbone is None else self.backbone(x)
     if features.shape[-1] != self.feature_dim:
       raise ValueError(
         f"features have dim {features.shape[-1]}, model.feature_dim={self.feature_dim}")
@@ -139,7 +155,7 @@ def model_forward(
   B = batch["batch_size"]
 
   out = {}
-  out["gauss"] = model(batch["features"].to(device))
+  out["gauss"] = model(model.inputs(batch, device))
   _check_grid(out["gauss"], batch["source"]["xyz_cam"])
 
   # render 3DGS if necessary
@@ -316,6 +332,7 @@ class GSDataModule(pl.LightningDataModule):
     kwargs = dict(
       num_layers=d.num_layers, num_views=d.num_views,
       allow_source_as_target=d.allow_source_as_target, depth_size=d.depth_size,
+      image_size=d.image_size if d.input == "image" else None,
     )
 
     if d.val_meshes is None:
@@ -408,7 +425,15 @@ class GSLightningModule(pl.LightningModule):
   def configure_optimizers(self):
     out = {}
 
-    out["optimizer"] = hydra.utils.instantiate(self.cfg.optim)(self.model.parameters())
+    if self.model.backbone is None:
+      params = self.model.parameters()
+    else:
+      # the pretrained backbone trains at its own (lower) learning rate
+      params = [
+        {"params": self.model.head.parameters()},
+        {"params": self.model.backbone.parameters(), "lr": self.cfg.model.backbone.lr},
+      ]
+    out["optimizer"] = hydra.utils.instantiate(self.cfg.optim)(params)
     if OmegaConf.select(self.cfg, "sched") is not None:
       out["lr_scheduler"] = {
         "scheduler": hydra.utils.instantiate(self.cfg.sched)(out["optimizer"]),
@@ -648,7 +673,7 @@ class GSLightningModule(pl.LightningModule):
     batch = collate_with_batch_size([item])
     device = self.device
     with set_mode(self.model, "eval"), torch.no_grad():
-      gauss = self.model(batch["features"].to(device))
+      gauss = self.model(self.model.inputs(batch, device))
       flat = next(flatten_gaussians(
         batch["batch_size"], gauss,
         batch["source"]["xyz_cam"].to(device), batch["source"]["hit"].to(device),
