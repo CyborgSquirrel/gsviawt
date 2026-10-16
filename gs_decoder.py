@@ -259,7 +259,7 @@ class PatchGaussianHead(nn.Module):
                opacity_scale=1e-3, opacity_bias=0.0, scale_scale=1e-1, scale_bias=0.02,
                sh_scale=1.0, scale_lambda=0.01, zero_init_last_conv=False,
                predict_mean_offset=False, num_blocks=0, num_heads=24, mlp_ratio=4.0,
-               layer_scale_init=1e-4, layer_embed_dim=None):
+               layer_scale_init=1e-4, layer_embed_dim=None, input_proj_dim=None):
     super().__init__()
     self.num_layers = num_layers
     # With layer_embed_dim set, the features may be a single [1, P, D] map (e.g. one
@@ -270,7 +270,11 @@ class PatchGaussianHead(nn.Module):
     self.layer_embed = (
       nn.Parameter(torch.randn(num_layers, layer_embed_dim)) if layer_embed_dim else None
     )
-    in_dim = feature_dim + (layer_embed_dim or 0)
+    # With input_proj_dim set, a learned Linear(feature_dim -> input_proj_dim) is applied to the
+    # features first (like WT's own final_project on the concatenated encoder blocks), so a wide
+    # feature (e.g. 4 DINOv2 blocks = 4096 channels) doesn't make the trunk wider.
+    self.input_proj = nn.Linear(feature_dim, input_proj_dim) if input_proj_dim else None
+    in_dim = (input_proj_dim or feature_dim) + (layer_embed_dim or 0)
     self.max_sh_degree = max_sh_degree
     self.patch_size = patch_size
     self.scale_lambda = scale_lambda
@@ -309,6 +313,8 @@ class PatchGaussianHead(nn.Module):
   def forward(self, features):
     """features: (B, L, P, D) -> dict of (B, L, C, H, W), see
     activate_gaussians."""
+    if self.input_proj is not None:
+      features = self.input_proj(features)
     _, num_layers, num_patches, _ = features.shape
     if self.layer_embed is not None and num_layers == 1:
       features = features.expand(-1, self.num_layers, -1, -1)
