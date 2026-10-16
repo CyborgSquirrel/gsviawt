@@ -1,6 +1,11 @@
-# Config for wt_features.py -- one World Tracing forward pass per view on a
-# *noised* GT layered point cloud, saving the decoder token volume that feeds
-# the prediction head. See the module docstring.
+# Config for wt_features.py -- one feature extraction pass per view (see the
+# module docstring), with the feature extractor picked by the `extractor` group:
+#     extractor=wt     World Tracing decoder tokens on a noised GT point cloud
+#     extractor=moge   MoGe-2 DINOv2 intermediate tokens of the RGB image
+# Each is a Hydra `_target_` class from extractors.py; see conf/extractor/*.yaml.
+defaults:
+  - extractor: wt
+  - _self_
 
 # --- input: a render_objaverse.py h5 (images, depth_peel, *_intrinsics) ---
 input: ???                # required -- pass input=/app/bla/....h5
@@ -8,42 +13,16 @@ input: ???                # required -- pass input=/app/bla/....h5
 # Explicit view indices into the h5 (`images` / `depth_peel` row numbers).
 views: ???                # required -- pass 'views=[0,5,12]'
 
-# null -> "<input>.wt_features.h5" next to the input
+# null -> "<input>.<extractor name>_features.h5" next to the input
 output: null
 
-# --- model ---
-config: r75b              # wt.checkpoint.CONFIGS key (r75b / r69e / r76 ...)
-ckpt: r75b                # config name | hf://repo[/file.pt] | local .pt path
-# Cast the stored weights to bf16 after loading (autocast is bf16 regardless).
-# Needed for r75b on the 10GB RTX 3080, else OOM -- see wt_infer_layers.py.
-bf16_weights_hack: true
-
-# --- noising ---
-# Flow-matching time t in [0, 1]: x_t = (1 - t) * x0 + t * eps. 0 = clean GT
-# point cloud, 1 = pure noise. Also the timestep the model is called with.
-# A list (e.g. [0.25,0.5,0.75]) runs every level for each seed: rows go view,
-# then seed, then noise level, and all levels of a (view, seed) share the same
-# sub-seed, i.e. the same eps.
-noise_level: 0.5
-# Independent noise draws per view. The output has one row per (view, draw),
-# view-major: N = len(views) * seeds_per_view * len(noise_level list), `view_indices`
-# repeats each view.
-seeds_per_view: 1
-# Main seed. One SeedSequence(seed); each (view, draw) pair spawns the next child as its
-# sub-seed, which seeds torch's global RNG right before every noise level of that pair --
-# so eps and the model's own internal randn (invalid-pixel fill) are reproducible and
-# differ across views and draws. Note a sub-seed depends on the pair's position in `views`
-# and on seeds_per_view. Sub-seeds are saved in the output's `seed` dataset; the main seed
-# in the `main_seed` attr.
-seed: 42
-
-# --- conditioning image (same knobs as wt_infer_layers.py) ---
-bg_color: [0, 0, 0]       # RGB the masked-out region is composited to
-hard_alpha: false         # ignore a stored soft alpha; use the layer-0 depth hit
-
 # --- output h5 ---
-# gzip level for `features`. One chunk == one view's whole [L, P, D] volume.
+# gzip level for `features`; 0 = no compression filter at all. One chunk == one row's whole
+# [L, P, D] volume. Float token volumes barely compress (~7%), so large runs should use 0.
 compression_level: 4
+# Cast the tokens to this torch dtype before writing (float32 | float16 | bfloat16), null = as
+# the extractor returned them. bfloat16 is stored as its raw uint16 bits (see `stored_as_uint16_bits`).
+feature_dtype: null
 
 hydra:
   job:
