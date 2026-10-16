@@ -16,7 +16,7 @@ from torch.utils.checkpoint import checkpoint
 class MoGeBackbone(nn.Module):
   PATCH_SIZE = 14
 
-  def __init__(self, weights="Ruicheng/moge-vitl", image_size=504, checkpoint_activations=True):
+  def __init__(self, weights="Ruicheng/moge-vitl", image_size=504, checkpoint_activations=True, freeze_blocks=0):
     super().__init__()
     import os
 
@@ -31,17 +31,32 @@ class MoGeBackbone(nn.Module):
     ckpt = torch.load(path, map_location="cpu", weights_only=True)
     moge = MoGeModel(**ckpt["model_config"])
     moge.load_state_dict(ckpt["model"])
-    self.backbone = moge.backbone
+    self.backbone = moge.backbone.float()   # the checkpoint is fp16; Adam needs fp32 weights (its eps underflows in fp16 -> NaN)
     for block in self.backbone.blocks:
       block.attn = wrap_dinov2_attention_with_sdpa(block.attn)
-    self.register_buffer("image_mean", moge.image_mean.clone())
-    self.register_buffer("image_std", moge.image_std.clone())
+    self.register_buffer("image_mean", moge.image_mean.clone().float())
+    self.register_buffer("image_std", moge.image_std.clone().float())
     del moge, ckpt
     self.image_size = int(image_size)
     if self.image_size % self.PATCH_SIZE:
       raise ValueError(f"image_size={image_size} is not a multiple of the patch size {self.PATCH_SIZE}")
     self.checkpoint_activations = bool(checkpoint_activations)
     self.out_dim = self.backbone.blocks[0].attn.qkv.in_features
+    # freeze_blocks > 0: the patch embedding and the first freeze_blocks blocks are frozen (they
+    # run without autograd, so they cost no gradient / optimizer / activation memory)
+    self.freeze_blocks = int(freeze_blocks)
+    if not 0 <= self.freeze_blocks <= len(self.backbone.blocks):
+      raise ValueError(f"freeze_blocks={freeze_blocks} out of range for {len(self.backbone.blocks)} blocks")
+    if self.freeze_blocks:
+      frozen = [self.backbone.cls_token, self.backbone.pos_embed, *self.backbone.patch_embed.parameters()]
+      for block in self.backbone.blocks[: self.freeze_blocks]:
+        frozen += list(block.parameters())
+      for p in frozen:
+        p.requires_grad_(False)
+
+  def train(self, mode=True):
+    super().train(mode)
+    return self
 
   def forward(self, image):
     """image: (B, 3, S, S) RGB in [0, 1] -> (B, 1, P, out_dim) tokens, P = (S / 14)^2."""
@@ -49,8 +64,11 @@ class MoGeBackbone(nn.Module):
     x = (image - self.image_mean) / self.image_std
     x = F.interpolate(x, (self.image_size, self.image_size), mode="bilinear")
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=x.is_cuda):
-      x = bb.prepare_tokens_with_masks(x)
-      for block in bb.blocks:
+      with torch.set_grad_enabled(torch.is_grad_enabled() and self.freeze_blocks == 0):
+        x = bb.prepare_tokens_with_masks(x)
+        for block in bb.blocks[: self.freeze_blocks]:
+          x = block(x)
+      for block in bb.blocks[self.freeze_blocks:]:
         x = checkpoint(block, x, use_reentrant=False) if self.training and self.checkpoint_activations else block(x)
       x = bb.norm(x)[:, 1 + bb.num_register_tokens:]
     return x.float()[:, None]

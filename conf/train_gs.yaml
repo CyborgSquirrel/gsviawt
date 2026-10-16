@@ -73,6 +73,7 @@ model:
     image_size: ${data.image_size}
     lr: 1.0e-5              # backbone learning rate (the head's is optim.lr)
     checkpoint_activations: true   # recompute each block's activations in the backward pass (memory)
+    freeze_blocks: 0        # freeze the patch embedding and the first N of the 24 blocks (no grad / optimizer memory for them)
   # Optional transformer trunk in front of the per-patch linear projection (a
   # small version of World Tracing's head: blocks cycle frame -> ray -> global
   # attention, plus a per-layer FiLM; see gs_decoder.TransformerTrunk).

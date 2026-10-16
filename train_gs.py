@@ -50,6 +50,7 @@ import numpy as np
 import polars
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint
 from einops import pack, rearrange
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import DictConfig, OmegaConf, open_dict
@@ -109,7 +110,7 @@ class GSModel(nn.Module):
     # (the batch carries the source "image" instead of cached "features")
     backbone = cfg.model.get("backbone")
     self.backbone = (
-      MoGeBackbone(backbone.weights, backbone.image_size, backbone.checkpoint_activations)
+      MoGeBackbone(backbone.weights, backbone.image_size, backbone.checkpoint_activations, backbone.get("freeze_blocks", 0))
       if backbone is not None and backbone.get("weights") else None
     )
     self.input_key = "features" if self.backbone is None else "image"
@@ -198,25 +199,31 @@ def model_forward(
     ):
       _b, _v, _c, ih, iw = batch["views"]["rgb"].shape
 
-      x_pred_rgb, x_pred_alpha, _ = gsplat.rasterization(
-        means=x_gauss_flat["means"],
-        quats=x_gauss_flat["quats"],
-        scales=x_gauss_flat["scales"],
-        opacities=x_gauss_flat["opacities"],
-        colors=x_gauss_flat["colors"],
-        viewmats=x_viewmats,
-        Ks=x_Ks,
-        width=int(iw),
-        height=int(ih),
-        sh_degree=model.max_sh_degree,
-        render_mode="RGB",
-        packed=True,
-        # packed=True (always, here) -> gsplat's low-level rasterizer wants
-        # backgrounds shaped just (channels,), shared across every view in
-        # this call, not one per view -- which is exactly the granularity
-        # we want (one call per batch item already).
-        backgrounds=bg if bg is not None else None,
-      )
+      def rasterize(means, quats, scales, opacities, colors, viewmats, Ks, bg=bg, iw=iw, ih=ih):
+        return gsplat.rasterization(
+          means=means, quats=quats, scales=scales, opacities=opacities, colors=colors,
+          viewmats=viewmats, Ks=Ks,
+          width=int(iw),
+          height=int(ih),
+          sh_degree=model.max_sh_degree,
+          render_mode="RGB",
+          packed=True,
+          # packed=True (always, here) -> gsplat's low-level rasterizer wants
+          # backgrounds shaped just (channels,), shared across every view in
+          # this call, not one per view -- which is exactly the granularity
+          # we want (one call per batch item already).
+          backgrounds=bg if bg is not None else None,
+        )
+
+      render_args = (
+        x_gauss_flat["means"], x_gauss_flat["quats"], x_gauss_flat["scales"],
+        x_gauss_flat["opacities"], x_gauss_flat["colors"], x_viewmats, x_Ks)
+      if model.backbone is not None and torch.is_grad_enabled():
+        # a trainable backbone leaves little GPU memory for the renderer's activations:
+        # recompute each batch item's render in the backward pass instead of keeping all of them
+        x_pred_rgb, x_pred_alpha, _ = torch.utils.checkpoint.checkpoint(rasterize, *render_args, use_reentrant=False)
+      else:
+        x_pred_rgb, x_pred_alpha, _ = rasterize(*render_args)
 
       x_pred_rgb   = rearrange(x_pred_rgb, "v h w c -> v c h w")
       x_pred_alpha = rearrange(x_pred_alpha, "v h w c -> v c h w")
@@ -431,7 +438,7 @@ class GSLightningModule(pl.LightningModule):
       # the pretrained backbone trains at its own (lower) learning rate
       params = [
         {"params": self.model.head.parameters()},
-        {"params": self.model.backbone.parameters(), "lr": self.cfg.model.backbone.lr},
+        {"params": [p for p in self.model.backbone.parameters() if p.requires_grad], "lr": self.cfg.model.backbone.lr},
       ]
     out["optimizer"] = hydra.utils.instantiate(self.cfg.optim)(params)
     if OmegaConf.select(self.cfg, "sched") is not None:
