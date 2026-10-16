@@ -42,7 +42,7 @@ import torch
 from einops import rearrange
 from torch.utils.data import Dataset, random_split
 
-from util import intrinsics_name
+from util import intrinsics_name, resize_depth_nearest
 
 log = logging.getLogger(__name__)
 
@@ -359,12 +359,18 @@ def _assemble_item(src, targets, num_layers, mesh_id, source_view, target_views)
   }
 
 
-def _build_item(f, path, source_view, target_views, num_layers, mesh_id):
+def _build_item(f, path, source_view, target_views, num_layers, mesh_id, depth_size=None):
   """_assemble_item, reading src/targets from an open render_objaverse.py-
-  schema h5py.File (f) at path -- see _assemble_item for the shared part."""
+  schema h5py.File (f) at path -- see _assemble_item for the shared part.
+  depth_size: resample the SOURCE view's depth-peel (and its K_depth) to
+  depth_size x depth_size by nearest neighbour before unprojecting it, for a
+  head whose grid is not the render's (e.g. 504 for a 512 render). The RGB
+  and K_image, which the targets are rendered against, keep the render's size."""
   k_depth_name = intrinsics_name(f, "depth")
   k_image_name = intrinsics_name(f, "image", None)
   src = _read_view(f, path, source_view, k_depth_name, k_image_name)
+  if depth_size is not None and src["depth_peel"].shape[:2] != (depth_size, depth_size):
+    src["depth_peel"], src["K_depth"] = resize_depth_nearest(src["depth_peel"], src["K_depth"], depth_size)
   targets = [_read_view(f, path, v, k_depth_name, k_image_name) for v in target_views]
   return _assemble_item(src, targets, num_layers, mesh_id, source_view, target_views)
 
@@ -720,6 +726,9 @@ class WTFeatureDataset(Dataset):
   `rows`: which volumes (row indices of the features h5) the dataset holds;
   None = all of them. len(dataset) == the number of volumes.
 
+  `depth_size`: if set, the source view's depth is resampled to this square size
+  (nearest neighbour) before the point cloud is built -- see _build_item.
+
   `allow_source_as_target`: whether the volume's own source view can also be
   drawn into its sampled views. False (default): it never is, so every
   sampled view is a genuinely different one. True: it is just another member
@@ -730,7 +739,7 @@ class WTFeatureDataset(Dataset):
   """
 
   def __init__(self, features_h5, views, rows=None, num_layers=6, num_views=1,
-               allow_source_as_target=False):
+               allow_source_as_target=False, depth_size=None):
     with h5py.File(features_h5, "r") as f:
       if "mesh_index" not in f:
         raise ValueError(f"{features_h5!r} has no per-row `mesh_index`; re-run wt_features.py")
@@ -752,6 +761,7 @@ class WTFeatureDataset(Dataset):
     self.num_layers = num_layers
     self.num_views = num_views
     self.allow_source_as_target = allow_source_as_target
+    self.depth_size = depth_size
 
     groups = (
       views.df.filter(pl.col("path") == self.source_h5)
@@ -793,7 +803,8 @@ class WTFeatureDataset(Dataset):
         sampled = random.sample(pool, min(k + 1, len(pool)))
         targets = [v for v in sampled if v != source_view][:k]
     out = _build_item(
-      _get_h5(self.source_h5), self.source_h5, source_view, targets, self.num_layers, vol["mesh_id"])
+      _get_h5(self.source_h5), self.source_h5, source_view, targets, self.num_layers, vol["mesh_id"],
+      depth_size=self.depth_size)
 
     feats = _get_h5(self.features_h5)["features"][vol["row"]]
     if self.bits:

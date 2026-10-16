@@ -31,13 +31,38 @@ data:
   # false: it never is (it's dropped from the draw).
   allow_source_as_target: false
   # Per-mesh train/val view split: this fraction of each mesh's views (at
-  # least one) is held out for val. Train and val hold the same volumes but
-  # sample from disjoint views. 0 = no validation.
+  # least one) is held out for val. 0 = no validation.
   val_fraction: 0.1
+  # mesh_index values of meshes held out entirely (null = none). With a list, the view split
+  # above is made on the other meshes only, and validation is split into val_meshes (volumes
+  # of the held-out meshes), val_views_strain (train-view source, val-view targets) and
+  # val_views_sval (val-view source and targets) -- see train_gs.GSDataModule. null: train and
+  # val share the volumes, one set logged "val".
+  val_meshes: null
+  # Size of each validation set in volumes (a fixed random subset, so a val pass stays cheap);
+  # null = all of them. Only with val_meshes.
+  val_volumes: null
+  # Resample the source view's depth (nearest neighbour) to this square size, for features
+  # extracted at the model size from a larger render: 504 for r75b on a 512 render. null = off.
+  depth_size: null
 
 model:
   patch_size: 14            # WT's patch size; head output grid = sqrt(P) * patch_size per side
-  feature_dim: 1536         # WT decoder_embed_dim (r75b)
+  feature_dim: 1536         # per-token feature channels (WT decoder_embed_dim for r75b; 1024 for MoGe)
+  # Append a learnable vector of this many channels, one per Gaussian layer, to every
+  # token. Lets the features be a single [1, P, D] map (e.g. extractor=moge), repeated
+  # across the data.num_layers Gaussian layers. null = off (features need L == data.num_layers).
+  # With transformer.num_blocks > 0, feature_dim + layer_embed_dim must split into
+  # num_heads heads whose size is a multiple of 4.
+  layer_embed_dim: null
+  # Optional transformer trunk in front of the per-patch linear projection (a
+  # small version of World Tracing's head: blocks cycle frame -> ray -> global
+  # attention, plus a per-layer FiLM; see gs_decoder.TransformerTrunk).
+  transformer:
+    num_blocks: 0           # 0 = just the linear projection
+    num_heads: 24           # must divide feature_dim into heads whose size is a multiple of 4
+    mlp_ratio: 4.0
+    layer_scale_init: 1.0e-4  # small -> the trunk starts close to the identity
   max_sh_degree: 0           # 0 = plain RGB, 1 = DC + 1 SH band (9 extra channels).
                               # Default 0 for now: fit_gsplat.py's ground truth is flat
                               # RGB with no SH>0 at all, so direct_color_weight only ever

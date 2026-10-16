@@ -4,7 +4,7 @@ cached World Tracing decoder tokens.
 
 Input is a wt_features.py output h5 (the (layers, patches, dim) token volume
 World Tracing's decoder produced for one view, from a noised GT layered
-point cloud). A per-patch linear layer (gs_decoder.PatchLinearGaussianHead)
+point cloud). A per-patch linear layer (gs_decoder.PatchGaussianHead)
 maps each token to per-pixel per-layer Gaussian appearance/shape parameters
 (opacity, scale, rotation, SH color), with the same activations/init as the
 Flash3D-style decoder this script used to train. Gaussian positions are
@@ -47,6 +47,7 @@ import h5py
 import hydra
 import lightning.pytorch as pl
 import numpy as np
+import polars
 import torch
 import torch.nn as nn
 from einops import pack, rearrange
@@ -59,7 +60,7 @@ import wandb
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
 from gs_dataset import (OPENGL_TO_OPENCV, H5Catalog, WTFeatureDataset,  # noqa: E402
                         _EmptyDataset, rotate_quats_wxyz, split_views_per_mesh)
-from gs_decoder import PatchLinearGaussianHead  # noqa: E402
+from gs_decoder import PatchGaussianHead  # noqa: E402
 from module import DSSIMLoss  # noqa: E402
 from util import collate_with_batch_size, pipe, set_mode, timed  # noqa: E402
 
@@ -70,7 +71,8 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 class GSModel(nn.Module):
-  """Per-patch linear head over cached World Tracing decoder tokens: maps the
+  """Per-patch head (a linear layer, optionally behind a transformer trunk --
+  cfg.model.transformer.num_blocks) over cached World Tracing decoder tokens: maps the
   (B, L, P, D) token volume of the source view to per-pixel per-layer
   Gaussian appearance/shape parameters. Positions are anchored to the input
   point cloud (gs_dataset.dense_unproject_camera); with
@@ -84,7 +86,7 @@ class GSModel(nn.Module):
     self.min_scale_mult = float(cfg.model.min_scale_mult)
     self.feature_dim = int(cfg.model.feature_dim)
 
-    self.head = PatchLinearGaussianHead(
+    self.head = PatchGaussianHead(
       feature_dim=self.feature_dim,
       num_layers=self.num_layers,
       max_sh_degree=self.max_sh_degree,
@@ -94,6 +96,11 @@ class GSModel(nn.Module):
       sh_scale=cfg.model.sh_scale, scale_lambda=cfg.model.scale_lambda,
       zero_init_last_conv=cfg.model.zero_init_last_conv,
       predict_mean_offset=cfg.model.predict_mean_offset,
+      num_blocks=int(cfg.model.transformer.num_blocks),
+      num_heads=int(cfg.model.transformer.num_heads),
+      mlp_ratio=float(cfg.model.transformer.mlp_ratio),
+      layer_scale_init=float(cfg.model.transformer.layer_scale_init),
+      layer_embed_dim=cfg.model.layer_embed_dim,
     )
 
   def forward(self, features):
@@ -266,16 +273,32 @@ def flatten_gaussians(b, gauss, xyz_cam, hit):
 # ---------------------------------------------------------------------------
 
 class GSDataModule(pl.LightningDataModule):
-  """Train/val over cached feature volumes: both datasets hold the same
-  volumes (data.item: one row, a list of rows, or null for all of them), but
-  sample their supervision views from disjoint per-mesh view splits
-  (data.val_fraction of each mesh's views go to val; 0 = no validation)."""
+  """Train/val over cached feature volumes (data.item: one row, a list of rows, or
+  null for all of them). Two modes:
+
+  data.val_meshes null: train and val hold the same volumes but sample their
+  supervision views from disjoint per-mesh view splits (data.val_fraction of each
+  mesh's views go to val; 0 = no validation). One validation set, logged "val".
+
+  data.val_meshes a list of mesh_index values: those meshes are held out entirely.
+  The view split (data.val_fraction) is then made on the remaining meshes only, and
+  volumes are assigned by their source view:
+    train:            volumes of the other meshes whose source view is a train view
+                      (targets sampled from train views)
+    val_meshes:       volumes of the held-out meshes (targets from their views)
+    val_views_strain: volumes of the other meshes with a train-view source, targets
+                      from the val views
+    val_views_sval:   volumes of the other meshes with a val-view source, targets
+                      from the val views
+  Each validation set is a fixed random subset of data.val_volumes volumes (null =
+  all), the same size for all of them; empty sets are dropped. The datasets are in
+  self.val_datasets, in that order, one val dataloader each."""
 
   def __init__(self, cfg):
     super().__init__()
     self.cfg = cfg
     self.train_ds = None
-    self.val_ds = None
+    self.val_datasets = None
 
   def setup(self, stage=None):
     if self.train_ds is not None:
@@ -283,21 +306,63 @@ class GSDataModule(pl.LightningDataModule):
     d = self.cfg.data
     with h5py.File(d.features_h5, "r") as f:
       source_h5 = str(f.attrs.get("source_h5", f.attrs["input"]))
+      volume_views, volume_meshes = f["view_indices"][:], f["mesh_index"][:]
     views = H5Catalog(
       source_h5, H5Catalog.path(), H5Catalog.index().alias("view_idx"),
       H5Catalog.dataset("mesh_index").alias("mesh_id"),
     )
-    train_views, val_views = split_views_per_mesh(views, d.val_fraction, seed=self.cfg.seed)
-    rows = None if d.item is None else ([d.item] if isinstance(d.item, int) else list(d.item))
+    rows = np.arange(len(volume_views)) if d.item is None else np.array(
+      [d.item] if isinstance(d.item, int) else list(d.item))
     kwargs = dict(
-      rows=rows, num_layers=d.num_layers, num_views=d.num_views,
-      allow_source_as_target=d.allow_source_as_target,
+      num_layers=d.num_layers, num_views=d.num_views,
+      allow_source_as_target=d.allow_source_as_target, depth_size=d.depth_size,
     )
-    self.train_ds = WTFeatureDataset(d.features_h5, train_views, **kwargs)
-    self.val_ds = (
-      WTFeatureDataset(d.features_h5, val_views, **kwargs)
-      if len(val_views) else _EmptyDataset()
-    )
+
+    if d.val_meshes is None:
+      train_views, val_views = split_views_per_mesh(views, d.val_fraction, seed=self.cfg.seed)
+      self.train_ds = WTFeatureDataset(d.features_h5, train_views, rows=rows, **kwargs)
+      self.val_datasets = {"val": (
+        WTFeatureDataset(d.features_h5, val_views, rows=rows, **kwargs) if len(val_views) else _EmptyDataset())}
+      return
+
+    held = {int(m) for m in d.val_meshes}
+    is_held = polars.col("mesh_id").is_in(sorted(held))
+    train_views, val_views = split_views_per_mesh(
+      views.filter(~is_held), d.val_fraction, seed=self.cfg.seed)
+    held_views = views.filter(is_held)
+
+    volume_in = lambda catalog: set(zip(
+      catalog.df["mesh_id"].to_list(), catalog.df["view_idx"].to_list()))
+    train_keys, val_keys = volume_in(train_views), volume_in(val_views)
+    volume_keys = list(zip(volume_meshes[rows].tolist(), volume_views[rows].tolist()))
+    train_rows = [r for r, k in zip(rows, volume_keys) if k in train_keys]
+    sval_rows = [r for r, k in zip(rows, volume_keys) if k in val_keys]
+    held_rows = [r for r, (m, _) in zip(rows, volume_keys) if m in held]
+    if not train_rows:
+      raise SystemExit("no training volumes: check data.val_meshes / data.item")
+
+    rng = np.random.default_rng(self.cfg.seed)
+    def subset(r):
+      n = len(r) if d.val_volumes is None else min(int(d.val_volumes), len(r))
+      return sorted(rng.choice(r, size=n, replace=False).tolist()) if len(r) else []
+
+    self.train_ds = WTFeatureDataset(d.features_h5, train_views, rows=train_rows, **kwargs)
+    sets = {
+      "val_meshes": (held_views, subset(held_rows)),
+      "val_views_strain": (val_views, None),
+      "val_views_sval": (val_views, subset(sval_rows)),
+    }
+    # as many train-source volumes as the val-source set has
+    sets["val_views_strain"] = (val_views, subset(train_rows)[:len(sets["val_views_sval"][1])])
+    self.val_datasets = {
+      name: WTFeatureDataset(d.features_h5, v, rows=r, **kwargs)
+      for name, (v, r) in sets.items() if len(r) and len(v)
+    }
+    log.info(
+      "volumes: %d train, validation sets %s", len(self.train_ds),
+      {n: len(ds) for n, ds in self.val_datasets.items()})
+    if not self.val_datasets:
+      self.val_datasets = {"val": _EmptyDataset()}
 
   def train_dataloader(self):
     return DataLoader(
@@ -308,13 +373,17 @@ class GSDataModule(pl.LightningDataModule):
     )
 
   def val_dataloader(self):
-    return DataLoader(
-      self.val_ds,
-      shuffle=False,
-      collate_fn=collate_with_batch_size,
-      num_workers=0,
-      batch_size=self.cfg.loader.batch_size,
-    )
+    return [
+      DataLoader(
+        ds,
+        shuffle=False,
+        collate_fn=collate_with_batch_size,
+        num_workers=0,
+        batch_size=self.cfg.loader.batch_size,
+        drop_last=False,
+      )
+      for ds in self.val_datasets.values()
+    ]
 
 
 class GSLightningModule(pl.LightningModule):
@@ -362,8 +431,10 @@ class GSLightningModule(pl.LightningModule):
   def training_step(self, batch, batch_idx):
     return self._step("train", batch, batch_idx)
 
-  def validation_step(self, batch, batch_idx):
-    return self._step("val", batch, batch_idx)
+  def validation_step(self, batch, batch_idx, dataloader_idx=0):
+    # dataloader_idx: Lightning omits it with a single val loader, hence the default.
+    stage = list(self.trainer.datamodule.val_datasets)[dataloader_idx]
+    return self._step(stage, batch, batch_idx)
 
   def _step(self, stage, batch, batch_idx):
     B = batch["batch_size"]
@@ -372,7 +443,7 @@ class GSLightningModule(pl.LightningModule):
 
     @ft.wraps(self.log)
     def _log(key, *args, **kwargs):
-      self.log(f"{stage}/{key}", *args, **kwargs, batch_size=B)
+      self.log(f"{stage}/{key}", *args, **kwargs, batch_size=B, add_dataloader_idx=False)
 
     cfg = self.cfg
     device = self.device
@@ -402,6 +473,11 @@ class GSLightningModule(pl.LightningModule):
     if stage == "train":
       self.views_seen += B * len(render_view_idx)
       self.pixels_seen += B * len(render_view_idx) * H * W
+    # DO NOT move these two log calls into the `if stage == "train":` block
+    # above (or anywhere else): only the increments are train-only, the
+    # logging must run in every stage so validation also reports the counters.
+    # Moving them there has broken val logging before -- leave them alone
+    # unless explicitly asked.
     self.log("views_seen", self.views_seen, reduce_fx="max")
     self.log("pixels_seen", self.pixels_seen, reduce_fx="max")
 
@@ -641,11 +717,9 @@ class GSLightningModule(pl.LightningModule):
     if getattr(self, "_preview_cache_key", None) == key:
       return self._preview_cache
 
-    val_ds = self.trainer.datamodule.val_ds
-    source = {
-      "train": self._preview_entry(self.trainer.datamodule.train_ds[0]),
-      "val": self._preview_entry(val_ds[0]) if mode == "step" and len(val_ds) > 0 else None,
-    }
+    source = {"train": self._preview_entry(self.trainer.datamodule.train_ds[0])}
+    for name, val_ds in self.trainer.datamodule.val_datasets.items():
+      source[name] = self._preview_entry(val_ds[0]) if mode == "step" and len(val_ds) > 0 else None
     self._preview_cache_key, self._preview_cache = key, source
     return source
 
