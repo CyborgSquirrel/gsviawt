@@ -56,8 +56,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
 from module import SH_C0  # noqa: E402
 from gs_dataset import (OPENGL_TO_OPENCV, GaussH5ValDataset,  # noqa: E402
                         GSFixedSourceDataset, GSFixedViewsDataset,
-                        GSPairDataset, H5Catalog, _EmptyDataset,
-                        rotate_quats_wxyz)
+                        GSPairDataset, _EmptyDataset,
+                        rotate_quats_wxyz, render_catalog, sample_matching_sources)
 from gs_decoder import GaussianResnetDecoder, GSDecoderStack  # noqa: E402
 from gs_encoder import GSResnetEncoder  # noqa: E402
 from module import DSSIMLoss, WarmupCosineAnnealingLR  # noqa: E402
@@ -431,16 +431,56 @@ def _external_val_dataset(cfg):
   (deterministic_targets=True, exactly like today's multi-scene val split),
   not from data.photom_h5 / data.fixed_source_view. See conf/train_gs.yaml's
   data.photom_h5_val comment for why this is the deliberate design."""
-  catalog = H5Catalog(
-    cfg.data.photom_h5_val,
-    H5Catalog.path().alias("path"),
-    H5Catalog.index().alias("view_idx"),
-    H5Catalog.dataset("mesh_index").alias("mesh_id"),
-  )
+  catalog = render_catalog(cfg.data.photom_h5_val)
   return GSPairDataset(
     catalog, num_layers=cfg.data.num_layers, num_target_views=cfg.data.num_target_views,
     seed=cfg.seed, deterministic_targets=True, allow_source_as_target=cfg.data.allow_source_as_target,
   )
+
+
+def _split_datasets(cfg, catalog):
+  """The ordinary multi-scene split: data.mesh_split (all meshes ->
+  train_meshes + val_meshes), then data.view_split on the train_meshes (->
+  train_views + val_views). Returns (train_ds, val_datasets); val_datasets
+  maps a metric prefix to a validation dataset, with only the non-empty ones:
+    val_meshes:       every view of the held-out meshes (source and targets
+                      both drawn from them)
+    val_views_strain: train meshes, sources = train views (as many per mesh
+                      as it has val_views, see sample_matching_sources),
+                      targets = val_views
+    val_views_sval:   train meshes, sources AND targets = val_views"""
+  train_meshes, val_meshes = hydra.utils.instantiate(cfg.data.mesh_split)(catalog, seed=cfg.seed)
+  train_views, val_views = hydra.utils.instantiate(cfg.data.view_split)(train_meshes, seed=cfg.seed)
+
+  pair_kwargs = dict(
+    num_layers=cfg.data.num_layers, num_target_views=cfg.data.num_target_views,
+    seed=cfg.seed, deterministic_targets=True, allow_source_as_target=cfg.data.allow_source_as_target,
+  )
+  train_ds = GSPairDataset(
+    train_views, num_layers=cfg.data.num_layers, num_target_views=cfg.data.num_target_views,
+    seed=cfg.seed, deterministic_targets=False, source_views=cfg.data.source_views,
+    allow_source_as_target=cfg.data.allow_source_as_target,
+  )
+
+  val_datasets = {}
+  if len(val_meshes) > 0:
+    val_datasets["val_meshes"] = GSPairDataset(val_meshes, **pair_kwargs)
+  if len(val_views) > 0:
+    views_per_mesh = val_views.df.group_by("mesh_name").len()["len"].min()
+    if views_per_mesh < 2 and not cfg.data.allow_source_as_target:
+      raise SystemExit(
+        f"data.view_split holds out only {views_per_mesh} view(s) for some mesh: "
+        "val_views_sval needs a source and at least one different target view "
+        "(or set data.allow_source_as_target=true)")
+    val_datasets["val_views_strain"] = GSPairDataset(
+      sample_matching_sources(train_views, val_views, seed=cfg.seed),
+      target_catalog=val_views, **pair_kwargs)
+    val_datasets["val_views_sval"] = GSPairDataset(val_views, **pair_kwargs)
+  log.info(
+    "split: %d train meshes / %d val meshes, %d train views / %d val views (per-mesh), validation sets %s",
+    train_meshes.df["mesh_name"].n_unique(), val_meshes.df["mesh_name"].n_unique(),
+    len(train_views), len(val_views), list(val_datasets) or "none")
+  return train_ds, val_datasets
 
 
 class GSDataModule(pl.LightningDataModule):
@@ -448,7 +488,10 @@ class GSDataModule(pl.LightningDataModule):
     super().__init__()
     self.cfg = cfg
     self.train_ds = None
-    self.val_ds = None
+    # Ordered {metric prefix: validation dataset} -- one val dataloader per
+    # entry, in this order (GSLightningModule.validation_step reads the
+    # prefix back off dataloader_idx). Legacy single-set modes use {"val": ds}.
+    self.val_datasets = None
 
   def setup(self, stage=None):
     if self.train_ds is not None:
@@ -478,45 +521,35 @@ class GSDataModule(pl.LightningDataModule):
       # a direct-supervision-only run without needing any separate render
       # corpus on disk.
       if cfg.data.photom_h5_val is not None:
-        self.val_ds = _external_val_dataset(cfg)
+        self.val_datasets = {"val": _external_val_dataset(cfg)}
       elif cfg.data.gauss_h5 is not None:
-        self.val_ds = GaussH5ValDataset(cfg.data.gauss_h5, num_layers=cfg.data.num_layers)
+        self.val_datasets = {"val": GaussH5ValDataset(cfg.data.gauss_h5, num_layers=cfg.data.num_layers)}
       else:
-        self.val_ds = _EmptyDataset()
+        self.val_datasets = {"val": _EmptyDataset()}
     elif cfg.data.photom_h5_val is not None:
       # Multi-scene training with an external validation corpus: bypass
-      # data.split_fn entirely and use the WHOLE photom_h5 catalog for
-      # train_ds -- data.split_fn becomes a no-op here (logged in main()'s
+      # the mesh/view split entirely and use the WHOLE photom_h5 catalog for
+      # train_ds -- data.mesh_split/view_split become no-ops here (logged in main()'s
       # config-validation block, not silently swallowed).
-      catalog = H5Catalog(
-        cfg.data.photom_h5,
-        H5Catalog.path().alias("path"),
-        H5Catalog.index().alias("view_idx"),
-        H5Catalog.dataset("mesh_index").alias("mesh_id"),
-      )
+      catalog = render_catalog(cfg.data.photom_h5)
       self.train_ds = GSPairDataset(
         catalog, num_layers=cfg.data.num_layers, num_target_views=cfg.data.num_target_views,
         seed=cfg.seed, deterministic_targets=False, source_views=cfg.data.source_views,
         allow_source_as_target=cfg.data.allow_source_as_target,
       )
-      self.val_ds = _external_val_dataset(cfg)
+      self.val_datasets = {"val": _external_val_dataset(cfg)}
     elif cfg.data.fixed_source_dataset:
       # HACK (temporary, deliberately separate from every other branch
       # here): GSPairDataset's row-indexed/mesh-grouped machinery and
-      # data.split_fn both assume a dataset indexed by source row, which
+      # the mesh/view split both assume a dataset indexed by source row, which
       # doesn't fit a fixed-source, target-view-indexed dataset at all --
       # rather than bend that machinery to fit, this just builds ONE plain
       # shuffled split of the raw view list and hands each half to its own
-      # GSFixedSourceDataset. No mesh grouping, no split_fn, no
+      # GSFixedSourceDataset. No mesh grouping, no mesh/view split, no
       # GSPairDataset involved on either side.
       if cfg.data.source_views is None or len(cfg.data.source_views) != 1:
         raise SystemExit("data.fixed_source_dataset requires exactly one data.source_views entry")
-      catalog = H5Catalog(
-        cfg.data.photom_h5,
-        H5Catalog.path().alias("path"),
-        H5Catalog.index().alias("view_idx"),
-        H5Catalog.dataset("mesh_index").alias("mesh_id"),
-      )
+      catalog = render_catalog(cfg.data.photom_h5)
       source_view = int(catalog.take([cfg.data.source_views[0]]).df["view_idx"][0])
       views = catalog.df["view_idx"].to_list()
       random.Random(cfg.seed).shuffle(views)
@@ -526,28 +559,23 @@ class GSDataModule(pl.LightningDataModule):
         catalog, source_view=source_view, target_views=train_views,
         num_layers=cfg.data.num_layers, targets_per_item=cfg.data.num_target_views,
       )
-      self.val_ds = GSFixedSourceDataset(
+      self.val_datasets = {"val": GSFixedSourceDataset(
         catalog, source_view=source_view, target_views=val_views,
         num_layers=cfg.data.num_layers, targets_per_item=cfg.data.val_targets_per_item,
-      )
+      )}
     elif cfg.data.val_target_views is not None:
       # Single-fixed-source setup (data.source_views == exactly one entry)
       # validated by holding out a set of TARGET views instead of by
       # mesh/view split -- GSPairDataset's own row-indexed val collapses to
-      # 1 row (or 0, across a mesh-level split_fn) when there's only one
+      # 1 row (or 0, across a mesh-level split) when there's only one
       # eligible source, giving no real per-epoch validation signal (see
-      # GSFixedSourceDataset's own docstring). Bypasses data.split_fn
+      # GSFixedSourceDataset's own docstring). Bypasses data.mesh_split/view_split
       # entirely, same rationale as the photom_h5_val branch above --
       # assumes a single-mesh catalog, since target_views/val_target_views
       # are raw view_idx values with no mesh_id qualifier.
       if cfg.data.source_views is None or len(cfg.data.source_views) != 1:
         raise SystemExit("data.val_target_views requires exactly one data.source_views entry")
-      catalog = H5Catalog(
-        cfg.data.photom_h5,
-        H5Catalog.path().alias("path"),
-        H5Catalog.index().alias("view_idx"),
-        H5Catalog.dataset("mesh_index").alias("mesh_id"),
-      )
+      catalog = render_catalog(cfg.data.photom_h5)
       source_view = int(catalog.take([cfg.data.source_views[0]]).df["view_idx"][0])
       val_targets = [int(v) for v in cfg.data.val_target_views]
       val_targets_set = set(val_targets)
@@ -557,32 +585,18 @@ class GSDataModule(pl.LightningDataModule):
         allow_source_as_target=cfg.data.allow_source_as_target,
         target_views=[v for v in catalog.df["view_idx"].to_list() if v not in val_targets_set],
       )
-      self.val_ds = GSFixedSourceDataset(
+      self.val_datasets = {"val": GSFixedSourceDataset(
         catalog, source_view=source_view, target_views=val_targets,
         num_layers=cfg.data.num_layers, targets_per_item=cfg.data.val_targets_per_item,
-      )
+      )}
     else:
-      catalog = H5Catalog(
-        cfg.data.photom_h5,
-        H5Catalog.path().alias("path"),
-        H5Catalog.index().alias("view_idx"),
-        H5Catalog.dataset("mesh_index").alias("mesh_id"),
-      )
+      catalog = render_catalog(cfg.data.photom_h5)
 
-      split_fn = hydra.utils.instantiate(cfg.data.split_fn)
-      train_catalog, val_catalog = split_fn(catalog, seed=cfg.seed)
-
-      self.train_ds = GSPairDataset(
-        train_catalog, num_layers=cfg.data.num_layers, num_target_views=cfg.data.num_target_views,
-        seed=cfg.seed, deterministic_targets=False, source_views=cfg.data.source_views,
-        allow_source_as_target=cfg.data.allow_source_as_target,
-      )
-      self.val_ds = GSPairDataset(
-        val_catalog, num_layers=cfg.data.num_layers, num_target_views=cfg.data.num_target_views,
-        seed=cfg.seed, deterministic_targets=True, allow_source_as_target=cfg.data.allow_source_as_target,
-      )
+      self.train_ds, self.val_datasets = _split_datasets(cfg, catalog)
+      if not self.val_datasets:
+        self.val_datasets = {"val": _EmptyDataset()}
     if len(self.train_ds) == 0:
-      raise SystemExit("train split is empty -- check data.photom_h5 / data.split_fn")
+      raise SystemExit("train split is empty -- check data.photom_h5 / data.mesh_split / data.view_split")
 
   def train_dataloader(self):
     return DataLoader(
@@ -593,13 +607,16 @@ class GSDataModule(pl.LightningDataModule):
     )
 
   def val_dataloader(self):
-    return DataLoader(
-      self.val_ds,
-      shuffle=False,
-      collate_fn=collate_with_batch_size,
-      num_workers=0,
-      batch_size=self.cfg.loader.batch_size,
-    )
+    return [
+      DataLoader(
+        ds,
+        shuffle=False,
+        collate_fn=collate_with_batch_size,
+        num_workers=0,
+        batch_size=self.cfg.loader.batch_size,
+      )
+      for ds in self.val_datasets.values()
+    ]
 
 
 class GSLightningModule(pl.LightningModule):
@@ -647,8 +664,10 @@ class GSLightningModule(pl.LightningModule):
   def training_step(self, batch, batch_idx):
     return self._step("train", batch, batch_idx)
 
-  def validation_step(self, batch, batch_idx):
-    return self._step("val", batch, batch_idx)
+  def validation_step(self, batch, batch_idx, dataloader_idx=0):
+    # dataloader_idx: Lightning omits it with a single val loader, hence the default.
+    stage = list(self.trainer.datamodule.val_datasets)[dataloader_idx]
+    return self._step(stage, batch, batch_idx)
 
   def _step(self, stage, batch, batch_idx):
     B = batch["batch_size"]
@@ -657,7 +676,7 @@ class GSLightningModule(pl.LightningModule):
 
     @ft.wraps(self.log)
     def _log(key, *args, **kwargs):
-      self.log(f"{stage}/{key}", *args, **kwargs, batch_size=B)
+      self.log(f"{stage}/{key}", *args, **kwargs, batch_size=B, add_dataloader_idx=False)
 
     cfg = self.cfg
     device = self.device
@@ -687,6 +706,11 @@ class GSLightningModule(pl.LightningModule):
     if stage == "train":
       self.views_seen += B * len(render_view_idx)
       self.pixels_seen += B * len(render_view_idx) * H * W
+    # DO NOT move these two log calls into the `if stage == "train":` block
+    # above (or anywhere else): only the increments are train-only, the
+    # logging must run in every stage so validation also reports the counters.
+    # Moving them there has broken val logging before -- leave them alone
+    # unless explicitly asked.
     self.log("views_seen", self.views_seen, reduce_fx="max")
     self.log("pixels_seen", self.pixels_seen, reduce_fx="max")
 
@@ -825,7 +849,7 @@ class GSLightningModule(pl.LightningModule):
   def _preview_entry(self, item):
     """One stage's {"gauss","scene_scale","views"} entry for
     get_preview_source() below, computed from a SINGLE fixed dataset item
-    (train_ds[0], or val_ds[0] for the "val" stage) via this model's own
+    (train_ds[0], or a validation set's [0]) via this model's own
     forward pass -- in true WORLD space, for module.PanelCallback's
     [GT | render | |diff|] panel and module.OrbitCallback's turntable
     video.
@@ -910,14 +934,15 @@ class GSLightningModule(pl.LightningModule):
     }
 
   def get_preview_source(self, mode):
-    """{"train": entry, "val": entry-or-None} for module.PanelCallback/
+    """{"train": entry, <one key per validation set>: entry-or-None} for module.PanelCallback/
     OrbitCallback -- see module.py's own comment block for the full
     contract. Unlike fit_gsplat.py's version, train and val here are NOT
     the same Gaussians rendered against different views -- the model
     predicts an entirely different Gaussian set per forward-passed item,
     so each stage gets its own full _preview_entry() call (own gauss, own
     scene_scale, own views), from a fixed dataset item (train_ds[0], or
-    val_ds[0] for "val").
+    val_ds[0] for each validation set -- "val_meshes" etc., or "val" for the
+    single-set legacy modes, see GSDataModule.val_datasets).
 
     mode picks both the cache granularity (epoch: once per
     self.current_epoch; step: once per self.trainer.global_step) and
@@ -929,11 +954,9 @@ class GSLightningModule(pl.LightningModule):
     if getattr(self, "_preview_cache_key", None) == key:
       return self._preview_cache
 
-    val_ds = self.trainer.datamodule.val_ds
-    source = {
-      "train": self._preview_entry(self.trainer.datamodule.train_ds[0]),
-      "val": self._preview_entry(val_ds[0]) if mode == "step" and len(val_ds) > 0 else None,
-    }
+    source = {"train": self._preview_entry(self.trainer.datamodule.train_ds[0])}
+    for name, val_ds in self.trainer.datamodule.val_datasets.items():
+      source[name] = self._preview_entry(val_ds[0]) if mode == "step" and len(val_ds) > 0 else None
     self._preview_cache_key, self._preview_cache = key, source
     return source
 
@@ -966,7 +989,7 @@ def main(cfg: DictConfig) -> None:
 
   if cfg.data.photom_h5_val is not None and cfg.data.fixed_source_view is None:
     log.info(
-      "data.photom_h5_val set -- data.split_fn is ignored, the full "
+      "data.photom_h5_val set -- data.mesh_split/view_split are ignored, the full "
       "training corpus is used for train_ds.")
   # A real (nonempty, force_render=True) val_ds gets built either from
   # data.photom_h5_val directly, or -- when that's unset -- as a fallback

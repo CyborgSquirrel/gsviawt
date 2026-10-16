@@ -3,7 +3,8 @@
 # render_objaverse.py-schema HDF5 files. See train_gs.py's module docstring.
 
 defaults:
-  - data/split_fn: by_mesh
+  - data/mesh_split: fraction
+  - data/view_split: fraction
   - _self_
 
 # Directory for everything a single run produces.
@@ -28,10 +29,10 @@ data:
   # (GSPairDataset.source_views; not applied to val_ds -- an empty/small val
   # split has no guarantee of overlapping whatever's restricted here, and
   # val is a separate concern from what the model trains to encode). Row
-  # positions (H5Catalog.take()'s index space), not raw view_idx values --
-  # they coincide for an unsplit single-file catalog (e.g. omit
-  # data/split_fn=by_view, which reorders rows via random_split even at
-  # val_fraction=0) but NOT after any split that reorders/subsets rows.
+  # positions into the TRAIN catalog (H5Catalog.take()'s index space, i.e.
+  # after data.mesh_split and data.view_split), not raw view_idx values --
+  # they coincide only for a single-file catalog nothing was held out of
+  # (e.g. a single mesh with the default view_split val_fraction: 0).
   # Target-view sampling is unaffected, still drawn from every view of the
   # source's mesh. null (default): every view is eligible, unchanged
   # behavior.
@@ -50,7 +51,7 @@ data:
   # collapsed to 0/1 rows the way GSPairDataset's own row-indexed val would
   # be with only one eligible source. Raw view_idx values (GSFixedSourceDataset's
   # own domain, not H5Catalog.take()'s row-position space like source_views
-  # above). Bypasses data.split_fn entirely (assumes a single-mesh catalog).
+  # above). Bypasses data.mesh_split/view_split entirely (assumes a single-mesh catalog).
   # train_ds's own target-sampling pool automatically excludes these views
   # (via GSPairDataset.target_views), so train/val targets stay disjoint.
   # null (default): unchanged behavior, no fixed-source validation split.
@@ -62,7 +63,7 @@ data:
 
   # HACK (temporary): switches BOTH train_ds and val_ds to
   # GSFixedSourceDataset, built off one plain shuffled split of the raw
-  # view list -- no mesh grouping, no data.split_fn, no GSPairDataset on
+  # view list -- no mesh grouping, no mesh/view split, no GSPairDataset on
   # either side (unlike val_target_views above, which still uses
   # GSPairDataset for train_ds). Requires data.source_views to have
   # exactly one entry. Takes priority over val_target_views if both are
@@ -74,16 +75,23 @@ data:
 
   # Train/val split for ordinary multi-scene training (ignored when
   # fixed_source_view or photom_h5_val is set -- see their own comments
-  # below). A config group (conf/data/split_fn/*.yaml, picked via the
-  # `defaults:` list up top) rather than inline here, so the strategy is a
-  # one-token CLI override instead of rewriting _target_ by hand, e.g.:
-  #   data/split_fn=by_view data.split_fn.val_fraction=0.2
-  #   data/split_fn=by_indices data.split_fn.train_idx='[0,1,2]' data.split_fn.val_idx='[3,4]'
-  # See conf/data/split_fn/*.yaml for what each option takes.
+  # below), in two stages, each a config group picked via the `defaults:` list
+  # up top (a one-token CLI override, e.g.
+  # data/mesh_split=names data.mesh_split.val_meshes='[a.glb,b.glb]'):
+  #   1. data/mesh_split: all meshes -> train_meshes + val_meshes
+  #   2. data/view_split: the train_meshes' views -> train_views + val_views
+  # Training uses train_views only (sources and targets). Each non-empty
+  # piece is validated separately, logged under its own prefix:
+  #   val_meshes:       held-out meshes, every view eligible as source/target
+  #   val_views_strain: train meshes, source = a train view (as many per mesh
+  #                     as it has val_views), targets = val_views
+  #   val_views_sval:   train meshes, source AND targets = val_views
+  # See conf/data/mesh_split/*.yaml and conf/data/view_split/*.yaml. The
+  # defaults hold out 10% of the meshes and no views.
 
   # Single-batch overfit mode (fit_gsplat.py's primary/secondary terms
   # applied here): if set, train on this EXACT source+target view set every
-  # step, no resampling at all (ignores num_target_views/split_fn).
+  # step, no resampling at all (ignores num_target_views/mesh_split/view_split).
   # fixed_target_views is required when fixed_source_view + photom_h5 are
   # both set (irrelevant/ignored in gauss_h5-only mode -- see gauss_h5 below).
   fixed_source_view: null    # int, e.g. 0
@@ -98,7 +106,7 @@ data:
   # validation genuinely tests the trained network as a normal single-image
   # encoder on a different image, not a held-out subset of the training
   # corpus. Also usable (optionally) with ordinary multi-scene training,
-  # replacing the split_fn mesh-holdout split with a wholly
+  # replacing the mesh_split holdout with a wholly
   # separate corpus. null (default): when fixed_source_view + gauss_h5 are
   # set and this is left null, val_ds instead falls back to gauss_h5's OWN
   # embedded secondary views (GaussH5ValDataset, gs_dataset.py) -- the exact

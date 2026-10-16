@@ -325,6 +325,9 @@ def _completed_steps(trainer, pl_module):
 #              "views": {"viewmat","K","width","height","gt_rgb"},
 #              "gauss_layers": {...} (optional)},
 #    "val": same shape, or None}
+# (train_gs.py returns one key per validation set instead of the single
+# "val" -- "val_meshes", "val_views_strain", ... -- and the step-mode logging
+# below covers whatever keys come back, each under its own "{key}/..." name.)
 # (gauss arrays already flattened/activated -- exactly what render() already
 # needs in fit_gsplat.py, or one flatten_gaussians() yield in train_gs.py;
 # gt_rgb: (V,C,H,W) in [0,1]; sh_degree: None or an int) -- cached keyed by
@@ -339,7 +342,7 @@ def _completed_steps(trainer, pl_module):
 # single exploded pixel doesn't disappear into flatten_gaussians' ~14k-point
 # mean/render.
 #
-# "val" is only ever populated in step mode (mode == "step"): epoch mode
+# Every non-"train" key is only ever populated in step mode (mode == "step"): epoch mode
 # stays train-only, same as it always has been (on_train_epoch_end is the
 # only epoch-cadence hook either callback implements -- there's no
 # on_validation_epoch_end here, deliberately). Step mode has no equivalent
@@ -417,7 +420,7 @@ class PanelCallback(pl.Callback):
       n = _completed_steps(trainer, pl_module)  # count of COMPLETED optimizer steps
       if n == 0 or n % self.every_n_steps != 0:
         return
-      stages = ("train", "val")
+      stages = None  # every stage get_preview_source returns
 
     wandb_run = pl_module.logger.experiment if pl_module.logger is not None else None
     if wandb_run is None:
@@ -427,7 +430,7 @@ class PanelCallback(pl.Callback):
     with guarded_render(f"{mode}/panel"), torch.no_grad():
       import gsplat
       source = pl_module.get_preview_source(mode)
-      for stage in stages:
+      for stage in (stages or source):
         entry = source.get(stage)
         if entry is None:
           continue
@@ -530,7 +533,7 @@ class ScaleLayersCallback(pl.Callback):
       n = _completed_steps(trainer, pl_module)  # count of COMPLETED optimizer steps
       if n == 0 or n % self.every_n_steps != 0:
         return
-      stages = ("train", "val")
+      stages = None  # every stage get_preview_source returns
 
     wandb_run = pl_module.logger.experiment if pl_module.logger is not None else None
     if wandb_run is None:
@@ -539,7 +542,7 @@ class ScaleLayersCallback(pl.Callback):
     log_payload = {}
     with guarded_render(f"{mode}/scale_layers"), torch.no_grad():
       source = pl_module.get_preview_source(mode)
-      for stage in stages:
+      for stage in (stages or source):
         entry = source.get(stage)
         if entry is None:
           continue
@@ -681,7 +684,7 @@ class OrbitCallback(pl.Callback):
       n = _completed_steps(trainer, pl_module)  # count of COMPLETED optimizer steps
       if n == 0 or n % self.every_n_steps != 0:
         return
-      stages = ("train", "val")
+      stages = None  # every stage get_preview_source returns
 
     wandb_run = pl_module.logger.experiment if pl_module.logger is not None else None
     if wandb_run is None:
@@ -691,7 +694,7 @@ class OrbitCallback(pl.Callback):
     with guarded_render(f"{mode}/orbit"), torch.no_grad():
       import gsplat
       source = pl_module.get_preview_source(mode)
-      for stage in stages:
+      for stage in (stages or source):
         entry = source.get(stage)
         if entry is None:
           continue
