@@ -726,8 +726,9 @@ class WTFeatureDataset(Dataset):
   `rows`: which volumes (row indices of the features h5) the dataset holds;
   None = all of them. len(dataset) == the number of volumes.
 
-  `image_size`: if set, items carry the source view's RGB image (`image`, (3, S, S) in [0, 1]) instead
-  of its cached `features`, for a trainable encoder (gs_backbone.py).
+  `image_size`: if set, items carry the source view's RGB image (`image`, (3, S, S) in [0, 1]), instead
+  of its cached `features` if `read_features` is false (a trainable encoder, gs_backbone.py), else next to
+  them (model.rgb_patch).
   `depth_size`: if set, the source view's depth is resampled to this square size
   (nearest neighbour) before the point cloud is built -- see _build_item.
 
@@ -741,7 +742,7 @@ class WTFeatureDataset(Dataset):
   """
 
   def __init__(self, features_h5, views, rows=None, num_layers=6, num_views=1,
-               allow_source_as_target=False, depth_size=None, image_size=None):
+               allow_source_as_target=False, depth_size=None, image_size=None, read_features=True):
     with h5py.File(features_h5, "r") as f:
       if "mesh_index" not in f:
         raise ValueError(f"{features_h5!r} has no per-row `mesh_index`; re-run wt_features.py")
@@ -765,6 +766,7 @@ class WTFeatureDataset(Dataset):
     self.allow_source_as_target = allow_source_as_target
     self.depth_size = depth_size
     self.image_size = image_size
+    self.read_features = read_features
 
     groups = (
       views.df.filter(pl.col("path") == self.source_h5)
@@ -819,7 +821,8 @@ class WTFeatureDataset(Dataset):
         rgba_from_render(_get_h5(self.source_h5), source_view), image_size=self.image_size,
         num_layers=1, center_crop=False, bg_color=(0, 0, 0))
       out["image"] = rgb[0]   # (3, S, S) in [0, 1]
-      return out
+      if not self.read_features:
+        return out
 
     feats = _get_h5(self.features_h5)["features"][vol["row"]]
     if self.bits:
