@@ -104,6 +104,7 @@ class GSModel(nn.Module):
       layer_scale_init=float(cfg.model.transformer.layer_scale_init),
       layer_embed_dim=cfg.model.layer_embed_dim,
       input_proj_dim=cfg.model.get("input_proj_dim"),
+      input_proj_identity_init=bool(cfg.model.get("input_proj_identity_init")),
     )
 
     # model.backbone.weights set: the encoder is part of the model and trained with the head
@@ -115,14 +116,28 @@ class GSModel(nn.Module):
     )
     self.input_key = "features" if self.backbone is None else "image"
 
+    # model.rgb_patch: every patch token gets its own 14x14x3 RGB pixels concatenated (in [-1, 1],
+    # the same patch for all L layers); feature_dim is then the cached feature dim + 3 * patch_size^2
+    self.rgb_patch = bool(cfg.model.get("rgb_patch"))
+    self.patch_size = int(cfg.model.patch_size)
+
   def inputs(self, batch, device):
-    """The model input of a collated batch: cached features, or the source image."""
+    """The model input of a collated batch: cached features, the source image, or
+    (model.rgb_patch) both."""
+    if self.rgb_patch:
+      return batch["features"].to(device), batch["image"].to(device)
     return batch[self.input_key].to(device)
 
   def forward(self, x):
     """x: cached features (B, L, P, D), or with a backbone the source image (B, 3, S, S);
     -> dict of (B, L, C, H, W) Gaussian parameters, H = W = sqrt(P) * patch_size."""
-    features = x if self.backbone is None else self.backbone(x)
+    if self.rgb_patch:
+      features, image = x
+      patches = rearrange(
+        image * 2 - 1, "b c (h py) (w px) -> b 1 (h w) (py px c)", py=self.patch_size, px=self.patch_size)
+      features = torch.cat([features, patches.expand(-1, features.shape[1], -1, -1).to(features.dtype)], dim=-1)
+    else:
+      features = x if self.backbone is None else self.backbone(x)
     if features.shape[-1] != self.feature_dim:
       raise ValueError(
         f"features have dim {features.shape[-1]}, model.feature_dim={self.feature_dim}")
@@ -339,7 +354,8 @@ class GSDataModule(pl.LightningDataModule):
     kwargs = dict(
       num_layers=d.num_layers, num_views=d.num_views,
       allow_source_as_target=d.allow_source_as_target, depth_size=d.depth_size,
-      image_size=d.image_size if d.input == "image" else None,
+      image_size=d.image_size if d.input in ("image", "features_image") else None,
+      read_features=d.input != "image",
     )
 
     if d.val_meshes is None:

@@ -259,7 +259,7 @@ class PatchGaussianHead(nn.Module):
                opacity_scale=1e-3, opacity_bias=0.0, scale_scale=1e-1, scale_bias=0.02,
                sh_scale=1.0, scale_lambda=0.01, zero_init_last_conv=False,
                predict_mean_offset=False, num_blocks=0, num_heads=24, mlp_ratio=4.0,
-               layer_scale_init=1e-4, layer_embed_dim=None, input_proj_dim=None):
+               layer_scale_init=1e-4, layer_embed_dim=None, input_proj_dim=None, input_proj_identity_init=False):
     super().__init__()
     self.num_layers = num_layers
     # With layer_embed_dim set, the features may be a single [1, P, D] map (e.g. one
@@ -274,6 +274,14 @@ class PatchGaussianHead(nn.Module):
     # features first (like WT's own final_project on the concatenated encoder blocks), so a wide
     # feature (e.g. 4 DINOv2 blocks = 4096 channels) doesn't make the trunk wider.
     self.input_proj = nn.Linear(feature_dim, input_proj_dim) if input_proj_dim else None
+    if self.input_proj is not None and input_proj_identity_init:
+      # the first input_proj_dim input channels pass through unchanged, the rest start at zero
+      if input_proj_dim > feature_dim:
+        raise ValueError(f"input_proj_identity_init needs input_proj_dim <= feature_dim, got {input_proj_dim} > {feature_dim}")
+      with torch.no_grad():
+        self.input_proj.weight.zero_()
+        self.input_proj.weight[:, :input_proj_dim].copy_(torch.eye(input_proj_dim))
+        self.input_proj.bias.zero_()
     in_dim = (input_proj_dim or feature_dim) + (layer_embed_dim or 0)
     self.max_sh_degree = max_sh_degree
     self.patch_size = patch_size
