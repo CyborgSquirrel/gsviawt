@@ -38,6 +38,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from einops import rearrange
 
 
@@ -244,10 +245,12 @@ class RGBViT(nn.Module):
   embedded linearly, and num_blocks frame-attention AttentionBlocks (2D RoPE) mix them.
   (B, 3, H, W) in [0, 1] -> (B, 1, P, dim) tokens, one per patch, in the WT tokens' order."""
 
-  def __init__(self, patch_size, dim, num_blocks, num_heads=16, mlp_ratio=4.0, layer_scale_init=1e-4):
+  def __init__(self, patch_size, dim, num_blocks, num_heads=16, mlp_ratio=4.0, layer_scale_init=1e-4,
+               checkpoint_activations=False):
     super().__init__()
     self.patch_size = patch_size
     self.num_heads = num_heads
+    self.checkpoint_activations = checkpoint_activations
     self.embed = nn.Linear(3 * patch_size ** 2, dim)
     self.blocks = nn.ModuleList(
       AttentionBlock(dim, num_heads, "frame", mlp_ratio, layer_scale_init) for _ in range(num_blocks))
@@ -269,7 +272,10 @@ class RGBViT(nn.Module):
     cos, sin = self._rope[key]
     x = self.embed(rearrange(image * 2 - 1, "b c (h py) (w px) -> b 1 (h w) (py px c)", py=p, px=p))
     for block in self.blocks:
-      x = block(x, cos, sin)
+      if self.checkpoint_activations and torch.is_grad_enabled():
+        x = torch.utils.checkpoint.checkpoint(block, x, cos, sin, use_reentrant=False)
+      else:
+        x = block(x, cos, sin)
     return self.norm(x)
 
 

@@ -84,6 +84,7 @@ model:
     num_heads: 16
     mlp_ratio: 4.0
     layer_scale_init: 1.0e-4
+    checkpoint_activations: false   # recompute the ViT blocks in backward (less memory, same numerics)
   # Trainable image encoder in front of the head: the DINOv2 ViT-L/14 of a pretrained MoGe-1
   # (gs_backbone.MoGeBackbone), its last block's tokens as the head's input -- trained together
   # with the head. Needs data.input=image, feature_dim=1024.

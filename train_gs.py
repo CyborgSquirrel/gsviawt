@@ -127,7 +127,8 @@ class GSModel(nn.Module):
     vit = cfg.model.get("rgb_vit")
     self.rgb_vit = (
       RGBViT(self.patch_size, int(vit.dim), int(vit.num_blocks), int(vit.num_heads),
-             float(vit.mlp_ratio), float(vit.layer_scale_init))
+             float(vit.mlp_ratio), float(vit.layer_scale_init),
+             bool(vit.get("checkpoint_activations", False)))
       if vit is not None and int(vit.num_blocks) > 0 else None
     )
     if self.rgb_vit is not None and self.rgb_patch:
