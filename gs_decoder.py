@@ -238,6 +238,41 @@ class TransformerTrunk(nn.Module):
     return x
 
 
+class RGBViT(nn.Module):
+  """A small ViT over the source image, trained with the head: the image is cut into
+  patch_size x patch_size patches (the grid of the WT tokens), each patch's pixels are
+  embedded linearly, and num_blocks frame-attention AttentionBlocks (2D RoPE) mix them.
+  (B, 3, H, W) in [0, 1] -> (B, 1, P, dim) tokens, one per patch, in the WT tokens' order."""
+
+  def __init__(self, patch_size, dim, num_blocks, num_heads=16, mlp_ratio=4.0, layer_scale_init=1e-4):
+    super().__init__()
+    self.patch_size = patch_size
+    self.num_heads = num_heads
+    self.embed = nn.Linear(3 * patch_size ** 2, dim)
+    self.blocks = nn.ModuleList(
+      AttentionBlock(dim, num_heads, "frame", mlp_ratio, layer_scale_init) for _ in range(num_blocks))
+    self.norm = nn.LayerNorm(dim)
+    self._rope = {}
+
+  def forward(self, image):
+    p = self.patch_size
+    h, w = image.shape[-2:]
+    if h % p or w % p:
+      raise ValueError(f"image size {h}x{w} is not a multiple of the patch size {p}")
+    grid = h // p
+    if grid * grid != (h // p) * (w // p):
+      raise ValueError(f"non-square image {h}x{w}")
+    key = (grid, image.device)
+    if key not in self._rope:
+      cos, sin = rope_cos_sin(grid, self.blocks[0].qkv.in_features // self.num_heads)
+      self._rope[key] = (cos.to(image.device), sin.to(image.device))
+    cos, sin = self._rope[key]
+    x = self.embed(rearrange(image * 2 - 1, "b c (h py) (w px) -> b 1 (h w) (py px c)", py=p, px=p))
+    for block in self.blocks:
+      x = block(x, cos, sin)
+    return self.norm(x)
+
+
 class PatchGaussianHead(nn.Module):
   """(B, L, P, D) World Tracing decoder tokens (wt_features.py) -> per-pixel
   Gaussian parameters for each of the L depth-peel layers, (B, L, C, H, W) per
