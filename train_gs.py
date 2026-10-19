@@ -46,7 +46,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import pack, rearrange, repeat
-from lightning.pytorch.loggers import WandbLogger
 from omegaconf import DictConfig, OmegaConf, open_dict
 from torch.utils.data import DataLoader
 
@@ -60,7 +59,8 @@ from gs_dataset import (OPENGL_TO_OPENCV, GaussH5ValDataset,  # noqa: E402
                         rotate_quats_wxyz)
 from gs_decoder import GaussianResnetDecoder, GSDecoderStack  # noqa: E402
 from gs_encoder import GSResnetEncoder  # noqa: E402
-from module import DSSIMLoss, WarmupCosineAnnealingLR  # noqa: E402
+from module import (DSSIMLoss, ProgressWandbLogger, WarmupCosineAnnealingLR,  # noqa: E402
+                    _completed_steps)
 from util import collate_with_batch_size, pipe, set_mode, timed  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -687,8 +687,6 @@ class GSLightningModule(pl.LightningModule):
     if stage == "train":
       self.views_seen += B * len(render_view_idx)
       self.pixels_seen += B * len(render_view_idx) * H * W
-    self.log("views_seen", self.views_seen, reduce_fx="max")
-    self.log("pixels_seen", self.pixels_seen, reduce_fx="max")
 
     # Per-item background compositing (loss.background): train-stage only,
     # and only affects this render/loss computation -- _preview_entry
@@ -1059,7 +1057,11 @@ def main(cfg: DictConfig) -> None:
       name=cfg.wandb.name,
       config=OmegaConf.to_container(cfg, resolve=True),
     )
-    logger = WandbLogger(experiment=wandb_run)
+    logger = ProgressWandbLogger(
+      experiment=wandb_run,
+      progress_fn=lambda: {"views_seen": model.views_seen, "pixels_seen": model.pixels_seen},
+      step_fn=lambda: _completed_steps(model.trainer, model),
+    )
 
   callbacks = []
   callbacks += list(hydra.utils.instantiate(cfg.callbacks).values())

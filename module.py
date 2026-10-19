@@ -38,6 +38,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import pack, rearrange, repeat
+from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf
 from torch.optim import Optimizer
 
@@ -280,6 +281,42 @@ def guarded_render(tag):
     torch.cuda.empty_cache()
 
 
+class ProgressWandbLogger(WandbLogger):
+  """WandbLogger that stamps the progress metrics (views_seen, pixels_seen, ...
+  -- the counters we want as an x-axis, whatever the row is about) onto every
+  row it logs, so they sit in the same row as the learning rate, the losses,
+  the panels and the videos.
+
+  progress_fn: called at the start of every log_metrics(), returns a dict of
+  progress metrics, which is overlaid onto the metrics passed in. None: no
+  overlay, plain WandbLogger. If the overlay overwrites a metric that was
+  passed in, that is warned about once -- the progress metrics are meant to
+  come from progress_fn only.
+
+  step_fn: called when log_metrics() is given no step, to get one (the
+  trainer/global_step the row is logged with). Callers that pass a step keep
+  theirs. None: a row logged without a step has no trainer/global_step."""
+
+  def __init__(self, *args, progress_fn=None, step_fn=None, **kwargs):
+    super().__init__(*args, **kwargs)
+    self.progress_fn = progress_fn
+    self.step_fn = step_fn
+    self._warned_overwrite = False
+
+  def log_metrics(self, metrics, step=None):
+    if step is None and self.step_fn is not None:
+      step = self.step_fn()
+    if self.progress_fn is not None:
+      progress = self.progress_fn()
+      overwritten = sorted(metrics.keys() & progress.keys())
+      if overwritten and not self._warned_overwrite:
+        self._warned_overwrite = True
+        log.warning("progress_fn overwrote metrics passed to log_metrics(): %s "
+                    "(warning once)", ", ".join(overwritten))
+      metrics = {**metrics, **progress}
+    super().log_metrics(metrics, step)
+
+
 def _completed_steps(trainer, pl_module):
   """trainer.global_step, except for a LightningModule using MANUAL
   optimization (pl_module.automatic_optimization == False) that steps its
@@ -419,8 +456,7 @@ class PanelCallback(pl.Callback):
         return
       stages = ("train", "val")
 
-    wandb_run = pl_module.logger.experiment if pl_module.logger is not None else None
-    if wandb_run is None:
+    if pl_module.logger is None:
       return
 
     log_payload = {}
@@ -446,10 +482,7 @@ class PanelCallback(pl.Callback):
     if not log_payload:
       return
 
-    log_payload["views_seen"] = pl_module.views_seen  # TODO: better way to handle this
-    if hasattr(pl_module, "pixels_seen"):  # not every consumer of these callbacks tracks it
-      log_payload["pixels_seen"] = pl_module.pixels_seen
-    wandb_run.log(log_payload)
+    pl_module.logger.log_metrics(log_payload)
 
 
 def _colorize_scale_layers(scale, hit):
@@ -532,8 +565,7 @@ class ScaleLayersCallback(pl.Callback):
         return
       stages = ("train", "val")
 
-    wandb_run = pl_module.logger.experiment if pl_module.logger is not None else None
-    if wandb_run is None:
+    if pl_module.logger is None:
       return
 
     log_payload = {}
@@ -552,10 +584,7 @@ class ScaleLayersCallback(pl.Callback):
     if not log_payload:
       return
 
-    log_payload["views_seen"] = pl_module.views_seen  # TODO: better way to handle this
-    if hasattr(pl_module, "pixels_seen"):  # not every consumer of these callbacks tracks it
-      log_payload["pixels_seen"] = pl_module.pixels_seen
-    wandb_run.log(log_payload)
+    pl_module.logger.log_metrics(log_payload)
 
 
 def write_mp4(frames, path, fps, crf):
@@ -683,8 +712,7 @@ class OrbitCallback(pl.Callback):
         return
       stages = ("train", "val")
 
-    wandb_run = pl_module.logger.experiment if pl_module.logger is not None else None
-    if wandb_run is None:
+    if pl_module.logger is None:
       return
 
     log_payload = {}
@@ -721,7 +749,4 @@ class OrbitCallback(pl.Callback):
     if not log_payload:
       return
 
-    log_payload["views_seen"] = pl_module.views_seen  # TODO: better way to handle this
-    if hasattr(pl_module, "pixels_seen"):  # not every consumer of these callbacks tracks it
-      log_payload["pixels_seen"] = pl_module.pixels_seen
-    wandb_run.log(log_payload)
+    pl_module.logger.log_metrics(log_payload)
