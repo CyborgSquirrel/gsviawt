@@ -291,14 +291,21 @@ class ProgressWandbLogger(WandbLogger):
   progress metrics, which is overlaid onto the metrics passed in. None: no
   overlay, plain WandbLogger. If the overlay overwrites a metric that was
   passed in, that is warned about once -- the progress metrics are meant to
-  come from progress_fn only."""
+  come from progress_fn only.
 
-  def __init__(self, *args, progress_fn=None, **kwargs):
+  step_fn: called when log_metrics() is given no step, to get one (the
+  trainer/global_step the row is logged with). Callers that pass a step keep
+  theirs. None: a row logged without a step has no trainer/global_step."""
+
+  def __init__(self, *args, progress_fn=None, step_fn=None, **kwargs):
     super().__init__(*args, **kwargs)
     self.progress_fn = progress_fn
+    self.step_fn = step_fn
     self._warned_overwrite = False
 
   def log_metrics(self, metrics, step=None):
+    if step is None and self.step_fn is not None:
+      step = self.step_fn()
     if self.progress_fn is not None:
       progress = self.progress_fn()
       overwritten = sorted(metrics.keys() & progress.keys())
@@ -475,7 +482,7 @@ class PanelCallback(pl.Callback):
     if not log_payload:
       return
 
-    pl_module.logger.log_metrics(log_payload, step=_completed_steps(trainer, pl_module))
+    pl_module.logger.log_metrics(log_payload)
 
 
 def _colorize_scale_layers(scale, hit):
@@ -577,7 +584,7 @@ class ScaleLayersCallback(pl.Callback):
     if not log_payload:
       return
 
-    pl_module.logger.log_metrics(log_payload, step=_completed_steps(trainer, pl_module))
+    pl_module.logger.log_metrics(log_payload)
 
 
 def write_mp4(frames, path, fps, crf):
@@ -742,4 +749,4 @@ class OrbitCallback(pl.Callback):
     if not log_payload:
       return
 
-    pl_module.logger.log_metrics(log_payload, step=_completed_steps(trainer, pl_module))
+    pl_module.logger.log_metrics(log_payload)

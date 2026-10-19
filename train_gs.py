@@ -59,7 +59,8 @@ from gs_dataset import (OPENGL_TO_OPENCV, GaussH5ValDataset,  # noqa: E402
                         rotate_quats_wxyz)
 from gs_decoder import GaussianResnetDecoder, GSDecoderStack  # noqa: E402
 from gs_encoder import GSResnetEncoder  # noqa: E402
-from module import DSSIMLoss, ProgressWandbLogger, WarmupCosineAnnealingLR  # noqa: E402
+from module import (DSSIMLoss, ProgressWandbLogger, WarmupCosineAnnealingLR,  # noqa: E402
+                    _completed_steps)
 from util import collate_with_batch_size, pipe, set_mode, timed  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -1059,6 +1060,7 @@ def main(cfg: DictConfig) -> None:
     logger = ProgressWandbLogger(
       experiment=wandb_run,
       progress_fn=lambda: {"views_seen": model.views_seen, "pixels_seen": model.pixels_seen},
+      step_fn=lambda: _completed_steps(model.trainer, model),
     )
 
   callbacks = []
