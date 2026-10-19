@@ -116,7 +116,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from lightning.pytorch.loggers import WandbLogger
 from omegaconf import DictConfig, OmegaConf
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
@@ -125,7 +124,7 @@ import wandb
 
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _REPO_ROOT)
-from module import DSSIMLoss, OPENGL_TO_OPENCV  # noqa: E402
+from module import DSSIMLoss, OPENGL_TO_OPENCV, ProgressWandbLogger, _completed_steps  # noqa: E402
 from gs_dataset import _EmptyDataset, render_catalog, split_by_view  # noqa: E402
 from util import timed  # noqa: E402
 
@@ -908,12 +907,6 @@ class Fit3DGSLightningModule(pl.LightningModule):
     if stage == "train":
       self.log("train/num_gaussians", float(len(self.params["means"])), batch_size=B)
       self.log("train/active_sh_degree", float(self.active_sh_degree), batch_size=B)
-    # Bare key, no stage prefix (matches fit_gsplat.py) -- logged every
-    # call, both stages, so the x-axis-like counter has continuous
-    # coverage across train AND val points instead of gaps during
-    # validation-only logging windows. Only train increments it.
-    self.log("views_seen", self.views_seen, reduce_fx="max", batch_size=B)
-    self.log("pixels_seen", self.pixels_seen, reduce_fx="max", batch_size=B)  # same convention as views_seen
     return loss
 
   def params_np(self):
@@ -1053,7 +1046,7 @@ def main(cfg: DictConfig) -> None:
       project=cfg.wandb.project, mode=cfg.wandb.mode, tags=list(cfg.wandb.tags),
       name=cfg.wandb.name, config=OmegaConf.to_container(cfg, resolve=True),
     )
-    logger = WandbLogger(experiment=wandb_run)
+    logger = ProgressWandbLogger(experiment=wandb_run)  # progress_fn/step_fn are set once the model exists, below
 
   with timed("load"):
     if use_h5:
@@ -1089,6 +1082,9 @@ def main(cfg: DictConfig) -> None:
     "val": test_cams[:4] if test_cams else [],
   }
   model = Fit3DGSLightningModule(cfg, g, scene_extent, preview_cams)
+  if logger:
+    logger.progress_fn = lambda: {"views_seen": model.views_seen, "pixels_seen": model.pixels_seen}
+    logger.step_fn = lambda: _completed_steps(model.trainer, model)
   datamodule = Fit3DGSDataModule(cfg, train_cams, test_cams)
 
   callbacks = list(hydra.utils.instantiate(cfg.callbacks).values())
