@@ -38,6 +38,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import pack, rearrange, repeat
+from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf
 from torch.optim import Optimizer
 
@@ -280,6 +281,35 @@ def guarded_render(tag):
     torch.cuda.empty_cache()
 
 
+class ProgressWandbLogger(WandbLogger):
+  """WandbLogger that stamps the progress metrics (views_seen, pixels_seen, ...
+  -- the counters we want as an x-axis, whatever the row is about) onto every
+  row it logs, so they sit in the same row as the learning rate, the losses,
+  the panels and the videos.
+
+  progress_fn: called at the start of every log_metrics(), returns a dict of
+  progress metrics, which is overlaid onto the metrics passed in. None: no
+  overlay, plain WandbLogger. If the overlay overwrites a metric that was
+  passed in, that is warned about once -- the progress metrics are meant to
+  come from progress_fn only."""
+
+  def __init__(self, *args, progress_fn=None, **kwargs):
+    super().__init__(*args, **kwargs)
+    self.progress_fn = progress_fn
+    self._warned_overwrite = False
+
+  def log_metrics(self, metrics, step=None):
+    if self.progress_fn is not None:
+      progress = self.progress_fn()
+      overwritten = sorted(metrics.keys() & progress.keys())
+      if overwritten and not self._warned_overwrite:
+        self._warned_overwrite = True
+        log.warning("progress_fn overwrote metrics passed to log_metrics(): %s "
+                    "(warning once)", ", ".join(overwritten))
+      metrics = {**metrics, **progress}
+    super().log_metrics(metrics, step)
+
+
 def _completed_steps(trainer, pl_module):
   """trainer.global_step, except for a LightningModule using MANUAL
   optimization (pl_module.automatic_optimization == False) that steps its
@@ -445,9 +475,6 @@ class PanelCallback(pl.Callback):
     if not log_payload:
       return
 
-    log_payload["views_seen"] = pl_module.views_seen  # TODO: better way to handle this
-    if hasattr(pl_module, "pixels_seen"):  # not every consumer of these callbacks tracks it
-      log_payload["pixels_seen"] = pl_module.pixels_seen
     pl_module.logger.log_metrics(log_payload, step=_completed_steps(trainer, pl_module))
 
 
@@ -550,9 +577,6 @@ class ScaleLayersCallback(pl.Callback):
     if not log_payload:
       return
 
-    log_payload["views_seen"] = pl_module.views_seen  # TODO: better way to handle this
-    if hasattr(pl_module, "pixels_seen"):  # not every consumer of these callbacks tracks it
-      log_payload["pixels_seen"] = pl_module.pixels_seen
     pl_module.logger.log_metrics(log_payload, step=_completed_steps(trainer, pl_module))
 
 
@@ -718,7 +742,4 @@ class OrbitCallback(pl.Callback):
     if not log_payload:
       return
 
-    log_payload["views_seen"] = pl_module.views_seen  # TODO: better way to handle this
-    if hasattr(pl_module, "pixels_seen"):  # not every consumer of these callbacks tracks it
-      log_payload["pixels_seen"] = pl_module.pixels_seen
     pl_module.logger.log_metrics(log_payload, step=_completed_steps(trainer, pl_module))
