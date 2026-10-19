@@ -43,6 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--count", type=int, default=500, help="number of meshes to download (with --have-file: the total, counting the ones already downloaded)")
     parser.add_argument("--sample-seed", type=int, default=None, help="take a random sample of --count objects with this seed, instead of the first --count")
     parser.add_argument("--have-file", default=None, help="text file of already downloaded GLB paths: they count towards --count and are not downloaded again")
+    parser.add_argument("--batch-size", type=int, default=200, help="objects per download call: a network error (the objaverse-xl pool re-raises the first one) then loses only the rest of its batch; rerun with --have-file to fetch what is missing")
     parser.add_argument("--processes", type=int, default=multiprocessing.cpu_count(), help="parallel download processes")
     parser.add_argument("--download-dir", default="~/.objaverse", help="objaverse-xl cache dir (also holds the cached TRELLIS-500K CSV)")
     parser.add_argument("--refresh", action="store_true", help="re-download cached annotations/CSV even if a cached copy exists")
@@ -111,9 +112,16 @@ def main() -> None:
     objects = get_objects(args.dataset, args.count, download_dir, args.refresh, args.sample_seed, have_uids)
     print(f"Downloading {len(objects)} Sketchfab meshes ({args.dataset}; {len(have_uids)} already downloaded) into {download_dir}...")
 
-    paths = oxl.download_objects(objects=objects, download_dir=str(download_dir), processes=args.processes)
+    paths, failed_batches = {}, 0
+    for start in tqdm(range(0, len(objects), args.batch_size), desc="batches"):
+        batch = objects.iloc[start:start + args.batch_size]
+        try:
+            paths.update(oxl.download_objects(objects=batch, download_dir=str(download_dir), processes=args.processes))
+        except Exception as e:
+            failed_batches += 1
+            print(f"batch at {start} failed ({type(e).__name__}: {e}); continuing, rerun with --have-file to fetch what is missing")
 
-    print(f"Done. {len(paths)} meshes cached under {download_dir}")
+    print(f"Done. {len(paths)} meshes cached under {download_dir} ({failed_batches} batches failed)")
 
 
 if __name__ == "__main__":
