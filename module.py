@@ -419,8 +419,7 @@ class PanelCallback(pl.Callback):
         return
       stages = ("train", "val")
 
-    wandb_run = pl_module.logger.experiment if pl_module.logger is not None else None
-    if wandb_run is None:
+    if pl_module.logger is None:
       return
 
     log_payload = {}
@@ -449,7 +448,7 @@ class PanelCallback(pl.Callback):
     log_payload["views_seen"] = pl_module.views_seen  # TODO: better way to handle this
     if hasattr(pl_module, "pixels_seen"):  # not every consumer of these callbacks tracks it
       log_payload["pixels_seen"] = pl_module.pixels_seen
-    wandb_run.log(log_payload)
+    pl_module.logger.log_metrics(log_payload, step=_completed_steps(trainer, pl_module))
 
 
 def _colorize_scale_layers(scale, hit):
@@ -532,8 +531,7 @@ class ScaleLayersCallback(pl.Callback):
         return
       stages = ("train", "val")
 
-    wandb_run = pl_module.logger.experiment if pl_module.logger is not None else None
-    if wandb_run is None:
+    if pl_module.logger is None:
       return
 
     log_payload = {}
@@ -555,7 +553,7 @@ class ScaleLayersCallback(pl.Callback):
     log_payload["views_seen"] = pl_module.views_seen  # TODO: better way to handle this
     if hasattr(pl_module, "pixels_seen"):  # not every consumer of these callbacks tracks it
       log_payload["pixels_seen"] = pl_module.pixels_seen
-    wandb_run.log(log_payload)
+    pl_module.logger.log_metrics(log_payload, step=_completed_steps(trainer, pl_module))
 
 
 def write_mp4(frames, path, fps, crf):
@@ -683,8 +681,7 @@ class OrbitCallback(pl.Callback):
         return
       stages = ("train", "val")
 
-    wandb_run = pl_module.logger.experiment if pl_module.logger is not None else None
-    if wandb_run is None:
+    if pl_module.logger is None:
       return
 
     log_payload = {}
@@ -724,4 +721,4 @@ class OrbitCallback(pl.Callback):
     log_payload["views_seen"] = pl_module.views_seen  # TODO: better way to handle this
     if hasattr(pl_module, "pixels_seen"):  # not every consumer of these callbacks tracks it
       log_payload["pixels_seen"] = pl_module.pixels_seen
-    wandb_run.log(log_payload)
+    pl_module.logger.log_metrics(log_payload, step=_completed_steps(trainer, pl_module))
