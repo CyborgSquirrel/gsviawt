@@ -90,6 +90,7 @@ model:
     num_heads: 24           # must divide feature_dim into heads whose size is a multiple of 4
     mlp_ratio: 4.0
     layer_scale_init: 1.0e-4  # small -> the trunk starts close to the identity
+    checkpoint_activations: false   # recompute the blocks in backward (less memory, same numerics)
   max_sh_degree: 0           # 0 = plain RGB, 1 = DC + 1 SH band (9 extra channels).
                               # Default 0 for now: fit_gsplat.py's ground truth is flat
                               # RGB with no SH>0 at all, so direct_color_weight only ever
