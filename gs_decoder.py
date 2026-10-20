@@ -38,6 +38,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from einops import rearrange
 
 
@@ -203,8 +204,10 @@ class TransformerTrunk(nn.Module):
 
   MODES = ("frame", "ray", "global")
 
-  def __init__(self, dim, num_layers, num_blocks, num_heads=24, mlp_ratio=4.0, layer_scale_init=1e-4):
+  def __init__(self, dim, num_layers, num_blocks, num_heads=24, mlp_ratio=4.0, layer_scale_init=1e-4,
+               checkpoint_activations=False):
     super().__init__()
+    self.checkpoint_activations = checkpoint_activations
     self.num_heads = num_heads
     self.blocks = nn.ModuleList(
       AttentionBlock(dim, num_heads, self.MODES[i % 3], mlp_ratio, layer_scale_init)
@@ -234,7 +237,10 @@ class TransformerTrunk(nn.Module):
     for block in self.blocks:
       if block.mode == "frame":
         x = x * (1 + gamma) + beta
-      x = block(x, cos, sin)
+      if self.checkpoint_activations and torch.is_grad_enabled():
+        x = torch.utils.checkpoint.checkpoint(block, x, cos, sin, use_reentrant=False)
+      else:
+        x = block(x, cos, sin)
     return x
 
 
@@ -259,7 +265,8 @@ class PatchGaussianHead(nn.Module):
                opacity_scale=1e-3, opacity_bias=0.0, scale_scale=1e-1, scale_bias=0.02,
                sh_scale=1.0, scale_lambda=0.01, zero_init_last_conv=False,
                predict_mean_offset=False, num_blocks=0, num_heads=24, mlp_ratio=4.0,
-               layer_scale_init=1e-4, layer_embed_dim=None, input_proj_dim=None, input_proj_identity_init=False):
+               layer_scale_init=1e-4, layer_embed_dim=None, input_proj_dim=None, input_proj_identity_init=False,
+               checkpoint_activations=False):
     super().__init__()
     self.num_layers = num_layers
     # With layer_embed_dim set, the features may be a single [1, P, D] map (e.g. one
@@ -293,7 +300,8 @@ class PatchGaussianHead(nn.Module):
     self.channels = sum(self.field_dims)
     p2 = patch_size ** 2
     self.trunk = (
-      TransformerTrunk(in_dim, num_layers, num_blocks, num_heads, mlp_ratio, layer_scale_init)
+      TransformerTrunk(in_dim, num_layers, num_blocks, num_heads, mlp_ratio, layer_scale_init,
+                       checkpoint_activations)
       if num_blocks > 0 else None
     )
     self.proj = nn.Linear(in_dim, self.channels * p2)
