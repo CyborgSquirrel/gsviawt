@@ -118,6 +118,11 @@ class GSModel(nn.Module):
     # model.rgb_patch: every patch token gets its own 14x14x3 RGB pixels concatenated (in [-1, 1],
     # the same patch for all L layers); feature_dim is then the cached feature dim + 3 * patch_size^2
     self.rgb_patch = bool(cfg.model.get("rgb_patch"))
+    # model.rgb_patch_noise: only Gaussian layer 0 gets the RGB patch; layers 1.. get N(0, 1) noise
+    # of the same shape, freshly sampled on every forward (train and eval)
+    self.rgb_patch_noise = bool(cfg.model.get("rgb_patch_noise"))
+    if self.rgb_patch_noise and not self.rgb_patch:
+      raise ValueError("model.rgb_patch_noise needs model.rgb_patch")
     self.patch_size = int(cfg.model.patch_size)
 
   def inputs(self, batch, device):
@@ -134,7 +139,10 @@ class GSModel(nn.Module):
       features, image = x
       patches = rearrange(
         image * 2 - 1, "b c (h py) (w px) -> b 1 (h w) (py px c)", py=self.patch_size, px=self.patch_size)
-      features = torch.cat([features, patches.expand(-1, features.shape[1], -1, -1).to(features.dtype)], dim=-1)
+      patches = patches.expand(-1, features.shape[1], -1, -1)
+      if self.rgb_patch_noise:
+        patches = torch.cat([patches[:, :1], torch.randn_like(patches[:, 1:])], dim=1)
+      features = torch.cat([features, patches.to(features.dtype)], dim=-1)
     else:
       features = x if self.backbone is None else self.backbone(x)
     if features.shape[-1] != self.feature_dim:
