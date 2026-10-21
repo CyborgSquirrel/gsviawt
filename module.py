@@ -234,6 +234,10 @@ class TrainClock(pl.Callback):
       raise RuntimeError("TrainClock must be the first callback and its tail() must come after it, after the other callbacks")
 
   def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+    # The batch's GPU work is queued asynchronously: without this the CPU only waits for it later (in the
+    # progress bar / logger reading the loss), after the clock has stopped, and the clock misses most of it
+    if pl_module.device.type == "cuda":
+      torch.cuda.synchronize(pl_module.device)
     self._elapsed = self.seconds()
     self._start = None
     if self.max_seconds is not None and self._elapsed >= self.max_seconds:
