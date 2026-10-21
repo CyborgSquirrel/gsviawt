@@ -3,8 +3,8 @@
 
     python render_queue.py meshes=/app/bla/meshes.txt output_path=/app/bla/out.h5 \\
         work_dir=/app/bla/out_work num_workers=3 \\
-        'render_args=[view_strategy=random-views,view_strategy.num_views=10,width=504,height=504,
-                      render_engine=BLENDER_EEVEE_NEXT,device=cpu]'
+        'render_args="view_strategy=random-views view_strategy.num_views=10 width=504 height=504
+                      render_engine=BLENDER_EEVEE_NEXT device=cpu"'
 
 `meshes` is a text file with one mesh path per line; one job is one mesh with all its views. The
 launcher enqueues the meshes (largest file first) into work_dir/queue.db, keeps `num_workers`
@@ -24,6 +24,7 @@ workers on exit, but not if it is killed with SIGKILL -- stop those by hand befo
 import glob
 import logging
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -41,18 +42,24 @@ class Pool:
   def __init__(self, cfg, queue, parts_dir, logs_dir):
     self.cfg, self.queue, self.parts_dir, self.logs_dir = cfg, queue, parts_dir, logs_dir
     self.running = {}   # worker id -> Popen
-    self.started = 0
     self.crashes = 0
+    # worker numbers continue after the parts of earlier runs in this work_dir: a worker's part file is
+    # opened with "w", and its id tells its claims apart from those of a dead worker of the same number
+    old = [int(os.path.basename(p)[len("part_w"):-len(".h5")]) for p in glob.glob(os.path.join(parts_dir, "part_w*.h5"))]
+    self.started = max(old, default=-1) + 1
 
   def spawn(self):
     cfg = self.cfg
     wid = f"w{self.started:05d}"
     self.started += 1
+    part = os.path.join(self.parts_dir, f"part_{wid}.h5")
+    if os.path.exists(part):
+      raise FileExistsError(f"{part} exists already; a worker would overwrite it")
     cmd = [
       cfg.blender, "--background", "--python", os.path.join(os.path.dirname(os.path.abspath(__file__)), "render_objaverse.py"),
-      "--", *cfg.render_args,
+      "--", *shlex.split(cfg.render_args),
       f"queue_path={self.queue.path}", f"queue_worker={wid}", f"queue_max_meshes={cfg.max_meshes_per_worker}",
-      f"output_path={os.path.join(self.parts_dir, f'part_{wid}.h5')}",
+      f"output_path={part}",
       f"hydra.run.dir={os.path.join(self.logs_dir, 'hydra_' + wid)}",
     ]
     log = open(os.path.join(self.logs_dir, f"{wid}.log"), "wb")

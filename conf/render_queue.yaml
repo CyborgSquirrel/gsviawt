@@ -15,9 +15,10 @@ blender: /opt/blender/blender
 # Environment for the Blender processes (EEVEE needs the NVIDIA EGL vendor file).
 env:
   __EGL_VENDOR_LIBRARY_FILENAMES: /tmp/10_nvidia.json
-# Overrides passed to render_objaverse.py (view/mesh strategy, resolution, engine, device, ...). The
-# queue_* and output_path keys are set per worker and must not be listed here.
-render_args: []
+# Overrides passed to render_objaverse.py as one whitespace-separated string (view strategy,
+# resolution, engine, device, ...). The queue_* and output_path keys are set per worker and must not
+# be listed here.
+render_args: ""
 
 hydra:
   run:
