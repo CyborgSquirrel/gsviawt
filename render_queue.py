@@ -20,8 +20,10 @@ meshes missing from every good part -- e.g. those in a part whose write marker w
 enqueued again, up to queue_max_rounds rounds, and then everything is merged into output_path. Meshes
 a worker or the queue failed for good are recorded in the output's failed_mesh_indices.
 
-Resumable: run it again with the same overrides and queue_dir and it continues from the queue. It
-stops its workers on exit, but not if it is killed with SIGKILL -- stop those by hand before resuming.
+Once the merged file is written the part files (and any write markers) are deleted; queue_dir keeps
+queue.db and the worker logs. Resumable until then: run it again with the same overrides and queue_dir
+and it continues from the queue. It stops its workers on exit, but not if it is killed with SIGKILL --
+stop those by hand before resuming. It refuses to start if output_path exists.
 """
 
 import glob
@@ -131,6 +133,8 @@ def main(cfg):
   logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
   if cfg.queue_dir is None:
     raise ValueError("queue_dir must be set")
+  if os.path.exists(cfg.output_path):
+    raise FileExistsError(f"{cfg.output_path} exists already (the part files of a finished run are deleted, so it can't be resumed)")
   meshes = list(hydra.utils.instantiate(cfg.mesh_strategy).meshes())
   work = os.path.abspath(cfg.queue_dir)
   parts_dir, logs_dir = os.path.join(work, "parts"), os.path.join(work, "logs")
@@ -175,7 +179,11 @@ def main(cfg):
     pool.stop()
 
   report = merge_parts(scan, meshes, os.path.abspath(cfg.output_path), failed=queue_failed)
-  logger.info("done: %s", report)
+  leftovers = glob.glob(os.path.join(parts_dir, "part_*"))   # part files and their write markers
+  for path in leftovers:
+    os.remove(path)
+  os.rmdir(parts_dir)
+  logger.info("done: %s; removed %d part files", report, len(leftovers))
 
 
 if __name__ == "__main__":
