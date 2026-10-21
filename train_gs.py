@@ -59,7 +59,7 @@ from gs_dataset import (OPENGL_TO_OPENCV, GaussH5ValDataset,  # noqa: E402
                         rotate_quats_wxyz, render_catalog, sample_matching_sources)
 from gs_decoder import GaussianResnetDecoder, GSDecoderStack  # noqa: E402
 from gs_encoder import GSResnetEncoder  # noqa: E402
-from module import (DSSIMLoss, ProgressWandbLogger, WarmupCosineAnnealingLR,  # noqa: E402
+from module import (DSSIMLoss, ProgressWandbLogger, TimeBudget, WarmupCosineAnnealingLR,  # noqa: E402
                     _completed_steps)
 from util import collate_with_batch_size, pipe, set_mode, timed  # noqa: E402
 
@@ -1057,6 +1057,16 @@ def main(cfg: DictConfig) -> None:
   with open_dict(cfg):
     cfg.model.num_params = sum(p.numel() for p in model.parameters())
 
+  # time_budget replaces the LR scheduler: a warmup-stable-decay LR driven by training seconds, which
+  # also stops the run (see module.TimeBudget)
+  budget = None
+  if cfg.time_budget.max_seconds is not None:
+    if cfg.sched is not None:
+      raise SystemExit("time_budget.max_seconds replaces the LR scheduler: also pass sched=null")
+    budget = TimeBudget(
+      max_seconds=cfg.time_budget.max_seconds, warmup_fraction=cfg.time_budget.warmup_fraction,
+      decay_fraction=cfg.time_budget.decay_fraction, min_lr=cfg.time_budget.min_lr)
+
   logger = False
   if cfg.wandb.mode != "disabled":
     tags: list[str] = OmegaConf.to_container(cfg.wandb.tags, resolve=True)
@@ -1077,12 +1087,17 @@ def main(cfg: DictConfig) -> None:
     )
     logger = ProgressWandbLogger(
       experiment=wandb_run,
-      progress_fn=lambda: {"views_seen": model.views_seen, "pixels_seen": model.pixels_seen},
+      progress_fn=lambda: {
+        "views_seen": model.views_seen, "pixels_seen": model.pixels_seen,
+        **({} if budget is None else {"train_seconds": budget.seconds()}),
+      },
       step_fn=lambda: _completed_steps(model.trainer, model),
     )
 
   callbacks = []
   callbacks += list(hydra.utils.instantiate(cfg.callbacks).values())
+  if budget is not None:
+    callbacks = [budget, *callbacks, budget.tail()]   # first and last: see module.TimeBudget
 
   trainer = pl.Trainer(
     **OmegaConf.to_container(cfg.trainer, resolve=True),

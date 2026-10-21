@@ -28,9 +28,11 @@ by fit_3dgs.py's layered mode, orbit_video.py and gs_decoder.py.
 
 import contextlib as ctl
 import logging
+import math
 import os
 import shutil
 import tempfile
+import time
 
 import lightning.pytorch as pl
 import numpy as np
@@ -177,6 +179,108 @@ class WarmupCosineAnnealingLR(torch.optim.lr_scheduler.SequentialLR):
       schedulers=[warmup, cosine],
       milestones=[self.warmup_steps],
     )
+
+
+def time_wsd_progress(seconds, max_seconds, warmup_fraction, decay_fraction):
+  """Position in [0, 1] of a warmup-stable-decay schedule over max_seconds: linear 0 -> 1 during
+  the first warmup_fraction, 1 until the last decay_fraction, then a cosine 1 -> 0."""
+  warmup_end = warmup_fraction * max_seconds
+  decay_start = (1.0 - decay_fraction) * max_seconds
+  if seconds < warmup_end:
+    return seconds / warmup_end
+  if seconds < decay_start:
+    return 1.0
+  if seconds >= max_seconds:
+    return 0.0
+  return 0.5 * (1.0 + math.cos(math.pi * (seconds - decay_start) / (max_seconds - decay_start)))
+
+
+class TimeBudget(pl.Callback):
+  """A warmup-stable-decay learning rate driven by the TRAINING time spent, with a hard stop.
+
+  The clock counts what a training run pays for: the wait for each batch, the forward pass, the
+  backward pass and the optimizer step. It does not count validation, checkpoint saves, or the
+  callbacks that run after a batch (the panel / orbit / scale-layer previews). Lightning calls, per
+  batch: [next(data) ->] on_train_batch_start -> training_step, backward, optimizer step -> LR
+  scheduler step -> on_train_batch_end; validation runs after the last batch of an epoch. So this
+  callback must be FIRST in the trainer's callback list (its on_train_batch_end stamps the end of the
+  batch before the other callbacks run) and its tail() after all the others (it restarts the clock
+  after them; Lightning's own progress bar and checkpoint callbacks still come after it); on_fit_start
+  checks that the order is right. The clock also restarts at the start of every epoch, after the
+  validation and checkpoint saves of the previous one.
+
+  The LR is set at on_train_batch_start from the clock: min_lr + (peak - min_lr) * time_wsd_progress,
+  the peak being each param group's LR when training starts. It replaces an LR scheduler (don't
+  configure one). Once max_seconds of training time are spent the trainer is asked to stop; Lightning
+  then still runs its validation, and final.ckpt is written to the trainer's default_root_dir.
+
+  The elapsed seconds and the peak LRs are saved in checkpoints, so a resumed run continues the
+  schedule."""
+
+  def __init__(self, max_seconds, warmup_fraction=0.05, decay_fraction=0.1, min_lr=1e-6):
+    self.max_seconds = float(max_seconds)
+    self.warmup_fraction = float(warmup_fraction)
+    self.decay_fraction = float(decay_fraction)
+    self.min_lr = float(min_lr)
+    self._elapsed = 0.0
+    self._anchor = None   # when the current stretch of training time began (None: not counting)
+    self._peak_lrs = None
+    self._stopped = False
+
+  def seconds(self):
+    """Training seconds so far, including the stretch in progress."""
+    return self._elapsed + (0.0 if self._anchor is None else time.monotonic() - self._anchor)
+
+  def tail(self):
+    return TimeBudgetTail(self)
+
+  def on_fit_start(self, trainer, pl_module):
+    callbacks = trainer.callbacks
+    after = callbacks[callbacks.index(self) + 1:]
+    tails = [c for c in after if isinstance(c, TimeBudgetTail) and c.budget is self]
+    if callbacks[0] is not self or len(tails) != 1:
+      raise RuntimeError("TimeBudget must be the first callback and its tail() must come after it, after the other callbacks")
+
+  def on_train_epoch_start(self, trainer, pl_module):
+    self._anchor = time.monotonic()
+
+  def on_validation_start(self, trainer, pl_module):
+    self._anchor = None
+
+  def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+    optimizer = trainer.optimizers[0]
+    if self._peak_lrs is None:
+      self._peak_lrs = [group["lr"] for group in optimizer.param_groups]
+    progress = time_wsd_progress(self.seconds(), self.max_seconds, self.warmup_fraction, self.decay_fraction)
+    for group, peak in zip(optimizer.param_groups, self._peak_lrs):
+      group["lr"] = self.min_lr + (peak - self.min_lr) * progress
+
+  def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+    self._elapsed = self.seconds()
+    self._anchor = None
+    if self._elapsed >= self.max_seconds:
+      self._stopped = True
+      trainer.should_stop = True
+
+  def on_train_end(self, trainer, pl_module):
+    if self._stopped:
+      trainer.save_checkpoint(os.path.join(trainer.default_root_dir, "final.ckpt"))
+
+  def state_dict(self):
+    return {"elapsed": self._elapsed, "peak_lrs": self._peak_lrs}
+
+  def load_state_dict(self, state):
+    self._elapsed, self._peak_lrs = state["elapsed"], state["peak_lrs"]
+
+
+class TimeBudgetTail(pl.Callback):
+  """Restarts the TimeBudget clock once every other callback has run -- see TimeBudget."""
+
+  def __init__(self, budget):
+    self.budget = budget
+
+  def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+    self.budget._anchor = time.monotonic()
 
 
 class WarmupLR(torch.optim.lr_scheduler.LinearLR):
