@@ -467,9 +467,17 @@ def run(cfg):
       raise ValueError("depth_width/depth_height must be set (config default is "
                        "${width}/${height}; use that to match the RGB pass)")
     DW, DH = int(cfg.depth_width), int(cfg.depth_height)
+    queue = worker = None
+    if cfg.queue_path is not None:
+      if src is not None:
+        raise ValueError("queue_path doesn't combine with source_path")
+      from job_queue import JobQueue
+      queue = JobQueue(cfg.queue_path)
+      worker = str(os.getpid()) if cfg.queue_worker is None else str(cfg.queue_worker)
     if src is None:
       view_strategy = hydra.utils.instantiate(cfg.view_strategy)
-      meshes = list(hydra.utils.instantiate(cfg.mesh_strategy).meshes())
+      # queue mode: the mesh list the jobs index into is stored in the queue
+      meshes = queue.get_meta("meshes") if queue is not None else list(hydra.utils.instantiate(cfg.mesh_strategy).meshes())
       Lmax = int(cfg.max_peel_layers)
       mesh_views = lambda mi: _strategy_views(cfg, view_strategy, meshes[mi])
     else:
@@ -506,18 +514,24 @@ def run(cfg):
     writer.init("depth_scale")
 
     failed = []
-    for mi, mesh_path in enumerate(meshes):
+    for mi, job in _mesh_jobs(meshes, queue, worker, cfg.queue_max_meshes):
+      mesh_path = meshes[mi]
       views = list(mesh_views(mi))
       if not views:
         continue  # re-render: mesh has no rows in the source (it failed there)
       try:
         with writer.transaction():
           _render_mesh(cfg, scene, mi, mesh_path, views, W, H, DW, DH, Lmax, tmp, writer)
-      except Exception:
+      except Exception as e:
         if src is not None:
           raise  # skipping would misalign rows with the copied images
         logger.exception("mesh %d (%s) failed -- skipping", mi, mesh_path)
         failed.append(mi)
+        if job is not None:
+          queue.fail(job, worker, repr(e))
+      else:
+        if job is not None:
+          queue.done(job, worker)   # only after the rows are committed to the file
 
     if src is not None:
       if "images" in src and not render_rgb:
@@ -529,6 +543,22 @@ def run(cfg):
       logger.warning("%d/%d meshes failed: %s", len(failed), len(meshes), failed)
 
   logger.info("wrote %s", cfg.output_path)
+
+
+def _mesh_jobs(meshes, queue, worker, max_meshes):
+  """(mesh index, job) per mesh to render: every mesh in order with job None, or -- with a queue --
+  the meshes this worker claims, until the queue has none ready or max_meshes were claimed."""
+  if queue is None:
+    for mi in range(len(meshes)):
+      yield mi, None
+    return
+  claimed = 0
+  while max_meshes is None or claimed < max_meshes:
+    job = queue.claim(worker)
+    if job is None:
+      return
+    claimed += 1
+    yield int(job["payload"]["mesh_index"]), job
 
 
 def _strategy_views(cfg, view_strategy, mesh_path):
