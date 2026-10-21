@@ -120,21 +120,31 @@ class LazyDataset:
 class TransactionalWriter:
   """Appends rows to resizable datasets of an open h5py.File, a transaction at a time.
 
-  w = TransactionalWriter(f)
-  w.init("depth", dataset_kwargs=dict(compression="gzip"))
-  with w.transaction():
-    w.append("depth", row)     # only cached in memory
-  # leaving the block writes every cached row to the file, then flushes it; if the block
-  # raises, the cache is dropped and the file is untouched
+  with TransactionalWriter(f) as w:
+    w.init("depth", dataset_kwargs=dict(compression="gzip"))
+    with w.transaction():
+      w.append("depth", row)     # only cached in memory
+    # leaving the transaction block writes every cached row to the file, then flushes it; if
+    # the block raises, the cache is dropped and the file is untouched
+  # leaving the writer trims every dataset to the rows actually written
 
   append() outside a transaction raises. A dataset is created on the first transaction that
   appends to it (shape/dtype come from the first row; one row per chunk unless dataset_kwargs
-  sets chunks)."""
+  sets chunks) and its capacity doubles until a transaction's rows fit, so until the writer is
+  closed the datasets are longer than the rows written."""
 
   def __init__(self, f: h5py.File):
     self.f = f
     self.datasets = {}   # name -> dataset_kwargs; "name in w.datasets" = registered
+    self.rows = {}       # name -> rows written so far (<= the dataset's capacity)
     self._cache = None
+
+  def __enter__(self):
+    return self
+
+  def __exit__(self, exc_type, exc_value, traceback):
+    for name, n in self.rows.items():
+      self.f[name].resize(n, axis=0)
 
   def init(self, name, *, dataset_kwargs=None):
     if name in self.datasets:
@@ -175,14 +185,20 @@ class TransactionalWriter:
       shape, dtype = (), type(first)
       block = np.array(rows, dtype=dtype)
 
-    if name not in self.f:
+    if name not in self.rows:
       self.f.create_dataset(
-        name, shape=(0, *shape), maxshape=(None, *shape), dtype=dtype,
+        name, shape=(len(block), *shape), maxshape=(None, *shape), dtype=dtype,
         **{"chunks": (1, *shape), **self.datasets[name]})
+      self.rows[name] = 0
     ds = self.f[name]
-    n = len(ds)
-    ds.resize(n + len(block), axis=0)
-    ds[n:] = block
+    n = self.rows[name]
+    capacity = len(ds)
+    while capacity < n + len(block):
+      capacity *= 2
+    if capacity != len(ds):
+      ds.resize(capacity, axis=0)
+    ds[n:n + len(block)] = block
+    self.rows[name] = n + len(block)
 
 
 def check_shape(x, pattern):
