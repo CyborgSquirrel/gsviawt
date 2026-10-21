@@ -1058,11 +1058,13 @@ def main(cfg: DictConfig) -> None:
   with open_dict(cfg):
     cfg.model.num_params = sum(p.numel() for p in model.parameters())
 
-  # A time-driven LR scheduler (sched=time_wsd, module.TimeWSD) reads a TrainClock, which also stops the
-  # run at sched.max_seconds; configure_optimizers hands it the clock
+  # max_seconds: a TrainClock stops the run after that much training time; a time-driven LR scheduler
+  # (sched=time_wsd, module.TimeWSD) reads the same clock, which configure_optimizers hands it
   clock = None
-  if cfg.sched is not None and needs_clock(hydra.utils.instantiate(cfg.sched)):
-    clock = TrainClock(max_seconds=cfg.sched.max_seconds)
+  if cfg.sched is not None and needs_clock(hydra.utils.instantiate(cfg.sched)) and cfg.max_seconds is None:
+    raise SystemExit("this LR scheduler is driven by the training time: set max_seconds")
+  if cfg.max_seconds is not None:
+    clock = TrainClock(max_seconds=cfg.max_seconds)
   model.clock = clock
 
   logger = False

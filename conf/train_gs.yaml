@@ -10,6 +10,12 @@ defaults:
   - sched: step_cosine
   - _self_
 
+# Stop after this many seconds of TRAINING time (the optimization pass of each batch: forward, backward,
+# optimizer step -- not validation, checkpoint saves or any callback; see module.TrainClock). The run
+# then validates and writes final.ckpt to the output dir. Also the length of the time_wsd LR schedule
+# (sched=time_wsd needs it). null = no time limit. Every wandb row gets train_seconds when it is set.
+max_seconds: null
+
 # Directory for everything a single run produces.
 output_dirname: 3dgs-model-${now:%Y-%m-%d_%H-%M-%S}
 output_dir: outputs/${output_dirname}
