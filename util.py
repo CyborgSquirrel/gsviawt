@@ -1,6 +1,7 @@
 import contextlib as ctl
 import logging
 import math
+import os
 import time
 
 import h5py
@@ -118,6 +119,11 @@ class LazyDataset:
     self.idx += 1
 
 
+def txn_lock_path(h5_path):
+  """The marker TransactionalWriter keeps next to an h5 file while it writes a transaction."""
+  return f"{h5_path}.txn"
+
+
 def row_chunks(shape, dtype, n=1):
   """Chunk shape of n rows of a dataset whose rows have the given shape: (n, *shape)."""
   return (n, *shape)
@@ -138,6 +144,12 @@ class TransactionalWriter:
     w.append("depth", row)     # only cached in memory
   # leaving the block writes every cached row to the file, then flushes it; if the block
   # raises, the cache is dropped and the file is untouched
+
+  While the rows are being written (and only then) the marker file txn_lock_path(f.filename)
+  exists: created right before the first dataset is touched, removed after the flush. A marker
+  left next to a file means a writer died, or failed, mid-write and the file can't be trusted;
+  a file without one holds exactly its committed transactions. Starting a commit while the
+  marker exists raises FileExistsError.
 
   append() outside a transaction raises. A dataset is created on the first transaction that
   appends to it (shape/dtype come from the first row) and is resized to exactly the rows written
@@ -176,9 +188,14 @@ class TransactionalWriter:
       self._cache = None
       raise
     cache, self._cache = self._cache, None
-    for name, rows in cache.items():
-      self._write(name, rows)
+    if cache:
+      lock = txn_lock_path(self.f.filename)
+      open(lock, "x").close()
+      for name, rows in cache.items():
+        self._write(name, rows)
     self.f.flush()
+    if cache:
+      os.remove(lock)
 
   def _write(self, name, rows):
     first = rows[0]
