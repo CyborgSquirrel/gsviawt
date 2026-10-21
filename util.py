@@ -128,7 +128,8 @@ class TransactionalWriter:
   # raises, the cache is dropped and the file is untouched
 
   append() outside a transaction raises. A dataset is created on the first transaction that
-  appends to it (shape/dtype come from the first row)."""
+  appends to it (shape/dtype come from the first row; one row per chunk unless dataset_kwargs
+  sets chunks)."""
 
   def __init__(self, f: h5py.File):
     self.f = f
@@ -176,7 +177,8 @@ class TransactionalWriter:
 
     if name not in self.f:
       self.f.create_dataset(
-        name, shape=(0, *shape), maxshape=(None, *shape), dtype=dtype, **self.datasets[name])
+        name, shape=(0, *shape), maxshape=(None, *shape), dtype=dtype,
+        **{"chunks": (1, *shape), **self.datasets[name]})
     ds = self.f[name]
     n = len(ds)
     ds.resize(n + len(block), axis=0)
