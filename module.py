@@ -199,16 +199,14 @@ def time_wsd_progress(seconds, max_seconds, warmup_fraction, decay_fraction):
 class TrainClock(pl.Callback):
   """Counts the TRAINING time spent, for time-driven LR schedules (TimeWSD) and a hard stop.
 
-  The clock counts what a training run pays for: the wait for each batch, the forward pass, the
-  backward pass and the optimizer step. It does not count validation, checkpoint saves, or the
-  callbacks that run after a batch (the panel / orbit / scale-layer previews). Lightning calls, per
-  batch: [next(data) ->] on_train_batch_start -> training_step, backward, optimizer step -> LR
+  The clock counts the optimization pass of each batch: the forward pass, the backward pass and the
+  optimizer step (plus the LR scheduler step). It does not count the wait for the batch (about 5% of a
+  batch with the cached WT features), validation, checkpoint saves, or any callback. Lightning calls,
+  per batch: [next(data) ->] on_train_batch_start -> training_step, backward, optimizer step -> LR
   scheduler step -> on_train_batch_end; validation runs after the last batch of an epoch. So this
-  callback must be FIRST in the trainer's callback list (its on_train_batch_end stamps the end of the
-  batch before the other callbacks run) and its tail() after all the others (it restarts the clock
-  after them; Lightning's own progress bar and checkpoint callbacks still come after it); on_fit_start
-  checks that the order is right. The clock also restarts at the start of every epoch, after the
-  validation and checkpoint saves of the previous one.
+  callback must be FIRST in the trainer's callback list (its on_train_batch_end runs before the other
+  callbacks' ones and stops the clock) and its tail() LAST of ours (its on_train_batch_start runs after
+  the other callbacks' ones and starts the clock); on_fit_start checks that the order is right.
 
   With max_seconds set, the trainer is asked to stop once that much training time is spent; Lightning
   then still runs its validation, and final.ckpt is written to the trainer's default_root_dir. The
@@ -217,12 +215,12 @@ class TrainClock(pl.Callback):
   def __init__(self, max_seconds=None):
     self.max_seconds = None if max_seconds is None else float(max_seconds)
     self._elapsed = 0.0
-    self._anchor = None   # when the current stretch of training time began (None: not counting)
+    self._start = None   # when the current batch's optimization pass began (None: between batches)
     self._stopped = False
 
   def seconds(self):
-    """Training seconds so far, including the stretch in progress."""
-    return self._elapsed + (0.0 if self._anchor is None else time.monotonic() - self._anchor)
+    """Training seconds so far, including the batch in progress."""
+    return self._elapsed + (0.0 if self._start is None else time.monotonic() - self._start)
 
   def tail(self):
     return TrainClockTail(self)
@@ -234,15 +232,9 @@ class TrainClock(pl.Callback):
     if callbacks[0] is not self or len(tails) != 1:
       raise RuntimeError("TrainClock must be the first callback and its tail() must come after it, after the other callbacks")
 
-  def on_train_epoch_start(self, trainer, pl_module):
-    self._anchor = time.monotonic()
-
-  def on_validation_start(self, trainer, pl_module):
-    self._anchor = None
-
   def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
     self._elapsed = self.seconds()
-    self._anchor = None
+    self._start = None
     if self.max_seconds is not None and self._elapsed >= self.max_seconds:
       self._stopped = True
       trainer.should_stop = True
@@ -259,13 +251,14 @@ class TrainClock(pl.Callback):
 
 
 class TrainClockTail(pl.Callback):
-  """Restarts the TrainClock once every other callback has run -- see TrainClock."""
+  """Starts the TrainClock for a batch once every other callback's on_train_batch_start has run --
+  see TrainClock."""
 
   def __init__(self, clock):
     self.clock = clock
 
-  def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-    self.clock._anchor = time.monotonic()
+  def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+    self.clock._start = time.monotonic()
 
 
 class TimeWSD(torch.optim.lr_scheduler.LRScheduler):
