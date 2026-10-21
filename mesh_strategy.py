@@ -5,7 +5,7 @@ Hydra `_target_` from conf/mesh_strategy/*.yaml.
 import glob
 import random
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 
 class MeshStrategy:
@@ -15,9 +15,14 @@ class MeshStrategy:
 
 @dataclass
 class ListMeshes(MeshStrategy):
-  paths: List[str]
+  """The given `paths`, or -- if `file` is set -- the paths in that text file (one per line)."""
+  paths: List[str] = ()
+  file: Optional[str] = None
 
   def meshes(self):
+    if self.file is not None:
+      with open(self.file) as f:
+        return [line.strip() for line in f if line.strip()]
     return list(self.paths)
 
 

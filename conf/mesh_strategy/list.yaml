@@ -1,3 +1,5 @@
 _target_: mesh_strategy.ListMeshes
 paths:
   - /home/user/.objaverse/hf-objaverse-v1/glbs/000-147/405f47d6ce6d481d94f54800ee913fa4.glb
+# or a text file with one mesh path per line (replaces `paths`)
+file: null
