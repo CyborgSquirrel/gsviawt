@@ -1,5 +1,6 @@
 import contextlib as ctl
 import logging
+import math
 import time
 
 import h5py
@@ -115,6 +116,104 @@ class LazyDataset:
 
     self.dataset[self.idx] = item
     self.idx += 1
+
+
+def row_chunks(shape, dtype, n=1):
+  """Chunk shape of n rows of a dataset whose rows have the given shape: (n, *shape)."""
+  return (n, *shape)
+
+
+def size_chunks(shape, dtype, size=64 * 1024):
+  """Chunk shape of as many rows as come closest to `size` bytes (at least 1 row)."""
+  row_bytes = math.prod(shape) * np.dtype(dtype).itemsize
+  return (max(1, round(size / row_bytes)), *shape)
+
+
+class TransactionalWriter:
+  """Appends rows to resizable datasets of an open h5py.File, a transaction at a time.
+
+  with TransactionalWriter(f) as w:
+    w.init("depth", dataset_kwargs=dict(compression="gzip"))
+    with w.transaction():
+      w.append("depth", row)     # only cached in memory
+    # leaving the transaction block writes every cached row to the file, then flushes it; if
+    # the block raises, the cache is dropped and the file is untouched
+  # leaving the writer trims every dataset to the rows actually written
+
+  append() outside a transaction raises. A dataset is created on the first transaction that
+  appends to it (shape/dtype come from the first row) and its capacity doubles until a
+  transaction's rows fit, so until the writer is closed the datasets are longer than the rows
+  written. init's `chunks` is a chunk shape or a function (row shape, dtype) -> chunk shape, e.g.
+  functools.partial(size_chunks, size=...); the default is row_chunks (one row)."""
+
+  def __init__(self, f: h5py.File):
+    self.f = f
+    self.datasets = {}   # name -> (chunks, dataset_kwargs); "name in w.datasets" = registered
+    self.rows = {}       # name -> rows written so far (<= the dataset's capacity)
+    self._cache = None
+
+  def __enter__(self):
+    return self
+
+  def __exit__(self, exc_type, exc_value, traceback):
+    for name, n in self.rows.items():
+      self.f[name].resize(n, axis=0)
+
+  def init(self, name, *, chunks=row_chunks, dataset_kwargs=None):
+    if name in self.datasets:
+      raise ValueError(f"dataset {name!r} already registered")
+    kwargs = {} if dataset_kwargs is None else dict(dataset_kwargs)
+    if any(kwargs.get(k) is not None for k in ("chunks", "maxshape", "dtype", "shape")):
+      raise ValueError(f"dataset_kwargs of {name!r} must not set chunks/maxshape/dtype/shape")
+    self.datasets[name] = (chunks, kwargs)
+
+  def append(self, name, item):
+    if self._cache is None:
+      raise RuntimeError(f"append to {name!r} outside a transaction")
+    if name not in self.datasets:
+      raise KeyError(f"dataset {name!r} not registered (registered: {sorted(self.datasets)})")
+    self._cache.setdefault(name, []).append(item)
+
+  @ctl.contextmanager
+  def transaction(self):
+    if self._cache is not None:
+      raise RuntimeError("transactions don't nest")
+    self._cache = {}
+    try:
+      yield self
+    except BaseException:
+      self._cache = None
+      raise
+    cache, self._cache = self._cache, None
+    for name, rows in cache.items():
+      self._write(name, rows)
+    self.f.flush()
+
+  def _write(self, name, rows):
+    first = rows[0]
+    if isinstance(first, np.ndarray):
+      shape, dtype = first.shape, first.dtype
+      block = np.stack(rows)
+    else:
+      shape, dtype = (), type(first)
+      block = np.array(rows, dtype=dtype)
+
+    if name not in self.rows:
+      chunks, kwargs = self.datasets[name]
+      if callable(chunks):
+        chunks = chunks(shape, dtype)
+      self.f.create_dataset(
+        name, shape=(len(block), *shape), maxshape=(None, *shape), dtype=dtype, chunks=chunks, **kwargs)
+      self.rows[name] = 0
+    ds = self.f[name]
+    n = self.rows[name]
+    capacity = len(ds)
+    while capacity < n + len(block):
+      capacity *= 2
+    if capacity != len(ds):
+      ds.resize(capacity, axis=0)
+    ds[n:n + len(block)] = block
+    self.rows[name] = n + len(block)
 
 
 def check_shape(x, pattern):
