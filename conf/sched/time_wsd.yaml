@@ -1,0 +1,10 @@
+# Time-driven warmup-stable-decay (module.TimeWSD). The LR follows the schedule over the top-level
+# max_seconds of TRAINING time (the optimization pass of each batch -- not validation, checkpoint saves or
+# any callback, see module.TrainClock); max_seconds also stops the run, which then validates and writes
+# final.ckpt to the output dir. Needs max_seconds to be set, e.g. sched=time_wsd max_seconds=3600.
+_target_: module.TimeWSD
+_partial_: true
+max_seconds: ${max_seconds}
+warmup_fraction: 0.05     # linear warmup over this fraction of max_seconds
+decay_fraction: 0.1       # cosine decay over the last fraction of max_seconds
+min_lr: 1.0e-6

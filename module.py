@@ -27,10 +27,14 @@ by fit_3dgs.py's layered mode, orbit_video.py and gs_decoder.py.
 """
 
 import contextlib as ctl
+import datetime
+import inspect
 import logging
+import math
 import os
 import shutil
 import tempfile
+import time
 
 import lightning.pytorch as pl
 import numpy as np
@@ -177,6 +181,132 @@ class WarmupCosineAnnealingLR(torch.optim.lr_scheduler.SequentialLR):
       schedulers=[warmup, cosine],
       milestones=[self.warmup_steps],
     )
+
+
+def time_wsd_progress(seconds, max_seconds, warmup_fraction, decay_fraction):
+  """Position in [0, 1] of a warmup-stable-decay schedule over max_seconds: linear 0 -> 1 during
+  the first warmup_fraction, 1 until the last decay_fraction, then a cosine 1 -> 0."""
+  warmup_end = warmup_fraction * max_seconds
+  decay_start = (1.0 - decay_fraction) * max_seconds
+  if seconds < warmup_end:
+    return seconds / warmup_end
+  if seconds < decay_start:
+    return 1.0
+  if seconds >= max_seconds:
+    return 0.0
+  return 0.5 * (1.0 + math.cos(math.pi * (seconds - decay_start) / (max_seconds - decay_start)))
+
+
+class TrainClock(pl.Callback):
+  """Counts the TRAINING time spent, for time-driven LR schedules (TimeWSD) and a hard stop.
+
+  The clock counts the optimization pass of each batch: the forward pass, the backward pass and the
+  optimizer step (plus the LR scheduler step). It does not count the wait for the batch (about 5% of a
+  batch with the cached WT features), validation, checkpoint saves, or any callback. Lightning calls,
+  per batch: [next(data) ->] on_train_batch_start -> training_step, backward, optimizer step -> LR
+  scheduler step -> on_train_batch_end; validation runs after the last batch of an epoch. So this
+  callback must be FIRST in the trainer's callback list (its on_train_batch_end runs before the other
+  callbacks' ones and stops the clock) and its tail() LAST of ours (its on_train_batch_start runs after
+  the other callbacks' ones and starts the clock); on_fit_start checks that the order is right.
+
+  With max_seconds set, the trainer is asked to stop once that much training time is spent; Lightning
+  then still runs its validation, and final.ckpt is written to the trainer's default_root_dir. The
+  elapsed seconds are saved in checkpoints, so a resumed run continues the clock."""
+
+  def __init__(self, max_seconds=None):
+    self.max_seconds = None if max_seconds is None else float(max_seconds)
+    self._elapsed = 0.0
+    self._start = None   # when the current batch's optimization pass began (None: between batches)
+    self._stopped = False
+
+  def seconds(self):
+    """Training seconds so far, including the batch in progress."""
+    return self._elapsed + (0.0 if self._start is None else time.monotonic() - self._start)
+
+  def tail(self):
+    return TrainClockTail(self)
+
+  def on_fit_start(self, trainer, pl_module):
+    callbacks = trainer.callbacks
+    after = callbacks[callbacks.index(self) + 1:]
+    tails = [c for c in after if isinstance(c, TrainClockTail) and c.clock is self]
+    if callbacks[0] is not self or len(tails) != 1:
+      raise RuntimeError("TrainClock must be the first callback and its tail() must come after it, after the other callbacks")
+
+  def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+    self._elapsed = self.seconds()
+    self._start = None
+    if self.max_seconds is not None and self._elapsed >= self.max_seconds:
+      self._stopped = True
+      trainer.should_stop = True
+
+  def on_train_end(self, trainer, pl_module):
+    if self._stopped:
+      trainer.save_checkpoint(os.path.join(trainer.default_root_dir, "final.ckpt"))
+
+  def state_dict(self):
+    return {"elapsed": self._elapsed}
+
+  def load_state_dict(self, state):
+    self._elapsed = state["elapsed"]
+
+
+class TrainClockTail(pl.Callback):
+  """Starts the TrainClock for a batch once every other callback's on_train_batch_start has run --
+  see TrainClock."""
+
+  def __init__(self, clock):
+    self.clock = clock
+
+  def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+    self.clock._start = time.monotonic()
+
+
+class TimedCheckpoint(pl.callbacks.ModelCheckpoint):
+  """ModelCheckpoint with a flat every_n_seconds key, Lightning's own train_time_interval: WALL-clock
+  seconds since the last check (validation and previews included, unlike the TrainClock). It is
+  mutually exclusive with every_n_epochs / every_n_train_steps, so set those to null."""
+
+  def __init__(self, *, every_n_seconds, **kwargs):
+    super().__init__(train_time_interval=datetime.timedelta(seconds=every_n_seconds), **kwargs)
+
+
+class TimeWSD(torch.optim.lr_scheduler.LRScheduler):
+  """Warmup-stable-decay LR driven by a TrainClock instead of a step count: the LR goes
+  min_lr -> peak over the first warmup_fraction of max_seconds, stays at the peak, and follows a
+  cosine back down to min_lr over the last decay_fraction (peak = each param group's LR when the
+  scheduler is made). Step it once per optimizer step like any scheduler; the LR it sets depends on
+  the clock's time at that moment. Pair it with TrainClock(max_seconds) to stop the run at the end of
+  the decay (train_gs.py does)."""
+
+  def __init__(self, optimizer, clock, max_seconds, warmup_fraction=0.05, decay_fraction=0.1, min_lr=1e-6):
+    self.clock = clock
+    self.max_seconds = float(max_seconds)
+    self.warmup_fraction = float(warmup_fraction)
+    self.decay_fraction = float(decay_fraction)
+    self.min_lr = float(min_lr)
+    super().__init__(optimizer)
+
+  def get_lr(self):
+    progress = time_wsd_progress(self.clock.seconds(), self.max_seconds, self.warmup_fraction, self.decay_fraction)
+    return [self.min_lr + (peak - self.min_lr) * progress for peak in self.base_lrs]
+
+  def state_dict(self):
+    return {k: v for k, v in super().state_dict().items() if k != "clock"}   # the clock lives in its own callback
+
+
+def needs_clock(scheduler_factory):
+  """Whether a scheduler (class or functools.partial of one) takes a TrainClock."""
+  return "clock" in inspect.signature(scheduler_factory).parameters
+
+
+def make_scheduler(factory, optimizer, clock=None):
+  """factory(optimizer), or factory(optimizer, clock=clock) for a scheduler that takes a TrainClock."""
+  if not needs_clock(factory):
+    return factory(optimizer)
+  if clock is None:
+    raise ValueError("this scheduler needs a TrainClock, but none was given")
+  return factory(optimizer, clock=clock)
 
 
 class WarmupLR(torch.optim.lr_scheduler.LinearLR):
@@ -351,7 +481,8 @@ def _completed_steps(trainer, pl_module):
 # logging it -- lives here.
 #
 # Pull, not push: PanelCallback below CALLS pl_module.get_preview_source(mode)
-# itself, only when its own cadence (every_n_epochs XOR every_n_steps --
+# itself, only when its own cadence (exactly one of every_n_epochs /
+# every_n_steps / every_n_seconds --
 # see __init__) actually fires, instead of some other callback
 # unconditionally stashing a value onto pl_module every epoch whether or
 # not it's ever read. Each LightningModule (train_gs.py's GSLightningModule,
@@ -402,9 +533,26 @@ def _build_panel(gt_rgb, pred_rgb):
   return pack(rows, "c h *")[0]
 
 
-def _cadence_check(every_n_epochs, every_n_steps, cls_name):
-  if (every_n_epochs is None) == (every_n_steps is None):
-    raise ValueError(f"{cls_name}: pass exactly one of every_n_epochs/every_n_steps")
+def _cadence_check(every_n_epochs, every_n_steps, every_n_seconds, cls_name):
+  if [every_n_epochs, every_n_steps, every_n_seconds].count(None) != 2:
+    raise ValueError(f"{cls_name}: pass exactly one of every_n_epochs/every_n_steps/every_n_seconds")
+
+
+def _due_on_batch_end(callback, trainer, n_steps):
+  """Whether a callback's batch-end cadence fires now: every_n_steps (n_steps = completed optimizer
+  steps) or every_n_seconds, counted in TRAINING seconds on the TrainClock -- it fires when the clock
+  passes another multiple of every_n_seconds (the first call only notes where the clock is, so a
+  resumed run doesn't fire at once). False when the callback has neither cadence."""
+  if callback.every_n_steps is not None:
+    return n_steps != 0 and n_steps % callback.every_n_steps == 0
+  if callback.every_n_seconds is None:
+    return False
+  clock = next((c for c in trainer.callbacks if isinstance(c, TrainClock)), None)
+  if clock is None:
+    raise RuntimeError(f"{type(callback).__name__}: every_n_seconds needs a TrainClock in the trainer's callbacks")
+  index = int(clock.seconds() // callback.every_n_seconds)
+  previous, callback._seconds_index = callback._seconds_index, index
+  return previous is not None and index > previous
 
 
 class PanelCallback(pl.Callback):
@@ -414,17 +562,22 @@ class PanelCallback(pl.Callback):
   views in ONE gsplat.rasterization() call per stage, then logs a
   [GT | render | |diff|] panel per stage.
 
-  every_n_epochs XOR every_n_steps picks which cadence this instance
-  fires on (exactly one must be set) -- epoch cadence only ever previews
-  "train" (on_train_epoch_end); step cadence previews "train" and, when a
+  Exactly one of every_n_epochs / every_n_steps / every_n_seconds picks
+  which cadence this instance fires on -- epoch cadence only ever previews
+  "train" (on_train_epoch_end); step and seconds cadence (the latter in
+  TRAINING seconds on the TrainClock, which must be among the trainer's
+  callbacks) preview "train" and, when a
   val split exists, "val" too, together in one wandb.log call
   (on_train_batch_end -- there's no per-step validation loop to hook a
   separate "val batch end" into)."""
 
-  def __init__(self, *, every_n_epochs: int | None = None, every_n_steps: int | None = None):
-    _cadence_check(every_n_epochs, every_n_steps, "PanelCallback")
+  def __init__(self, *, every_n_epochs: int | None = None, every_n_steps: int | None = None,
+               every_n_seconds: float | None = None):
+    _cadence_check(every_n_epochs, every_n_steps, every_n_seconds, "PanelCallback")
     self.every_n_epochs = every_n_epochs
     self.every_n_steps = every_n_steps
+    self.every_n_seconds = every_n_seconds
+    self._seconds_index = None   # see _due_on_batch_end
 
   def on_train_epoch_end(self, trainer, pl_module):
     self._step("epoch", trainer, pl_module)
@@ -449,10 +602,8 @@ class PanelCallback(pl.Callback):
         return
       stages = ("train",)
     else:
-      if self.every_n_steps is None:
-        return
       n = _completed_steps(trainer, pl_module)  # count of COMPLETED optimizer steps
-      if n == 0 or n % self.every_n_steps != 0:
+      if not _due_on_batch_end(self, trainer, n):
         return
       stages = None  # every stage get_preview_source returns
 
@@ -532,16 +683,19 @@ class ScaleLayersCallback(pl.Callback):
   and numerically identifiable.
 
   Same pull/cadence contract as PanelCallback/OrbitCallback (see this
-  module's own top-of-file comment block): every_n_epochs XOR
-  every_n_steps, pulls pl_module.get_preview_source(mode) (same call,
+  module's own top-of-file comment block): exactly one of every_n_epochs /
+  every_n_steps / every_n_seconds, pulls pl_module.get_preview_source(mode) (same call,
   same cache). Stages whose entry has no "gauss_layers" key (an
   implementation that doesn't populate it) are skipped, same as a stage
   with no entry at all."""
 
-  def __init__(self, *, every_n_epochs: int | None = None, every_n_steps: int | None = None):
-    _cadence_check(every_n_epochs, every_n_steps, "ScaleLayersCallback")
+  def __init__(self, *, every_n_epochs: int | None = None, every_n_steps: int | None = None,
+               every_n_seconds: float | None = None):
+    _cadence_check(every_n_epochs, every_n_steps, every_n_seconds, "ScaleLayersCallback")
     self.every_n_epochs = every_n_epochs
     self.every_n_steps = every_n_steps
+    self.every_n_seconds = every_n_seconds
+    self._seconds_index = None   # see _due_on_batch_end
 
   def on_train_epoch_end(self, trainer, pl_module):
     self._step("epoch", trainer, pl_module)
@@ -558,10 +712,8 @@ class ScaleLayersCallback(pl.Callback):
         return
       stages = ("train",)
     else:
-      if self.every_n_steps is None:
-        return
       n = _completed_steps(trainer, pl_module)  # count of COMPLETED optimizer steps
-      if n == 0 or n % self.every_n_steps != 0:
+      if not _due_on_batch_end(self, trainer, n):
         return
       stages = None  # every stage get_preview_source returns
 
@@ -650,8 +802,8 @@ class OrbitCallback(pl.Callback):
   needed at all. Renders all N orbit frames of a stage in ONE batched
   gsplat.rasterization() call, writes an mp4, and logs wandb.Video.
 
-  every_n_epochs XOR every_n_steps picks which cadence this instance
-  fires on -- see PanelCallback's own docstring, same contract exactly
+  Exactly one of every_n_epochs / every_n_steps / every_n_seconds picks
+  which cadence this instance fires on -- see PanelCallback's own docstring, same contract exactly
   (epoch cadence == train only; step cadence == train + val together).
 
   resolution: size in pixels of the longer side of the rendered frames, e.g.
@@ -668,11 +820,14 @@ class OrbitCallback(pl.Callback):
   videos then only survive as the wandb.Video uploads."""
 
   def __init__(self, *, every_n_epochs: int | None = None, every_n_steps: int | None = None,
+               every_n_seconds: float | None = None,
               num_frames: int = 24, fps: int = 12, crf: int = 28, elevation_deg: float = 20.0,
               path_format: str | None = None, resolution: int | None = None):
-    _cadence_check(every_n_epochs, every_n_steps, "OrbitCallback")
+    _cadence_check(every_n_epochs, every_n_steps, every_n_seconds, "OrbitCallback")
     self.every_n_epochs = every_n_epochs
     self.every_n_steps = every_n_steps
+    self.every_n_seconds = every_n_seconds
+    self._seconds_index = None   # see _due_on_batch_end
     self.num_frames = num_frames
     self.fps = fps
     self.crf = crf
@@ -705,10 +860,8 @@ class OrbitCallback(pl.Callback):
         return
       stages = ("train",)
     else:
-      if self.every_n_steps is None:
-        return
       n = _completed_steps(trainer, pl_module)  # count of COMPLETED optimizer steps
-      if n == 0 or n % self.every_n_steps != 0:
+      if not _due_on_batch_end(self, trainer, n):
         return
       stages = None  # every stage get_preview_source returns
 
