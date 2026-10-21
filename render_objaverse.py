@@ -492,16 +492,18 @@ def run(cfg):
     # when re-rendering depth only, the RGB images are copied from the source
     render_rgb = cfg.render and (src is None or cfg.source_rerender_rgb)
     writer = TransactionalWriter(hf)
-    ds_img = writer.init("images", dataset_kwargs=img_kw) if render_rgb else None
-    ds_pose = writer.init("camera_pose")
+    if render_rgb:
+      writer.init("images", dataset_kwargs=img_kw)
+    writer.init("camera_pose")
     # two intrinsics datasets, both always written (identical when the RGB and
     # depth-peel resolutions match) so consumers never have to guess which K a
     # dataset goes with.
-    ds_depth_intr = writer.init("depth_intrinsics")  # matches depth_peel
-    ds_img_intr = writer.init("image_intrinsics") if cfg.render else None  # matches images
-    ds_depth = writer.init("depth_peel", dataset_kwargs=depth_kw)
-    ds_mesh = writer.init("mesh_index")
-    ds_scale = writer.init("depth_scale")
+    writer.init("depth_intrinsics")  # matches depth_peel
+    if cfg.render:
+      writer.init("image_intrinsics")  # matches images
+    writer.init("depth_peel", dataset_kwargs=depth_kw)
+    writer.init("mesh_index")
+    writer.init("depth_scale")
 
     failed = []
     for mi, mesh_path in enumerate(meshes):
@@ -510,8 +512,7 @@ def run(cfg):
         continue  # re-render: mesh has no rows in the source (it failed there)
       try:
         with writer.transaction():
-          _render_mesh(cfg, scene, mi, mesh_path, views, W, H, DW, DH, Lmax, tmp,
-                       ds_img, ds_pose, ds_depth_intr, ds_img_intr, ds_depth, ds_mesh, ds_scale)
+          _render_mesh(cfg, scene, mi, mesh_path, views, W, H, DW, DH, Lmax, tmp, writer)
       except Exception:
         if src is not None:
           raise  # skipping would misalign rows with the copied images
@@ -559,12 +560,11 @@ def _source_views(src, mi):
     yield f"row={row}", place
 
 
-def _render_mesh(cfg, scene, mi, mesh_path, views, W, H, DW, DH, Lmax, tmp,
-                 ds_img, ds_pose, ds_depth_intr, ds_img_intr, ds_depth, ds_mesh, ds_scale):
+def _render_mesh(cfg, scene, mi, mesh_path, views, W, H, DW, DH, Lmax, tmp, writer):
   """Load, normalize and render one mesh for every (label, place(cam)) in
   `views`, appending a row per view to the open datasets. Raises on any
   Blender failure (bad glb, degenerate bbox, ...) so run() can skip the mesh.
-  RGB is rendered only when ds_img is given.
+  RGB is rendered only when the writer has an "images" dataset.
 
   W,H is the RGB resolution; DW,DH the depth-peel resolution (equal unless
   cfg.depth_width/height override)."""
@@ -588,7 +588,7 @@ def _render_mesh(cfg, scene, mi, mesh_path, views, W, H, DW, DH, Lmax, tmp,
     bpy.context.view_layer.update()
     label = f"mesh={mi} {view_label}"
 
-    if ds_img is not None:
+    if "images" in writer.datasets:
       scene.render.engine = str(cfg.render_engine)
       with timed(f"{label} rgb ({scene.render.engine})"):
         rgba = render_rgba(os.path.join(tmp, "rgb.png"), W, H)
@@ -608,15 +608,15 @@ def _render_mesh(cfg, scene, mi, mesh_path, views, W, H, DW, DH, Lmax, tmp,
         depth_vol = depth_vol * depth_scale  # NaN * s = NaN, so no-hit stays no-hit
         pose[:3, 3] *= depth_scale
 
-    if ds_img is not None:
-      ds_img.append(rgba)
-    if ds_img_intr is not None:
-      ds_img_intr.append(image_intr)
-    ds_pose.append(pose)
-    ds_depth_intr.append(depth_intr)
-    ds_depth.append(depth_vol.astype(np.float32))
-    ds_mesh.append(np.int64(mi))
-    ds_scale.append(np.float32(depth_scale))
+    if "images" in writer.datasets:
+      writer.append("images", rgba)
+    if "image_intrinsics" in writer.datasets:
+      writer.append("image_intrinsics", image_intr)
+    writer.append("camera_pose", pose)
+    writer.append("depth_intrinsics", depth_intr)
+    writer.append("depth_peel", depth_vol.astype(np.float32))
+    writer.append("mesh_index", np.int64(mi))
+    writer.append("depth_scale", np.float32(depth_scale))
 
 
 def main():

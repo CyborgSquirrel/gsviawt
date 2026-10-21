@@ -121,38 +121,40 @@ class TransactionalWriter:
   """Appends rows to resizable datasets of an open h5py.File, a transaction at a time.
 
   w = TransactionalWriter(f)
-  ds = w.init("depth", dataset_kwargs=dict(compression="gzip"))   # or w.append("depth", row)
+  w.init("depth", dataset_kwargs=dict(compression="gzip"))
   with w.transaction():
-    ds.append(row)       # only cached in memory
+    w.append("depth", row)     # only cached in memory
   # leaving the block writes every cached row to the file, then flushes it; if the block
   # raises, the cache is dropped and the file is untouched
 
-  append() outside a transaction raises. Datasets are created on the first transaction that
-  appends to them (shape/dtype come from the first row); init_hook(ds, shape=, dtype=) may edit
-  ds.dataset_kwargs just before that, as with LazyDataset."""
+  append() outside a transaction raises. A dataset is created on the first transaction that
+  appends to it (shape/dtype come from the first row)."""
 
   def __init__(self, f: h5py.File):
     self.f = f
-    self.datasets = {}
+    self.datasets = {}   # name -> dataset_kwargs; "name in w.datasets" = registered
     self._cache = None
 
-  def init(self, name, *, dataset_kwargs=None, init_hook=None):
+  def init(self, name, *, dataset_kwargs=None):
     if name in self.datasets:
       raise ValueError(f"dataset {name!r} already registered")
-    ds = TransactionalDataset(self, name, dataset_kwargs, init_hook)
-    self.datasets[name] = ds
-    return ds
+    kwargs = {} if dataset_kwargs is None else dict(dataset_kwargs)
+    if any(kwargs.get(k) is not None for k in ("maxshape", "dtype", "shape")):
+      raise ValueError(f"dataset_kwargs of {name!r} must not set maxshape/dtype/shape")
+    self.datasets[name] = kwargs
 
   def append(self, name, item):
     if self._cache is None:
       raise RuntimeError(f"append to {name!r} outside a transaction")
-    self._cache[name].append(item)
+    if name not in self.datasets:
+      raise KeyError(f"dataset {name!r} not registered (registered: {sorted(self.datasets)})")
+    self._cache.setdefault(name, []).append(item)
 
   @ctl.contextmanager
   def transaction(self):
     if self._cache is not None:
       raise RuntimeError("transactions don't nest")
-    self._cache = {name: [] for name in self.datasets}
+    self._cache = {}
     try:
       yield self
     except BaseException:
@@ -160,25 +162,10 @@ class TransactionalWriter:
       raise
     cache, self._cache = self._cache, None
     for name, rows in cache.items():
-      if rows:
-        self.datasets[name]._write(rows)
+      self._write(name, rows)
     self.f.flush()
 
-
-class TransactionalDataset:
-  """A dataset handed out by TransactionalWriter.init()."""
-
-  def __init__(self, writer, name, dataset_kwargs, init_hook):
-    self.writer = writer
-    self.name = name
-    self.dataset_kwargs = {} if dataset_kwargs is None else dataset_kwargs
-    self.init_hook = init_hook
-    self.dataset = None
-
-  def append(self, item):
-    self.writer.append(self.name, item)
-
-  def _write(self, rows):
+  def _write(self, name, rows):
     first = rows[0]
     if isinstance(first, np.ndarray):
       shape, dtype = first.shape, first.dtype
@@ -187,17 +174,13 @@ class TransactionalDataset:
       shape, dtype = (), type(first)
       block = np.array(rows, dtype=dtype)
 
-    if self.dataset is None:
-      if self.init_hook is not None:
-        self.init_hook(self, shape=shape, dtype=dtype)
-      if any(self.dataset_kwargs.get(k) is not None for k in ("maxshape", "dtype", "shape")):
-        raise ValueError(f"dataset_kwargs of {self.name!r} must not set maxshape/dtype/shape")
-      self.dataset = self.writer.f.create_dataset(
-        self.name, shape=(0, *shape), maxshape=(None, *shape), dtype=dtype, **self.dataset_kwargs)
-
-    n = len(self.dataset)
-    self.dataset.resize(n + len(block), axis=0)
-    self.dataset[n:] = block
+    if name not in self.f:
+      self.f.create_dataset(
+        name, shape=(0, *shape), maxshape=(None, *shape), dtype=dtype, **self.datasets[name])
+    ds = self.f[name]
+    n = len(ds)
+    ds.resize(n + len(block), axis=0)
+    ds[n:] = block
 
 
 def check_shape(x, pattern):
