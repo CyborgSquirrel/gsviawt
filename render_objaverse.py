@@ -491,7 +491,7 @@ def run(cfg):
 
     # when re-rendering depth only, the RGB images are copied from the source
     render_rgb = cfg.render and (src is None or cfg.source_rerender_rgb)
-    writer = stack.enter_context(TransactionalWriter(hf))
+    writer = TransactionalWriter(hf)
     if render_rgb:
       writer.init("images", dataset_kwargs=img_kw)
     writer.init("camera_pose")
