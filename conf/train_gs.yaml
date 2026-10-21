@@ -261,6 +261,10 @@ loss:
   direct_color_weight: 0.0     # only touches sh_dc's gradient (SH_C0*sh_dc+0.5
                                  # vs. gt's flat RGB) -- sh_rest has no GT signal
 
+# Each of orbit / panel / scale_layers takes exactly one of every_n_epochs / every_n_steps /
+# every_n_seconds (TRAINING seconds on module.TrainClock, e.g. +callbacks.orbit.every_n_seconds=600 after
+# callbacks.orbit.every_n_epochs=null). For the checkpoint, set _target_=module.TimedCheckpoint,
+# every_n_epochs=null and every_n_seconds (wall-clock seconds), or use ModelCheckpoint's own train_time_interval.
 callbacks:
   # https://pytorch-lightning.readthedocs.io/en/2.6.1/pytorch/api/lightning.pytorch.callbacks.LearningRateMonitor.html
   lr_monitor:

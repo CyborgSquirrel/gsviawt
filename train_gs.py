@@ -1058,12 +1058,15 @@ def main(cfg: DictConfig) -> None:
   with open_dict(cfg):
     cfg.model.num_params = sum(p.numel() for p in model.parameters())
 
-  # max_seconds: a TrainClock stops the run after that much training time; a time-driven LR scheduler
-  # (sched=time_wsd, module.TimeWSD) reads the same clock, which configure_optimizers hands it
+  # A TrainClock stops the run after max_seconds of training time; a time-driven LR scheduler
+  # (sched=time_wsd, module.TimeWSD) reads the same clock, which configure_optimizers hands it; so do
+  # callbacks with an every_n_seconds cadence (the clock then only counts, if max_seconds is null)
   clock = None
   if cfg.sched is not None and needs_clock(hydra.utils.instantiate(cfg.sched)) and cfg.max_seconds is None:
     raise SystemExit("this LR scheduler is driven by the training time: set max_seconds")
-  if cfg.max_seconds is not None:
+  seconds_cadence = any(
+    cb is not None and OmegaConf.select(cb, "every_n_seconds") is not None for cb in cfg.callbacks.values())
+  if cfg.max_seconds is not None or seconds_cadence:   # no max_seconds: the clock only counts
     clock = TrainClock(max_seconds=cfg.max_seconds)
   model.clock = clock
 
