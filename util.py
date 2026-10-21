@@ -1,5 +1,6 @@
 import contextlib as ctl
 import logging
+import math
 import time
 
 import h5py
@@ -117,6 +118,17 @@ class LazyDataset:
     self.idx += 1
 
 
+def row_chunks(shape, dtype, n=1):
+  """Chunk shape of n rows of a dataset whose rows have the given shape: (n, *shape)."""
+  return (n, *shape)
+
+
+def size_chunks(shape, dtype, size=64 * 1024):
+  """Chunk shape of as many rows as come closest to `size` bytes (at least 1 row)."""
+  row_bytes = math.prod(shape) * np.dtype(dtype).itemsize
+  return (max(1, round(size / row_bytes)), *shape)
+
+
 class TransactionalWriter:
   """Appends rows to resizable datasets of an open h5py.File, a transaction at a time.
 
@@ -129,9 +141,10 @@ class TransactionalWriter:
   # leaving the writer trims every dataset to the rows actually written
 
   append() outside a transaction raises. A dataset is created on the first transaction that
-  appends to it (shape/dtype come from the first row; one row per chunk unless dataset_kwargs
-  sets chunks) and its capacity doubles until a transaction's rows fit, so until the writer is
-  closed the datasets are longer than the rows written."""
+  appends to it (shape/dtype come from the first row) and its capacity doubles until a
+  transaction's rows fit, so until the writer is closed the datasets are longer than the rows
+  written. dataset_kwargs["chunks"] is a chunk shape or a function (row shape, dtype) -> chunk
+  shape, e.g. functools.partial(size_chunks, size=...); the default is row_chunks (one row)."""
 
   def __init__(self, f: h5py.File):
     self.f = f
@@ -186,9 +199,12 @@ class TransactionalWriter:
       block = np.array(rows, dtype=dtype)
 
     if name not in self.rows:
+      kwargs = dict(self.datasets[name])
+      chunks = kwargs.pop("chunks", row_chunks)
+      if callable(chunks):
+        chunks = chunks(shape, dtype)
       self.f.create_dataset(
-        name, shape=(len(block), *shape), maxshape=(None, *shape), dtype=dtype,
-        **{"chunks": (1, *shape), **self.datasets[name]})
+        name, shape=(len(block), *shape), maxshape=(None, *shape), dtype=dtype, chunks=chunks, **kwargs)
       self.rows[name] = 0
     ds = self.f[name]
     n = self.rows[name]

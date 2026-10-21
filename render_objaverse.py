@@ -428,7 +428,7 @@ def run(cfg):
   import hydra
   import h5py
   from omegaconf import OmegaConf
-  from util import TransactionalWriter
+  from util import TransactionalWriter, size_chunks
 
   logging.basicConfig(level=logging.INFO)
 
@@ -502,7 +502,7 @@ def run(cfg):
     if cfg.render:
       writer.init("image_intrinsics")  # matches images
     writer.init("depth_peel", dataset_kwargs=depth_kw)
-    writer.init("mesh_index")
+    writer.init("mesh_index", dataset_kwargs=dict(chunks=size_chunks))
     writer.init("depth_scale")
 
     failed = []
