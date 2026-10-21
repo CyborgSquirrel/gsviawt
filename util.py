@@ -1,6 +1,7 @@
 import contextlib as ctl
 import logging
 import math
+import os
 import time
 
 import h5py
@@ -118,6 +119,11 @@ class LazyDataset:
     self.idx += 1
 
 
+def txn_lock_path(h5_path):
+  """The marker TransactionalWriter keeps next to an h5 file while it writes a transaction."""
+  return f"{h5_path}.txn"
+
+
 def row_chunks(shape, dtype, n=1):
   """Chunk shape of n rows of a dataset whose rows have the given shape: (n, *shape)."""
   return (n, *shape)
@@ -132,32 +138,29 @@ def size_chunks(shape, dtype, size=64 * 1024):
 class TransactionalWriter:
   """Appends rows to resizable datasets of an open h5py.File, a transaction at a time.
 
-  with TransactionalWriter(f) as w:
-    w.init("depth", dataset_kwargs=dict(compression="gzip"))
-    with w.transaction():
-      w.append("depth", row)     # only cached in memory
-    # leaving the transaction block writes every cached row to the file, then flushes it; if
-    # the block raises, the cache is dropped and the file is untouched
-  # leaving the writer trims every dataset to the rows actually written
+  w = TransactionalWriter(f)
+  w.init("depth", dataset_kwargs=dict(compression="gzip"))
+  with w.transaction():
+    w.append("depth", row)     # only cached in memory
+  # leaving the block writes every cached row to the file, then flushes it; if the block
+  # raises, the cache is dropped and the file is untouched
+
+  While the rows are being written (and only then) the marker file txn_lock_path(f.filename)
+  exists: created right before the first dataset is touched, removed after the flush. A marker
+  left next to a file means a writer died, or failed, mid-write and the file can't be trusted;
+  a file without one holds exactly its committed transactions. Starting a commit while the
+  marker exists raises FileExistsError.
 
   append() outside a transaction raises. A dataset is created on the first transaction that
-  appends to it (shape/dtype come from the first row) and its capacity doubles until a
-  transaction's rows fit, so until the writer is closed the datasets are longer than the rows
-  written. init's `chunks` is a chunk shape or a function (row shape, dtype) -> chunk shape, e.g.
-  functools.partial(size_chunks, size=...); the default is row_chunks (one row)."""
+  appends to it (shape/dtype come from the first row) and is resized to exactly the rows written
+  at every transaction, so after any completed transaction the file holds precisely the rows
+  committed so far. init's `chunks` is a chunk shape or a function (row shape, dtype) -> chunk
+  shape, e.g. functools.partial(size_chunks, size=...); the default is row_chunks (one row)."""
 
   def __init__(self, f: h5py.File):
     self.f = f
     self.datasets = {}   # name -> (chunks, dataset_kwargs); "name in w.datasets" = registered
-    self.rows = {}       # name -> rows written so far (<= the dataset's capacity)
     self._cache = None
-
-  def __enter__(self):
-    return self
-
-  def __exit__(self, exc_type, exc_value, traceback):
-    for name, n in self.rows.items():
-      self.f[name].resize(n, axis=0)
 
   def init(self, name, *, chunks=row_chunks, dataset_kwargs=None):
     if name in self.datasets:
@@ -185,9 +188,14 @@ class TransactionalWriter:
       self._cache = None
       raise
     cache, self._cache = self._cache, None
-    for name, rows in cache.items():
-      self._write(name, rows)
+    if cache:
+      lock = txn_lock_path(self.f.filename)
+      open(lock, "x").close()
+      for name, rows in cache.items():
+        self._write(name, rows)
     self.f.flush()
+    if cache:
+      os.remove(lock)
 
   def _write(self, name, rows):
     first = rows[0]
@@ -198,22 +206,16 @@ class TransactionalWriter:
       shape, dtype = (), type(first)
       block = np.array(rows, dtype=dtype)
 
-    if name not in self.rows:
+    if name not in self.f:
       chunks, kwargs = self.datasets[name]
       if callable(chunks):
         chunks = chunks(shape, dtype)
       self.f.create_dataset(
-        name, shape=(len(block), *shape), maxshape=(None, *shape), dtype=dtype, chunks=chunks, **kwargs)
-      self.rows[name] = 0
+        name, shape=(0, *shape), maxshape=(None, *shape), dtype=dtype, chunks=chunks, **kwargs)
     ds = self.f[name]
-    n = self.rows[name]
-    capacity = len(ds)
-    while capacity < n + len(block):
-      capacity *= 2
-    if capacity != len(ds):
-      ds.resize(capacity, axis=0)
-    ds[n:n + len(block)] = block
-    self.rows[name] = n + len(block)
+    n = len(ds)
+    ds.resize(n + len(block), axis=0)
+    ds[n:] = block
 
 
 def check_shape(x, pattern):
