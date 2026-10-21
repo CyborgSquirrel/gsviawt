@@ -451,6 +451,16 @@ def run(cfg):
         raise ValueError("source_max_meshes needs source_rerender_rgb=true "
                          "(copied images can't be subset)")
 
+    # Queue mode: the config (and the mesh list the jobs index into) comes from the queue; only this
+    # worker's own keys come from the command line.
+    queue = None
+    if cfg.queue_path is not None:
+      if src is not None:
+        raise ValueError("queue_path doesn't combine with source_path")
+      from job_queue import JobQueue
+      queue = JobQueue(cfg.queue_path)
+      cfg = OmegaConf.merge(queue.get_meta("config"), {k: cfg[k] for k in ("queue_path", "queue_worker", "output_path")})
+
     scene = bpy.context.scene
     # Per-engine settings are all set up front; _render_mesh switches
     # scene.render.engine per pass (RGB: cfg.render_engine, depth: Cycles).
@@ -467,12 +477,8 @@ def run(cfg):
       raise ValueError("depth_width/depth_height must be set (config default is "
                        "${width}/${height}; use that to match the RGB pass)")
     DW, DH = int(cfg.depth_width), int(cfg.depth_height)
-    queue = worker = None
-    if cfg.queue_path is not None:
-      if src is not None:
-        raise ValueError("queue_path doesn't combine with source_path")
-      from job_queue import JobQueue
-      queue = JobQueue(cfg.queue_path)
+    worker = None
+    if queue is not None:
       worker = str(os.getpid()) if cfg.queue_worker is None else str(cfg.queue_worker)
     if src is None:
       view_strategy = hydra.utils.instantiate(cfg.view_strategy)
