@@ -45,6 +45,14 @@ source_rerender_rgb: false
 # Requires source_rerender_rgb, since copied images can't be subset.
 source_max_meshes: null
 
+# Queue mode: instead of rendering every mesh of mesh_strategy, claim meshes (one job = one mesh with
+# all its views) from a job_queue.JobQueue sqlite file whose "meshes" meta entry is the full mesh list
+# (jobs carry {"mesh_index": i}); the rows keep that global mesh_index. A job is marked done only after
+# its rows are committed to output_path. Give every worker process its own output_path.
+queue_path: null
+queue_worker: null       # this worker's id in the queue (null = the process id)
+queue_max_meshes: null   # exit after claiming this many meshes (null = until none is ready)
+
 # --- Objaverse blender_script.py conventions ---
 # Recenter the object on the origin and scale so its longest bbox axis == 1
 # (Objaverse / Shap-E "unit cube" normalisation). With a fixed
