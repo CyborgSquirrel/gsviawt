@@ -1,0 +1,9 @@
+# Mesh split by explicit mesh path (the `mesh_paths` entry of the render h5),
+# e.g. to pin one fixed held-out set while the training set grows:
+#   data/mesh_split=names data.mesh_split.val_meshes='[/path/a.glb,/path/b.glb]'
+# train_meshes null: every mesh not in val_meshes. See
+# gs_dataset.split_meshes_by_names.
+_target_: gs_dataset.split_meshes_by_names
+_partial_: true
+val_meshes: ???
+train_meshes: null
