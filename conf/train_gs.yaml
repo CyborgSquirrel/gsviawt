@@ -5,6 +5,9 @@
 defaults:
   - data/mesh_split: fraction
   - data/view_split: fraction
+  # LR scheduler: step_cosine (warmup + cosine over total_steps), time_wsd (warmup-stable-decay over
+  # max_seconds of training time; also stops the run -- see conf/sched/time_wsd.yaml), or sched=null for none
+  - sched: step_cosine
   - _self_
 
 # Directory for everything a single run produces.
@@ -306,24 +309,6 @@ optim:
   _target_: torch.optim.AdamW
   _partial_: true
   lr: 1e-4
-
-sched:
-  _target_: module.WarmupCosineAnnealingLR
-  _partial_: true
-  total_steps: ${total_steps}
-  warmup_steps: ${eval:'int(${total_steps} * 0.05)'}
-  min_lr: 1.0e-6
-
-# Time-budgeted training (module.TimeBudget): the LR follows a warmup-stable-decay schedule over
-# max_seconds of TRAINING time (batch waits, forward, backward, optimizer step -- not validation, checkpoint
-# saves or the preview callbacks), then the run stops, validates and writes final.ckpt to the output
-# dir. Replaces the LR scheduler (pass sched=null), and trainer.max_epochs should be large enough not
-# to end the run first. null = off. Also logs train_seconds with every wandb row.
-time_budget:
-  max_seconds: null
-  warmup_fraction: 0.05    # linear warmup over this fraction of max_seconds
-  decay_fraction: 0.1      # cosine decay over the last fraction of max_seconds
-  min_lr: 1.0e-6
 
 wandb:
   project: gsviawt

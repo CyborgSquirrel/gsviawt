@@ -27,6 +27,7 @@ by fit_3dgs.py's layered mode, orbit_video.py and gs_decoder.py.
 """
 
 import contextlib as ctl
+import inspect
 import logging
 import math
 import os
@@ -195,8 +196,8 @@ def time_wsd_progress(seconds, max_seconds, warmup_fraction, decay_fraction):
   return 0.5 * (1.0 + math.cos(math.pi * (seconds - decay_start) / (max_seconds - decay_start)))
 
 
-class TimeBudget(pl.Callback):
-  """A warmup-stable-decay learning rate driven by the TRAINING time spent, with a hard stop.
+class TrainClock(pl.Callback):
+  """Counts the TRAINING time spent, for time-driven LR schedules (TimeWSD) and a hard stop.
 
   The clock counts what a training run pays for: the wait for each batch, the forward pass, the
   backward pass and the optimizer step. It does not count validation, checkpoint saves, or the
@@ -209,22 +210,14 @@ class TimeBudget(pl.Callback):
   checks that the order is right. The clock also restarts at the start of every epoch, after the
   validation and checkpoint saves of the previous one.
 
-  The LR is set at on_train_batch_start from the clock: min_lr + (peak - min_lr) * time_wsd_progress,
-  the peak being each param group's LR when training starts. It replaces an LR scheduler (don't
-  configure one). Once max_seconds of training time are spent the trainer is asked to stop; Lightning
-  then still runs its validation, and final.ckpt is written to the trainer's default_root_dir.
+  With max_seconds set, the trainer is asked to stop once that much training time is spent; Lightning
+  then still runs its validation, and final.ckpt is written to the trainer's default_root_dir. The
+  elapsed seconds are saved in checkpoints, so a resumed run continues the clock."""
 
-  The elapsed seconds and the peak LRs are saved in checkpoints, so a resumed run continues the
-  schedule."""
-
-  def __init__(self, max_seconds, warmup_fraction=0.05, decay_fraction=0.1, min_lr=1e-6):
-    self.max_seconds = float(max_seconds)
-    self.warmup_fraction = float(warmup_fraction)
-    self.decay_fraction = float(decay_fraction)
-    self.min_lr = float(min_lr)
+  def __init__(self, max_seconds=None):
+    self.max_seconds = None if max_seconds is None else float(max_seconds)
     self._elapsed = 0.0
     self._anchor = None   # when the current stretch of training time began (None: not counting)
-    self._peak_lrs = None
     self._stopped = False
 
   def seconds(self):
@@ -232,14 +225,14 @@ class TimeBudget(pl.Callback):
     return self._elapsed + (0.0 if self._anchor is None else time.monotonic() - self._anchor)
 
   def tail(self):
-    return TimeBudgetTail(self)
+    return TrainClockTail(self)
 
   def on_fit_start(self, trainer, pl_module):
     callbacks = trainer.callbacks
     after = callbacks[callbacks.index(self) + 1:]
-    tails = [c for c in after if isinstance(c, TimeBudgetTail) and c.budget is self]
+    tails = [c for c in after if isinstance(c, TrainClockTail) and c.clock is self]
     if callbacks[0] is not self or len(tails) != 1:
-      raise RuntimeError("TimeBudget must be the first callback and its tail() must come after it, after the other callbacks")
+      raise RuntimeError("TrainClock must be the first callback and its tail() must come after it, after the other callbacks")
 
   def on_train_epoch_start(self, trainer, pl_module):
     self._anchor = time.monotonic()
@@ -247,18 +240,10 @@ class TimeBudget(pl.Callback):
   def on_validation_start(self, trainer, pl_module):
     self._anchor = None
 
-  def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
-    optimizer = trainer.optimizers[0]
-    if self._peak_lrs is None:
-      self._peak_lrs = [group["lr"] for group in optimizer.param_groups]
-    progress = time_wsd_progress(self.seconds(), self.max_seconds, self.warmup_fraction, self.decay_fraction)
-    for group, peak in zip(optimizer.param_groups, self._peak_lrs):
-      group["lr"] = self.min_lr + (peak - self.min_lr) * progress
-
   def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
     self._elapsed = self.seconds()
     self._anchor = None
-    if self._elapsed >= self.max_seconds:
+    if self.max_seconds is not None and self._elapsed >= self.max_seconds:
       self._stopped = True
       trainer.should_stop = True
 
@@ -267,20 +252,58 @@ class TimeBudget(pl.Callback):
       trainer.save_checkpoint(os.path.join(trainer.default_root_dir, "final.ckpt"))
 
   def state_dict(self):
-    return {"elapsed": self._elapsed, "peak_lrs": self._peak_lrs}
+    return {"elapsed": self._elapsed}
 
   def load_state_dict(self, state):
-    self._elapsed, self._peak_lrs = state["elapsed"], state["peak_lrs"]
+    self._elapsed = state["elapsed"]
 
 
-class TimeBudgetTail(pl.Callback):
-  """Restarts the TimeBudget clock once every other callback has run -- see TimeBudget."""
+class TrainClockTail(pl.Callback):
+  """Restarts the TrainClock once every other callback has run -- see TrainClock."""
 
-  def __init__(self, budget):
-    self.budget = budget
+  def __init__(self, clock):
+    self.clock = clock
 
   def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-    self.budget._anchor = time.monotonic()
+    self.clock._anchor = time.monotonic()
+
+
+class TimeWSD(torch.optim.lr_scheduler.LRScheduler):
+  """Warmup-stable-decay LR driven by a TrainClock instead of a step count: the LR goes
+  min_lr -> peak over the first warmup_fraction of max_seconds, stays at the peak, and follows a
+  cosine back down to min_lr over the last decay_fraction (peak = each param group's LR when the
+  scheduler is made). Step it once per optimizer step like any scheduler; the LR it sets depends on
+  the clock's time at that moment. Pair it with TrainClock(max_seconds) to stop the run at the end of
+  the decay (train_gs.py does)."""
+
+  def __init__(self, optimizer, clock, max_seconds, warmup_fraction=0.05, decay_fraction=0.1, min_lr=1e-6):
+    self.clock = clock
+    self.max_seconds = float(max_seconds)
+    self.warmup_fraction = float(warmup_fraction)
+    self.decay_fraction = float(decay_fraction)
+    self.min_lr = float(min_lr)
+    super().__init__(optimizer)
+
+  def get_lr(self):
+    progress = time_wsd_progress(self.clock.seconds(), self.max_seconds, self.warmup_fraction, self.decay_fraction)
+    return [self.min_lr + (peak - self.min_lr) * progress for peak in self.base_lrs]
+
+  def state_dict(self):
+    return {k: v for k, v in super().state_dict().items() if k != "clock"}   # the clock lives in its own callback
+
+
+def needs_clock(scheduler_factory):
+  """Whether a scheduler (class or functools.partial of one) takes a TrainClock."""
+  return "clock" in inspect.signature(scheduler_factory).parameters
+
+
+def make_scheduler(factory, optimizer, clock=None):
+  """factory(optimizer), or factory(optimizer, clock=clock) for a scheduler that takes a TrainClock."""
+  if not needs_clock(factory):
+    return factory(optimizer)
+  if clock is None:
+    raise ValueError("this scheduler needs a TrainClock, but none was given")
+  return factory(optimizer, clock=clock)
 
 
 class WarmupLR(torch.optim.lr_scheduler.LinearLR):

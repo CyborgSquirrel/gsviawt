@@ -59,8 +59,8 @@ from gs_dataset import (OPENGL_TO_OPENCV, GaussH5ValDataset,  # noqa: E402
                         rotate_quats_wxyz, render_catalog, sample_matching_sources)
 from gs_decoder import GaussianResnetDecoder, GSDecoderStack  # noqa: E402
 from gs_encoder import GSResnetEncoder  # noqa: E402
-from module import (DSSIMLoss, ProgressWandbLogger, TimeBudget, WarmupCosineAnnealingLR,  # noqa: E402
-                    _completed_steps)
+from module import (DSSIMLoss, ProgressWandbLogger, TrainClock, WarmupCosineAnnealingLR,  # noqa: E402
+                    _completed_steps, make_scheduler, needs_clock)
 from util import collate_with_batch_size, pipe, set_mode, timed  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -623,6 +623,7 @@ class GSLightningModule(pl.LightningModule):
   def __init__(self, cfg):
     super().__init__()
     self.cfg = cfg
+    self.clock = None   # a module.TrainClock, set by main() for time-driven LR schedulers
     self.views_seen = 0
     self.pixels_seen = 0  # pixels of the supervised target images seen so far (views x H x W)
 
@@ -644,7 +645,7 @@ class GSLightningModule(pl.LightningModule):
     out["optimizer"] = hydra.utils.instantiate(self.cfg.optim)(self.model.parameters())
     if OmegaConf.select(self.cfg, "sched") is not None:
       out["lr_scheduler"] = {
-        "scheduler": hydra.utils.instantiate(self.cfg.sched)(out["optimizer"]),
+        "scheduler": make_scheduler(hydra.utils.instantiate(self.cfg.sched), out["optimizer"], self.clock),
         "interval": "step",
       }
 
@@ -1057,15 +1058,12 @@ def main(cfg: DictConfig) -> None:
   with open_dict(cfg):
     cfg.model.num_params = sum(p.numel() for p in model.parameters())
 
-  # time_budget replaces the LR scheduler: a warmup-stable-decay LR driven by training seconds, which
-  # also stops the run (see module.TimeBudget)
-  budget = None
-  if cfg.time_budget.max_seconds is not None:
-    if cfg.sched is not None:
-      raise SystemExit("time_budget.max_seconds replaces the LR scheduler: also pass sched=null")
-    budget = TimeBudget(
-      max_seconds=cfg.time_budget.max_seconds, warmup_fraction=cfg.time_budget.warmup_fraction,
-      decay_fraction=cfg.time_budget.decay_fraction, min_lr=cfg.time_budget.min_lr)
+  # A time-driven LR scheduler (sched=time_wsd, module.TimeWSD) reads a TrainClock, which also stops the
+  # run at sched.max_seconds; configure_optimizers hands it the clock
+  clock = None
+  if cfg.sched is not None and needs_clock(hydra.utils.instantiate(cfg.sched)):
+    clock = TrainClock(max_seconds=cfg.sched.max_seconds)
+  model.clock = clock
 
   logger = False
   if cfg.wandb.mode != "disabled":
@@ -1089,15 +1087,15 @@ def main(cfg: DictConfig) -> None:
       experiment=wandb_run,
       progress_fn=lambda: {
         "views_seen": model.views_seen, "pixels_seen": model.pixels_seen,
-        **({} if budget is None else {"train_seconds": budget.seconds()}),
+        **({} if clock is None else {"train_seconds": clock.seconds()}),
       },
       step_fn=lambda: _completed_steps(model.trainer, model),
     )
 
   callbacks = []
   callbacks += list(hydra.utils.instantiate(cfg.callbacks).values())
-  if budget is not None:
-    callbacks = [budget, *callbacks, budget.tail()]   # first and last: see module.TimeBudget
+  if clock is not None:
+    callbacks = [clock, *callbacks, clock.tail()]   # first and last: see module.TrainClock
 
   trainer = pl.Trainer(
     **OmegaConf.to_container(cfg.trainer, resolve=True),

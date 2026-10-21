@@ -1,0 +1,11 @@
+# Time-driven warmup-stable-decay (module.TimeWSD). The LR follows the schedule over max_seconds of
+# TRAINING time (batch waits, forward, backward, optimizer step -- not validation, checkpoint saves or
+# the preview callbacks, see module.TrainClock); then the run stops, validates, and writes final.ckpt to
+# the output dir. trainer.max_epochs should be large enough not to end the run first. Every wandb row
+# also gets train_seconds.
+_target_: module.TimeWSD
+_partial_: true
+max_seconds: ???          # required, e.g. sched.max_seconds=3600
+warmup_fraction: 0.05     # linear warmup over this fraction of max_seconds
+decay_fraction: 0.1       # cosine decay over the last fraction of max_seconds
+min_lr: 1.0e-6
