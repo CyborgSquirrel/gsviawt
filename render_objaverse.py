@@ -481,8 +481,8 @@ def run(cfg):
     logger.info("RGB %dx%d, depth-peel %dx%d", W, H, DW, DH)
 
     os.makedirs(os.path.dirname(cfg.output_path) or ".", exist_ok=True)
-    img_kw = dict(chunks=(1, H, W, 4), compression="gzip", compression_opts=4)
-    depth_kw = dict(chunks=(1, DH, DW, Lmax), compression="gzip", compression_opts=4)
+    img_kw = dict(compression="gzip", compression_opts=4)
+    depth_kw = dict(compression="gzip", compression_opts=4)
 
     tmp = stack.enter_context(TemporaryDirectory())
     hf = stack.enter_context(h5py.File(cfg.output_path, "w"))
@@ -502,7 +502,7 @@ def run(cfg):
     if cfg.render:
       writer.init("image_intrinsics")  # matches images
     writer.init("depth_peel", dataset_kwargs=depth_kw)
-    writer.init("mesh_index", dataset_kwargs=dict(chunks=size_chunks))
+    writer.init("mesh_index", chunks=size_chunks)
     writer.init("depth_scale")
 
     failed = []

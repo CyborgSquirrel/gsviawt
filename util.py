@@ -143,12 +143,12 @@ class TransactionalWriter:
   append() outside a transaction raises. A dataset is created on the first transaction that
   appends to it (shape/dtype come from the first row) and its capacity doubles until a
   transaction's rows fit, so until the writer is closed the datasets are longer than the rows
-  written. dataset_kwargs["chunks"] is a chunk shape or a function (row shape, dtype) -> chunk
-  shape, e.g. functools.partial(size_chunks, size=...); the default is row_chunks (one row)."""
+  written. init's `chunks` is a chunk shape or a function (row shape, dtype) -> chunk shape, e.g.
+  functools.partial(size_chunks, size=...); the default is row_chunks (one row)."""
 
   def __init__(self, f: h5py.File):
     self.f = f
-    self.datasets = {}   # name -> dataset_kwargs; "name in w.datasets" = registered
+    self.datasets = {}   # name -> (chunks, dataset_kwargs); "name in w.datasets" = registered
     self.rows = {}       # name -> rows written so far (<= the dataset's capacity)
     self._cache = None
 
@@ -159,13 +159,13 @@ class TransactionalWriter:
     for name, n in self.rows.items():
       self.f[name].resize(n, axis=0)
 
-  def init(self, name, *, dataset_kwargs=None):
+  def init(self, name, *, chunks=row_chunks, dataset_kwargs=None):
     if name in self.datasets:
       raise ValueError(f"dataset {name!r} already registered")
     kwargs = {} if dataset_kwargs is None else dict(dataset_kwargs)
-    if any(kwargs.get(k) is not None for k in ("maxshape", "dtype", "shape")):
-      raise ValueError(f"dataset_kwargs of {name!r} must not set maxshape/dtype/shape")
-    self.datasets[name] = kwargs
+    if any(kwargs.get(k) is not None for k in ("chunks", "maxshape", "dtype", "shape")):
+      raise ValueError(f"dataset_kwargs of {name!r} must not set chunks/maxshape/dtype/shape")
+    self.datasets[name] = (chunks, kwargs)
 
   def append(self, name, item):
     if self._cache is None:
@@ -199,8 +199,7 @@ class TransactionalWriter:
       block = np.array(rows, dtype=dtype)
 
     if name not in self.rows:
-      kwargs = dict(self.datasets[name])
-      chunks = kwargs.pop("chunks", row_chunks)
+      chunks, kwargs = self.datasets[name]
       if callable(chunks):
         chunks = chunks(shape, dtype)
       self.f.create_dataset(
