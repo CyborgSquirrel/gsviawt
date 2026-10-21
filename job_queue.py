@@ -11,7 +11,8 @@ A claim is one atomic UPDATE ... RETURNING, so two processes never get the same 
 resumed implicitly: a job claimed by a worker that died stays "claimed" (with its worker and claim
 time) until requeue_stale() is called with the workers that are still alive. done()/fail() only
 take effect for the worker that holds the claim, so a worker that was presumed dead can't undo a
-requeue. A job is whatever JSON payload the caller wants; `meta` holds shared JSON values (e.g. the
+requeue. Every claim counts as an attempt; fail_exhausted() retires jobs that keep killing their
+workers. A job is whatever JSON payload the caller wants; `meta` holds shared JSON values (e.g. the
 full mesh list the jobs index into).
 """
 
@@ -31,7 +32,8 @@ class JobQueue:
     self.db.execute(
       "CREATE TABLE IF NOT EXISTS jobs ("
       " id INTEGER PRIMARY KEY, priority REAL NOT NULL, payload TEXT NOT NULL,"
-      " status TEXT NOT NULL DEFAULT 'ready', worker TEXT, claimed_at REAL, error TEXT)")
+      " status TEXT NOT NULL DEFAULT 'ready', worker TEXT, claimed_at REAL, error TEXT,"
+      " attempts INTEGER NOT NULL DEFAULT 0)")
     self.db.execute("CREATE INDEX IF NOT EXISTS jobs_ready ON jobs (status, priority DESC, id)")
     self.db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
 
@@ -60,7 +62,7 @@ class JobQueue:
 
   def claim(self, worker):
     row = self.db.execute(
-      "UPDATE jobs SET status = 'claimed', worker = ?, claimed_at = ?"
+      "UPDATE jobs SET status = 'claimed', worker = ?, claimed_at = ?, attempts = attempts + 1"
       " WHERE id = (SELECT id FROM jobs WHERE status = 'ready' ORDER BY priority DESC, id LIMIT 1)"
       " RETURNING id, payload", (str(worker), time.time())).fetchone()
     if row is None:
@@ -88,6 +90,13 @@ class JobQueue:
     cur = self.db.execute(
       "UPDATE jobs SET status = 'ready', worker = NULL, claimed_at = NULL WHERE status = 'claimed'" + cond, alive)
     return cur.rowcount
+
+  def fail_exhausted(self, max_attempts):
+    """Ready jobs that were already claimed max_attempts times (each claim that wasn't finished was
+    a worker dying on it) -> failed for good. Returns their ids."""
+    return [i for (i,) in self.db.execute(
+      "UPDATE jobs SET status = 'failed', error = 'claimed ' || attempts || ' times without finishing'"
+      " WHERE status = 'ready' AND attempts >= ? RETURNING id", (max_attempts,)).fetchall()]
 
   def claims(self):
     """(job id, worker, claimed_at) of every claimed job -- to spot jobs held for suspiciously long."""
