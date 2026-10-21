@@ -428,7 +428,7 @@ def run(cfg):
   import hydra
   import h5py
   from omegaconf import OmegaConf
-  from util import LazyDataset
+  from util import TransactionalWriter
 
   logging.basicConfig(level=logging.INFO)
 
@@ -491,16 +491,17 @@ def run(cfg):
 
     # when re-rendering depth only, the RGB images are copied from the source
     render_rgb = cfg.render and (src is None or cfg.source_rerender_rgb)
-    ds_img = stack.enter_context(LazyDataset(hf, "images", dataset_kwargs=img_kw)) if render_rgb else None
-    ds_pose = stack.enter_context(LazyDataset(hf, "camera_pose"))
+    writer = TransactionalWriter(hf)
+    ds_img = writer.init("images", dataset_kwargs=img_kw) if render_rgb else None
+    ds_pose = writer.init("camera_pose")
     # two intrinsics datasets, both always written (identical when the RGB and
     # depth-peel resolutions match) so consumers never have to guess which K a
     # dataset goes with.
-    ds_depth_intr = stack.enter_context(LazyDataset(hf, "depth_intrinsics"))  # matches depth_peel
-    ds_img_intr = stack.enter_context(LazyDataset(hf, "image_intrinsics")) if cfg.render else None  # matches images
-    ds_depth = stack.enter_context(LazyDataset(hf, "depth_peel", dataset_kwargs=depth_kw))
-    ds_mesh = stack.enter_context(LazyDataset(hf, "mesh_index"))
-    ds_scale = stack.enter_context(LazyDataset(hf, "depth_scale"))
+    ds_depth_intr = writer.init("depth_intrinsics")  # matches depth_peel
+    ds_img_intr = writer.init("image_intrinsics") if cfg.render else None  # matches images
+    ds_depth = writer.init("depth_peel", dataset_kwargs=depth_kw)
+    ds_mesh = writer.init("mesh_index")
+    ds_scale = writer.init("depth_scale")
 
     failed = []
     for mi, mesh_path in enumerate(meshes):
@@ -508,8 +509,9 @@ def run(cfg):
       if not views:
         continue  # re-render: mesh has no rows in the source (it failed there)
       try:
-        _render_mesh(cfg, scene, mi, mesh_path, views, W, H, DW, DH, Lmax, tmp,
-                     ds_img, ds_pose, ds_depth_intr, ds_img_intr, ds_depth, ds_mesh, ds_scale)
+        with writer.transaction():
+          _render_mesh(cfg, scene, mi, mesh_path, views, W, H, DW, DH, Lmax, tmp,
+                       ds_img, ds_pose, ds_depth_intr, ds_img_intr, ds_depth, ds_mesh, ds_scale)
       except Exception:
         if src is not None:
           raise  # skipping would misalign rows with the copied images
