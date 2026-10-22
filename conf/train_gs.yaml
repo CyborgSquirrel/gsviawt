@@ -47,8 +47,9 @@ data:
   depth_size: null
   # features: the head's input is read from features_h5. image: items carry the source view's RGB
   # image instead (model.backbone must be set); features_h5 then only lists the volumes
-  # (view_indices, mesh_index, source_h5) -- its features are not read.
-  input: features
+  # (view_indices, mesh_index, source_h5) -- its features are not read. features_image: both
+  # (model.rgb_patch).
+  input: features           # features | image | features_image (both: model.rgb_patch)
   image_size: 504           # side of the image fed to the backbone (input: image), a multiple of 14
 
 model:
@@ -65,6 +66,13 @@ model:
   # width at input_proj_dim + layer_embed_dim for a wide feature, e.g. 4096 channels from
   # 4 DINOv2 blocks. null = off.
   input_proj_dim: null
+  # With input_proj_dim: start the projection as the identity on the first input_proj_dim input
+  # channels (the rest zero), so the model starts out as the one without the extra channels.
+  input_proj_identity_init: false
+  # Concatenate each patch token's own RGB pixels (3 * patch_size^2 channels, in [-1, 1], from the
+  # source image) to its features. Needs data.input=features_image, and feature_dim = the cached
+  # feature dim + 588 (patch_size 14).
+  rgb_patch: false
   # Trainable image encoder in front of the head: the DINOv2 ViT-L/14 of a pretrained MoGe-1
   # (gs_backbone.MoGeBackbone), its last block's tokens as the head's input -- trained together
   # with the head. Needs data.input=image, feature_dim=1024.
