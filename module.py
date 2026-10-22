@@ -295,8 +295,13 @@ class TimeWSD(torch.optim.lr_scheduler.LRScheduler):
     progress = time_wsd_progress(self.clock.seconds(), self.max_seconds, self.warmup_fraction, self.decay_fraction)
     return [self.min_lr + (peak - self.min_lr) * progress for peak in self.base_lrs]
 
+  # The schedule's own parameters come from the config of the run that loads the checkpoint, not from the
+  # one that saved it -- resuming with a larger max_seconds is how a run gets extended. The clock lives in
+  # its own callback.
+  NOT_SAVED = ("clock", "max_seconds", "warmup_fraction", "decay_fraction", "min_lr")
+
   def state_dict(self):
-    return {k: v for k, v in super().state_dict().items() if k != "clock"}   # the clock lives in its own callback
+    return {k: v for k, v in super().state_dict().items() if k not in self.NOT_SAVED}
 
 
 def needs_clock(scheduler_factory):
