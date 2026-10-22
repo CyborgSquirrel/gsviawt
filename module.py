@@ -275,6 +275,40 @@ class TimedCheckpoint(pl.callbacks.ModelCheckpoint):
     super().__init__(train_time_interval=datetime.timedelta(seconds=every_n_seconds), **kwargs)
 
 
+class MilestoneCheckpoints(pl.Callback):
+  """num_checkpoints checkpoints spread evenly over the TrainClock's max_seconds, in TRAINING seconds: a
+  milestone-{k}of{n}-step{step}.ckpt in the trainer's default_root_dir when the clock passes k/n of
+  max_seconds, for k = 1..n-1. The n-th is final.ckpt, which the TrainClock writes when the budget is spent.
+  num_checkpoints=None turns this off; otherwise max_seconds must be set (the trainer must have a
+  TrainClock). The first batch only notes where the clock is, so a resumed run doesn't save at once."""
+
+  def __init__(self, num_checkpoints=None):
+    if num_checkpoints is not None and num_checkpoints < 2:
+      raise ValueError(f"num_checkpoints must be at least 2 (the last one is final.ckpt), got {num_checkpoints}")
+    self.num_checkpoints = num_checkpoints
+    self._index = None
+
+  def _clock(self, trainer):
+    clock = next((c for c in trainer.callbacks if isinstance(c, TrainClock)), None)
+    if clock is None or clock.max_seconds is None:
+      raise RuntimeError("MilestoneCheckpoints needs max_seconds (a TrainClock that stops the run) to count off")
+    return clock
+
+  def on_fit_start(self, trainer, pl_module):
+    if self.num_checkpoints is not None:
+      self._clock(trainer)
+
+  def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+    if self.num_checkpoints is None:
+      return
+    clock = self._clock(trainer)
+    index = min(int(clock.seconds() // (clock.max_seconds / self.num_checkpoints)), self.num_checkpoints - 1)
+    previous, self._index = self._index, index
+    if previous is not None and index > previous:
+      name = f"milestone-{index}of{self.num_checkpoints}-step{trainer.global_step}.ckpt"
+      trainer.save_checkpoint(os.path.join(trainer.default_root_dir, name))
+
+
 class TimeWSD(torch.optim.lr_scheduler.LRScheduler):
   """Warmup-stable-decay LR driven by a TrainClock instead of a step count: the LR goes
   min_lr -> peak over the first warmup_fraction of max_seconds, stays at the peak, and follows a
