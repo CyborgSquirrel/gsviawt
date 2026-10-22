@@ -1,0 +1,5 @@
+_target_: module.WarmupCosineAnnealingLR
+_partial_: true
+total_steps: ${total_steps}
+warmup_steps: ${eval:'int(${total_steps} * 0.05)'}
+min_lr: 1.0e-6

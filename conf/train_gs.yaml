@@ -5,7 +5,16 @@
 defaults:
   - data/mesh_split: fraction
   - data/view_split: fraction
+  # LR scheduler: step_cosine (warmup + cosine over total_steps), time_wsd (warmup-stable-decay over
+  # max_seconds of training time; also stops the run -- see conf/sched/time_wsd.yaml), or sched=null for none
+  - sched: step_cosine
   - _self_
+
+# Stop after this many seconds of TRAINING time (the optimization pass of each batch: forward, backward,
+# optimizer step -- not validation, checkpoint saves or any callback; see module.TrainClock). The run
+# then validates and writes final.ckpt to the output dir. Also the length of the time_wsd LR schedule
+# (sched=time_wsd needs it). null = no time limit. Every wandb row gets train_seconds when it is set.
+max_seconds: null
 
 # Directory for everything a single run produces.
 output_dirname: 3dgs-model-${now:%Y-%m-%d_%H-%M-%S}
@@ -252,6 +261,10 @@ loss:
   direct_color_weight: 0.0     # only touches sh_dc's gradient (SH_C0*sh_dc+0.5
                                  # vs. gt's flat RGB) -- sh_rest has no GT signal
 
+# Each of orbit / panel / scale_layers takes exactly one of every_n_epochs / every_n_steps /
+# every_n_seconds (TRAINING seconds on module.TrainClock, e.g. +callbacks.orbit.every_n_seconds=600 after
+# callbacks.orbit.every_n_epochs=null). For the checkpoint, set _target_=module.TimedCheckpoint,
+# every_n_epochs=null and every_n_seconds (wall-clock seconds), or use ModelCheckpoint's own train_time_interval.
 callbacks:
   # https://pytorch-lightning.readthedocs.io/en/2.6.1/pytorch/api/lightning.pytorch.callbacks.LearningRateMonitor.html
   lr_monitor:
@@ -306,13 +319,6 @@ optim:
   _target_: torch.optim.AdamW
   _partial_: true
   lr: 1e-4
-
-sched:
-  _target_: module.WarmupCosineAnnealingLR
-  _partial_: true
-  total_steps: ${total_steps}
-  warmup_steps: ${eval:'int(${total_steps} * 0.05)'}
-  min_lr: 1.0e-6
 
 wandb:
   project: gsviawt
