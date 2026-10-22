@@ -61,7 +61,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
 from gs_dataset import (OPENGL_TO_OPENCV, H5Catalog, WTFeatureDataset,  # noqa: E402
                         _EmptyDataset, rotate_quats_wxyz, split_views_per_mesh)
 from gs_backbone import MoGeBackbone  # noqa: E402
-from gs_decoder import PatchGaussianHead  # noqa: E402
+from gs_decoder import PatchGaussianHead, RGBViT  # noqa: E402
 from module import DSSIMLoss, ProgressWandbLogger, _completed_steps  # noqa: E402
 from util import collate_with_batch_size, pipe, set_mode, timed  # noqa: E402
 
@@ -120,17 +120,34 @@ class GSModel(nn.Module):
     self.rgb_patch = bool(cfg.model.get("rgb_patch"))
     self.patch_size = int(cfg.model.patch_size)
 
+    # model.rgb_vit.num_blocks > 0: a ViT trained with the head embeds the source image's patches
+    # and its tokens (rgb_vit.dim channels) are concatenated to the features instead of the raw
+    # pixels; feature_dim is then the cached feature dim + rgb_vit.dim
+    vit = cfg.model.get("rgb_vit")
+    self.rgb_vit = (
+      RGBViT(self.patch_size, int(vit.dim), int(vit.num_blocks), int(vit.num_heads),
+             float(vit.mlp_ratio), float(vit.layer_scale_init),
+             bool(vit.get("checkpoint_activations", False)))
+      if vit is not None and int(vit.num_blocks) > 0 else None
+    )
+    if self.rgb_vit is not None and self.rgb_patch:
+      raise ValueError("model.rgb_patch and model.rgb_vit are exclusive")
+
   def inputs(self, batch, device):
     """The model input of a collated batch: cached features, the source image, or
     (model.rgb_patch) both."""
-    if self.rgb_patch:
+    if self.rgb_patch or self.rgb_vit is not None:
       return batch["features"].to(device), batch["image"].to(device)
     return batch[self.input_key].to(device)
 
   def forward(self, x):
     """x: cached features (B, L, P, D), or with a backbone the source image (B, 3, S, S);
     -> dict of (B, L, C, H, W) Gaussian parameters, H = W = sqrt(P) * patch_size."""
-    if self.rgb_patch:
+    if self.rgb_vit is not None:
+      features, image = x
+      tokens = self.rgb_vit(image)   # (B, 1, P, dim)
+      features = torch.cat([features, tokens.expand(-1, features.shape[1], -1, -1).to(features.dtype)], dim=-1)
+    elif self.rgb_patch:
       features, image = x
       patches = rearrange(
         image * 2 - 1, "b c (h py) (w px) -> b 1 (h w) (py px c)", py=self.patch_size, px=self.patch_size)

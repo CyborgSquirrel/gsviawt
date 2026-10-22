@@ -73,6 +73,18 @@ model:
   # source image) to its features. Needs data.input=features_image, and feature_dim = the cached
   # feature dim + 588 (patch_size 14).
   rgb_patch: false
+  # A small ViT over the source image, trained with the head: the image is cut into 14x14 patches (the
+  # grid of the cached tokens), embedded, and mixed by num_blocks attention blocks (2D RoPE); its
+  # tokens (dim channels, one per patch) are concatenated to every layer's cached tokens in place of
+  # the raw pixels of rgb_patch. Needs data.input=features_image and feature_dim = the cached feature
+  # dim + dim. num_blocks 0 = off.
+  rgb_vit:
+    num_blocks: 0
+    dim: 1024
+    num_heads: 16
+    mlp_ratio: 4.0
+    layer_scale_init: 1.0e-4
+    checkpoint_activations: false   # recompute the ViT blocks in backward (less memory, same numerics)
   # Trainable image encoder in front of the head: the DINOv2 ViT-L/14 of a pretrained MoGe-1
   # (gs_backbone.MoGeBackbone), its last block's tokens as the head's input -- trained together
   # with the head. Needs data.input=image, feature_dim=1024.
