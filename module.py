@@ -303,6 +303,9 @@ class TimeWSD(torch.optim.lr_scheduler.LRScheduler):
   def state_dict(self):
     return {k: v for k, v in super().state_dict().items() if k not in self.NOT_SAVED}
 
+  def load_state_dict(self, state_dict):
+    super().load_state_dict({k: v for k, v in state_dict.items() if k not in self.NOT_SAVED})   # also for older checkpoints
+
 
 def needs_clock(scheduler_factory):
   """Whether a scheduler (class or functools.partial of one) takes a TrainClock."""
