@@ -28,6 +28,10 @@ torch_detect_anomaly: false
 # restores model/optimizer/scheduler state and the trainer's epoch/step
 # counters, then continues training into a fresh output_dir. null: fresh run.
 ckpt_path: null
+# With ckpt_path: true -> drop the checkpoint's saved LR-scheduler state and use the scheduler built from this
+# config (sched=...), e.g. to extend a time_wsd run or warm up again; the optimizer, model and clock are restored
+# as usual. false: the saved state is loaded, and a time_wsd checkpoint with different schedule parameters raises.
+reset_scheduler: false
 
 data:
   features_h5: ???          # required -- a wt_features.py output h5

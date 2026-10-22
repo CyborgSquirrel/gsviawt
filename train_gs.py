@@ -485,6 +485,8 @@ class GSLightningModule(pl.LightningModule):
     # .get: checkpoints written before this hook existed have no such key.
     self.views_seen = checkpoint.get("views_seen", 0)
     self.pixels_seen = checkpoint.get("pixels_seen", 0)
+    if self.cfg.get("reset_scheduler"):
+      checkpoint["lr_schedulers"] = []   # Lightning then restores no scheduler state: the config's scheduler stays as built
 
   def training_step(self, batch, batch_idx):
     return self._step("train", batch, batch_idx)
