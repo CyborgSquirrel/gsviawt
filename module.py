@@ -279,7 +279,9 @@ class TimeWSD(torch.optim.lr_scheduler.LRScheduler):
   """Warmup-stable-decay LR driven by a TrainClock instead of a step count. Over the clock's span
   [start_seconds, max_seconds] the LR goes min_lr -> peak over the first warmup_fraction of the span,
   stays at the peak, and follows a cosine back down to min_lr over the last decay_fraction (peak = each
-  param group's LR when the scheduler is made); before start_seconds it is min_lr. start_seconds=0 is a
+  param group's LR when the scheduler is made); before start_seconds it is min_lr. With cycle_seconds the
+  span is cut into cycles of that length (it must divide the span), each a full warmup -> plateau -> decay,
+  so the LR returns to min_lr and warms up again at every cycle boundary. start_seconds=0 is a
   schedule over the whole run; a run resumed from a decayed checkpoint can warm up again by setting it to
   the clock's value there. Step it once per optimizer step like any scheduler; the LR it sets depends on
   the clock's time at that moment. Pair it with TrainClock(max_seconds) to stop the run at the end of
@@ -288,14 +290,19 @@ class TimeWSD(torch.optim.lr_scheduler.LRScheduler):
   The schedule's parameters are saved with the scheduler's state, and loading a state saved with
   different ones raises: resume with reset_scheduler=true (train_gs.py) to take the config's instead."""
 
-  PARAMS = ("max_seconds", "start_seconds", "warmup_fraction", "decay_fraction", "min_lr")
+  PARAMS = ("max_seconds", "start_seconds", "cycle_seconds", "warmup_fraction", "decay_fraction", "min_lr")
 
-  def __init__(self, optimizer, clock, max_seconds, start_seconds=0.0, warmup_fraction=0.05, decay_fraction=0.1, min_lr=1e-6):
+  def __init__(self, optimizer, clock, max_seconds, start_seconds=0.0, cycle_seconds=None, warmup_fraction=0.05, decay_fraction=0.1, min_lr=1e-6):
     self.clock = clock
     self.max_seconds = float(max_seconds)
     self.start_seconds = float(start_seconds)
     if not 0.0 <= self.start_seconds < self.max_seconds:
       raise ValueError(f"start_seconds={start_seconds} must be in [0, max_seconds={max_seconds})")
+    self.cycle_seconds = None if cycle_seconds is None else float(cycle_seconds)
+    if self.cycle_seconds is not None:
+      cycles = (self.max_seconds - self.start_seconds) / self.cycle_seconds
+      if self.cycle_seconds <= 0 or abs(cycles - round(cycles)) > 1e-9:
+        raise ValueError(f"cycle_seconds={cycle_seconds} must divide max_seconds - start_seconds = {max_seconds - start_seconds}")
     self.warmup_fraction = float(warmup_fraction)
     self.decay_fraction = float(decay_fraction)
     self.min_lr = float(min_lr)
@@ -303,7 +310,10 @@ class TimeWSD(torch.optim.lr_scheduler.LRScheduler):
 
   def get_lr(self):
     seconds = max(self.clock.seconds() - self.start_seconds, 0.0)
-    progress = time_wsd_progress(seconds, self.max_seconds - self.start_seconds, self.warmup_fraction, self.decay_fraction)
+    span = self.max_seconds - self.start_seconds
+    if self.cycle_seconds is not None and seconds < span:
+      seconds, span = seconds % self.cycle_seconds, self.cycle_seconds
+    progress = time_wsd_progress(seconds, span, self.warmup_fraction, self.decay_fraction)
     return [self.min_lr + (peak - self.min_lr) * progress for peak in self.base_lrs]
 
   def state_dict(self):
