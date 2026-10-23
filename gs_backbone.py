@@ -110,16 +110,24 @@ class MoGeMixBackbone(MoGeBackbone):
 class RGBPatchBackbone(nn.Module):
   """No encoder: each 14x14 patch's own RGB pixels (in [-1, 1], (py px c) order, as model.rgb_patch) are the token,
   (B, 3, S, S) -> (B, 1, P, 3 * patch_size^2). Nothing to train; the head's trunk gets 588-d tokens
-  (model.feature_dim=588, no input projection) and tells the 6 layers apart by its FiLM."""
+  (model.feature_dim=588, no input projection) and tells the 6 layers apart by its FiLM.
+
+  With noise_layers = n > 0 the output has 1 + n layers: layer 0 is the RGB patch and the others N(0, 1)
+  noise of the same shape, freshly sampled on every forward (train and eval), as model.rgb_patch_noise."""
 
   trains_encoder = False
 
-  def __init__(self, patch_size=14):
+  def __init__(self, patch_size=14, noise_layers=0):
     super().__init__()
     self.patch_size = int(patch_size)
+    self.noise_layers = int(noise_layers)
     self.out_dim = 3 * self.patch_size**2
 
   def forward(self, image):
     from einops import rearrange
 
-    return rearrange(image * 2 - 1, "b c (h py) (w px) -> b 1 (h w) (py px c)", py=self.patch_size, px=self.patch_size)
+    patches = rearrange(image * 2 - 1, "b c (h py) (w px) -> b 1 (h w) (py px c)", py=self.patch_size, px=self.patch_size)
+    if self.noise_layers:
+      noise = torch.randn(patches.shape[0], self.noise_layers, *patches.shape[2:], device=patches.device, dtype=patches.dtype)   # independent per layer
+      patches = torch.cat([patches, noise], dim=1)
+    return patches

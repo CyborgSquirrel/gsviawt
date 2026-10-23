@@ -112,7 +112,7 @@ class GSModel(nn.Module):
     # (the batch carries the source "image" instead of cached "features")
     backbone = cfg.model.get("backbone")
     if backbone is not None and backbone.get("rgb_only"):
-      self.backbone = RGBPatchBackbone(cfg.model.patch_size)
+      self.backbone = RGBPatchBackbone(cfg.model.patch_size, cfg.data.num_layers - 1 if backbone.get("rgb_only_noise") else 0)
     elif backbone is None or not backbone.get("weights"):
       self.backbone = None
     elif backbone.get("mix_blocks"):
