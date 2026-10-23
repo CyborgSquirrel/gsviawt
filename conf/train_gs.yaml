@@ -100,6 +100,8 @@ model:
     image_size: ${data.image_size}
     lr: 1.0e-5              # backbone learning rate (the head's is optim.lr)
     checkpoint_activations: true   # recompute each block's activations in the backward pass (memory)
+    rgb_only: false         # true: no encoder, the token of a patch is its own RGB pixels (gs_backbone.RGBPatchBackbone);
+                            # set feature_dim=3*patch_size^2 (588), no weights needed
     mix_blocks: false       # true: the encoder is frozen and its tokens are sum_k mix[k] * norm(block k output) over ALL
                             # blocks, mix (blocks, 1024) learned (init: last block 1, others 0) -- gs_backbone.MoGeMixBackbone.
                             # Set lr (below) to the head's LR: it is the learning rate of mix
