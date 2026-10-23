@@ -60,7 +60,7 @@ import wandb
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
 from gs_dataset import (OPENGL_TO_OPENCV, H5Catalog, WTFeatureDataset,  # noqa: E402
                         _EmptyDataset, rotate_quats_wxyz, split_views_per_mesh)
-from gs_backbone import MoGeBackbone, MoGeMixBackbone  # noqa: E402
+from gs_backbone import MoGeBackbone, MoGeMixBackbone, RGBPatchBackbone  # noqa: E402
 from gs_decoder import PatchGaussianHead  # noqa: E402
 from module import (DSSIMLoss, ProgressWandbLogger, TrainClock, _completed_steps,  # noqa: E402
                     make_scheduler, needs_clock)
@@ -111,7 +111,9 @@ class GSModel(nn.Module):
     # model.backbone.weights set: the encoder is part of the model and trained with the head
     # (the batch carries the source "image" instead of cached "features")
     backbone = cfg.model.get("backbone")
-    if backbone is None or not backbone.get("weights"):
+    if backbone is not None and backbone.get("rgb_only"):
+      self.backbone = RGBPatchBackbone(cfg.model.patch_size, cfg.data.num_layers - 1 if backbone.get("rgb_only_noise") else 0)
+    elif backbone is None or not backbone.get("weights"):
       self.backbone = None
     elif backbone.get("mix_blocks"):
       self.backbone = MoGeMixBackbone(backbone.weights, backbone.image_size)
@@ -244,7 +246,7 @@ def model_forward(
       render_args = (
         x_gauss_flat["means"], x_gauss_flat["quats"], x_gauss_flat["scales"],
         x_gauss_flat["opacities"], x_gauss_flat["colors"], x_viewmats, x_Ks)
-      if model.backbone is not None and torch.is_grad_enabled():
+      if getattr(model.backbone, "trains_encoder", False) and torch.is_grad_enabled():
         # a trainable backbone leaves little GPU memory for the renderer's activations:
         # recompute each batch item's render in the backward pass instead of keeping all of them
         x_pred_rgb, x_pred_alpha, _ = torch.utils.checkpoint.checkpoint(rasterize, *render_args, use_reentrant=False)
@@ -464,10 +466,10 @@ class GSLightningModule(pl.LightningModule):
       params = self.model.parameters()
     else:
       # the pretrained backbone trains at its own (lower) learning rate
-      params = [
-        {"params": self.model.head.parameters()},
-        {"params": [p for p in self.model.backbone.parameters() if p.requires_grad], "lr": self.cfg.model.backbone.lr},
-      ]
+      params = [{"params": self.model.head.parameters()}]
+      backbone_params = [p for p in self.model.backbone.parameters() if p.requires_grad]
+      if backbone_params:   # none for a backbone without parameters (rgb_only)
+        params.append({"params": backbone_params, "lr": self.cfg.model.backbone.lr})
     out["optimizer"] = hydra.utils.instantiate(self.cfg.optim)(params)
     if OmegaConf.select(self.cfg, "sched") is not None:
       out["lr_scheduler"] = {

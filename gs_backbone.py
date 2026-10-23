@@ -15,6 +15,7 @@ from torch.utils.checkpoint import checkpoint
 
 class MoGeBackbone(nn.Module):
   PATCH_SIZE = 14
+  trains_encoder = True   # train_gs.py: the encoder's activations compete with the renderer's for GPU memory
 
   def __init__(self, weights="Ruicheng/moge-vitl", image_size=504, checkpoint_activations=True, freeze_blocks=0):
     super().__init__()
@@ -75,6 +76,8 @@ class MoGeBackbone(nn.Module):
 
 
 class MoGeMixBackbone(MoGeBackbone):
+  trains_encoder = False
+
   """Frozen MoGe-1 DINOv2 whose tokens are a learned per-channel mix of ALL its blocks: the output is
   sum_k mix[k] * norm(block_k output), mix (blocks, 1024) trained with the head (init: 1 on the last
   block, 0 elsewhere = MoGeBackbone's output). The backbone runs without autograd, so it costs no
@@ -102,3 +105,29 @@ class MoGeMixBackbone(MoGeBackbone):
         outs.append(bb.norm(x)[:, 1 + bb.num_register_tokens:])
       outs = torch.stack(outs, 1)   # (B, blocks, P, D)
     return (outs.float() * self.mix[None, :, None, :]).sum(1)[:, None]
+
+
+class RGBPatchBackbone(nn.Module):
+  """No encoder: each 14x14 patch's own RGB pixels (in [-1, 1], (py px c) order, as model.rgb_patch) are the token,
+  (B, 3, S, S) -> (B, 1, P, 3 * patch_size^2). Nothing to train; the head's trunk gets 588-d tokens
+  (model.feature_dim=588, no input projection) and tells the 6 layers apart by its FiLM.
+
+  With noise_layers = n > 0 the output has 1 + n layers: layer 0 is the RGB patch and the others N(0, 1)
+  noise of the same shape, freshly sampled on every forward (train and eval), as model.rgb_patch_noise."""
+
+  trains_encoder = False
+
+  def __init__(self, patch_size=14, noise_layers=0):
+    super().__init__()
+    self.patch_size = int(patch_size)
+    self.noise_layers = int(noise_layers)
+    self.out_dim = 3 * self.patch_size**2
+
+  def forward(self, image):
+    from einops import rearrange
+
+    patches = rearrange(image * 2 - 1, "b c (h py) (w px) -> b 1 (h w) (py px c)", py=self.patch_size, px=self.patch_size)
+    if self.noise_layers:
+      noise = torch.randn(patches.shape[0], self.noise_layers, *patches.shape[2:], device=patches.device, dtype=patches.dtype)   # independent per layer
+      patches = torch.cat([patches, noise], dim=1)
+    return patches
