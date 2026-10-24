@@ -879,6 +879,13 @@ class OrbitCallback(pl.Callback):
   framing is unchanged -- only the pixel density. None (default): the
   preview views' own size.
 
+  grid: [width, height] objects per video (default [1, 1], one object). With more, every stage's video
+  is a grid of that many DIFFERENT meshes (pl_module.get_preview_sources(mode, width * height); the first
+  object is the one get_preview_source gives), each orbiting in its own cell, row by row; cells
+  without an object (fewer meshes than cells) stay black. `resolution` is then the longer side of the
+  whole video, so each cell gets resolution // max(width, height) (rounded to even); None: each
+  cell is the preview view's own size.
+
   path_format: where each mp4 is written, as a str.format() template over
   {stage} ("train"/"val"), {mode} ("epoch"/"step") and {n} (completed
   epochs/steps; format specs like {n:06d} work). Parent directories are
@@ -889,8 +896,12 @@ class OrbitCallback(pl.Callback):
   def __init__(self, *, every_n_epochs: int | None = None, every_n_steps: int | None = None,
                every_n_seconds: float | None = None,
               num_frames: int = 24, fps: int = 12, crf: int = 28, elevation_deg: float = 20.0,
-              path_format: str | None = None, resolution: int | None = None):
+              path_format: str | None = None, resolution: int | None = None, grid: tuple[int, int] = (1, 1)):
     _cadence_check(every_n_epochs, every_n_steps, every_n_seconds, "OrbitCallback")
+    grid = tuple(int(g) for g in grid)
+    if len(grid) != 2 or min(grid) < 1:
+      raise ValueError(f"OrbitCallback: grid must be [width, height] with both >= 1, got {list(grid)}")
+    self.grid = grid
     self.every_n_epochs = every_n_epochs
     self.every_n_steps = every_n_steps
     self.every_n_seconds = every_n_seconds
@@ -904,6 +915,8 @@ class OrbitCallback(pl.Callback):
     self.workdir = None
 
   def on_fit_start(self, trainer, pl_module):
+    if self.grid != (1, 1) and not hasattr(pl_module, "get_preview_sources"):
+      raise ValueError(f"OrbitCallback: grid={list(self.grid)} needs a module with get_preview_sources(mode, count)")
     if self.path_format is None:
       self.workdir = tempfile.mkdtemp(prefix="orbit_")
 
@@ -917,6 +930,39 @@ class OrbitCallback(pl.Callback):
 
   def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
     self._step("step", trainer, pl_module)
+
+  def _render_object(self, entry, gsplat, resolution):
+    """The num_frames frames, (F, H, W, 3) uint8, of one object's orbit at `resolution` (longer side)."""
+    gauss, views = entry["gauss"], entry["views"]
+    device = gauss["means"].device
+    viewmats = torch.from_numpy(
+      _orbit_viewmats(entry["scene_scale"], self.num_frames, self.elevation_deg)).to(device)
+    width, height, K = _orbit_frame_size(int(views["width"]), int(views["height"]), views["K"][0], resolution)
+    Ks = repeat(K, "... -> b ...", b=viewmats.shape[0])
+    rgb, _, _ = gsplat.rasterization(
+      means=gauss["means"], quats=gauss["quats"], scales=gauss["scales"],
+      opacities=gauss["opacities"], colors=gauss["colors"],
+      viewmats=viewmats, Ks=Ks,
+      width=width, height=height,
+      sh_degree=gauss["sh_degree"], render_mode="RGB", packed=True,
+    )
+    return (rgb.clamp(0.0, 1.0).cpu().numpy() * 255).astype("uint8")
+
+  def _render_stage(self, entries, gsplat):
+    """A stage's frames: a list of (H, W, 3) uint8 arrays. One object: its orbit as is. A grid: the
+    objects' orbits side by side, row by row, each centred in a black cell of the same size."""
+    if self.grid == (1, 1):
+      return list(self._render_object(entries[0], gsplat, self.resolution))
+    cols, rows = self.grid
+    cell_res = None if self.resolution is None else max(2, 2 * (self.resolution // max(cols, rows) // 2))
+    orbits = [self._render_object(e, gsplat, cell_res) for e in entries[:cols * rows]]
+    cell_h, cell_w = max(o.shape[1] for o in orbits), max(o.shape[2] for o in orbits)
+    canvas = np.zeros((self.num_frames, rows * cell_h, cols * cell_w, 3), np.uint8)
+    for j, orbit in enumerate(orbits):
+      r, c = divmod(j, cols)
+      y0, x0 = r * cell_h + (cell_h - orbit.shape[1]) // 2, c * cell_w + (cell_w - orbit.shape[2]) // 2
+      canvas[:, y0:y0 + orbit.shape[1], x0:x0 + orbit.shape[2]] = orbit
+    return list(canvas)
 
   def _step(self, mode, trainer, pl_module):
     if mode == "epoch":
@@ -938,34 +984,25 @@ class OrbitCallback(pl.Callback):
     log_payload = {}
     with guarded_render(f"{mode}/orbit"), torch.no_grad():
       import gsplat
-      source = pl_module.get_preview_source(mode)
-      for stage in (stages or source):
-        entry = source.get(stage)
-        if entry is None:
+      count = self.grid[0] * self.grid[1]
+      if count == 1:
+        sources = {k: [] if v is None else [v] for k, v in pl_module.get_preview_source(mode).items()}
+      else:
+        sources = pl_module.get_preview_sources(mode, count)
+      for stage in (stages or sources):
+        entries = sources.get(stage) or []
+        if not entries:
           continue
-        gauss, views = entry["gauss"], entry["views"]
-        device = gauss["means"].device
-        viewmats = torch.from_numpy(
-          _orbit_viewmats(entry["scene_scale"], self.num_frames, self.elevation_deg)).to(device)
-        width, height, K = _orbit_frame_size(
-          int(views["width"]), int(views["height"]), views["K"][0], self.resolution)
-        Ks = repeat(K, "... -> b ...", b=viewmats.shape[0])
-        rgb, _, _ = gsplat.rasterization(
-          means=gauss["means"], quats=gauss["quats"], scales=gauss["scales"],
-          opacities=gauss["opacities"], colors=gauss["colors"],
-          viewmats=viewmats, Ks=Ks,
-          width=width, height=height,
-          sh_degree=gauss["sh_degree"], render_mode="RGB", packed=True,
-        )
-        rgb_np = (rgb.clamp(0.0, 1.0).cpu().numpy() * 255).astype("uint8")
-        frames = [rgb_np[i] for i in range(rgb_np.shape[0])]
+        frames = self._render_stage(entries, gsplat)
         if self.path_format is None:
           path = os.path.join(self.workdir, f"{stage}_orbit_{mode}{n}.mp4")
         else:
           path = self.path_format.format(stage=stage, mode=mode, n=n)
           os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         write_mp4(frames, path, self.fps, self.crf)
-        log_payload[f"{stage}/orbit"] = wandb.Video(path, caption=f"{mode} {n}", format="mp4")
+        meshes = [e.get("mesh_index") for e in entries]
+        caption = f"{mode} {n}" + (f", meshes {meshes}" if count > 1 and None not in meshes else "")
+        log_payload[f"{stage}/orbit"] = wandb.Video(path, caption=caption, format="mp4")
     if not log_payload:
       return
 

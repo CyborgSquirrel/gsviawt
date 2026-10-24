@@ -734,6 +734,7 @@ class GSLightningModule(pl.LightningModule):
     world_viewmat = viewmat_np @ np.linalg.inv(c2w_cv)  # (V,4,4), true world-to-camera
 
     return {
+      "mesh_index": int(item["mesh_index"]) if "mesh_index" in item else None,   # for the orbit grid's caption
       "gauss": flat,
       "gauss_layers": gauss_layers,
       # scene_scale: the source camera's own real distance from the world
@@ -750,6 +751,47 @@ class GSLightningModule(pl.LightningModule):
       },
     }
 
+  def _preview_indices(self, ds):
+    """Dataset indices of the preview objects, in a fixed order: ds[0] first (what get_preview_source has
+    always used), then the first view of every OTHER mesh in the order the meshes first appear -- so the
+    objects of a grid are distinct meshes, and any prefix of the list is the same whatever its length."""
+    cache = self.__dict__.setdefault("_preview_index_cache", {})
+    if id(ds) not in cache:
+      df = getattr(getattr(ds, "volumes", None), "df", None)
+      if df is not None and {"mesh_id", "view_idx"} <= set(df.columns):
+        mesh, view = df["mesh_id"].to_list(), df["view_idx"].to_list()
+        best = {}
+        for i, (m, v) in enumerate(zip(mesh, view)):
+          if m not in best or v < best[m][0]:
+            best[m] = (v, i)
+        cache[id(ds)] = [0] + [best[m][1] for m in dict.fromkeys(mesh) if m != mesh[0]]
+      else:
+        cache[id(ds)] = list(range(len(ds)))
+    return cache[id(ds)]
+
+  def get_preview_sources(self, mode, count):
+    """Like get_preview_source() below but with up to `count` objects per stage: {stage: [entry, ...]}
+    (an empty list where get_preview_source() returns None). The objects are distinct meshes, see
+    _preview_indices; every entry is its own full _preview_entry() call, cached per (mode, epoch-or-step)
+    and computed only as far as some caller has asked, so a panel callback asking for one object and an
+    orbit callback asking for nine cost nine forward passes in all, not ten."""
+    key = (mode, self.current_epoch if mode == "epoch" else self.trainer.global_step)
+    if getattr(self, "_preview_cache_key", None) != key:
+      self._preview_cache_key, self._preview_cache = key, {}
+    dm = self.trainer.datamodule
+    stages = {"train": dm.train_ds, **dm.val_datasets}
+    sources = {}
+    for stage, ds in stages.items():
+      if stage != "train" and mode != "step":
+        sources[stage] = []   # nothing pulls the val stages in epoch mode
+        continue
+      indices = self._preview_indices(ds)[:count] if len(ds) > 0 else []
+      entries = self._preview_cache.setdefault(stage, [])
+      while len(entries) < len(indices):
+        entries.append(self._preview_entry(ds[indices[len(entries)]]))
+      sources[stage] = entries[:len(indices)]
+    return sources
+
   def get_preview_source(self, mode):
     """{"train": entry, "val": entry-or-None} for module.PanelCallback/
     OrbitCallback -- see module.py's own comment block for the full
@@ -765,16 +807,10 @@ class GSLightningModule(pl.LightningModule):
     whether "val" is computed at all -- skipped (left None) in epoch mode
     even when a val split exists, since nothing pulls it there (see
     module.PanelCallback._step) -- this avoids the extra forward pass on
-    every epoch-cadence tick when it's not needed."""
-    key = (mode, self.current_epoch if mode == "epoch" else self.trainer.global_step)
-    if getattr(self, "_preview_cache_key", None) == key:
-      return self._preview_cache
+    every epoch-cadence tick when it's not needed.
 
-    source = {"train": self._preview_entry(self.trainer.datamodule.train_ds[0])}
-    for name, val_ds in self.trainer.datamodule.val_datasets.items():
-      source[name] = self._preview_entry(val_ds[0]) if mode == "step" and len(val_ds) > 0 else None
-    self._preview_cache_key, self._preview_cache = key, source
-    return source
+    The first object of get_preview_sources(mode, count) for every stage."""
+    return {stage: (entries[0] if entries else None) for stage, entries in self.get_preview_sources(mode, 1).items()}
 
 
 @hydra.main(version_base=None, config_path="conf", config_name="train_gs")
