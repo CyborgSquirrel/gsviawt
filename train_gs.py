@@ -666,7 +666,7 @@ class GSLightningModule(pl.LightningModule):
 
     return out
 
-  def _preview_entry(self, item):
+  def _preview_entry(self, item, with_layers=True):
     """One stage's {"gauss","scene_scale","views"} entry for
     get_preview_source() below, computed from a SINGLE fixed dataset item
     (train_ds[0], or val_ds[0] for the "val" stage) via this model's own
@@ -714,8 +714,12 @@ class GSLightningModule(pl.LightningModule):
     # mutated by the flatten/world-space-transform steps below. batch dim
     # is 1 (single fixed preview item), so index it out: each field is
     # (L,C,H,W), matching flatten_gaussians' own per-item slicing.
-    gauss_layers = {k: v[0].detach() for k, v in gauss.items()}
-    gauss_layers["hit"] = batch["source"]["hit"][0]
+    # (with_layers=False: left out, it is ~120 MB per object -- only ScaleLayersCallback reads it, and only
+    # for the first object of a stage)
+    gauss_layers = None
+    if with_layers:
+      gauss_layers = {k: v[0].detach() for k, v in gauss.items()}
+      gauss_layers["hit"] = batch["source"]["hit"][0]
 
     # world <- source-camera-frame, from this item's own known real pose.
     pose_gl_np = batch["source"]["pose_gl"][0].numpy()
@@ -736,7 +740,7 @@ class GSLightningModule(pl.LightningModule):
     return {
       "mesh_index": int(item["mesh_index"]) if "mesh_index" in item else None,   # for the orbit grid's caption
       "gauss": flat,
-      "gauss_layers": gauss_layers,
+      **({"gauss_layers": gauss_layers} if gauss_layers is not None else {}),
       # scene_scale: the source camera's own real distance from the world
       # origin -- module.OrbitCallback's orbit radius (matches
       # fit_gsplat.py's own scene_scale: norm of a capture camera's own
@@ -788,9 +792,17 @@ class GSLightningModule(pl.LightningModule):
       indices = self._preview_indices(ds)[:count] if len(ds) > 0 else []
       entries = self._preview_cache.setdefault(stage, [])
       while len(entries) < len(indices):
-        entries.append(self._preview_entry(ds[indices[len(entries)]]))
+        entries.append(self._preview_entry(ds[indices[len(entries)]], with_layers=not entries))
       sources[stage] = entries[:len(indices)]
     return sources
+
+  def release_preview_sources(self, keep=1):
+    """Drop all but the first `keep` cached objects of every stage (a grid's other objects are only read by
+    the orbit callback that asked for them, and each holds GPU memory a training step needs)."""
+    for entries in getattr(self, "_preview_cache", {}).values():
+      del entries[keep:]
+    if torch.cuda.is_available():
+      torch.cuda.empty_cache()
 
   def get_preview_source(self, mode):
     """{"train": entry, "val": entry-or-None} for module.PanelCallback/

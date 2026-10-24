@@ -1003,6 +1003,8 @@ class OrbitCallback(pl.Callback):
         meshes = [e.get("mesh_index") for e in entries]
         caption = f"{mode} {n}" + (f", meshes {meshes}" if count > 1 and None not in meshes else "")
         log_payload[f"{stage}/orbit"] = wandb.Video(path, caption=caption, format="mp4")
+    if count > 1 and hasattr(pl_module, "release_preview_sources"):
+      pl_module.release_preview_sources(1)
     if not log_payload:
       return
 
