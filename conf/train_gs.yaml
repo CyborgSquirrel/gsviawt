@@ -235,6 +235,7 @@ callbacks:
     crf: 28                    # x264 quality (higher = smaller/faster; fine for monitoring)
     elevation_deg: 20.0        # camera distance = the actual source view's own capture distance,
                                 # not a re-fit bounding-sphere framing -- see GSLightningModule.get_preview_source
+    grid: [1, 1]               # [width, height]: objects (different meshes) per video, each orbiting in its own cell; resolution is then the whole video's longer side
     resolution: 1024           # longer side of the turntable frames in px (aspect kept); null -> the preview views' own size
     path_format: ${output_dir}/orbits/{stage}_orbit_{mode}{n:06d}.mp4   # null -> temp dir, deleted at fit end
 
