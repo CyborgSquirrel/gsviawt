@@ -95,7 +95,7 @@ def rotate_quats_wxyz(q_wxyz, R_transform):
   wxyz, same shape. Uses scipy.spatial.transform.Rotation (already a project
   dependency -- fit_gsplat.py uses it too) rather than hand-rolled quaternion
   composition, which is an easy place to get sign/order conventions wrong.
-  Public (not _-prefixed): train_gs.py's get_preview_source() also uses this,
+  Public (not _-prefixed): train_gs.py's _preview_entry() also uses this,
   the opposite direction (camera-to-world instead of world-to-camera), to
   transform its preview Gaussians into world space for module.OrbitCallback."""
   from scipy.spatial.transform import Rotation

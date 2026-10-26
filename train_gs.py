@@ -62,7 +62,7 @@ from gs_dataset import (OPENGL_TO_OPENCV, H5Catalog, WTFeatureDataset,  # noqa: 
                         _EmptyDataset, rotate_quats_wxyz, split_views_per_mesh)
 from gs_backbone import MoGeBackbone  # noqa: E402
 from gs_decoder import PatchGaussianHead  # noqa: E402
-from module import (DSSIMLoss, ProgressWandbLogger, TrainClock, _completed_steps,  # noqa: E402
+from module import (DSSIMLoss, Events, ProgressWandbLogger, TrainClock, _completed_steps,  # noqa: E402
                     make_scheduler, needs_clock)
 from util import collate_with_batch_size, pipe, set_mode, timed  # noqa: E402
 
@@ -666,10 +666,10 @@ class GSLightningModule(pl.LightningModule):
 
     return out
 
-  def _preview_entry(self, item):
+  def _preview_entry(self, item, with_layers=True):
     """One stage's {"gauss","scene_scale","views"} entry for
-    get_preview_source() below, computed from a SINGLE fixed dataset item
-    (train_ds[0], or val_ds[0] for the "val" stage) via this model's own
+    preview_entries() below, computed from a SINGLE fixed dataset item
+    (a fixed dataset item of the stage) via this model's own
     forward pass -- in true WORLD space, for module.PanelCallback's
     [GT | render | |diff|] panel and module.OrbitCallback's turntable
     video.
@@ -714,8 +714,12 @@ class GSLightningModule(pl.LightningModule):
     # mutated by the flatten/world-space-transform steps below. batch dim
     # is 1 (single fixed preview item), so index it out: each field is
     # (L,C,H,W), matching flatten_gaussians' own per-item slicing.
-    gauss_layers = {k: v[0].detach() for k, v in gauss.items()}
-    gauss_layers["hit"] = batch["source"]["hit"][0]
+    # (with_layers=False: left out, it is ~120 MB per object -- only ScaleLayersCallback reads it, and only
+    # for the first object of a stage)
+    gauss_layers = None
+    if with_layers:
+      gauss_layers = {k: v[0].detach() for k, v in gauss.items()}
+      gauss_layers["hit"] = batch["source"]["hit"][0]
 
     # world <- source-camera-frame, from this item's own known real pose.
     pose_gl_np = batch["source"]["pose_gl"][0].numpy()
@@ -734,8 +738,9 @@ class GSLightningModule(pl.LightningModule):
     world_viewmat = viewmat_np @ np.linalg.inv(c2w_cv)  # (V,4,4), true world-to-camera
 
     return {
+      "mesh_index": int(item["mesh_index"]) if "mesh_index" in item else None,   # for the orbit grid's caption
       "gauss": flat,
-      "gauss_layers": gauss_layers,
+      **({"gauss_layers": gauss_layers} if gauss_layers is not None else {}),
       # scene_scale: the source camera's own real distance from the world
       # origin -- module.OrbitCallback's orbit radius (matches
       # fit_gsplat.py's own scene_scale: norm of a capture camera's own
@@ -750,31 +755,37 @@ class GSLightningModule(pl.LightningModule):
       },
     }
 
-  def get_preview_source(self, mode):
-    """{"train": entry, "val": entry-or-None} for module.PanelCallback/
-    OrbitCallback -- see module.py's own comment block for the full
-    contract. Unlike fit_gsplat.py's version, train and val here are NOT
-    the same Gaussians rendered against different views -- the model
-    predicts an entirely different Gaussian set per forward-passed item,
-    so each stage gets its own full _preview_entry() call (own gauss, own
-    scene_scale, own views), from a fixed dataset item (train_ds[0], or
-    val_ds[0] for "val").
+  def _preview_indices(self, ds):
+    """Dataset indices of the preview objects, in a fixed order: ds[0] first (what the single-object preview
+    has always used), then the first view of every OTHER mesh in the order the meshes first appear -- so the
+    objects of a grid are distinct meshes, and any prefix of the list is the same whatever its length."""
+    df = getattr(getattr(ds, "volumes", None), "df", None)
+    if df is not None and {"mesh_id", "view_idx"} <= set(df.columns):
+      mesh, view = df["mesh_id"].to_list(), df["view_idx"].to_list()
+      best = {}
+      for i, (m, v) in enumerate(zip(mesh, view)):
+        if m not in best or v < best[m][0]:
+          best[m] = (v, i)
+      return [0] + [best[m][1] for m in dict.fromkeys(mesh) if m != mesh[0]]
+    return list(range(len(ds)))
 
-    mode picks both the cache granularity (epoch: once per
-    self.current_epoch; step: once per self.trainer.global_step) and
-    whether "val" is computed at all -- skipped (left None) in epoch mode
-    even when a val split exists, since nothing pulls it there (see
-    module.PanelCallback._step) -- this avoids the extra forward pass on
-    every epoch-cadence tick when it's not needed."""
-    key = (mode, self.current_epoch if mode == "epoch" else self.trainer.global_step)
-    if getattr(self, "_preview_cache_key", None) == key:
-      return self._preview_cache
+  def _preview_datasets(self):
+    dm = self.trainer.datamodule
+    return {stage: ds for stage, ds in {"train": dm.train_ds, **dm.val_datasets}.items() if len(ds) > 0}
 
-    source = {"train": self._preview_entry(self.trainer.datamodule.train_ds[0])}
-    for name, val_ds in self.trainer.datamodule.val_datasets.items():
-      source[name] = self._preview_entry(val_ds[0]) if mode == "step" and len(val_ds) > 0 else None
-    self._preview_cache_key, self._preview_cache = key, source
-    return source
+  def preview_stages(self):
+    """The stages that have preview objects: "train", then each val set. See module.py's comment block
+    for the contract."""
+    return list(self._preview_datasets())
+
+  def preview_entries(self, stage, count=1, with_layers=False):
+    """A generator of up to `count` entries of a stage -- distinct meshes (see _preview_indices), each its own
+    _preview_entry() call, made when the generator reaches it and kept by nothing here: the consumer holds at
+    most the one it is working on. Nothing is cached between calls. with_layers: the first entry also carries
+    gauss_layers (module.ScaleLayersCallback), which is ~120 MB."""
+    ds = self._preview_datasets()[stage]
+    for rank, i in enumerate(self._preview_indices(ds)[:count]):
+      yield self._preview_entry(ds[i], with_layers=with_layers and rank == 0)
 
 
 @hydra.main(version_base=None, config_path="conf", config_name="train_gs")
@@ -782,6 +793,12 @@ def main(cfg: DictConfig) -> None:
   logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
   torch.manual_seed(int(cfg.seed))
   torch.autograd.set_detect_anomaly(cfg.torch_detect_anomaly)
+
+  # The run's events by name (module.Events): fired by cfg.events' cadences and the scheduler's
+  # trough_event, read by the callbacks with a trigger_event. Set first: everything that names an event
+  # registers itself with it as it is built.
+  events = Events(OmegaConf.to_container(cfg.events, resolve=True))
+  events.make_current()
 
   datamodule = GSDataModule(cfg)
   datamodule.setup()
@@ -803,12 +820,12 @@ def main(cfg: DictConfig) -> None:
 
   # A TrainClock stops the run after max_seconds of training time; a time-driven LR scheduler
   # (sched=time_wsd, module.TimeWSD) reads the same clock, which configure_optimizers hands it; so do
-  # callbacks with an every_n_seconds cadence (the clock then only counts, if max_seconds is null)
+  # triggers with an every_n_seconds cadence (the clock then only counts, if max_seconds is null)
   clock = None
   if cfg.sched is not None and needs_clock(hydra.utils.instantiate(cfg.sched)) and cfg.max_seconds is None:
     raise SystemExit("this LR scheduler is driven by the training time: set max_seconds")
-  seconds_cadence = any(
-    cb is not None and OmegaConf.select(cb, "every_n_seconds") is not None for cb in cfg.callbacks.values())
+  specs = [OmegaConf.select(cb, "trigger_event") for cb in cfg.callbacks.values() if cb is not None] + list(cfg.events.values())
+  seconds_cadence = any(isinstance(spec, DictConfig) and spec.get("every_n_seconds") is not None for spec in specs)
   if cfg.max_seconds is not None or seconds_cadence:   # no max_seconds: the clock only counts
     clock = TrainClock(max_seconds=cfg.max_seconds)
   model.clock = clock
@@ -840,8 +857,8 @@ def main(cfg: DictConfig) -> None:
       step_fn=lambda: _completed_steps(model.trainer, model),
     )
 
-  callbacks = []
-  callbacks += list(hydra.utils.instantiate(cfg.callbacks).values())
+  callbacks = list(hydra.utils.instantiate(cfg.callbacks).values())
+  callbacks = [events, *callbacks]   # before every consumer: see module.Events
   if clock is not None:
     callbacks = [clock, *callbacks, clock.tail()]   # first and last: see module.TrainClock
 
