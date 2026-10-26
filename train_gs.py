@@ -668,8 +668,8 @@ class GSLightningModule(pl.LightningModule):
 
   def _preview_entry(self, item, with_layers=True):
     """One stage's {"gauss","scene_scale","views"} entry for
-    get_preview_source() below, computed from a SINGLE fixed dataset item
-    (train_ds[0], or val_ds[0] for the "val" stage) via this model's own
+    preview_entries() below, computed from a SINGLE fixed dataset item
+    (a fixed dataset item of the stage) via this model's own
     forward pass -- in true WORLD space, for module.PanelCallback's
     [GT | render | |diff|] panel and module.OrbitCallback's turntable
     video.
@@ -756,73 +756,36 @@ class GSLightningModule(pl.LightningModule):
     }
 
   def _preview_indices(self, ds):
-    """Dataset indices of the preview objects, in a fixed order: ds[0] first (what get_preview_source has
-    always used), then the first view of every OTHER mesh in the order the meshes first appear -- so the
+    """Dataset indices of the preview objects, in a fixed order: ds[0] first (what the single-object preview
+    has always used), then the first view of every OTHER mesh in the order the meshes first appear -- so the
     objects of a grid are distinct meshes, and any prefix of the list is the same whatever its length."""
-    cache = self.__dict__.setdefault("_preview_index_cache", {})
-    if id(ds) not in cache:
-      df = getattr(getattr(ds, "volumes", None), "df", None)
-      if df is not None and {"mesh_id", "view_idx"} <= set(df.columns):
-        mesh, view = df["mesh_id"].to_list(), df["view_idx"].to_list()
-        best = {}
-        for i, (m, v) in enumerate(zip(mesh, view)):
-          if m not in best or v < best[m][0]:
-            best[m] = (v, i)
-        cache[id(ds)] = [0] + [best[m][1] for m in dict.fromkeys(mesh) if m != mesh[0]]
-      else:
-        cache[id(ds)] = list(range(len(ds)))
-    return cache[id(ds)]
+    df = getattr(getattr(ds, "volumes", None), "df", None)
+    if df is not None and {"mesh_id", "view_idx"} <= set(df.columns):
+      mesh, view = df["mesh_id"].to_list(), df["view_idx"].to_list()
+      best = {}
+      for i, (m, v) in enumerate(zip(mesh, view)):
+        if m not in best or v < best[m][0]:
+          best[m] = (v, i)
+      return [0] + [best[m][1] for m in dict.fromkeys(mesh) if m != mesh[0]]
+    return list(range(len(ds)))
 
-  def get_preview_sources(self, mode, count):
-    """Like get_preview_source() below but with up to `count` objects per stage: {stage: [entry, ...]}
-    (an empty list where get_preview_source() returns None). The objects are distinct meshes, see
-    _preview_indices; every entry is its own full _preview_entry() call, cached per (mode, epoch-or-step)
-    and computed only as far as some caller has asked, so a panel callback asking for one object and an
-    orbit callback asking for nine cost nine forward passes in all, not ten."""
-    key = (mode, self.current_epoch if mode == "epoch" else self.trainer.global_step)
-    if getattr(self, "_preview_cache_key", None) != key:
-      self._preview_cache_key, self._preview_cache = key, {}
+  def _preview_datasets(self):
     dm = self.trainer.datamodule
-    stages = {"train": dm.train_ds, **dm.val_datasets}
-    sources = {}
-    for stage, ds in stages.items():
-      if stage != "train" and mode != "step":
-        sources[stage] = []   # nothing pulls the val stages in epoch mode
-        continue
-      indices = self._preview_indices(ds)[:count] if len(ds) > 0 else []
-      entries = self._preview_cache.setdefault(stage, [])
-      while len(entries) < len(indices):
-        entries.append(self._preview_entry(ds[indices[len(entries)]], with_layers=not entries))
-      sources[stage] = entries[:len(indices)]
-    return sources
+    return {stage: ds for stage, ds in {"train": dm.train_ds, **dm.val_datasets}.items() if len(ds) > 0}
 
-  def release_preview_sources(self, keep=1):
-    """Drop all but the first `keep` cached objects of every stage (a grid's other objects are only read by
-    the orbit callback that asked for them, and each holds GPU memory a training step needs)."""
-    for entries in getattr(self, "_preview_cache", {}).values():
-      del entries[keep:]
-    if torch.cuda.is_available():
-      torch.cuda.empty_cache()
+  def preview_stages(self):
+    """The stages that have preview objects: "train", then each val set. See module.py's comment block
+    for the contract."""
+    return list(self._preview_datasets())
 
-  def get_preview_source(self, mode):
-    """{"train": entry, "val": entry-or-None} for module.PanelCallback/
-    OrbitCallback -- see module.py's own comment block for the full
-    contract. Unlike fit_gsplat.py's version, train and val here are NOT
-    the same Gaussians rendered against different views -- the model
-    predicts an entirely different Gaussian set per forward-passed item,
-    so each stage gets its own full _preview_entry() call (own gauss, own
-    scene_scale, own views), from a fixed dataset item (train_ds[0], or
-    val_ds[0] for "val").
-
-    mode picks both the cache granularity (epoch: once per
-    self.current_epoch; step: once per self.trainer.global_step) and
-    whether "val" is computed at all -- skipped (left None) in epoch mode
-    even when a val split exists, since nothing pulls it there (see
-    module.PanelCallback._step) -- this avoids the extra forward pass on
-    every epoch-cadence tick when it's not needed.
-
-    The first object of get_preview_sources(mode, count) for every stage."""
-    return {stage: (entries[0] if entries else None) for stage, entries in self.get_preview_sources(mode, 1).items()}
+  def preview_entries(self, stage, count=1, with_layers=False):
+    """A generator of up to `count` entries of a stage -- distinct meshes (see _preview_indices), each its own
+    _preview_entry() call, made when the generator reaches it and kept by nothing here: the consumer holds at
+    most the one it is working on. Nothing is cached between calls. with_layers: the first entry also carries
+    gauss_layers (module.ScaleLayersCallback), which is ~120 MB."""
+    ds = self._preview_datasets()[stage]
+    for rank, i in enumerate(self._preview_indices(ds)[:count]):
+      yield self._preview_entry(ds[i], with_layers=with_layers and rank == 0)
 
 
 @hydra.main(version_base=None, config_path="conf", config_name="train_gs")

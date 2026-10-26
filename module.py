@@ -6,19 +6,19 @@ renders under a `pl.Trainer` (train_gs.py: a network's predicted Gaussians
 over a dataset; fit_3dgs.py: one scene's own Gaussians, directly). That's
 where the overlap actually is -- the loss/schedule/OOM-handling plumbing,
 plus the PanelCallback/OrbitCallback pair below, which each PULL a
-normalized snapshot from the LightningModule (get_preview_source(), one
+normalized snapshot from the LightningModule (preview_entries(), one
 implementation per script) and do the actual gsplat.rasterization()+
 encode+wandb-log call once, here.
 
-Both scripts' get_preview_source() returns Gaussians AND camera views in
+Both scripts' preview_entries() yield Gaussians AND camera views in
 true WORLD space (train_gs.py's Gaussians are natively predicted in the
 source view's own camera frame -- see gs_dataset.py's module docstring --
-but get_preview_source() transforms them into world space using that
+but preview_entries() transforms them into world space using that
 view's own raw pose before returning, precisely so this module doesn't
 need to know or care about that distinction). That's what makes
 OrbitCallback fully shared below: one world-frame turntable formula
 (WORLD_UP/look_at_c2w), no per-script pose method at all -- it only needs
-a distance (each get_preview_source() includes its own "scene_scale") and
+a distance (each entry includes its own "scene_scale") and
 the already-world-space Gaussians.
 
 Also holds the depth-peel Gaussian-seeding helpers (SH_C0/init_gaussians/
@@ -547,42 +547,43 @@ def _completed_steps(trainer, pl_module):
 # you have those arrays -- the render call, building the panel image, and
 # logging it -- lives here.
 #
-# Pull, not push: PanelCallback below CALLS pl_module.get_preview_source(mode)
+# Pull, not push: PanelCallback below CALLS pl_module.preview_entries(stage)
 # itself, only when its own cadence (exactly one of every_n_epochs /
 # every_n_steps / every_n_seconds --
 # see __init__) actually fires, instead of some other callback
 # unconditionally stashing a value onto pl_module every epoch whether or
 # not it's ever read. Each LightningModule (train_gs.py's GSLightningModule,
-# fit_gsplat.py's GSFitLightningModule) implements that one method itself,
-# taking mode ("epoch" | "step", matching which cadence fired) and
-# returning
-#   {"train": {"gauss": {...}, "scene_scale": float,
-#              "views": {"viewmat","K","width","height","gt_rgb"},
-#              "gauss_layers": {...} (optional)},
-#    "val": same shape, or None}
+# fit_gsplat.py's GSFitLightningModule) implements two methods itself:
+#   preview_stages() -> the names of the stages that have preview objects:
+#       "train", then each val set
+#   preview_entries(stage, count=1, with_layers=False) -> a GENERATOR of up
+#       to `count` entries of that stage, one at a time (distinct objects,
+#       the first one always the same), each
+#   {"gauss": {...}, "scene_scale": float,
+#    "views": {"viewmat","K","width","height","gt_rgb"},
+#    "mesh_index": int (optional), "gauss_layers": {...} (optional)}
 # (gauss arrays already flattened/activated -- exactly what render() already
 # needs in fit_gsplat.py, or one flatten_gaussians() yield in train_gs.py;
-# gt_rgb: (V,C,H,W) in [0,1]; sh_degree: None or an int) -- cached keyed by
-# (mode, epoch-or-step) (see either implementation) so a second caller at
-# the same point doesn't redundantly redo the forward pass. No callback
-# ordering to get right, no cost on ticks the panel isn't even logged.
+# gt_rgb: (V,C,H,W) in [0,1]; sh_degree: None or an int).
 #
-# gauss_layers (optional, only train_gs.py's GSLightningModule populates
-# it): the PRE-flatten_gaussians per-layer decoder output -- {"scale":
-# (L,3,H,W), "hit": (L,H,W) bool, ...the rest of the raw gauss dict} --
-# ScaleLayersCallback below reads this instead of "gauss" specifically so a
-# single exploded pixel doesn't disappear into flatten_gaussians' ~14k-point
-# mean/render.
+# Stateless: nothing is cached between calls. A consumer that keeps no entry
+# beyond its own loop iteration never has more than one in memory, and one
+# that asks again simply computes again (an entry costs about one forward
+# pass) -- so there is no cache to size, key or release, and no callback
+# ordering to get right.
 #
-# "val" is only ever populated in step mode (mode == "step"): epoch mode
-# stays train-only, same as it always has been (on_train_epoch_end is the
-# only epoch-cadence hook either callback implements -- there's no
-# on_validation_epoch_end here, deliberately). Step mode has no equivalent
-# "validation batch end" hook to split train/val across, so instead
-# on_train_batch_end logs BOTH stages together in one wandb.log call
-# whenever it fires and a val split exists (get_preview_source(mode)
-# leaves "val" as None otherwise, or in epoch mode where nothing asks for
-# it) -- see _step below on both callbacks.
+# gauss_layers (optional, only with_layers=True, only on the first entry,
+# only train_gs.py's GSLightningModule populates it): the PRE-flatten_gaussians
+# per-layer decoder output -- {"scale": (L,3,H,W), "hit": (L,H,W) bool,
+# ...the rest of the raw gauss dict} -- ScaleLayersCallback below reads this
+# instead of "gauss" specifically so a single exploded pixel doesn't
+# disappear into flatten_gaussians' mean/render.
+#
+# Epoch cadence previews only "train" (on_train_epoch_end -- there's no
+# on_validation_epoch_end here, deliberately). Step cadence previews every
+# stage: it has no equivalent "validation batch end" hook to split
+# train/val across, so on_train_batch_end logs ALL stages together in one
+# wandb.log call whenever it fires -- see _step below on each callback.
 # ---------------------------------------------------------------------------
 
 def _build_panel(gt_rgb, pred_rgb):
@@ -625,7 +626,7 @@ def _due_on_batch_end(callback, trainer, n_steps):
 class PanelCallback(pl.Callback):
   """Shared consumer half of the preview_source hand-off -- see this
   module's own comment block above for the full contract. Pulls
-  pl_module.get_preview_source(mode) and renders its Gaussians into its
+  pl_module.preview_entries(stage) and renders its Gaussians into its
   views in ONE gsplat.rasterization() call per stage, then logs a
   [GT | render | |diff|] panel per stage.
 
@@ -672,7 +673,7 @@ class PanelCallback(pl.Callback):
       n = _completed_steps(trainer, pl_module)  # count of COMPLETED optimizer steps
       if not _due_on_batch_end(self, trainer, n):
         return
-      stages = None  # every stage get_preview_source returns
+      stages = None  # every stage the module has
 
     if pl_module.logger is None:
       return
@@ -680,9 +681,8 @@ class PanelCallback(pl.Callback):
     log_payload = {}
     with guarded_render(f"{mode}/panel"), torch.no_grad():
       import gsplat
-      source = pl_module.get_preview_source(mode)
-      for stage in (stages or source):
-        entry = source.get(stage)
+      for stage in (stages or pl_module.preview_stages()):
+        entry = next(pl_module.preview_entries(stage), None)
         if entry is None:
           continue
         gauss, views = entry["gauss"], entry["views"]
@@ -741,7 +741,7 @@ def _colorize_scale_layers(scale, hit):
 class ScaleLayersCallback(pl.Callback):
   """Per-depth-peel-layer visualization of the model's predicted Gaussian
   `scale`, pulled from the UNFLATTENED gauss_layers entry
-  get_preview_source() puts alongside its usual flattened "gauss" (see
+  preview_entries(with_layers=True) puts alongside its usual flattened "gauss" (see
   train_gs.py's _preview_entry) -- flatten_gaussians concatenates every
   layer/pixel into one ~14k-point cloud for PanelCallback/OrbitCallback,
   which is exactly where a single exploded pixel goes invisible (buried in
@@ -751,8 +751,7 @@ class ScaleLayersCallback(pl.Callback):
 
   Same pull/cadence contract as PanelCallback/OrbitCallback (see this
   module's own top-of-file comment block): exactly one of every_n_epochs /
-  every_n_steps / every_n_seconds, pulls pl_module.get_preview_source(mode) (same call,
-  same cache). Stages whose entry has no "gauss_layers" key (an
+  every_n_steps / every_n_seconds, pulls pl_module.preview_entries(stage). Stages whose entry has no "gauss_layers" key (an
   implementation that doesn't populate it) are skipped, same as a stage
   with no entry at all."""
 
@@ -782,16 +781,15 @@ class ScaleLayersCallback(pl.Callback):
       n = _completed_steps(trainer, pl_module)  # count of COMPLETED optimizer steps
       if not _due_on_batch_end(self, trainer, n):
         return
-      stages = None  # every stage get_preview_source returns
+      stages = None  # every stage the module has
 
     if pl_module.logger is None:
       return
 
     log_payload = {}
     with guarded_render(f"{mode}/scale_layers"), torch.no_grad():
-      source = pl_module.get_preview_source(mode)
-      for stage in (stages or source):
-        entry = source.get(stage)
+      for stage in (stages or pl_module.preview_stages()):
+        entry = next(pl_module.preview_entries(stage, with_layers=True), None)
         if entry is None:
           continue
         layers = entry.get("gauss_layers")
@@ -830,7 +828,7 @@ def _orbit_viewmats(dist, num_frames, elevation_deg):
   origin at radius `dist` (a fixed capture distance, not an auto-fit
   bounding-sphere framing -- both scripts anchor to their own scene_scale
   for the same "avoid exposing per-Gaussian spacing as a moire pattern"
-  reason, documented at each get_preview_source() implementation),
+  reason, documented at each preview_entries() implementation),
   converted to gsplat-ready (N,4,4) world-to-camera viewmats (OpenCV
   convention)."""
   elev = np.radians(float(elevation_deg))
@@ -861,8 +859,8 @@ def _orbit_frame_size(width, height, K, resolution):
 
 class OrbitCallback(pl.Callback):
   """Shared consumer half of the same pull pattern PanelCallback uses.
-  Pulls pl_module.get_preview_source(mode) -- same call PanelCallback
-  makes, same cache -- and, since both scripts' Gaussians are already in
+  Pulls pl_module.preview_entries(stage, count) -- one object at a time, kept
+  only while its orbit is rendered -- and, since both scripts' Gaussians are already in
   world space there (see this module's own docstring), builds ONE
   world-frame turntable orbit per stage (_orbit_viewmats, radius = that
   stage's own "scene_scale") entirely in here. No per-script pose method
@@ -880,8 +878,8 @@ class OrbitCallback(pl.Callback):
   preview views' own size.
 
   grid: [width, height] objects per video (default [1, 1], one object). With more, every stage's video
-  is a grid of that many DIFFERENT meshes (pl_module.get_preview_sources(mode, width * height); the first
-  object is the one get_preview_source gives), each orbiting in its own cell, row by row; cells
+  is a grid of that many DIFFERENT meshes (pl_module.preview_entries(stage, width * height); the first
+  object is the one the single-object callbacks use), each orbiting in its own cell, row by row; cells
   without an object (fewer meshes than cells) stay black. `resolution` is then the longer side of the
   whole video, so each cell gets resolution // max(width, height) (rounded to even); None: each
   cell is the preview view's own size.
@@ -915,8 +913,6 @@ class OrbitCallback(pl.Callback):
     self.workdir = None
 
   def on_fit_start(self, trainer, pl_module):
-    if self.grid != (1, 1) and not hasattr(pl_module, "get_preview_sources"):
-      raise ValueError(f"OrbitCallback: grid={list(self.grid)} needs a module with get_preview_sources(mode, count)")
     if self.path_format is None:
       self.workdir = tempfile.mkdtemp(prefix="orbit_")
 
@@ -949,20 +945,29 @@ class OrbitCallback(pl.Callback):
     return (rgb.clamp(0.0, 1.0).cpu().numpy() * 255).astype("uint8")
 
   def _render_stage(self, entries, gsplat):
-    """A stage's frames: a list of (H, W, 3) uint8 arrays. One object: its orbit as is. A grid: the
-    objects' orbits side by side, row by row, each centred in a black cell of the same size."""
-    if self.grid == (1, 1):
-      return list(self._render_object(entries[0], gsplat, self.resolution))
+    """(frames, mesh_indices) of a stage, from an iterable of its entries (a generator: one entry lives at a
+    time, only while its orbit is rendered); None when there is no entry. frames: a list of (H, W, 3) uint8
+    arrays. One object: its orbit as is. A grid: the objects' orbits side by side, row by row, each centred
+    in a black cell of the same size."""
     cols, rows = self.grid
-    cell_res = None if self.resolution is None else max(2, 2 * (self.resolution // max(cols, rows) // 2))
-    orbits = [self._render_object(e, gsplat, cell_res) for e in entries[:cols * rows]]
+    cell_res = self.resolution if self.grid == (1, 1) else (
+      None if self.resolution is None else max(2, 2 * (self.resolution // max(cols, rows) // 2)))
+    orbits, meshes = [], []
+    for entry in entries:
+      orbits.append(self._render_object(entry, gsplat, cell_res))
+      meshes.append(entry.get("mesh_index"))
+    entry = None   # the last entry is not kept either
+    if not orbits:
+      return None
+    if self.grid == (1, 1):
+      return list(orbits[0]), meshes
     cell_h, cell_w = max(o.shape[1] for o in orbits), max(o.shape[2] for o in orbits)
     canvas = np.zeros((self.num_frames, rows * cell_h, cols * cell_w, 3), np.uint8)
     for j, orbit in enumerate(orbits):
       r, c = divmod(j, cols)
       y0, x0 = r * cell_h + (cell_h - orbit.shape[1]) // 2, c * cell_w + (cell_w - orbit.shape[2]) // 2
       canvas[:, y0:y0 + orbit.shape[1], x0:x0 + orbit.shape[2]] = orbit
-    return list(canvas)
+    return list(canvas), meshes
 
   def _step(self, mode, trainer, pl_module):
     if mode == "epoch":
@@ -976,7 +981,7 @@ class OrbitCallback(pl.Callback):
       n = _completed_steps(trainer, pl_module)  # count of COMPLETED optimizer steps
       if not _due_on_batch_end(self, trainer, n):
         return
-      stages = None  # every stage get_preview_source returns
+      stages = None  # every stage the module has
 
     if pl_module.logger is None:
       return
@@ -985,26 +990,19 @@ class OrbitCallback(pl.Callback):
     with guarded_render(f"{mode}/orbit"), torch.no_grad():
       import gsplat
       count = self.grid[0] * self.grid[1]
-      if count == 1:
-        sources = {k: [] if v is None else [v] for k, v in pl_module.get_preview_source(mode).items()}
-      else:
-        sources = pl_module.get_preview_sources(mode, count)
-      for stage in (stages or sources):
-        entries = sources.get(stage) or []
-        if not entries:
+      for stage in (stages or pl_module.preview_stages()):
+        rendered = self._render_stage(pl_module.preview_entries(stage, count), gsplat)
+        if rendered is None:
           continue
-        frames = self._render_stage(entries, gsplat)
+        frames, meshes = rendered
         if self.path_format is None:
           path = os.path.join(self.workdir, f"{stage}_orbit_{mode}{n}.mp4")
         else:
           path = self.path_format.format(stage=stage, mode=mode, n=n)
           os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         write_mp4(frames, path, self.fps, self.crf)
-        meshes = [e.get("mesh_index") for e in entries]
         caption = f"{mode} {n}" + (f", meshes {meshes}" if count > 1 and None not in meshes else "")
         log_payload[f"{stage}/orbit"] = wandb.Video(path, caption=caption, format="mp4")
-    if count > 1 and hasattr(pl_module, "release_preview_sources"):
-      pl_module.release_preview_sources(1)
     if not log_payload:
       return
 

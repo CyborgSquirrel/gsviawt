@@ -698,7 +698,7 @@ class Fit3DGSLightningModule(pl.LightningModule):
     self.strategy_state = self.strategy.initialize_state(scene_scale=scene_extent)
 
     # A fixed handful of preview cameras (module.PanelCallback/OrbitCallback,
-    # via get_preview_source() below) -- not the full train/val split (that's
+    # via preview_entries() below) -- not the full train/val split (that's
     # GSFitDataModule's job), just enough to render a comparison panel.
     self._preview = {
       k: {
@@ -713,7 +713,7 @@ class Fit3DGSLightningModule(pl.LightningModule):
     """The actual world-space Gaussian positions -- self.params["means"]
     directly in "set" mode, means_original + self.params["means"] (now an
     offset) in "layered" mode. The only place that resolves the two;
-    render()/get_preview_source()/run_final_eval()/params_np() all go
+    render()/preview_entries()/run_final_eval()/params_np() all go
     through this instead of reading self.params["means"] as if it were
     always a position."""
     if self.gaussian_layout == "layered":
@@ -920,25 +920,18 @@ class Fit3DGSLightningModule(pl.LightningModule):
       out["means"] = self._active_means().detach().cpu().numpy()
     return out
 
-  def get_preview_source(self, mode):
-    """See module.py's PanelCallback/OrbitCallback contract. COLMAP means
-    are natively world-space already (no per-view camera-relative frame to
-    undo, unlike train_gs.py's), so this is a direct activation + the fixed
-    preview cameras from __init__.
+  def preview_stages(self):
+    """The stages that have preview views: "train", and "val" when there is a val split. See module.py's
+    comment block for the contract (this module has one object per stage, so `count` is ignored)."""
+    return [stage for stage in ("train", "val") if self._preview.get(stage) is not None]
 
-    self.step_count, not self.trainer.global_step: manual optimization
-    (this file's whole reason for MANUAL optimization -- gsplat needs to
-    run between backward() and each optimizer's own .step(), and there
-    are several separate optimizers, one per param group) means Lightning
-    never sees any of our raw torch.optim.Adam.step() calls, so
-    trainer.global_step stays frozen at 0 for the entire run (see
-    module._completed_steps' own comment) -- every "step"-mode preview
-    would otherwise cache-hit on the FIRST call forever, logging the same
-    frame every time cadence fires instead of a fresh one."""
-    key = (mode, self.current_epoch if mode == "epoch" else self.step_count)
-    if getattr(self, "_preview_cache_key", None) == key:
-      return self._preview_cache
-
+  def preview_entries(self, stage, count=1, with_layers=False):
+    """The stage's one entry. COLMAP means are natively world-space already (no per-view camera-relative
+    frame to undo, unlike train_gs.py's), so this is a direct activation + the fixed preview cameras from
+    __init__. Nothing is cached: the entry is built from the live parameters every time."""
+    p = self._preview.get(stage)
+    if p is None:
+      return
     with torch.no_grad():
       gauss = {
         "means": self._active_means(), "quats": F.normalize(self.params["quats"], dim=-1),
@@ -946,23 +939,14 @@ class Fit3DGSLightningModule(pl.LightningModule):
         "colors": torch.cat([self.params["sh0"], self.params["shN"]], dim=1),
         "sh_degree": self.active_sh_degree,
       }
-
-    def _entry(stage):
-      p = self._preview.get(stage)
-      if p is None:
-        return None
-      return {
-        "gauss": gauss, "scene_scale": self.scene_extent,
-        "views": {
-          "viewmat": p["viewmat"], "K": p["K"],
-          "width": p["gt_rgb"].shape[2], "height": p["gt_rgb"].shape[1],
-          "gt_rgb": rearrange(p["gt_rgb"], "v h w c -> v c h w"),
-        },
-      }
-
-    source = {"train": _entry("train"), "val": _entry("val") if mode == "step" else None}
-    self._preview_cache_key, self._preview_cache = key, source
-    return source
+    yield {
+      "gauss": gauss, "scene_scale": self.scene_extent,
+      "views": {
+        "viewmat": p["viewmat"], "K": p["K"],
+        "width": p["gt_rgb"].shape[2], "height": p["gt_rgb"].shape[1],
+        "gt_rgb": rearrange(p["gt_rgb"], "v h w c -> v c h w"),
+      },
+    }
 
   def on_fit_start(self):
     # self._preview is a plain dict of raw tensors (not registered
