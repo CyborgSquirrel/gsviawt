@@ -284,6 +284,13 @@ callbacks:
     save_on_exception: true
     save_weights_only: false
 
+  # num_checkpoints checkpoints over the run, counted off max_seconds in training seconds:
+  # milestone-{k}of{n}-step{step}.ckpt at k/n of max_seconds for k < n, and final.ckpt as the n-th.
+  # null = off; needs max_seconds.
+  milestones:
+    _target_: module.MilestoneCheckpoints
+    num_checkpoints: null
+
   orbit:
     _target_: module.OrbitCallback
     every_n_epochs: ${eval:'${trainer.max_epochs} // 50'}
