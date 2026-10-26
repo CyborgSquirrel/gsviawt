@@ -62,7 +62,7 @@ from gs_dataset import (OPENGL_TO_OPENCV, H5Catalog, WTFeatureDataset,  # noqa: 
                         _EmptyDataset, rotate_quats_wxyz, split_views_per_mesh)
 from gs_backbone import MoGeBackbone  # noqa: E402
 from gs_decoder import PatchGaussianHead  # noqa: E402
-from module import (DSSIMLoss, ProgressWandbLogger, TrainClock, _completed_steps,  # noqa: E402
+from module import (DSSIMLoss, Events, ProgressWandbLogger, TrainClock, _completed_steps,  # noqa: E402
                     make_scheduler, needs_clock)
 from util import collate_with_batch_size, pipe, set_mode, timed  # noqa: E402
 
@@ -794,6 +794,12 @@ def main(cfg: DictConfig) -> None:
   torch.manual_seed(int(cfg.seed))
   torch.autograd.set_detect_anomaly(cfg.torch_detect_anomaly)
 
+  # The run's events by name (module.Events): fired by cfg.events' cadences and the scheduler's
+  # trough_event, read by the callbacks with a trigger_event. Set first: everything that names an event
+  # registers itself with it as it is built.
+  events = Events(OmegaConf.to_container(cfg.events, resolve=True))
+  events.make_current()
+
   datamodule = GSDataModule(cfg)
   datamodule.setup()
 
@@ -814,12 +820,12 @@ def main(cfg: DictConfig) -> None:
 
   # A TrainClock stops the run after max_seconds of training time; a time-driven LR scheduler
   # (sched=time_wsd, module.TimeWSD) reads the same clock, which configure_optimizers hands it; so do
-  # callbacks with an every_n_seconds cadence (the clock then only counts, if max_seconds is null)
+  # triggers with an every_n_seconds cadence (the clock then only counts, if max_seconds is null)
   clock = None
   if cfg.sched is not None and needs_clock(hydra.utils.instantiate(cfg.sched)) and cfg.max_seconds is None:
     raise SystemExit("this LR scheduler is driven by the training time: set max_seconds")
-  seconds_cadence = any(
-    cb is not None and OmegaConf.select(cb, "every_n_seconds") is not None for cb in cfg.callbacks.values())
+  specs = [OmegaConf.select(cb, "trigger_event") for cb in cfg.callbacks.values() if cb is not None] + list(cfg.events.values())
+  seconds_cadence = any(isinstance(spec, DictConfig) and spec.get("every_n_seconds") is not None for spec in specs)
   if cfg.max_seconds is not None or seconds_cadence:   # no max_seconds: the clock only counts
     clock = TrainClock(max_seconds=cfg.max_seconds)
   model.clock = clock
@@ -851,8 +857,8 @@ def main(cfg: DictConfig) -> None:
       step_fn=lambda: _completed_steps(model.trainer, model),
     )
 
-  callbacks = []
-  callbacks += list(hydra.utils.instantiate(cfg.callbacks).values())
+  callbacks = list(hydra.utils.instantiate(cfg.callbacks).values())
+  callbacks = [events, *callbacks]   # before every consumer: see module.Events
   if clock is not None:
     callbacks = [clock, *callbacks, clock.tail()]   # first and last: see module.TrainClock
 
