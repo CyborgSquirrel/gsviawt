@@ -408,6 +408,13 @@ class EventValidation(pl.Callback):
     loop.val_loop.run()
     trainer.training = True
     trainer._logger_connector._first_loop_iter = first_loop_iter
+    # A one-shot flag of Lightning's epoch loop (loops/training_epoch_loop.py): its on_advance_end, which runs
+    # after every batch, computes whether Lightning's own check wants a validation (the time interval, the end
+    # of an epoch, a stop request), then, if this flag is set, forces that to False and clears the flag, whether
+    # or not a validation was due. We are in on_train_batch_end, inside the same step's advance(), so it is
+    # consumed in this very step: it suppresses Lightning's own validation of this step only (never a later
+    # one), and the validation above is the step's only one. Running the val loop resets Lightning's
+    # _last_val_time (evaluation_loop.py), so a time interval doesn't fire again right after.
     loop._skip_next_val = True
 
 
