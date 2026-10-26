@@ -277,6 +277,7 @@ class Trigger:
       completed epochs (due on the last batch of one), every_n_seconds TRAINING seconds on the
       TrainClock, which must then be among the trainer's callbacks: due when the clock passes another
       multiple of it (the first call only notes where the clock is, so a resumed run doesn't fire at once);
+    - a list of any of these: due when any of them is due (e.g. [trough, periodic]);
     - None: never due.
   due() is meant to be called once per batch, from on_train_batch_end."""
 
@@ -286,8 +287,12 @@ class Trigger:
     self.event = None
     self.events = None
     self.cadence = None
+    self.any_of = ()
     self._seconds_index = None
     if spec is None:
+      return
+    if isinstance(spec, (list, tuple)) or OmegaConf.is_list(spec):
+      self.any_of = tuple(Trigger(s) for s in spec)
       return
     if isinstance(spec, str):
       self.event = spec
@@ -304,6 +309,8 @@ class Trigger:
     self.cadence = (key, value)
 
   def due(self, trainer, pl_module, batch_idx):
+    if self.any_of:
+      return any([t.due(trainer, pl_module, batch_idx) for t in self.any_of])   # all of them: each one keeps its own state
     if self.event is not None:
       return self.events.fired(self.event)
     if self.cadence is None:
