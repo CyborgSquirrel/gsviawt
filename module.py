@@ -27,6 +27,7 @@ by fit_3dgs.py's layered mode, orbit_video.py and gs_decoder.py.
 """
 
 import contextlib as ctl
+import contextvars
 import inspect
 import logging
 import math
@@ -269,7 +270,8 @@ class TrainClockTail(pl.Callback):
 class Trigger:
   """When a consumer callback acts, as one config value (`trigger_event`):
     - a str: the name of an event; the trigger is due on the steps where that event fired (see Events:
-      some Events source, or a scheduler's trough_event, fires it);
+      some Events source, or a scheduler's trough_event, fires it). It registers itself as a consumer of
+      the name with the current Events (EVENTS), which must be set before it is built;
     - a mapping with exactly one of every_n_steps / every_n_epochs / every_n_seconds: a cadence of this
       consumer's own, no event needed. every_n_steps counts completed optimizer steps, every_n_epochs
       completed epochs (due on the last batch of one), every_n_seconds TRAINING seconds on the
@@ -283,12 +285,15 @@ class Trigger:
   def __init__(self, spec, what="trigger_event"):
     self.what = what
     self.event = None
+    self.events = None
     self.cadence = None
     self._seconds_index = None
     if spec is None:
       return
     if isinstance(spec, str):
       self.event = spec
+      self.events = current_events(what)
+      self.events.consumes(spec, what)
       return
     given = {k: v for k, v in dict(spec).items() if v is not None}
     unknown = set(dict(spec)) - set(self.CADENCES)
@@ -301,7 +306,7 @@ class Trigger:
 
   def due(self, trainer, pl_module, batch_idx):
     if self.event is not None:
-      return events_of(trainer, self.what).fired(self.event)
+      return self.events.fired(self.event)
     if self.cadence is None:
       return False
     key, every = self.cadence
@@ -318,30 +323,58 @@ class Trigger:
     return previous is not None and index > previous
 
 
+EVENTS = contextvars.ContextVar("events", default=None)   # the run's Events: see Events
+
+
+def current_events(what):
+  events = EVENTS.get()
+  if events is None:
+    raise RuntimeError(f"{what}: names an event, but no Events is set -- make one and EVENTS.set() it before "
+                       "building the callbacks and the scheduler")
+  return events
+
+
 class Events(pl.Callback):
   """The events that happened in the current training step, by name. The names are fired by `sources` (a
   mapping name -> a cadence mapping like Trigger's, e.g. {orbit: {every_n_seconds: 1800}}) in this
-  callback's own on_train_batch_end, and by a scheduler given this object (TimeWSD's trough_event) while it
-  steps; consumers (Panel/ScaleLayers/OrbitCallback, EventCheckpoint, EventValidation, ... -- anything that
-  takes a Trigger) read them with fired(name) in their own on_train_batch_end. The set is cleared at the
-  start of every batch.
+  callback's own on_train_batch_end, and by a scheduler (TimeWSD's trough_event) while it steps; consumers
+  (Panel/ScaleLayers/OrbitCallback, EventCheckpoint, EventValidation, ... -- anything that takes a Trigger)
+  read them with fired(name) in their own on_train_batch_end. The set is cleared at the start of every
+  batch.
 
-  So it must come right after the TrainClock (if there is one) and before every consumer in the
-  trainer's callbacks. Nothing checks that a name a consumer asks for is fired by anything: a typo'd
-  name never fires."""
+  The run's Events is put in the EVENTS context variable first thing (EVENTS.set(Events(...))), before
+  anything that names an event is built: the producers (the sources, TimeWSD) call produces(name) and the
+  consumers (Trigger) consumes(name, what) on it as they are built, and on_train_start fails when a
+  consumed name has no producer. It must also be in the trainer's callbacks, right after the TrainClock
+  (if there is one) and before every consumer."""
 
   def __init__(self, sources=None):
+    self.produced = set()
+    self.consumed = {}   # event name -> who asked for it
     self.sources = {name: Trigger(spec, f"events.{name}") for name, spec in (sources or {}).items()}
     for name, trigger in self.sources.items():
       if trigger.event is not None:
         raise ValueError(f"events.{name}: a source is a cadence mapping, not another event's name")
+      self.produces(name)
     self._fired = set()
+
+  def produces(self, name):
+    self.produced.add(name)
+
+  def consumes(self, name, what):
+    self.consumed.setdefault(name, []).append(what)
 
   def fire(self, name):
     self._fired.add(name)
 
   def fired(self, name):
     return name in self._fired
+
+  def on_train_start(self, trainer, pl_module):
+    missing = {name: who for name, who in self.consumed.items() if name not in self.produced}
+    if missing:
+      asked = "; ".join(f"{name!r} by {', '.join(who)}" for name, who in missing.items())
+      raise ValueError(f"event names nothing produces: {asked}. Produced: {sorted(self.produced)}")
 
   def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
     self._fired.clear()
@@ -350,13 +383,6 @@ class Events(pl.Callback):
     for name, trigger in self.sources.items():
       if trigger.due(trainer, pl_module, batch_idx):
         self.fire(name)
-
-
-def events_of(trainer, what="an event trigger"):
-  events = next((c for c in trainer.callbacks if isinstance(c, Events)), None)
-  if events is None:
-    raise RuntimeError(f"{what}: names an event, but there is no Events callback in the trainer's callbacks")
-  return events
 
 
 class EventCheckpoint(pl.Callback):
@@ -426,7 +452,7 @@ class TimeWSD(torch.optim.lr_scheduler.LRScheduler):
   span is cut into cycles of that length (it must divide the span), each a full warmup -> plateau -> decay,
   so the LR returns to min_lr and warms up again at every cycle boundary. start_seconds=0 is a
   schedule over the whole run; a run resumed from a decayed checkpoint can warm up again by setting it to
-  the clock's value there. trough_event (with events=, the Events callback) names an event fired on the
+  the clock's value there. trough_event names an event of the current Events (EVENTS) fired on the
   step where a cycle ends, when the LR is back at min_lr. Step it once per optimizer step like any scheduler; the LR it sets depends on
   the clock's time at that moment. Pair it with TrainClock(max_seconds) to stop the run at the end of
   the decay (train_gs.py does).
@@ -437,7 +463,7 @@ class TimeWSD(torch.optim.lr_scheduler.LRScheduler):
   PARAMS = ("max_seconds", "start_seconds", "cycle_seconds", "warmup_fraction", "decay_fraction", "min_lr")
 
   def __init__(self, optimizer, clock, max_seconds, start_seconds=0.0, cycle_seconds=None, warmup_fraction=0.05, decay_fraction=0.1, min_lr=1e-6,
-               trough_event=None, events=None):
+               trough_event=None):
     self.clock = clock
     self.max_seconds = float(max_seconds)
     self.start_seconds = float(start_seconds)
@@ -452,9 +478,10 @@ class TimeWSD(torch.optim.lr_scheduler.LRScheduler):
     self.decay_fraction = float(decay_fraction)
     self.min_lr = float(min_lr)
     self.trough_event = trough_event
-    self.events = events
-    if trough_event is not None and events is None:
-      raise ValueError("trough_event needs an Events callback (events=...) to fire it in")
+    self.events = None
+    if trough_event is not None:
+      self.events = current_events("TimeWSD.trough_event")
+      self.events.produces(trough_event)
     self._cycle = None   # which cycle the clock is in, to see it cross a trough
     super().__init__(optimizer)
 
@@ -497,15 +524,13 @@ def needs_clock(scheduler_factory):
   return "clock" in inspect.signature(scheduler_factory).parameters
 
 
-def make_scheduler(factory, optimizer, clock=None, events=None):
-  """factory(optimizer), or factory(optimizer, clock=clock) for a scheduler that takes a TrainClock; a
-  scheduler that also takes `events` (the Events callback) is given that too."""
+def make_scheduler(factory, optimizer, clock=None):
+  """factory(optimizer), or factory(optimizer, clock=clock) for a scheduler that takes a TrainClock."""
   if not needs_clock(factory):
     return factory(optimizer)
   if clock is None:
     raise ValueError("this scheduler needs a TrainClock, but none was given")
-  extra = {"events": events} if "events" in inspect.signature(factory).parameters else {}
-  return factory(optimizer, clock=clock, **extra)
+  return factory(optimizer, clock=clock)
 
 
 class WarmupLR(torch.optim.lr_scheduler.LinearLR):

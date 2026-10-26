@@ -208,7 +208,8 @@ loss:
 #   events: {panel_tick: {every_n_seconds: 600}}
 # A callback's trigger_event is either such a name (it acts on the steps where that event fired) or a
 # cadence of its own, a mapping with exactly one of the same three keys, for a one-off that needs no name,
-# or null for never. Nothing checks that an event name is fired by anything: a typo'd name never fires.
+# or null for never. Every event name a callback asks for must be fired by an events: entry or a scheduler's
+# trough_event (checked when training starts).
 events: {}
 
 # orbit / panel / scale_layers / event_checkpoint / event_validation each act on their trigger_event, e.g.
