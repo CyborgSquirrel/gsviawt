@@ -72,3 +72,33 @@ class MoGeBackbone(nn.Module):
         x = checkpoint(block, x, use_reentrant=False) if self.training and self.checkpoint_activations else block(x)
       x = bb.norm(x)[:, 1 + bb.num_register_tokens:]
     return x.float()[:, None]
+
+
+class MoGeMixBackbone(MoGeBackbone):
+  """Frozen MoGe-1 DINOv2 whose tokens are a learned per-channel mix of ALL its blocks: the output is
+  sum_k mix[k] * norm(block_k output), mix (blocks, 1024) trained with the head (init: 1 on the last
+  block, 0 elsewhere = MoGeBackbone's output). The backbone runs without autograd, so it costs no
+  gradient or optimizer memory; each block's output goes through the backbone's final LayerNorm (as
+  get_intermediate_layers(norm=True) does) so their scales are comparable. (B, 3, S, S) -> (B, 1, P, 1024)."""
+
+  def __init__(self, weights="Ruicheng/moge-vitl", image_size=504):
+    super().__init__(weights, image_size, checkpoint_activations=False, freeze_blocks=0)
+    for p in self.backbone.parameters():
+      p.requires_grad_(False)   # the whole encoder is frozen; only mix trains
+    n = len(self.backbone.blocks)
+    mix = torch.zeros(n, self.out_dim)
+    mix[-1] = 1.0
+    self.mix = nn.Parameter(mix)
+
+  def forward(self, image):
+    bb = self.backbone
+    x = (image - self.image_mean) / self.image_std
+    x = F.interpolate(x, (self.image_size, self.image_size), mode="bilinear")
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=x.is_cuda), torch.no_grad():
+      x = bb.prepare_tokens_with_masks(x)
+      outs = []
+      for block in bb.blocks:
+        x = block(x)
+        outs.append(bb.norm(x)[:, 1 + bb.num_register_tokens:])
+      outs = torch.stack(outs, 1)   # (B, blocks, P, D)
+    return (outs.float() * self.mix[None, :, None, :]).sum(1)[:, None]

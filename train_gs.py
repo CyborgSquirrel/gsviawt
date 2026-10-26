@@ -60,7 +60,7 @@ import wandb
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
 from gs_dataset import (OPENGL_TO_OPENCV, H5Catalog, WTFeatureDataset,  # noqa: E402
                         _EmptyDataset, rotate_quats_wxyz, split_views_per_mesh)
-from gs_backbone import MoGeBackbone  # noqa: E402
+from gs_backbone import MoGeBackbone, MoGeMixBackbone  # noqa: E402
 from gs_decoder import PatchGaussianHead  # noqa: E402
 from module import (DSSIMLoss, Events, ProgressWandbLogger, TrainClock, _completed_steps,  # noqa: E402
                     make_scheduler, needs_clock)
@@ -111,10 +111,12 @@ class GSModel(nn.Module):
     # model.backbone.weights set: the encoder is part of the model and trained with the head
     # (the batch carries the source "image" instead of cached "features")
     backbone = cfg.model.get("backbone")
-    self.backbone = (
-      MoGeBackbone(backbone.weights, backbone.image_size, backbone.checkpoint_activations, backbone.get("freeze_blocks", 0))
-      if backbone is not None and backbone.get("weights") else None
-    )
+    if backbone is None or not backbone.get("weights"):
+      self.backbone = None
+    elif backbone.get("mix_blocks"):
+      self.backbone = MoGeMixBackbone(backbone.weights, backbone.image_size)
+    else:
+      self.backbone = MoGeBackbone(backbone.weights, backbone.image_size, backbone.checkpoint_activations, backbone.get("freeze_blocks", 0))
     self.input_key = "features" if self.backbone is None else "image"
 
     # model.rgb_patch: every patch token gets its own 14x14x3 RGB pixels concatenated (in [-1, 1],
