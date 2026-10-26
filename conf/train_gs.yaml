@@ -201,10 +201,19 @@ loss:
   # conf/fit_3dgs.yaml -- adjust to taste.
   mean_offset_reg_weight: 0.01
 
-# Each of orbit / panel / scale_layers takes exactly one of every_n_epochs / every_n_steps /
-# every_n_seconds (TRAINING seconds on module.TrainClock, e.g. +callbacks.orbit.every_n_seconds=600 after
-# callbacks.orbit.every_n_epochs=null). For the checkpoint, set _target_=module.TimedCheckpoint,
-# every_n_epochs=null and every_n_seconds (wall-clock seconds), or use ModelCheckpoint's own train_time_interval.
+# Events (module.Events): named things that happen on a training step, for callbacks to act on. A name is
+# fired by a cadence here (exactly one of every_n_steps / every_n_epochs / every_n_seconds -- TRAINING seconds
+# on module.TrainClock; every_n_epochs fires on the last batch of an epoch) or by the LR scheduler
+# (sched.trough_event), e.g.
+#   events: {panel_tick: {every_n_seconds: 600}}
+# A callback's trigger_event is either such a name (it acts on the steps where that event fired) or a
+# cadence of its own, a mapping with exactly one of the same three keys, for a one-off that needs no name,
+# or null for never. Every event name a callback asks for must be fired by something (checked at fit start).
+events: {}
+
+# orbit / panel / scale_layers / event_checkpoint / event_validation each act on their trigger_event, e.g.
+# callbacks.orbit.trigger_event={every_n_seconds:1800} or callbacks.orbit.trigger_event=trough. The Lightning
+# checkpoint below keeps ModelCheckpoint's own every_n_epochs / train_time_interval.
 callbacks:
   # https://pytorch-lightning.readthedocs.io/en/2.6.1/pytorch/api/lightning.pytorch.callbacks.LearningRateMonitor.html
   lr_monitor:
@@ -220,16 +229,26 @@ callbacks:
     save_on_exception: true
     save_weights_only: false
 
-  # num_checkpoints checkpoints over the run, counted off max_seconds in training seconds:
-  # milestone-{k}of{n}-step{step}.ckpt at k/n of max_seconds for k < n, and final.ckpt as the n-th.
-  # null = off; needs max_seconds.
-  milestones:
-    _target_: module.MilestoneCheckpoints
-    num_checkpoints: null
+  # A checkpoint in the output dir whenever trigger_event is due, named by filename ({count}: how many so
+  # far, {step}: the completed optimizer steps). null = off. (final.ckpt is written by the TrainClock when
+  # max_seconds is spent.) E.g. one every tenth of a max_seconds run:
+  # callbacks.event_checkpoint.trigger_event={every_n_seconds:7200}, or at every LR trough: =trough.
+  event_checkpoint:
+    _target_: module.EventCheckpoint
+    trigger_event: null
+    filename: "checkpoint-{count}-step{step}.ckpt"
+
+  # A validation run right after the step where trigger_event is due (Lightning itself only validates on
+  # trainer.val_check_interval / check_val_every_n_epoch, or when asked to stop); null = off. A step is
+  # never validated twice: this one wins over Lightning's own check.
+  event_validation:
+    _target_: module.EventValidation
+    trigger_event: null
 
   orbit:
     _target_: module.OrbitCallback
-    every_n_epochs: ${eval:'${trainer.max_epochs} // 50'}
+    trigger_event:
+      every_n_epochs: ${eval:'${trainer.max_epochs} // 50'}
     num_frames: 24
     fps: 12
     crf: 28                    # x264 quality (higher = smaller/faster; fine for monitoring)
@@ -237,15 +256,17 @@ callbacks:
                                 # not a re-fit bounding-sphere framing -- see GSLightningModule.get_preview_source
     grid: [1, 1]               # [width, height]: objects (different meshes) per video, each orbiting in its own cell; resolution is then the whole video's longer side
     resolution: 1024           # longer side of the turntable frames in px (aspect kept); null -> the preview views' own size
-    path_format: ${output_dir}/orbits/{stage}_orbit_{mode}{n:06d}.mp4   # null -> temp dir, deleted at fit end
+    path_format: ${output_dir}/orbits/{stage}_orbit_{mode}{n:06d}.mp4   # null -> temp dir, deleted at fit end ({mode} is always "step")
 
   panel:
     _target_: module.PanelCallback
-    every_n_epochs: ${eval:'${trainer.max_epochs} // 50'}
+    trigger_event:
+      every_n_epochs: ${eval:'${trainer.max_epochs} // 50'}
 
   scale_layers:
     _target_: module.ScaleLayersCallback
-    every_n_epochs: ${eval:'${trainer.max_epochs} // 50'}
+    trigger_event:
+      every_n_epochs: ${eval:'${trainer.max_epochs} // 50'}
 
 loader:
   batch_size: 1
