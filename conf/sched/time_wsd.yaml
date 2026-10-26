@@ -5,6 +5,9 @@
 _target_: module.TimeWSD
 _partial_: true
 max_seconds: ${max_seconds}
-warmup_fraction: 0.05     # linear warmup over this fraction of max_seconds
-decay_fraction: 0.1       # cosine decay over the last fraction of max_seconds
+start_seconds: 0.0        # clock time the schedule starts at (warmup -> plateau -> decay span [start_seconds, max_seconds]);
+                          # for a run resumed from a decayed checkpoint, the clock's value there warms up again
+cycle_seconds: null       # repeat the warmup -> plateau -> decay every cycle_seconds (must divide max_seconds - start_seconds); null = one cycle
+warmup_fraction: 0.05     # linear warmup over this fraction of the span (of a cycle, with cycle_seconds)
+decay_fraction: 0.1       # cosine decay over the last fraction of the span (of a cycle, with cycle_seconds)
 min_lr: 1.0e-6
