@@ -201,12 +201,20 @@ loss:
   # conf/fit_3dgs.yaml -- adjust to taste.
   mean_offset_reg_weight: 0.01
 
-# orbit / panel / scale_layers / event_checkpoint / event_validation each act on their trigger_event: a cadence
-# of its own, a mapping with exactly one of every_n_steps / every_n_epochs / every_n_seconds (TRAINING seconds on
-# module.TrainClock; every_n_epochs is due on the last batch of an epoch), or the name of an event the LR
-# scheduler fires (sched.trough_event, e.g. callbacks.orbit.trigger_event=trough), or null for never. A name
-# nothing fires is an error when training starts. The Lightning checkpoint below keeps ModelCheckpoint's own
-# every_n_epochs / train_time_interval.
+# Events (module.Events): named things that happen on a training step, for callbacks to act on. A name is
+# fired by a cadence here (exactly one of every_n_steps / every_n_epochs / every_n_seconds -- TRAINING seconds
+# on module.TrainClock; every_n_epochs fires on the last batch of an epoch) or by the LR scheduler
+# (sched.trough_event), e.g.
+#   events: {panel_tick: {every_n_seconds: 600}}
+# A callback's trigger_event is either such a name (it acts on the steps where that event fired) or a
+# cadence of its own, a mapping with exactly one of the same three keys, for a one-off that needs no name,
+# or null for never. Every event name a callback asks for must be fired by an events: entry or a scheduler's
+# trough_event (checked when training starts).
+events: {}
+
+# orbit / panel / scale_layers / event_checkpoint / event_validation each act on their trigger_event, e.g.
+# callbacks.orbit.trigger_event={every_n_seconds:1800} or callbacks.orbit.trigger_event=trough. The Lightning
+# checkpoint below keeps ModelCheckpoint's own every_n_epochs / train_time_interval.
 callbacks:
   # https://pytorch-lightning.readthedocs.io/en/2.6.1/pytorch/api/lightning.pytorch.callbacks.LearningRateMonitor.html
   lr_monitor:
