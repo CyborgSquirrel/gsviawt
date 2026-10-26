@@ -270,7 +270,7 @@ class TrainClockTail(pl.Callback):
 class Trigger:
   """When a consumer callback acts, as one config value (`trigger_event`):
     - a str: the name of an event; the trigger is due on the steps where that event fired (see Events:
-      some Events source, or a scheduler's trough_event, fires it). It registers itself as a consumer of
+      a scheduler's trough_event, fires it). It registers itself as a consumer of
       the name with the current Events (Events.current), which must be current before it is built;
     - a mapping with exactly one of every_n_steps / every_n_epochs / every_n_seconds: a cadence of this
       consumer's own, no event needed. every_n_steps counts completed optimizer steps, every_n_epochs
@@ -323,18 +323,16 @@ class Trigger:
 
 
 class Events(pl.Callback):
-  """The events that happened in the current training step, by name. The names are fired by `sources` (a
-  mapping name -> a cadence mapping like Trigger's, e.g. {orbit: {every_n_seconds: 1800}}) in this
-  callback's own on_train_batch_end, and by a scheduler (TimeWSD's trough_event) while it steps; consumers
-  (Panel/ScaleLayers/OrbitCallback, EventCheckpoint, EventValidation, ... -- anything that takes a Trigger)
-  read them with fired(name) in their own on_train_batch_end. The set is cleared at the start of every
-  batch.
+  """The events that happened in the current training step, by name. A name is fired by whatever produces it
+  while the step runs (TimeWSD's trough_event, when its schedule steps); consumers (Panel/ScaleLayers/
+  OrbitCallback, EventCheckpoint, EventValidation, ... -- anything that takes a Trigger) read it with
+  fired(name) in their own on_train_batch_end. The set is cleared at the start of every batch.
 
-  The run's Events is made current first thing (Events(...).make_current(), a context variable), before
-  anything that names an event is built: the producers (the sources, TimeWSD) call produces(name) and the
-  consumers (Trigger) consumes(name) on it as they are built, and on_train_start fails when a
-  consumed name has no producer. It must also be in the trainer's callbacks, right after the TrainClock
-  (if there is one) and before every consumer."""
+  The run's Events is made current first thing (Events().make_current(), a context variable), before
+  anything that names an event is built: the producers (TimeWSD) call produces(name) and the consumers
+  (Trigger) consumes(name) on it as they are built, and on_train_start fails when a consumed name has no
+  producer. It must also be in the trainer's callbacks, right after the TrainClock (if there is one) and
+  before every consumer."""
 
   _current = contextvars.ContextVar("events", default=None)
 
@@ -350,14 +348,9 @@ class Events(pl.Callback):
   def make_current(self):
     self._current.set(self)
 
-  def __init__(self, sources=None):
+  def __init__(self):
     self.produced = set()
     self.consumed = set()
-    self.sources = {name: Trigger(spec) for name, spec in (sources or {}).items()}
-    for name, trigger in self.sources.items():
-      if trigger.event is not None:
-        raise ValueError(f"events.{name}: a source is a cadence mapping, not another event's name")
-      self.produces(name)
     self._fired = set()
 
   def produces(self, name):
@@ -379,11 +372,6 @@ class Events(pl.Callback):
 
   def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
     self._fired.clear()
-
-  def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-    for name, trigger in self.sources.items():
-      if trigger.due(trainer, pl_module, batch_idx):
-        self.fire(name)
 
 
 class EventCheckpoint(pl.Callback):

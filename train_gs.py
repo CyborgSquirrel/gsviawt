@@ -831,10 +831,10 @@ def main(cfg: DictConfig) -> None:
   torch.manual_seed(int(cfg.seed))
   torch.autograd.set_detect_anomaly(cfg.torch_detect_anomaly)
 
-  # The run's events by name (module.Events): fired by cfg.events' cadences and the scheduler's
-  # trough_event, read by the callbacks with a trigger_event. Set first: everything that names an event
-  # registers itself with it as it is built.
-  events = Events(OmegaConf.to_container(cfg.events, resolve=True))
+  # The run's events by name (module.Events): fired by the scheduler's trough_event, read by the callbacks
+  # with a trigger_event. Made current first: everything that names an event registers itself with it as it
+  # is built.
+  events = Events()
   events.make_current()
 
   datamodule = GSDataModule(cfg)
@@ -861,7 +861,7 @@ def main(cfg: DictConfig) -> None:
   clock = None
   if cfg.sched is not None and needs_clock(hydra.utils.instantiate(cfg.sched)) and cfg.max_seconds is None:
     raise SystemExit("this LR scheduler is driven by the training time: set max_seconds")
-  specs = [OmegaConf.select(cb, "trigger_event") for cb in cfg.callbacks.values() if cb is not None] + list(cfg.events.values())
+  specs = [OmegaConf.select(cb, "trigger_event") for cb in cfg.callbacks.values() if cb is not None]
   seconds_cadence = any(isinstance(spec, DictConfig) and spec.get("every_n_seconds") is not None for spec in specs)
   if cfg.max_seconds is not None or seconds_cadence:   # no max_seconds: the clock only counts
     clock = TrainClock(max_seconds=cfg.max_seconds)

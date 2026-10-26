@@ -11,5 +11,5 @@ cycle_seconds: null       # repeat the warmup -> plateau -> decay every cycle_se
 warmup_fraction: 0.05     # linear warmup over this fraction of the span (of a cycle, with cycle_seconds)
 decay_fraction: 0.1       # cosine decay over the last fraction of the span (of a cycle, with cycle_seconds)
 min_lr: 1.0e-6
-trough_event: null       # an event name (see events: in train_gs.yaml) fired on the step where a cycle ends, the LR back at min_lr -- the end of the span without cycle_seconds;
+trough_event: null       # an event name fired on the step where a cycle ends, the LR back at min_lr -- the end of the span without cycle_seconds;
                           # a callback's trigger_event can name it (e.g. orbit/validation/checkpoint at every trough)
