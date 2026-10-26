@@ -271,7 +271,7 @@ class Trigger:
   """When a consumer callback acts, as one config value (`trigger_event`):
     - a str: the name of an event; the trigger is due on the steps where that event fired (see Events:
       some Events source, or a scheduler's trough_event, fires it). It registers itself as a consumer of
-      the name with the current Events (EVENTS), which must be set before it is built;
+      the name with the current Events (Events.current), which must be current before it is built;
     - a mapping with exactly one of every_n_steps / every_n_epochs / every_n_seconds: a cadence of this
       consumer's own, no event needed. every_n_steps counts completed optimizer steps, every_n_epochs
       completed epochs (due on the last batch of one), every_n_seconds TRAINING seconds on the
@@ -292,7 +292,7 @@ class Trigger:
       return
     if isinstance(spec, str):
       self.event = spec
-      self.events = current_events(what)
+      self.events = Events.current(what)
       self.events.consumes(spec, what)
       return
     given = {k: v for k, v in dict(spec).items() if v is not None}
@@ -323,17 +323,6 @@ class Trigger:
     return previous is not None and index > previous
 
 
-EVENTS = contextvars.ContextVar("events", default=None)   # the run's Events: see Events
-
-
-def current_events(what):
-  events = EVENTS.get()
-  if events is None:
-    raise RuntimeError(f"{what}: names an event, but no Events is set -- make one and EVENTS.set() it before "
-                       "building the callbacks and the scheduler")
-  return events
-
-
 class Events(pl.Callback):
   """The events that happened in the current training step, by name. The names are fired by `sources` (a
   mapping name -> a cadence mapping like Trigger's, e.g. {orbit: {every_n_seconds: 1800}}) in this
@@ -342,11 +331,25 @@ class Events(pl.Callback):
   read them with fired(name) in their own on_train_batch_end. The set is cleared at the start of every
   batch.
 
-  The run's Events is put in the EVENTS context variable first thing (EVENTS.set(Events(...))), before
+  The run's Events is made current first thing (Events(...).make_current(), a context variable), before
   anything that names an event is built: the producers (the sources, TimeWSD) call produces(name) and the
   consumers (Trigger) consumes(name, what) on it as they are built, and on_train_start fails when a
   consumed name has no producer. It must also be in the trainer's callbacks, right after the TrainClock
   (if there is one) and before every consumer."""
+
+  _current = contextvars.ContextVar("events", default=None)
+
+  @classmethod
+  def current(cls, what):
+    """The run's Events, for `what` (the name in the error) to register with."""
+    events = cls._current.get()
+    if events is None:
+      raise RuntimeError(f"{what}: names an event, but no Events is current -- make one and call "
+                         "make_current() on it before building the callbacks and the scheduler")
+    return events
+
+  def make_current(self):
+    self._current.set(self)
 
   def __init__(self, sources=None):
     self.produced = set()
@@ -452,7 +455,7 @@ class TimeWSD(torch.optim.lr_scheduler.LRScheduler):
   span is cut into cycles of that length (it must divide the span), each a full warmup -> plateau -> decay,
   so the LR returns to min_lr and warms up again at every cycle boundary. start_seconds=0 is a
   schedule over the whole run; a run resumed from a decayed checkpoint can warm up again by setting it to
-  the clock's value there. trough_event names an event of the current Events (EVENTS) fired on the
+  the clock's value there. trough_event names an event of the current Events (Events.current) fired on the
   step where a cycle ends, when the LR is back at min_lr. Step it once per optimizer step like any scheduler; the LR it sets depends on
   the clock's time at that moment. Pair it with TrainClock(max_seconds) to stop the run at the end of
   the decay (train_gs.py does).
@@ -480,7 +483,7 @@ class TimeWSD(torch.optim.lr_scheduler.LRScheduler):
     self.trough_event = trough_event
     self.events = None
     if trough_event is not None:
-      self.events = current_events("TimeWSD.trough_event")
+      self.events = Events.current("TimeWSD.trough_event")
       self.events.produces(trough_event)
     self._cycle = None   # which cycle the clock is in, to see it cross a trough
     super().__init__(optimizer)

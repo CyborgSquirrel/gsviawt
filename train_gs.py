@@ -62,7 +62,7 @@ from gs_dataset import (OPENGL_TO_OPENCV, H5Catalog, WTFeatureDataset,  # noqa: 
                         _EmptyDataset, rotate_quats_wxyz, split_views_per_mesh)
 from gs_backbone import MoGeBackbone  # noqa: E402
 from gs_decoder import PatchGaussianHead  # noqa: E402
-from module import (DSSIMLoss, EVENTS, Events, ProgressWandbLogger, TrainClock, _completed_steps,  # noqa: E402
+from module import (DSSIMLoss, Events, ProgressWandbLogger, TrainClock, _completed_steps,  # noqa: E402
                     make_scheduler, needs_clock)
 from util import collate_with_batch_size, pipe, set_mode, timed  # noqa: E402
 
@@ -835,7 +835,7 @@ def main(cfg: DictConfig) -> None:
   # trough_event, read by the callbacks with a trigger_event. Set first: everything that names an event
   # registers itself with it as it is built.
   events = Events(OmegaConf.to_container(cfg.events, resolve=True))
-  EVENTS.set(events)
+  events.make_current()
 
   datamodule = GSDataModule(cfg)
   datamodule.setup()
