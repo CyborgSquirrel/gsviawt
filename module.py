@@ -327,8 +327,8 @@ class Events(pl.Callback):
   start of every batch.
 
   So it must come right after the TrainClock (if there is one) and before every consumer in the
-  trainer's callbacks. on_train_start checks that every event name a consumer asks for is produced by
-  something -- a typo'd name would otherwise silently never fire."""
+  trainer's callbacks. Nothing checks that a name a consumer asks for is fired by anything: a typo'd
+  name never fires."""
 
   def __init__(self, sources=None):
     self.sources = {name: Trigger(spec, f"events.{name}") for name, spec in (sources or {}).items()}
@@ -342,14 +342,6 @@ class Events(pl.Callback):
 
   def fired(self, name):
     return name in self._fired
-
-  def on_train_start(self, trainer, pl_module):
-    produced = set(self.sources)
-    produced |= {c.scheduler.trough_event for c in trainer.lr_scheduler_configs if getattr(c.scheduler, "trough_event", None)}
-    for callback in trainer.callbacks:
-      trigger = getattr(callback, "trigger", None)
-      if isinstance(trigger, Trigger) and trigger.event is not None and trigger.event not in produced:
-        raise ValueError(f"{trigger.what}: no event named {trigger.event!r}; the events are {sorted(produced)}")
 
   def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
     self._fired.clear()
