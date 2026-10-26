@@ -282,8 +282,7 @@ class Trigger:
 
   CADENCES = ("every_n_steps", "every_n_epochs", "every_n_seconds")
 
-  def __init__(self, spec, what="trigger_event"):
-    self.what = what
+  def __init__(self, spec):
     self.event = None
     self.events = None
     self.cadence = None
@@ -292,16 +291,16 @@ class Trigger:
       return
     if isinstance(spec, str):
       self.event = spec
-      self.events = Events.current(what)
-      self.events.consumes(spec, what)
+      self.events = Events.current()
+      self.events.consumes(spec)
       return
     given = {k: v for k, v in dict(spec).items() if v is not None}
     unknown = set(dict(spec)) - set(self.CADENCES)
     if unknown or len(given) != 1:
-      raise ValueError(f"{what}: an event name, or a mapping with exactly one of {self.CADENCES} (and nothing else), got {dict(spec)}")
+      raise ValueError(f"an event name, or a mapping with exactly one of {self.CADENCES} (and nothing else), got {dict(spec)}")
     (key, value), = given.items()
     if value <= 0:
-      raise ValueError(f"{what}: {key} must be positive, got {value}")
+      raise ValueError(f"{key} must be positive, got {value}")
     self.cadence = (key, value)
 
   def due(self, trainer, pl_module, batch_idx):
@@ -317,7 +316,7 @@ class Trigger:
       return batch_idx + 1 == trainer.num_training_batches and (trainer.current_epoch + 1) % every == 0
     clock = next((c for c in trainer.callbacks if isinstance(c, TrainClock)), None)
     if clock is None:
-      raise RuntimeError(f"{self.what}: every_n_seconds needs a TrainClock in the trainer's callbacks")
+      raise RuntimeError("every_n_seconds needs a TrainClock in the trainer's callbacks")
     index = int(clock.seconds() // every)
     previous, self._seconds_index = self._seconds_index, index
     return previous is not None and index > previous
@@ -333,19 +332,19 @@ class Events(pl.Callback):
 
   The run's Events is made current first thing (Events(...).make_current(), a context variable), before
   anything that names an event is built: the producers (the sources, TimeWSD) call produces(name) and the
-  consumers (Trigger) consumes(name, what) on it as they are built, and on_train_start fails when a
+  consumers (Trigger) consumes(name) on it as they are built, and on_train_start fails when a
   consumed name has no producer. It must also be in the trainer's callbacks, right after the TrainClock
   (if there is one) and before every consumer."""
 
   _current = contextvars.ContextVar("events", default=None)
 
   @classmethod
-  def current(cls, what):
-    """The run's Events, for `what` (the name in the error) to register with."""
+  def current(cls):
+    """The run's Events."""
     events = cls._current.get()
     if events is None:
-      raise RuntimeError(f"{what}: names an event, but no Events is current -- make one and call "
-                         "make_current() on it before building the callbacks and the scheduler")
+      raise RuntimeError("no Events is current -- make one and call make_current() on it before building "
+                         "the callbacks and the scheduler")
     return events
 
   def make_current(self):
@@ -353,8 +352,8 @@ class Events(pl.Callback):
 
   def __init__(self, sources=None):
     self.produced = set()
-    self.consumed = {}   # event name -> who asked for it
-    self.sources = {name: Trigger(spec, f"events.{name}") for name, spec in (sources or {}).items()}
+    self.consumed = set()
+    self.sources = {name: Trigger(spec) for name, spec in (sources or {}).items()}
     for name, trigger in self.sources.items():
       if trigger.event is not None:
         raise ValueError(f"events.{name}: a source is a cadence mapping, not another event's name")
@@ -364,8 +363,8 @@ class Events(pl.Callback):
   def produces(self, name):
     self.produced.add(name)
 
-  def consumes(self, name, what):
-    self.consumed.setdefault(name, []).append(what)
+  def consumes(self, name):
+    self.consumed.add(name)
 
   def fire(self, name):
     self._fired.add(name)
@@ -374,10 +373,9 @@ class Events(pl.Callback):
     return name in self._fired
 
   def on_train_start(self, trainer, pl_module):
-    missing = {name: who for name, who in self.consumed.items() if name not in self.produced}
+    missing = self.consumed - self.produced
     if missing:
-      asked = "; ".join(f"{name!r} by {', '.join(who)}" for name, who in missing.items())
-      raise ValueError(f"event names nothing produces: {asked}. Produced: {sorted(self.produced)}")
+      raise ValueError(f"event names nothing produces: {sorted(missing)}; produced: {sorted(self.produced)}")
 
   def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
     self._fired.clear()
@@ -396,7 +394,7 @@ class EventCheckpoint(pl.Callback):
   itself when the budget is spent.)"""
 
   def __init__(self, *, trigger_event, filename="checkpoint-{count}-step{step}.ckpt"):
-    self.trigger = Trigger(trigger_event, "EventCheckpoint.trigger_event")
+    self.trigger = Trigger(trigger_event)
     self.filename = filename
     self.count = 0
 
@@ -424,7 +422,7 @@ class EventValidation(pl.Callback):
   The TrainClock doesn't count the validation (it counts the optimization pass of a batch only)."""
 
   def __init__(self, *, trigger_event):
-    self.trigger = Trigger(trigger_event, "EventValidation.trigger_event")
+    self.trigger = Trigger(trigger_event)
 
   def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
     if not self.trigger.due(trainer, pl_module, batch_idx):
@@ -483,7 +481,7 @@ class TimeWSD(torch.optim.lr_scheduler.LRScheduler):
     self.trough_event = trough_event
     self.events = None
     if trough_event is not None:
-      self.events = Events.current("TimeWSD.trough_event")
+      self.events = Events.current()
       self.events.produces(trough_event)
     self._cycle = None   # which cycle the clock is in, to see it cross a trough
     super().__init__(optimizer)
@@ -767,7 +765,7 @@ class PanelCallback(pl.Callback):
   validation loop to hook a separate "val batch end" into)."""
 
   def __init__(self, *, trigger_event):
-    self.trigger = Trigger(trigger_event, "PanelCallback.trigger_event")
+    self.trigger = Trigger(trigger_event)
 
   def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
     self._step(trainer, pl_module, batch_idx)
@@ -861,7 +859,7 @@ class ScaleLayersCallback(pl.Callback):
   with no entry at all."""
 
   def __init__(self, *, trigger_event):
-    self.trigger = Trigger(trigger_event, "ScaleLayersCallback.trigger_event")
+    self.trigger = Trigger(trigger_event)
 
   def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
     self._step(trainer, pl_module, batch_idx)
@@ -984,7 +982,7 @@ class OrbitCallback(pl.Callback):
   def __init__(self, *, trigger_event,
               num_frames: int = 24, fps: int = 12, crf: int = 28, elevation_deg: float = 20.0,
               path_format: str | None = None, resolution: int | None = None, grid: tuple[int, int] = (1, 1)):
-    self.trigger = Trigger(trigger_event, "OrbitCallback.trigger_event")
+    self.trigger = Trigger(trigger_event)
     grid = tuple(int(g) for g in grid)
     if len(grid) != 2 or min(grid) < 1:
       raise ValueError(f"OrbitCallback: grid must be [width, height] with both >= 1, got {list(grid)}")
