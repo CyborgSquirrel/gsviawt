@@ -1,0 +1,30 @@
+# Config for scripts/download_objaverse_sketchfab.py -- see its module docstring.
+
+# trellis-500k | objaverse-xl
+#   trellis-500k -> TRELLIS-500K's curated subset
+#   objaverse-xl -> the full Objaverse-XL sketchfab annotations
+dataset: trellis-500k
+
+# Number of meshes to download (with have_file: the total, counting the ones already downloaded).
+count: 500
+# null -> the first `count` objects; a number -> a random sample of `count` objects with this seed.
+sample_seed: null
+# Text file of already downloaded GLB paths (one per line, the file stem is the object's uid):
+# they count towards `count` and are not downloaded again. null -> none.
+have_file: null
+
+# Objects per download call: a network error (the objaverse-xl pool re-raises the first one) then
+# loses only the rest of its batch; rerun with have_file to fetch what is missing.
+batch_size: 200
+processes: null           # null -> the number of CPUs
+# objaverse-xl cache dir (also holds the cached TRELLIS-500K CSV).
+download_dir: ~/.objaverse
+# Re-download cached annotations/CSV even if a cached copy exists.
+refresh: false
+
+hydra:
+  job:
+    chdir: false          # stay in cwd; have_file / download_dir are cwd-relative
+  output_subdir: null     # no .hydra/ dir
+  run:
+    dir: .                # no outputs/ dir

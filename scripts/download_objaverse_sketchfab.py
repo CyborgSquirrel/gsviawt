@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Download the first N Sketchfab meshes from Objaverse-XL, optionally via TRELLIS-500K.
 
-Two --dataset modes for choosing which objects to download:
+Two `dataset` modes for choosing which objects to download:
   - "trellis-500k" (default): TRELLIS-500K
     (https://huggingface.co/datasets/JeffreyXiang/TRELLIS-500K) is a curated,
     aesthetic-score-filtered subset of Objaverse-XL. Its sketchfab CSV is
@@ -12,42 +12,30 @@ Two --dataset modes for choosing which objects to download:
 Either way, the actual mesh files are fetched through the regular
 objaverse-xl API.
 
-By default the first --count objects are taken. With --sample-seed they are a seeded random
-sample of the whole list instead, and with --have-file, GLBs that are already downloaded (one
-path per line, the file stem is the object's uid) count towards --count and are not downloaded
-again: --count is then the total, and only the missing ones are fetched.
+By default the first `count` objects are taken. With `sample_seed` they are a seeded random
+sample of the whole list instead, and with `have_file`, GLBs that are already downloaded (one
+path per line, the file stem is the object's uid) count towards `count` and are not downloaded
+again: `count` is then the total, and only the missing ones are fetched.
 
-Usage:
+Configured with Hydra (conf/download_objaverse_sketchfab.yaml); the options are config keys:
     pip install objaverse
-    python scripts/download_objaverse_sketchfab.py --dataset trellis-500k --count 500
-    python scripts/download_objaverse_sketchfab.py --count 10000 --sample-seed 0 --have-file bla/trellis_glbs.txt --download-dir /mnt/hdd/objaverse
+    python scripts/download_objaverse_sketchfab.py dataset=trellis-500k count=500
+    python scripts/download_objaverse_sketchfab.py count=10000 sample_seed=0 have_file=bla/trellis_glbs.txt download_dir=/mnt/hdd/objaverse
 """
 
-import argparse
 import multiprocessing
 import os
 from pathlib import Path
 
+import hydra
 import objaverse.xl as oxl
 import pandas as pd
 import requests
+from omegaconf import DictConfig
 from tqdm import tqdm
 
 TRELLIS_500K_BASE_URL = "https://huggingface.co/datasets/JeffreyXiang/TRELLIS-500K/resolve/main"
 TRELLIS_500K_CSV = "ObjaverseXL_sketchfab.csv"
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--dataset", choices=["trellis-500k", "objaverse-xl"], default="trellis-500k", help="TRELLIS-500K's curated subset, or the full Objaverse-XL annotations")
-    parser.add_argument("--count", type=int, default=500, help="number of meshes to download (with --have-file: the total, counting the ones already downloaded)")
-    parser.add_argument("--sample-seed", type=int, default=None, help="take a random sample of --count objects with this seed, instead of the first --count")
-    parser.add_argument("--have-file", default=None, help="text file of already downloaded GLB paths: they count towards --count and are not downloaded again")
-    parser.add_argument("--batch-size", type=int, default=200, help="objects per download call: a network error (the objaverse-xl pool re-raises the first one) then loses only the rest of its batch; rerun with --have-file to fetch what is missing")
-    parser.add_argument("--processes", type=int, default=multiprocessing.cpu_count(), help="parallel download processes")
-    parser.add_argument("--download-dir", default="~/.objaverse", help="objaverse-xl cache dir (also holds the cached TRELLIS-500K CSV)")
-    parser.add_argument("--refresh", action="store_true", help="re-download cached annotations/CSV even if a cached copy exists")
-    return parser.parse_args()
 
 
 def get_trellis_500k_csv(download_dir: Path, refresh: bool) -> pd.DataFrame:
@@ -101,25 +89,28 @@ def get_objects(dataset: str, count: int, download_dir: Path, refresh: bool, sam
     return subset[["fileIdentifier", "sha256", "source"]].reset_index(drop=True)
 
 
-def main() -> None:
-    args = parse_args()
-    download_dir = Path(args.download_dir).expanduser()
+@hydra.main(version_base=None, config_path="../conf", config_name="download_objaverse_sketchfab")
+def main(cfg: DictConfig) -> None:
+    if cfg.dataset not in ("trellis-500k", "objaverse-xl"):
+        raise ValueError(f"dataset must be trellis-500k or objaverse-xl, got {cfg.dataset!r}")
+    download_dir = Path(cfg.download_dir).expanduser()
+    processes = cfg.processes or multiprocessing.cpu_count()
 
     have_uids = set()
-    if args.have_file is not None:
-        have_uids = {Path(line.strip()).stem for line in open(args.have_file) if line.strip()}
+    if cfg.have_file is not None:
+        have_uids = {Path(line.strip()).stem for line in open(cfg.have_file) if line.strip()}
 
-    objects = get_objects(args.dataset, args.count, download_dir, args.refresh, args.sample_seed, have_uids)
-    print(f"Downloading {len(objects)} Sketchfab meshes ({args.dataset}; {len(have_uids)} already downloaded) into {download_dir}...")
+    objects = get_objects(cfg.dataset, cfg.count, download_dir, cfg.refresh, cfg.sample_seed, have_uids)
+    print(f"Downloading {len(objects)} Sketchfab meshes ({cfg.dataset}; {len(have_uids)} already downloaded) into {download_dir}...")
 
     paths, failed_batches = {}, 0
-    for start in tqdm(range(0, len(objects), args.batch_size), desc="batches"):
-        batch = objects.iloc[start:start + args.batch_size]
+    for start in tqdm(range(0, len(objects), cfg.batch_size), desc="batches"):
+        batch = objects.iloc[start:start + cfg.batch_size]
         try:
-            paths.update(oxl.download_objects(objects=batch, download_dir=str(download_dir), processes=args.processes))
+            paths.update(oxl.download_objects(objects=batch, download_dir=str(download_dir), processes=processes))
         except Exception as e:
             failed_batches += 1
-            print(f"batch at {start} failed ({type(e).__name__}: {e}); continuing, rerun with --have-file to fetch what is missing")
+            print(f"batch at {start} failed ({type(e).__name__}: {e}); continuing, rerun with have_file to fetch what is missing")
 
     print(f"Done. {len(paths)} meshes cached under {download_dir} ({failed_batches} batches failed)")
 
