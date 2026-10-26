@@ -109,6 +109,9 @@ model:
     mix_blocks: false       # true: the encoder is frozen and its tokens are sum_k mix[k] * norm(block k output) over ALL
                             # blocks, mix (blocks, 1024) learned (init: last block 1, others 0) -- gs_backbone.MoGeMixBackbone.
                             # Set lr (below) to the head's LR: it is the learning rate of mix
+    mix_groups: shared      # with mix_blocks: how the Gaussian layers share the mix -- shared (one (blocks, 1024) mix, one token
+                            # map for all layers), first_rest (one mix for layer 0, one for layers 1..), per_layer (one per layer)
+    mix_init: last          # with mix_blocks: last (1 on the last block, 0 elsewhere) or gaussian (N(0, 1) / blocks)
     freeze_blocks: 0        # freeze the patch embedding and the first N of the 24 blocks (no grad / optimizer memory for them)
   # Optional transformer trunk in front of the per-patch linear projection (a
   # small version of World Tracing's head: blocks cycle frame -> ray -> global

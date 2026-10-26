@@ -115,7 +115,9 @@ class GSModel(nn.Module):
     if backbone is None or not backbone.get("weights"):
       self.backbone = None
     elif backbone.get("mix_blocks"):
-      self.backbone = MoGeMixBackbone(backbone.weights, backbone.image_size)
+      self.backbone = MoGeMixBackbone(
+        backbone.weights, backbone.image_size, groups=backbone.get("mix_groups", "shared"),
+        init=backbone.get("mix_init", "last"), num_layers=cfg.data.num_layers)
     else:
       self.backbone = MoGeBackbone(backbone.weights, backbone.image_size, backbone.checkpoint_activations, backbone.get("freeze_blocks", 0))
     self.input_key = "features" if self.backbone is None else "image"
