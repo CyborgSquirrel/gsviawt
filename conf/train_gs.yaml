@@ -4,6 +4,8 @@
 # module docstring.
 
 defaults:
+  - data/mesh_split: fraction
+  - data/view_split: fraction
   # LR scheduler: step_cosine (warmup + cosine over total_steps), time_wsd (warmup-stable-decay over
   # max_seconds of training time; also stops the run -- see conf/sched/time_wsd.yaml), or sched=null for none
   - sched: step_cosine
@@ -46,17 +48,21 @@ data:
   # Whether the volume's own source view can be one of the sampled views.
   # false: it never is (it's dropped from the draw).
   allow_source_as_target: false
-  # Per-mesh train/val view split: this fraction of each mesh's views (at
-  # least one) is held out for val. 0 = no validation.
-  val_fraction: 0.1
-  # mesh_index values of meshes held out entirely (null = none). With a list, the view split
-  # above is made on the other meshes only, and validation is split into val_meshes (volumes
-  # of the held-out meshes), val_views_strain (train-view source, val-view targets) and
-  # val_views_sval (val-view source and targets) -- see train_gs.GSDataModule. null: train and
-  # val share the volumes, one set logged "val".
-  val_meshes: null
+  # Train/val split, in two stages, each a config group picked via the `defaults:` list up top (a one-token
+  # CLI override, e.g. data/mesh_split=names data.mesh_split.val_meshes='[a.glb,b.glb]'; the paths are the
+  # render h5's `mesh_paths` entries):
+  #   1. data/mesh_split: all meshes -> train_meshes + val_meshes
+  #   2. data/view_split: the train_meshes' views -> train_views + val_views
+  # A feature volume goes where its SOURCE view is; training uses the train views' volumes, and each volume
+  # samples its num_views supervision views from the views of its own half. Each non-empty piece is validated
+  # separately, logged under its own prefix (see train_gs.GSDataModule):
+  #   val_meshes:       volumes of the held-out meshes, every view of theirs eligible as target
+  #   val_views_strain: train meshes, sources = train views (as many per mesh as it has val_views), targets = val_views
+  #   val_views_sval:   train meshes, sources AND targets = val_views
+  # See conf/data/mesh_split/*.yaml and conf/data/view_split/*.yaml. The defaults hold out 10% of the meshes
+  # and no views.
   # Size of each validation set in volumes (a fixed random subset, so a val pass stays cheap);
-  # null = all of them. Only with val_meshes.
+  # null = all of them.
   val_volumes: null
   # Resample the source view's depth (nearest neighbour) to this square size, for features
   # extracted at the model size from a larger render: 504 for r75b on a 512 render. null = off.

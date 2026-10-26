@@ -428,7 +428,7 @@ def run(cfg):
   import hydra
   import h5py
   from omegaconf import OmegaConf
-  from util import LazyDataset
+  from util import TransactionalWriter, size_chunks
 
   logging.basicConfig(level=logging.INFO)
 
@@ -451,6 +451,16 @@ def run(cfg):
         raise ValueError("source_max_meshes needs source_rerender_rgb=true "
                          "(copied images can't be subset)")
 
+    # Queue mode: the config (and the mesh list the jobs index into) comes from the queue; only this
+    # worker's own keys come from the command line.
+    queue = None
+    if cfg.queue_path is not None:
+      if src is not None:
+        raise ValueError("queue_path doesn't combine with source_path")
+      from job_queue import JobQueue
+      queue = JobQueue(cfg.queue_path)
+      cfg = OmegaConf.merge(queue.get_meta("config"), {k: cfg[k] for k in ("queue_path", "queue_worker", "output_path")})
+
     scene = bpy.context.scene
     # Per-engine settings are all set up front; _render_mesh switches
     # scene.render.engine per pass (RGB: cfg.render_engine, depth: Cycles).
@@ -467,9 +477,13 @@ def run(cfg):
       raise ValueError("depth_width/depth_height must be set (config default is "
                        "${width}/${height}; use that to match the RGB pass)")
     DW, DH = int(cfg.depth_width), int(cfg.depth_height)
+    worker = None
+    if queue is not None:
+      worker = str(os.getpid()) if cfg.queue_worker is None else str(cfg.queue_worker)
     if src is None:
       view_strategy = hydra.utils.instantiate(cfg.view_strategy)
-      meshes = list(hydra.utils.instantiate(cfg.mesh_strategy).meshes())
+      # queue mode: the mesh list the jobs index into is stored in the queue
+      meshes = queue.get_meta("meshes") if queue is not None else list(hydra.utils.instantiate(cfg.mesh_strategy).meshes())
       Lmax = int(cfg.max_peel_layers)
       mesh_views = lambda mi: _strategy_views(cfg, view_strategy, meshes[mi])
     else:
@@ -481,8 +495,8 @@ def run(cfg):
     logger.info("RGB %dx%d, depth-peel %dx%d", W, H, DW, DH)
 
     os.makedirs(os.path.dirname(cfg.output_path) or ".", exist_ok=True)
-    img_kw = dict(chunks=(1, H, W, 4), compression="gzip", compression_opts=4)
-    depth_kw = dict(chunks=(1, DH, DW, Lmax), compression="gzip", compression_opts=4)
+    img_kw = dict(compression="gzip", compression_opts=4)
+    depth_kw = dict(compression="gzip", compression_opts=4)
 
     tmp = stack.enter_context(TemporaryDirectory())
     hf = stack.enter_context(h5py.File(cfg.output_path, "w"))
@@ -491,30 +505,39 @@ def run(cfg):
 
     # when re-rendering depth only, the RGB images are copied from the source
     render_rgb = cfg.render and (src is None or cfg.source_rerender_rgb)
-    ds_img = stack.enter_context(LazyDataset(hf, "images", dataset_kwargs=img_kw)) if render_rgb else None
-    ds_pose = stack.enter_context(LazyDataset(hf, "camera_pose"))
+    writer = TransactionalWriter(hf)
+    if render_rgb:
+      writer.init("images", dataset_kwargs=img_kw)
+    writer.init("camera_pose")
     # two intrinsics datasets, both always written (identical when the RGB and
     # depth-peel resolutions match) so consumers never have to guess which K a
     # dataset goes with.
-    ds_depth_intr = stack.enter_context(LazyDataset(hf, "depth_intrinsics"))  # matches depth_peel
-    ds_img_intr = stack.enter_context(LazyDataset(hf, "image_intrinsics")) if cfg.render else None  # matches images
-    ds_depth = stack.enter_context(LazyDataset(hf, "depth_peel", dataset_kwargs=depth_kw))
-    ds_mesh = stack.enter_context(LazyDataset(hf, "mesh_index"))
-    ds_scale = stack.enter_context(LazyDataset(hf, "depth_scale"))
+    writer.init("depth_intrinsics")  # matches depth_peel
+    if cfg.render:
+      writer.init("image_intrinsics")  # matches images
+    writer.init("depth_peel", dataset_kwargs=depth_kw)
+    writer.init("mesh_index", chunks=size_chunks)
+    writer.init("depth_scale")
 
     failed = []
-    for mi, mesh_path in enumerate(meshes):
+    for mi, job in _mesh_jobs(meshes, queue, worker, cfg.queue_max_meshes):
+      mesh_path = meshes[mi]
       views = list(mesh_views(mi))
       if not views:
         continue  # re-render: mesh has no rows in the source (it failed there)
       try:
-        _render_mesh(cfg, scene, mi, mesh_path, views, W, H, DW, DH, Lmax, tmp,
-                     ds_img, ds_pose, ds_depth_intr, ds_img_intr, ds_depth, ds_mesh, ds_scale)
-      except Exception:
+        with writer.transaction():
+          _render_mesh(cfg, scene, mi, mesh_path, views, W, H, DW, DH, Lmax, tmp, writer)
+      except Exception as e:
         if src is not None:
           raise  # skipping would misalign rows with the copied images
         logger.exception("mesh %d (%s) failed -- skipping", mi, mesh_path)
         failed.append(mi)
+        if job is not None:
+          queue.fail(job, worker, repr(e))
+      else:
+        if job is not None:
+          queue.done(job, worker)   # only after the rows are committed to the file
 
     if src is not None:
       if "images" in src and not render_rgb:
@@ -526,6 +549,22 @@ def run(cfg):
       logger.warning("%d/%d meshes failed: %s", len(failed), len(meshes), failed)
 
   logger.info("wrote %s", cfg.output_path)
+
+
+def _mesh_jobs(meshes, queue, worker, max_meshes):
+  """(mesh index, job) per mesh to render: every mesh in order with job None, or -- with a queue --
+  the meshes this worker claims, until the queue has none ready or max_meshes were claimed."""
+  if queue is None:
+    for mi in range(len(meshes)):
+      yield mi, None
+    return
+  claimed = 0
+  while max_meshes is None or claimed < max_meshes:
+    job = queue.claim(worker)
+    if job is None:
+      return
+    claimed += 1
+    yield int(job["payload"]["mesh_index"]), job
 
 
 def _strategy_views(cfg, view_strategy, mesh_path):
@@ -557,12 +596,11 @@ def _source_views(src, mi):
     yield f"row={row}", place
 
 
-def _render_mesh(cfg, scene, mi, mesh_path, views, W, H, DW, DH, Lmax, tmp,
-                 ds_img, ds_pose, ds_depth_intr, ds_img_intr, ds_depth, ds_mesh, ds_scale):
+def _render_mesh(cfg, scene, mi, mesh_path, views, W, H, DW, DH, Lmax, tmp, writer):
   """Load, normalize and render one mesh for every (label, place(cam)) in
   `views`, appending a row per view to the open datasets. Raises on any
   Blender failure (bad glb, degenerate bbox, ...) so run() can skip the mesh.
-  RGB is rendered only when ds_img is given.
+  RGB is rendered only when the writer has an "images" dataset.
 
   W,H is the RGB resolution; DW,DH the depth-peel resolution (equal unless
   cfg.depth_width/height override)."""
@@ -586,7 +624,7 @@ def _render_mesh(cfg, scene, mi, mesh_path, views, W, H, DW, DH, Lmax, tmp,
     bpy.context.view_layer.update()
     label = f"mesh={mi} {view_label}"
 
-    if ds_img is not None:
+    if "images" in writer.datasets:
       scene.render.engine = str(cfg.render_engine)
       with timed(f"{label} rgb ({scene.render.engine})"):
         rgba = render_rgba(os.path.join(tmp, "rgb.png"), W, H)
@@ -606,15 +644,15 @@ def _render_mesh(cfg, scene, mi, mesh_path, views, W, H, DW, DH, Lmax, tmp,
         depth_vol = depth_vol * depth_scale  # NaN * s = NaN, so no-hit stays no-hit
         pose[:3, 3] *= depth_scale
 
-    if ds_img is not None:
-      ds_img.append(rgba)
-    if ds_img_intr is not None:
-      ds_img_intr.append(image_intr)
-    ds_pose.append(pose)
-    ds_depth_intr.append(depth_intr)
-    ds_depth.append(depth_vol.astype(np.float32))
-    ds_mesh.append(np.int64(mi))
-    ds_scale.append(np.float32(depth_scale))
+    if "images" in writer.datasets:
+      writer.append("images", rgba)
+    if "image_intrinsics" in writer.datasets:
+      writer.append("image_intrinsics", image_intr)
+    writer.append("camera_pose", pose)
+    writer.append("depth_intrinsics", depth_intr)
+    writer.append("depth_peel", depth_vol.astype(np.float32))
+    writer.append("mesh_index", np.int64(mi))
+    writer.append("depth_scale", np.float32(depth_scale))
 
 
 def main():

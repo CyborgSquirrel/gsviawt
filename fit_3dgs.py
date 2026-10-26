@@ -125,7 +125,7 @@ import wandb
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _REPO_ROOT)
 from module import DSSIMLoss, OPENGL_TO_OPENCV, ProgressWandbLogger, _completed_steps  # noqa: E402
-from gs_dataset import H5Catalog, _EmptyDataset, split_by_view  # noqa: E402
+from gs_dataset import _EmptyDataset, render_catalog, split_by_view  # noqa: E402
 from util import timed  # noqa: E402
 
 sys.path.insert(0, os.path.join(_REPO_ROOT, "gaussian-splatting"))
@@ -254,9 +254,7 @@ def resolve_views(hdf5_path, primary, secondary, validation, val_fraction, seed)
   With all three unset this is exactly the old behaviour: split_by_view
   over the whole catalog, primary == its smallest train index.
   Views in the inverse dataset that end up in no group are just unused."""
-  catalog = H5Catalog(
-    hdf5_path, H5Catalog.path().alias("path"), H5Catalog.index().alias("view_idx"),
-    H5Catalog.dataset("mesh_index").alias("mesh_id"))
+  catalog = render_catalog(hdf5_path)
   all_idx = [int(i) for i in catalog.df["view_idx"]]
 
   primary = None if primary is None else int(primary)

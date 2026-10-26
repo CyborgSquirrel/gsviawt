@@ -59,7 +59,8 @@ import wandb
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
 from gs_dataset import (OPENGL_TO_OPENCV, H5Catalog, WTFeatureDataset,  # noqa: E402
-                        _EmptyDataset, rotate_quats_wxyz, split_views_per_mesh)
+                        _EmptyDataset, render_catalog, rotate_quats_wxyz,
+                        sample_matching_sources)
 from gs_backbone import MoGeBackbone  # noqa: E402
 from gs_decoder import PatchGaussianHead  # noqa: E402
 from module import (DSSIMLoss, Events, ProgressWandbLogger, TrainClock, _completed_steps,  # noqa: E402
@@ -320,26 +321,19 @@ def flatten_gaussians(b, gauss, xyz_cam, hit):
 # ---------------------------------------------------------------------------
 
 class GSDataModule(pl.LightningDataModule):
-  """Train/val over cached feature volumes (data.item: one row, a list of rows, or
-  null for all of them). Two modes:
-
-  data.val_meshes null: train and val hold the same volumes but sample their
-  supervision views from disjoint per-mesh view splits (data.val_fraction of each
-  mesh's views go to val; 0 = no validation). One validation set, logged "val".
-
-  data.val_meshes a list of mesh_index values: those meshes are held out entirely.
-  The view split (data.val_fraction) is then made on the remaining meshes only, and
-  volumes are assigned by their source view:
-    train:            volumes of the other meshes whose source view is a train view
-                      (targets sampled from train views)
+  """Train/val over cached feature volumes (data.item: one row, a list of rows, or null for all of them),
+  split with master's two stages on the render catalog the volumes' source views are rows of:
+    data/mesh_split: all meshes -> train_meshes + val_meshes
+    data/view_split: the train meshes' views -> train_views + val_views
+  (see conf/data/mesh_split/*.yaml and conf/data/view_split/*.yaml). A volume goes where its SOURCE view is,
+  and samples its data.num_views supervision views from the views of that half:
+    train:            volumes whose source is a train view (targets from the train views)
     val_meshes:       volumes of the held-out meshes (targets from their views)
-    val_views_strain: volumes of the other meshes with a train-view source, targets
-                      from the val views
-    val_views_sval:   volumes of the other meshes with a val-view source, targets
-                      from the val views
-  Each validation set is a fixed random subset of data.val_volumes volumes (null =
-  all), the same size for all of them; empty sets are dropped. The datasets are in
-  self.val_datasets, in that order, one val dataloader each."""
+    val_views_strain: volumes with a train-view source, as many per mesh as it has val views (see
+                      gs_dataset.sample_matching_sources); targets from the val views
+    val_views_sval:   volumes with a val-view source, targets from the val views
+  Each validation set is a fixed random subset of data.val_volumes volumes (null = all of them); the
+  empty sets are dropped. The datasets are in self.val_datasets, in that order, one val dataloader each."""
 
   def __init__(self, cfg):
     super().__init__()
@@ -350,14 +344,12 @@ class GSDataModule(pl.LightningDataModule):
   def setup(self, stage=None):
     if self.train_ds is not None:
       return
-    d = self.cfg.data
+    cfg = self.cfg
+    d = cfg.data
     with h5py.File(d.features_h5, "r") as f:
       source_h5 = str(f.attrs.get("source_h5", f.attrs["input"]))
       volume_views, volume_meshes = f["view_indices"][:], f["mesh_index"][:]
-    views = H5Catalog(
-      source_h5, H5Catalog.path(), H5Catalog.index().alias("view_idx"),
-      H5Catalog.dataset("mesh_index").alias("mesh_id"),
-    )
+    catalog = render_catalog(source_h5)
     rows = np.arange(len(volume_views)) if d.item is None else np.array(
       [d.item] if isinstance(d.item, int) else list(d.item))
     kwargs = dict(
@@ -367,46 +359,38 @@ class GSDataModule(pl.LightningDataModule):
       read_features=d.input != "image",
     )
 
-    if d.val_meshes is None:
-      train_views, val_views = split_views_per_mesh(views, d.val_fraction, seed=self.cfg.seed)
-      self.train_ds = WTFeatureDataset(d.features_h5, train_views, rows=rows, **kwargs)
-      self.val_datasets = {"val": (
-        WTFeatureDataset(d.features_h5, val_views, rows=rows, **kwargs) if len(val_views) else _EmptyDataset())}
-      return
-
-    held = {int(m) for m in d.val_meshes}
-    is_held = polars.col("mesh_id").is_in(sorted(held))
-    train_views, val_views = split_views_per_mesh(
-      views.filter(~is_held), d.val_fraction, seed=self.cfg.seed)
-    held_views = views.filter(is_held)
-
-    volume_in = lambda catalog: set(zip(
-      catalog.df["mesh_id"].to_list(), catalog.df["view_idx"].to_list()))
-    train_keys, val_keys = volume_in(train_views), volume_in(val_views)
+    # the split of master's two stages (conf/data/mesh_split, conf/data/view_split) on the render catalog;
+    # a volume goes where its SOURCE view is, and samples its supervision views from the half's views
+    train_meshes, val_meshes = hydra.utils.instantiate(d.mesh_split)(catalog, seed=cfg.seed)
+    train_views, val_views = hydra.utils.instantiate(d.view_split)(train_meshes, seed=cfg.seed)
     volume_keys = list(zip(volume_meshes[rows].tolist(), volume_views[rows].tolist()))
-    train_rows = [r for r, k in zip(rows, volume_keys) if k in train_keys]
-    sval_rows = [r for r, k in zip(rows, volume_keys) if k in val_keys]
-    held_rows = [r for r, (m, _) in zip(rows, volume_keys) if m in held]
-    if not train_rows:
-      raise SystemExit("no training volumes: check data.val_meshes / data.item")
 
-    rng = np.random.default_rng(self.cfg.seed)
-    def subset(r):
+    def rows_in(half):
+      keys = set(zip(half.df["mesh_id"].to_list(), half.df["view_idx"].to_list()))
+      return [r for r, k in zip(rows, volume_keys) if k in keys]
+
+    train_rows = rows_in(train_views)
+    if not train_rows:
+      raise SystemExit("no training volumes: check data.item / data.mesh_split / data.view_split")
+    rng = np.random.default_rng(cfg.seed)
+
+    def subset(r):   # data.val_volumes of a set's volumes: a fixed random subset, so a val pass stays cheap
       n = len(r) if d.val_volumes is None else min(int(d.val_volumes), len(r))
       return sorted(rng.choice(r, size=n, replace=False).tolist()) if len(r) else []
 
+    # val_meshes:       every view of the held-out meshes (source and targets)
+    # val_views_strain: train meshes, sources = train views (as many per mesh as it has val views),
+    #                   targets = val views
+    # val_views_sval:   train meshes, sources and targets = val views
+    sets = {}
+    if len(val_meshes):
+      sets["val_meshes"] = (val_meshes, subset(rows_in(val_meshes)))
+    if len(val_views):
+      sets["val_views_strain"] = (val_views, subset(rows_in(sample_matching_sources(train_views, val_views, seed=cfg.seed))))
+      sets["val_views_sval"] = (val_views, subset(rows_in(val_views)))
     self.train_ds = WTFeatureDataset(d.features_h5, train_views, rows=train_rows, **kwargs)
-    sets = {
-      "val_meshes": (held_views, subset(held_rows)),
-      "val_views_strain": (val_views, None),
-      "val_views_sval": (val_views, subset(sval_rows)),
-    }
-    # as many train-source volumes as the val-source set has
-    sets["val_views_strain"] = (val_views, subset(train_rows)[:len(sets["val_views_sval"][1])])
     self.val_datasets = {
-      name: WTFeatureDataset(d.features_h5, v, rows=r, **kwargs)
-      for name, (v, r) in sets.items() if len(r) and len(v)
-    }
+      name: WTFeatureDataset(d.features_h5, v, rows=r, **kwargs) for name, (v, r) in sets.items() if len(r)}
     log.info(
       "volumes: %d train, validation sets %s", len(self.train_ds),
       {n: len(ds) for n, ds in self.val_datasets.items()})
