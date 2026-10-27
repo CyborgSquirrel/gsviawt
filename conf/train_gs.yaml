@@ -310,6 +310,12 @@ trainer:
   devices: 1
   # enable_checkpointing: false
   check_val_every_n_epoch: 1
+  # batches of each validation set that Lightning's own validations score (an int; a float is a fraction;
+  # 1.0 = the whole sets). The event validations have their own `volumes` (callbacks.validation_*). The
+  # validation at the end of a run is one of Lightning's own (the event validations step aside on the step
+  # where the trainer stops), so this is the size of the final validation: e.g. 375 = 1500 volumes per set
+  # at loader.batch_size=4.
+  limit_val_batches: 1.0
   log_every_n_steps: 1
   default_root_dir: ${output_dir}
   gradient_clip_val: 1.0

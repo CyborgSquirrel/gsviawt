@@ -455,6 +455,8 @@ class EventValidation(pl.Callback):
   def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
     if not self.trigger.due(trainer, pl_module, batch_idx):
       return
+    if trainer.should_stop:
+      return   # the last step (TrainClock's max_seconds, ...): Lightning's own validation of it (trainer.limit_val_batches) is the run's final one
     loop = trainer.fit_loop.epoch_loop
     val_loop = loop.val_loop
     val_loop.setup_data()   # makes the loaders and their batch limits the first time (a no-op after)
