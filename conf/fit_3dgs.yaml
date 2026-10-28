@@ -140,15 +140,17 @@ wandb:
 # their own docstrings. Cadence in STEPS (not epochs): one epoch here is one
 # pass over the (small, ~100-300 image) train split, so step cadence is the
 # only one worth using -- an every_n_epochs=1 panel would fire many times a
-# minute early on.
+# minute early on. (trigger_event: a cadence of its own, see conf/train_gs.yaml's events.)
 callbacks:
   panel:
     _target_: module.PanelCallback
-    every_n_steps: ${eval:'${iters} // 100'}
+    trigger_event:
+      every_n_steps: ${eval:'${iters} // 100'}
 
   orbit:
     _target_: module.OrbitCallback
-    every_n_steps: ${eval:'${iters} // 20'}
+    trigger_event:
+      every_n_steps: ${eval:'${iters} // 20'}
     num_frames: 24
     fps: 12
     crf: 18

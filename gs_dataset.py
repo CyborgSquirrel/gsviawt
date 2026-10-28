@@ -47,7 +47,7 @@ import torch
 from einops import rearrange
 from torch.utils.data import Dataset, random_split
 
-from util import intrinsics_name
+from util import intrinsics_name, resize_depth_nearest
 
 log = logging.getLogger(__name__)
 
@@ -100,7 +100,7 @@ def rotate_quats_wxyz(q_wxyz, R_transform):
   wxyz, same shape. Uses scipy.spatial.transform.Rotation (already a project
   dependency -- fit_gsplat.py uses it too) rather than hand-rolled quaternion
   composition, which is an easy place to get sign/order conventions wrong.
-  Public (not _-prefixed): train_gs.py's get_preview_source() also uses this,
+  Public (not _-prefixed): train_gs.py's _preview_entry() also uses this,
   the opposite direction (camera-to-world instead of world-to-camera), to
   transform its preview Gaussians into world space for module.OrbitCallback."""
   from scipy.spatial.transform import Rotation
@@ -396,13 +396,18 @@ def _build_catalog_item(source_catalog, source_pos, target_catalog, target_pos, 
   return _assemble_item(src, targets, num_layers, mesh_id, source_view, target_views)
 
 
-def _build_item(f, path, source_view, target_views, num_layers, mesh_id):
+def _build_item(f, path, source_view, target_views, num_layers, mesh_id, depth_size=None):
   """_assemble_item, reading src/targets from an open render_objaverse.py-
-  schema h5py.File (f) at path -- for datasets without an H5Catalog
-  (GSFixedViewsDataset); see _assemble_item for the shared part."""
+  schema h5py.File (f) at path -- see _assemble_item for the shared part.
+  depth_size: resample the SOURCE view's depth-peel (and its K_depth) to
+  depth_size x depth_size by nearest neighbour before unprojecting it, for a
+  head whose grid is not the render's (e.g. 504 for a 512 render). The RGB
+  and K_image, which the targets are rendered against, keep the render's size."""
   k_depth_name = intrinsics_name(f, "depth")
   k_image_name = intrinsics_name(f, "image", None)
   src = _read_view(f, path, source_view, k_depth_name, k_image_name)
+  if depth_size is not None and src["depth_peel"].shape[:2] != (depth_size, depth_size):
+    src["depth_peel"], src["K_depth"] = resize_depth_nearest(src["depth_peel"], src["K_depth"], depth_size)
   targets = [_read_view(f, path, v, k_depth_name, k_image_name) for v in target_views]
   return _assemble_item(src, targets, num_layers, mesh_id, source_view, target_views)
 
@@ -912,6 +917,135 @@ class GSFixedSourceDataset(Dataset):
     start = idx * self.targets_per_item
     chunk = self.target_pos[start:start + self.targets_per_item]
     return _build_catalog_item(self.catalog, self.source_pos, self.catalog, chunk, self.num_layers)
+
+
+class WTFeatureDataset(Dataset):
+  """One item per cached World Tracing feature volume (row of a
+  wt_features.py output h5): that volume's decoder tokens as the model input,
+  plus the render item built from it.
+
+  A volume knows its source view (`view_indices`) and mesh (`mesh_index`).
+  Gaussians are anchored to the SOURCE view's own depth-peel point cloud and
+  every other camera is expressed relative to it (see _assemble_item), so the
+  item always contains the source view (supervised iff `loss.photom.for`
+  includes "source"). On top of that, each access samples `num_views` random
+  views of the volume's mesh from `views` and supervises on those
+  ("targets").
+
+  `views`: H5Catalog over the render h5 with "path"/"mesh_id"/"view_idx"
+  columns (render_catalog) -- typically one half of the data.mesh_split / data.view_split split, so a train and a val
+  dataset share the same volumes but draw from disjoint views. Only rows of
+  `views` whose path is the features h5's `source_h5` attr (older files:
+  `input`) are used. Every volume's mesh needs at least one view in `views`.
+
+  `rows`: which volumes (row indices of the features h5) the dataset holds;
+  None = all of them. len(dataset) == the number of volumes.
+
+  `image_size`: if set, items carry the source view's RGB image (`image`, (3, S, S) in [0, 1]), instead
+  of its cached `features` if `read_features` is false (a trainable encoder, gs_backbone.py), else next to
+  them (model.rgb_patch).
+  `depth_size`: if set, the source view's depth is resampled to this square size
+  (nearest neighbour) before the point cloud is built -- see _build_item.
+
+  `allow_source_as_target`: whether the volume's own source view can also be
+  drawn into its sampled views. False (default): it never is, so every
+  sampled view is a genuinely different one. True: it is just another member
+  of the mesh's pool.
+
+  Volumes are read from the features h5 on access (one gzip chunk each), so
+  memory use doesn't grow with the number of volumes.
+  """
+
+  def __init__(self, features_h5, views, rows=None, num_layers=6, num_views=1,
+               allow_source_as_target=False, depth_size=None, image_size=None, read_features=True):
+    with h5py.File(features_h5, "r") as f:
+      if "mesh_index" not in f:
+        raise ValueError(f"{features_h5!r} has no per-row `mesh_index`; re-run wt_features.py")
+      self.source_h5 = str(f.attrs.get("source_h5", f.attrs["input"]))
+      self.bits = bool(f["features"].attrs.get("stored_as_uint16_bits", False))
+    # one row per volume: its own row in the features file, its source view (`view_idx`, a row of the render
+    # h5; this catalog's row() is not used) and its mesh
+    volumes = H5Catalog(features_h5, ["features"], lambda c: pl.DataFrame({
+      "path": c.path(), "row": c.index(),
+      "view_idx": c.dataset("view_indices"), "mesh_id": c.dataset("mesh_index")}))
+    if rows is not None:
+      rows = [int(r) for r in rows]
+      bad = [r for r in rows if not 0 <= r < len(volumes)]
+      if bad:
+        raise IndexError(f"rows {bad} out of range for {features_h5!r} ({len(volumes)} volumes)")
+      volumes = volumes.take(rows)
+    self.features_h5 = features_h5
+    self.volumes = volumes
+    self.num_layers = num_layers
+    self.num_views = num_views
+    self.allow_source_as_target = allow_source_as_target
+    self.depth_size = depth_size
+    self.image_size = image_size
+    self.read_features = read_features
+
+    groups = (
+      views.df.filter(pl.col("path") == self.source_h5)
+      .group_by("mesh_id", maintain_order=True).agg(pl.col("view_idx"))
+    )
+    self.pool = {row["mesh_id"]: row["view_idx"] for row in groups.iter_rows(named=True)}
+    self.pool_sets = {mesh_id: set(vs) for mesh_id, vs in self.pool.items()}
+    missing = sorted(set(volumes.df["mesh_id"].unique().to_list()) - set(self.pool))
+    if missing:
+      raise ValueError(
+        f"meshes {missing} have feature volumes but no views in `views` "
+        f"(source h5 {self.source_h5!r})")
+
+    log.info(
+      "WTFeatureDataset: %d volumes of %s over %d meshes, %d views to sample from, %d sampled per item",
+      len(self), features_h5, len(self.pool), sum(len(v) for v in self.pool.values()), num_views,
+    )
+
+  def __len__(self):
+    return len(self.volumes)
+
+  def __getitem__(self, idx):
+    vol = self.volumes[idx]
+    pool = self.pool[vol["mesh_id"]]
+    source_view = vol["view_idx"]
+    if self.allow_source_as_target:
+      k = min(self.num_views, len(pool))
+      targets = random.sample(pool, k) if k > 0 else []
+    else:
+      # Sample k+1 candidates and drop the source from that small sample
+      # instead of filtering it out of the whole pool every call (same trick
+      # as GSPairDataset). k+1 never exceeds len(pool): k is capped at the
+      # number of non-source views.
+      in_pool = source_view in self.pool_sets[vol["mesh_id"]]
+      k = min(self.num_views, len(pool) - in_pool)
+      if k <= 0:
+        targets = []
+      else:
+        sampled = random.sample(pool, min(k + 1, len(pool)))
+        targets = [v for v in sampled if v != source_view][:k]
+    out = _build_item(
+      _get_h5(self.source_h5), self.source_h5, source_view, targets, self.num_layers, vol["mesh_id"],
+      depth_size=self.depth_size)
+
+    if self.image_size is not None:
+      # the source image instead of its cached features, for a trainable encoder (gs_backbone.py);
+      # the same preprocessing as extractors.MoGeExtractor
+      from wt.data import preprocess_rgba_for_model
+      from wt_infer_layers import rgba_from_render
+
+      rgb, _, _ = preprocess_rgba_for_model(
+        rgba_from_render(_get_h5(self.source_h5), source_view), image_size=self.image_size,
+        num_layers=1, center_crop=False, bg_color=(0, 0, 0))
+      out["image"] = rgb[0]   # (3, S, S) in [0, 1]
+      if not self.read_features:
+        return out
+
+    feats = _get_h5(self.features_h5)["features"][vol["row"]]
+    if self.bits:
+      feats = torch.from_numpy(feats.view(np.int16)).view(torch.bfloat16)
+    else:
+      feats = torch.from_numpy(feats)
+    out["features"] = feats.float().contiguous()   # (L, P, D)
+    return out
 
 
 class GSFixedViewsDataset(Dataset):

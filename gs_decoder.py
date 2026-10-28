@@ -1,17 +1,16 @@
-"""Gaussian-parameter U-Net decoder for train_gs.py, ported from Flash3D's
-models/decoder/{resnet_decoder,gaussian_decoder}.py (~/projects/flash3d).
+"""Gaussian-parameter head for train_gs.py: a per-patch linear layer (optionally
+preceded by a small transformer trunk) over cached World Tracing decoder tokens (wt_features.py), plus the per-field
+activations/initialization it shares with the Flash3D-style decoder this
+file used to hold (ported from Flash3D's models/decoder/gaussian_decoder.py).
 
-Differences from Flash3D:
-  - Gaussian positions are anchored to the input point cloud
-    (gs_dataset.py's `dense_unproject_camera`). By default there's no
-    offset/xyz output at all; with predict_mean_offset=True the head also
-    emits a residual camera-space offset added on top of that anchor (see
-    train_gs.flatten_gaussians), zero-initialized so training starts exactly
-    at the depth-peel point cloud.
-  - `num_layers` is a free hyperparameter (Flash3D hardcodes 2).
+Gaussian positions are anchored to the input point cloud
+(gs_dataset.py's `dense_unproject_camera`). By default there's no
+offset/xyz output at all; with predict_mean_offset=True the head also
+emits a residual camera-space offset added on top of that anchor (see
+train_gs.flatten_gaussians), zero-initialized so training starts exactly
+at the depth-peel point cloud.
 
-Per-pixel, per-layer parameterization (this is the "parameterization" the
-plan calls out explicitly):
+Per-pixel, per-layer parameterization (see activate_gaussians):
     opacity  = sigmoid(raw)                     in (0, 1)
     scale    = exp(raw) * scale_lambda          a MULTIPLIER on this pixel's own real
                                                  geometric footprint (depth/fx), not an
@@ -29,45 +28,18 @@ plan calls out explicitly):
     rotation = normalize(raw_quat, dim=channel) unit quaternion, wxyz, no sign constraint
     sh_dc    = raw                              SH band-0 color coeff, unconstrained: the rendered
                                                  color is SH_C0*sh_dc + 0.5 (degree-0 SH, as gsplat
-                                                 and compute_direct_loss evaluate it), clamped only
-                                                 at render time.
+                                                 evaluates it), clamped only at render time.
     sh_rest  = raw                              unconstrained, SH band-1+ coeffs (only if max_sh_degree>0)
     offset   = raw                              unconstrained camera-space xyz residual added to the
                                                  depth-peel position (only if predict_mean_offset)
 """
 
-from collections import OrderedDict
-
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from einops import rearrange
-
-
-
-def upsample(x, mode="nearest"):
-  return F.interpolate(x, scale_factor=2, mode=mode)
-
-
-class Conv3x3(nn.Module):
-  def __init__(self, in_channels, out_channels, use_refl=True):
-    super().__init__()
-    self.pad = nn.ReflectionPad2d(1) if use_refl else nn.ZeroPad2d(1)
-    self.conv = nn.Conv2d(int(in_channels), int(out_channels), 3)
-
-  def forward(self, x):
-    return self.conv(self.pad(x))
-
-
-class ConvBlock(nn.Module):
-  def __init__(self, in_channels, out_channels):
-    super().__init__()
-    self.conv = Conv3x3(in_channels, out_channels)
-    self.nonlin = nn.ELU(inplace=True)
-
-  def forward(self, x):
-    return self.nonlin(self.conv(x))
 
 
 def gaussian_field_names(max_sh_degree, predict_mean_offset=False):
@@ -100,7 +72,7 @@ def gaussian_init_scales_biases(max_sh_degree, opacity_scale, opacity_bias,
   order. Rotation/sh_dc init scales (1.0, 5.0) are Flash3D's own hardcoded
   literals (not exposed as config there either) -- kept identical here.
   offset's scale is None: zero-init (weight and bias), not Xavier -- see
-  GaussianResnetDecoder.__init__."""
+  PatchGaussianHead.__init__."""
   scales = [opacity_scale, scale_scale, 1.0, 5.0]
   biases = [opacity_bias, float(np.log(scale_bias)), 0.0, 0.0]
   if max_sh_degree != 0:
@@ -112,159 +84,270 @@ def gaussian_init_scales_biases(max_sh_degree, opacity_scale, opacity_bias,
   return scales, biases
 
 
-class GaussianResnetDecoder(nn.Module):
-  """Flash3D-style 5-level ResNet U-Net decoder + Gaussian parameter head,
-  emitting `num_layers` Gaussian layers at once via channel-slicing
-  (Flash3D's `one_gauss_decoder=True` mode, generalized to `num_layers`
-  layers instead of a hardcoded 2). For `one_gauss_decoder=False` (default),
-  wrap `num_layers` instances of this class with `num_layers=1` each in
-  `GSDecoderStack` below instead.
+def activate_gaussians(raw, scale_lambda):
+  """raw: dict field name -> (B, L, C, H, W) raw head output (the names of
+  gaussian_field_names). Returns the activated Gaussian parameters, same
+  layout: opacity(1), raw_scale(3), scale(3), rotation(4), sh_dc(3)[,
+  sh_rest(K)][, offset(3)]."""
+  # scale_lambda folded in as an ADDITIVE log-space bias (log(exp(raw)*lambda)
+  # == raw + log(lambda)) rather than a separate post-exp multiply, so
+  # "raw_scale" stays log(the multiplier that "scale" actually uses) --
+  # matters for a log-space comparison of raw_scale against log(gt_scale);
+  # without folding lambda in here that comparison would be off by a constant
+  # log(scale_lambda) offset.
+  raw_scale = raw["scale"] + float(np.log(scale_lambda))
+
+  out = {
+    "opacity": torch.sigmoid(raw["opacity"]),
+    "raw_scale": raw_scale,
+    "scale": torch.exp(raw_scale),
+    # +1e-6: guards the exact-zero raw quaternion (all channels 0, e.g. under
+    # zero_init_last_conv) -- F.normalize's own eps only clamps the norm
+    # denominator, so a true zero vector normalizes to itself (still zero,
+    # not a unit quaternion). Negligible next to any real trained value.
+    "rotation": F.normalize(raw["rotation"] + 1e-6, dim=2),
+    # unconstrained color: gsplat evaluates rendered color as SH_C0*sh_dc + 0.5
+    # (degree-0 SH), so the raw value is used as-is (no sigmoid bounding it
+    # to (0,1)).
+    "sh_dc": raw["sh_dc"],
+  }
+  if "sh_rest" in raw:
+    out["sh_rest"] = raw["sh_rest"]
+  if "offset" in raw:
+    out["offset"] = raw["offset"]
+  return out
+
+
+def rope_cos_sin(grid, head_dim, base=100.0):
+  """2D RoPE tables for a row-major grid x grid patch grid: (cos, sin), each
+  (grid*grid, head_dim). The first half of head_dim rotates with the patch's
+  row, the second half with its column (same scheme as World Tracing's RoPE2D:
+  rotate-half within each half, frequencies base^(-2i/(head_dim/2)))."""
+  half = head_dim // 2
+  inv_freq = 1.0 / (base ** (torch.arange(0, half, 2).float() / half))        # (half/2,)
+  ang = torch.arange(grid).float()[:, None] * inv_freq[None]                  # (grid, half/2)
+  ang = torch.cat([ang, ang], dim=-1)                                         # (grid, half)
+  y = torch.arange(grid).repeat_interleave(grid)                              # token p = y*grid + x
+  x = torch.arange(grid).repeat(grid)
+  cos = torch.cat([ang.cos()[y], ang.cos()[x]], dim=-1)
+  sin = torch.cat([ang.sin()[y], ang.sin()[x]], dim=-1)
+  return cos, sin
+
+
+def apply_rope(t, cos, sin):
+  """t: (..., S, H, head_dim); cos/sin: (S, head_dim)."""
+  halves = t.unflatten(-1, (2, -1))                                           # (..., 2, half)
+  a, b = halves[..., : halves.shape[-1] // 2], halves[..., halves.shape[-1] // 2 :]
+  rotated = torch.cat([-b, a], dim=-1).flatten(-2)                            # rotate-half in each half
+  return t * cos[:, None, :] + rotated * sin[:, None, :]
+
+
+class AttentionBlock(nn.Module):
+  """Pre-norm transformer block over a (B, L, P, D) token volume -- a
+  stripped-down version of World Tracing's head block (DecoderBlockSA): QK-norm
+  attention with LayerScale'd residuals and an MLP, no timestep AdaLN. `mode`
+  picks which tokens attend to each other:
+    frame:  the P patches of one layer (2D RoPE)
+    ray:    the L layers at one patch position (no RoPE)
+    global: all L*P tokens of the volume (2D RoPE)
+  layer_scale_init is small (WT's is 1e-4), so a fresh block is close to the
+  identity."""
+
+  def __init__(self, dim, num_heads, mode, mlp_ratio=4.0, layer_scale_init=1e-4):
+    super().__init__()
+    if mode not in ("frame", "ray", "global"):
+      raise ValueError(f"mode must be frame/ray/global, got {mode!r}")
+    if dim % num_heads or (dim // num_heads) % 4:
+      raise ValueError(f"dim={dim} must split into num_heads={num_heads} heads of a multiple-of-4 size (2D RoPE)")
+    self.mode = mode
+    self.num_heads = num_heads
+    head_dim = dim // num_heads
+    self.norm1 = nn.LayerNorm(dim)
+    self.qkv = nn.Linear(dim, 3 * dim, bias=False)
+    self.q_norm = nn.LayerNorm(head_dim)
+    self.k_norm = nn.LayerNorm(head_dim)
+    self.proj = nn.Linear(dim, dim)
+    self.ls1 = nn.Parameter(layer_scale_init * torch.ones(dim))
+    self.norm2 = nn.LayerNorm(dim)
+    self.mlp = nn.Sequential(nn.Linear(dim, int(dim * mlp_ratio)), nn.GELU(), nn.Linear(int(dim * mlp_ratio), dim))
+    self.ls2 = nn.Parameter(layer_scale_init * torch.ones(dim))
+
+  def _attend(self, x, cos, sin):
+    """x: (N, S, D) -> (N, S, D); cos/sin: (S, head_dim) or None."""
+    n, s, d = x.shape
+    q, k, v = self.qkv(self.norm1(x)).reshape(n, s, 3, self.num_heads, d // self.num_heads).unbind(2)
+    q, k = self.q_norm(q), self.k_norm(k)
+    if cos is not None:
+      q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+    out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
+    return self.proj(out.transpose(1, 2).reshape(n, s, d))
+
+  def forward(self, x, cos, sin):
+    """x: (B, L, P, D); cos/sin: the (P, head_dim) RoPE tables of one layer's patch grid."""
+    b, l, p, d = x.shape
+    if self.mode == "frame":
+      y = self._attend(x.reshape(b * l, p, d), cos, sin).reshape(b, l, p, d)
+    elif self.mode == "ray":
+      y = self._attend(x.transpose(1, 2).reshape(b * p, l, d), None, None).reshape(b, p, l, d).transpose(1, 2)
+    else:
+      y = self._attend(x.reshape(b, l * p, d), cos.repeat(l, 1), sin.repeat(l, 1)).reshape(b, l, p, d)
+    x = x + self.ls1 * y
+    return x + self.ls2 * self.mlp(self.norm2(x))
+
+
+class TransformerTrunk(nn.Module):
+  """num_blocks AttentionBlocks cycling frame -> ray -> global (World Tracing's
+  "frame_ray_global" head pattern), with its per-layer FiLM: a learned layer
+  embedding -> MLP -> (gamma, beta) applied as x*(1+gamma)+beta before every
+  frame block (zero-initialized, so it starts as a no-op).  (B, L, P, D) in and
+  out."""
+
+  MODES = ("frame", "ray", "global")
+
+  def __init__(self, dim, num_layers, num_blocks, num_heads=24, mlp_ratio=4.0, layer_scale_init=1e-4,
+               checkpoint_activations=False):
+    super().__init__()
+    self.checkpoint_activations = checkpoint_activations
+    self.num_heads = num_heads
+    self.blocks = nn.ModuleList(
+      AttentionBlock(dim, num_heads, self.MODES[i % 3], mlp_ratio, layer_scale_init)
+      for i in range(num_blocks)
+    )
+    self.layer_embed = nn.Embedding(num_layers, dim)
+    self.film = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, 2 * dim))
+    nn.init.zeros_(self.film[-1].weight)
+    nn.init.zeros_(self.film[-1].bias)
+    self._rope = {}
+
+  def _rope_tables(self, grid, device):
+    key = (grid, device)
+    if key not in self._rope:
+      cos, sin = rope_cos_sin(grid, self.blocks[0].qkv.in_features // self.num_heads)
+      self._rope[key] = (cos.to(device), sin.to(device))
+    return self._rope[key]
+
+  def forward(self, x):
+    _, num_layers, num_patches, _ = x.shape
+    grid = int(round(num_patches ** 0.5))
+    if grid * grid != num_patches:
+      raise ValueError(f"non-square patch grid: P={num_patches}")
+    cos, sin = self._rope_tables(grid, x.device)
+    gamma, beta = self.film(self.layer_embed(torch.arange(num_layers, device=x.device))).chunk(2, dim=-1)  # (L, D)
+    gamma, beta = gamma[None, :, None], beta[None, :, None]
+    for block in self.blocks:
+      if block.mode == "frame":
+        x = x * (1 + gamma) + beta
+      if self.checkpoint_activations and torch.is_grad_enabled():
+        x = torch.utils.checkpoint.checkpoint(block, x, cos, sin, use_reentrant=False)
+      else:
+        x = block(x, cos, sin)
+    return x
+
+
+class PatchGaussianHead(nn.Module):
+  """(B, L, P, D) World Tracing decoder tokens (wt_features.py) -> per-pixel
+  Gaussian parameters for each of the L depth-peel layers, (B, L, C, H, W) per
+  field, H = W = sqrt(P) * patch_size. The tokens go through an optional
+  TransformerTrunk (num_blocks > 0; WT's own head does this before its
+  projection) and then one linear layer per patch token.
+
+  The same Linear is applied to every token of every layer (WT's own
+  geo_proj is shared across layers too -- the tokens already carry the
+  layer via WT's FiLM). Each token's outputs are laid out as
+  (channel, patch_y, patch_x), so every Gaussian field's output rows are a
+  contiguous slice of the weight matrix, and the per-field Xavier init
+  below slices it the same way the Flash3D decoder's 1x1 conv did. Token p
+  of the P = h*w patch grid is row-major (token p = h_idx*w + w_idx), the
+  same order WT's own patchify/unpatchify uses.
   """
 
-  def __init__(self, num_ch_enc, num_layers, max_sh_degree,
-              num_ch_dec=(32, 32, 64, 128, 256), upsample_mode="nearest",
-              use_skips=True, opacity_scale=1e-3, opacity_bias=0.0,
-              scale_scale=1e-1, scale_bias=0.02, sh_scale=1.0, scale_lambda=0.01,
-              zero_init_last_conv=False, predict_mean_offset=False):
+  def __init__(self, feature_dim, num_layers, max_sh_degree, patch_size=14,
+               opacity_scale=1e-3, opacity_bias=0.0, scale_scale=1e-1, scale_bias=0.02,
+               sh_scale=1.0, scale_lambda=0.01, zero_init_last_conv=False,
+               predict_mean_offset=False, num_blocks=0, num_heads=24, mlp_ratio=4.0,
+               layer_scale_init=1e-4, layer_embed_dim=None, input_proj_dim=None, input_proj_identity_init=False,
+               checkpoint_activations=False):
     super().__init__()
-    self.use_skips = use_skips
-    self.upsample_mode = upsample_mode
-    self.num_ch_enc = num_ch_enc
-    self.num_ch_dec = np.array(num_ch_dec)
-    self.max_sh_degree = max_sh_degree
     self.num_layers = num_layers
+    # With layer_embed_dim set, the features may be a single [1, P, D] map (e.g. one
+    # image encoder output): it is repeated across the num_layers Gaussian layers and
+    # a learnable per-layer vector is appended to every token, so the head sees
+    # D + layer_embed_dim channels. (A linear head can only use it as a per-layer bias.)
+    self.layer_embed_dim = layer_embed_dim
+    self.layer_embed = (
+      nn.Parameter(torch.randn(num_layers, layer_embed_dim)) if layer_embed_dim else None
+    )
+    # With input_proj_dim set, a learned Linear(feature_dim -> input_proj_dim) is applied to the
+    # features first (like WT's own final_project on the concatenated encoder blocks), so a wide
+    # feature (e.g. 4 DINOv2 blocks = 4096 channels) doesn't make the trunk wider.
+    self.input_proj = nn.Linear(feature_dim, input_proj_dim) if input_proj_dim else None
+    if self.input_proj is not None and input_proj_identity_init:
+      # the first input_proj_dim input channels pass through unchanged, the rest start at zero
+      if input_proj_dim > feature_dim:
+        raise ValueError(f"input_proj_identity_init needs input_proj_dim <= feature_dim, got {input_proj_dim} > {feature_dim}")
+      with torch.no_grad():
+        self.input_proj.weight.zero_()
+        self.input_proj.weight[:, :input_proj_dim].copy_(torch.eye(input_proj_dim))
+        self.input_proj.bias.zero_()
+    in_dim = (input_proj_dim or feature_dim) + (layer_embed_dim or 0)
+    self.max_sh_degree = max_sh_degree
+    self.patch_size = patch_size
     self.scale_lambda = scale_lambda
     self.predict_mean_offset = predict_mean_offset
 
-    per_layer_dims = gaussian_split_dims(max_sh_degree, predict_mean_offset)
-    per_layer_scales, per_layer_biases = gaussian_init_scales_biases(
-      max_sh_degree, opacity_scale, opacity_bias, scale_scale, scale_bias, sh_scale,
-      predict_mean_offset)
-    self.split_dimensions = per_layer_dims * num_layers
-    scale_inits = per_layer_scales * num_layers
-    bias_inits = per_layer_biases * num_layers
-    self.num_output_channels = sum(self.split_dimensions)
-
-    convs = OrderedDict()
-    top = len(self.num_ch_dec) - 1
-    for i in range(top, -1, -1):
-      num_ch_in = self.num_ch_enc[-1] if i == top else self.num_ch_dec[i + 1]
-      num_ch_out = self.num_ch_dec[i]
-      convs[("upconv", i, 0)] = ConvBlock(num_ch_in, num_ch_out)
-
-      num_ch_in = self.num_ch_dec[i]
-      if self.use_skips and i > 0:
-        num_ch_in += self.num_ch_enc[i - 1]
-      num_ch_out = self.num_ch_dec[i]
-      convs[("upconv", i, 1)] = ConvBlock(num_ch_in, num_ch_out)
-    self.convs = convs
-    self.decoder = nn.ModuleList(list(convs.values()))
-    self.out = nn.Conv2d(int(self.num_ch_dec[0]), self.num_output_channels, 1)
+    self.field_names = gaussian_field_names(max_sh_degree, predict_mean_offset)
+    self.field_dims = gaussian_split_dims(max_sh_degree, predict_mean_offset)
+    self.channels = sum(self.field_dims)
+    p2 = patch_size ** 2
+    self.trunk = (
+      TransformerTrunk(in_dim, num_layers, num_blocks, num_heads, mlp_ratio, layer_scale_init,
+                       checkpoint_activations)
+      if num_blocks > 0 else None
+    )
+    self.proj = nn.Linear(in_dim, self.channels * p2)
 
     if zero_init_last_conv:
-      nn.init.zeros_(self.out.weight)
-      nn.init.zeros_(self.out.bias)
+      nn.init.zeros_(self.proj.weight)
+      nn.init.zeros_(self.proj.bias)
     else:
+      scales, biases = gaussian_init_scales_biases(
+        max_sh_degree, opacity_scale, opacity_bias, scale_scale, scale_bias, sh_scale,
+        predict_mean_offset)
       start = 0
-      for out_channels, scale, bias in zip(self.split_dimensions, scale_inits, bias_inits):
+      for dim, scale, bias in zip(self.field_dims, scales, biases):
+        rows = slice(start * p2, (start + dim) * p2)
         if scale is None:
           # offset: zero-init, so every Gaussian starts exactly at its
-          # depth-peel position (same as 3dgs-paper-repro's fit_3dgs.py
-          # zero-initialized offset). Gradients still reach these weights
-          # through the (nonzero) decoder features.
-          nn.init.zeros_(self.out.weight[start:start + out_channels])
+          # depth-peel position. Gradients still reach these weights through
+          # the (nonzero) input features.
+          nn.init.zeros_(self.proj.weight[rows])
         else:
-          nn.init.xavier_uniform_(self.out.weight[start:start + out_channels], scale)
-        nn.init.constant_(self.out.bias[start:start + out_channels], bias)
-        start += out_channels
+          nn.init.xavier_uniform_(self.proj.weight[rows], scale)
+        nn.init.constant_(self.proj.bias[rows], bias)
+        start += dim
 
-  def forward(self, input_features):
-    """input_features: 5 encoder feature maps, finest first / coarsest last
-    (GSResnetEncoder's output). Returns a dict of (B, num_layers, C, H, W):
-    opacity(1), scale(3), rotation(4), sh_dc(3)[, sh_rest(K)][, offset(3)]."""
-    x = input_features[-1]
-    for i in range(len(self.num_ch_dec) - 1, -1, -1):
-      x = self.convs[("upconv", i, 0)](x)
-      x = upsample(x, mode=self.upsample_mode)
-      if self.use_skips and i > 0:
-        x = torch.cat([x, input_features[i - 1]], dim=1)
-      x = self.convs[("upconv", i, 1)](x)
-    x = self.out(x)  # (B, num_layers * per_layer_dims, H, W)
-
-    per_layer_dims = gaussian_split_dims(self.max_sh_degree, self.predict_mean_offset)
-    n_fields = len(per_layer_dims)
-    parts = x.split(per_layer_dims * self.num_layers, dim=1)
-
-    field_names = gaussian_field_names(self.max_sh_degree, self.predict_mean_offset)
-    per_field = {name: [] for name in field_names}
-    for l in range(self.num_layers):
-      layer_parts = parts[l * n_fields:(l + 1) * n_fields]
-      for name, raw in zip(field_names, layer_parts):
-        per_field[name].append(raw)
-
-    def stack_layers(tensors):
-      # tensors: num_layers entries, each (B,C,H,W) -> (B,L,C,H,W)
-      return rearrange(tensors, "l b c h w -> b l c h w")
-
-    # scale_lambda folded in as an ADDITIVE log-space bias (log(exp(raw)*lambda)
-    # == raw + log(lambda)) rather than a separate post-exp multiply, so
-    # "raw_scale" stays log(the multiplier that "scale" actually uses) --
-    # matters for compute_direct_loss's direct_scale_weight term, which
-    # compares raw_scale directly against log(gt_scale) in log-space; without
-    # folding lambda in here that comparison would be off by a constant
-    # log(scale_lambda) offset.
-    raw_scale = stack_layers(per_field["scale"]) + float(np.log(self.scale_lambda))
-
-    out = {
-      "opacity": torch.sigmoid(stack_layers(per_field["opacity"])),
-      "raw_scale": raw_scale,
-      "scale": torch.exp(raw_scale),
-      # +1e-6: guards the exact-zero raw quaternion (all channels 0, e.g. under
-      # zero_init_last_conv) -- F.normalize's own eps only clamps the norm
-      # denominator, so a true zero vector normalizes to itself (still zero,
-      # not a unit quaternion). Negligible next to any real trained value.
-      "rotation": F.normalize(stack_layers(per_field["rotation"]) + 1e-6, dim=2),
-      # unconstrained color: gsplat/compute_direct_loss both evaluate rendered
-      # color as SH_C0*sh_dc + 0.5 (degree-0 SH), so the raw value is used
-      # as-is (no sigmoid bounding it to (0,1)).
-      "sh_dc": stack_layers(per_field["sh_dc"]),
-    }
-    if self.max_sh_degree != 0:
-      out["sh_rest"] = stack_layers(per_field["sh_rest"])
-    if self.predict_mean_offset:
-      out["offset"] = stack_layers(per_field["offset"])
-    return out
-
-
-class GSDecoderStack(nn.Module):
-  """`num_layers` independent `GaussianResnetDecoder(num_layers=1, ...)`
-  heads sharing the same encoder trunk -- Flash3D's `one_gauss_decoder=False`
-  default (each layer specializes with its own decoder weights). Output
-  shape matches `GaussianResnetDecoder(num_layers=L)` exactly, so callers
-  don't need to know which mode is in use.
-  """
-
-  def __init__(self, num_ch_enc, num_layers, max_sh_degree, **decoder_kwargs):
-    super().__init__()
-    self.heads = nn.ModuleList([
-      GaussianResnetDecoder(num_ch_enc, num_layers=1, max_sh_degree=max_sh_degree, **decoder_kwargs)
-      for _ in range(num_layers)
-    ])
-
-  def forward(self, input_features, active_layers=None):
-    """active_layers: optional iterable of layer indices to actually run
-    through their own decoder head -- each head is a FULL independent 5-level
-    U-Net (~9M params here, 68% of this model's total is spread across the 6
-    heads), so skipping inactive ones is a real forward+backward compute/VRAM
-    saving, not just cosmetic. Skipped layers get an all-zero placeholder
-    (torch.zeros_like off an actually-computed layer's own output -- same
-    shape/dtype/device, no grad_fn, so it costs nothing in the backward pass
-    either) instead of running their head at all. None (default): every
-    layer runs, identical to the pre-active_layers behavior."""
-    indices = range(len(self.heads)) if active_layers is None else sorted(set(active_layers))
-    computed = {i: self.heads[i](input_features) for i in indices}
-    ref = next(iter(computed.values()))
-    return {
-      k: torch.cat([computed[i][k] if i in computed else torch.zeros_like(ref[k]) for i in range(len(self.heads))], dim=1)
-      for k in ref
-    }
+  def forward(self, features):
+    """features: (B, L, P, D) -> dict of (B, L, C, H, W), see
+    activate_gaussians."""
+    if self.input_proj is not None:
+      features = self.input_proj(features)
+    _, num_layers, num_patches, _ = features.shape
+    if self.layer_embed is not None and num_layers == 1:
+      features = features.expand(-1, self.num_layers, -1, -1)
+      num_layers = self.num_layers
+    if num_layers != self.num_layers:
+      raise ValueError(f"features have {num_layers} layers, head was built for {self.num_layers}")
+    grid = int(round(num_patches ** 0.5))
+    if grid * grid != num_patches:
+      raise ValueError(f"non-square patch grid: P={num_patches}")
+    if self.layer_embed is not None:
+      embed = self.layer_embed[None, :, None, :].expand(features.shape[0], -1, num_patches, -1)
+      features = torch.cat([features, embed.to(features.dtype)], dim=-1)
+    if self.trunk is not None:
+      features = self.trunk(features)
+    x = rearrange(
+      self.proj(features), "b l (h w) (c py px) -> b l c (h py) (w px)",
+      h=grid, w=grid, py=self.patch_size, px=self.patch_size,
+    )  # (B, L, C, H, W)
+    raw = dict(zip(self.field_names, x.split(self.field_dims, dim=2)))
+    return activate_gaussians(raw, self.scale_lambda)

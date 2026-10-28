@@ -1,0 +1,23 @@
+# World Tracing's own image encoder (extractors.MoGeExtractor): the frozen MoGe-1
+# DINOv2 ViT-L backbone (last 4 blocks, concatenated) + WT's trained final_project,
+# weights taken from the WT checkpoint. One [1, P, D] feature layer per view; no
+# depth / noise / seed.
+_target_: extractors.MoGeExtractor
+
+config: r75b              # wt.checkpoint.CONFIGS key; sets image_size and decoder_embed_dim
+ckpt: r75b                # config name | hf://repo[/file.pt] | local .pt path
+# null: take the encoder (backbone + final_project) from the WT checkpoint above. Or the
+# original pretrained MoGe-1 (local model.pt / HF repo id, e.g. Ruicheng/moge-vitl): backbone
+# only, so project must be false. "dinov2_vitl14": Meta's original DINOv2 ViT-L/14 (the
+# same architecture, without MoGe's fine-tuning), also project=false.
+weights: null
+# Apply WT's trained final_project (4096 -> decoder_embed_dim). false: the raw concat of the
+# last 4 blocks, [1, P, 4096].
+project: true
+# Last N DINOv2 blocks concatenated (1024 channels each). WT uses 4; N != 4 needs project=false.
+num_blocks: 4
+# Cast the stored weights to bf16 (as WTExtractor / WT's own run does); autocast is fp16.
+bf16_weights_hack: true
+
+bg_color: [0, 0, 0]       # RGB the masked-out region is composited to
+hard_alpha: false         # ignore a stored soft alpha; use the layer-0 depth hit
