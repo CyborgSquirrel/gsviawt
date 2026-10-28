@@ -214,7 +214,8 @@ loss:
 #   events: {panel_tick: {every_n_seconds: 600}}
 # A callback's trigger_event is either such a name (it acts on the steps where that event fired) or a
 # cadence of its own, a mapping with exactly one of the same three keys, for a one-off that needs no name,
-# or null for never. Every event name a callback asks for must be fired by an events: entry or a scheduler's
+# or a list of those (acts when any is due, e.g. [trough, panel_tick]), or null for never. Every event name a
+# callback asks for must be fired by an events: entry or a scheduler's
 # trough_event (checked when training starts).
 events: {}
 
