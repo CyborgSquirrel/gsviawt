@@ -259,18 +259,22 @@ callbacks:
   # fewer volumes is scored whole). Metrics are logged as val/<name>/<set>/<metric>, with val/<name>/<set>/
   # n_volumes and loss_se (the standard error of the logged mean). A small one often, a big one rarely, e.g.
   #   callbacks.validation_small.trigger_event=periodic  callbacks.validation_big.trigger_event=trough
-  # Lightning's own validations (the one at the end of training, ...) are sized by trainer.limit_val_batches
-  # (batches of loader.batch_size per set; default: the whole sets) and logged as val/default/<set>/<metric>.
+  # at_end: the validation also runs on the last step of the run (the TrainClock's max_seconds), so the
+  # final validation is the big one, with its name and size. (Lightning's own validations, which a run
+  # with an at_end validation doesn't have, are sized by trainer.limit_val_batches and logged as
+  # val/lightning/<set>/<metric>.)
   validation_small:
     _target_: module.EventValidation
     name: small
     trigger_event: null
     volumes: 200
+    at_end: false
   validation_big:
     _target_: module.EventValidation
     name: big
     trigger_event: null
     volumes: 1500
+    at_end: true
 
   # n_volumes and loss_se of every validation (see module.ValidationStats)
   validation_stats:
@@ -310,12 +314,6 @@ trainer:
   devices: 1
   # enable_checkpointing: false
   check_val_every_n_epoch: 1
-  # batches of each validation set that Lightning's own validations score (an int; a float is a fraction;
-  # 1.0 = the whole sets). The event validations have their own `volumes` (callbacks.validation_*). The
-  # validation at the end of a run is one of Lightning's own (the event validations step aside on the step
-  # where the trainer stops), so this is the size of the final validation: e.g. 375 = 1500 volumes per set
-  # at loader.batch_size=4.
-  limit_val_batches: 1.0
   log_every_n_steps: 1
   default_root_dir: ${output_dir}
   gradient_clip_val: 1.0

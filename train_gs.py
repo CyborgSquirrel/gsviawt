@@ -337,17 +337,17 @@ class GSDataModule(pl.LightningDataModule):
                       gs_dataset.sample_matching_sources); targets from the val views
     val_views_sval:   volumes with a val-view source, targets from the val views
   Every validation set is complete (the empty ones are dropped); how much of it a validation scores is
-  that validation's own choice (module.EventValidation volumes, trainer.limit_val_batches for Lightning's own
-  ones): the val dataloaders shuffle, so each validation scores a fresh random sample. The datasets are in
+  that validation's own choice (module.EventValidation volumes; trainer.limit_val_batches for Lightning's own
+  ones, which a run with an at_end validation doesn't have): the val dataloaders shuffle, so each validation scores a fresh random sample. The datasets are in
   self.val_datasets, in that order, one val dataloader each. self.validation names the validation running
-  (module.EventValidation sets it; "default" is Lightning's own), it is part of the logged metric names."""
+  (module.EventValidation sets it; "lightning" is Lightning's own), it is part of the logged metric names."""
 
   def __init__(self, cfg):
     super().__init__()
     self.cfg = cfg
     self.train_ds = None
     self.val_datasets = None
-    self.validation = "default"
+    self.validation = "lightning"
 
   def setup(self, stage=None):
     if self.train_ds is not None:

@@ -437,12 +437,13 @@ class EventValidation(pl.Callback):
   set with fewer volumes is scored whole (trainer.limit_val_batches doesn't apply to these). Lightning's own
   validations (at the end of training, ...) are sized by trainer.limit_val_batches instead."""
 
-  def __init__(self, *, name, trigger_event, volumes=None):
+  def __init__(self, *, name, trigger_event, volumes=None, at_end=False):
     if volumes is not None and not (isinstance(volumes, int) and volumes > 0 or isinstance(volumes, float) and 0 < volumes <= 1):
       raise ValueError(f"volumes={volumes!r} must be a positive int (volumes), a float in (0, 1] (a fraction) or None")
     self.name = name
     self.trigger = Trigger(trigger_event)
     self.volumes = volumes
+    self.at_end = at_end
 
   def _batches(self, loader):
     """How many batches of `loader` to run for `volumes` (trainer.limit_val_batches is for Lightning's own)."""
@@ -453,10 +454,11 @@ class EventValidation(pl.Callback):
     return min(want, n)
 
   def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-    if not self.trigger.due(trainer, pl_module, batch_idx):
+    due = self.trigger.due(trainer, pl_module, batch_idx)   # every step, for its own bookkeeping
+    if trainer.should_stop:   # the last step (TrainClock's max_seconds, ...)
+      due = self.at_end
+    if not due:
       return
-    if trainer.should_stop:
-      return   # the last step (TrainClock's max_seconds, ...): Lightning's own validation of it (trainer.limit_val_batches) is the run's final one
     loop = trainer.fit_loop.epoch_loop
     val_loop = loop.val_loop
     val_loop.setup_data()   # makes the loaders and their batch limits the first time (a no-op after)
@@ -472,7 +474,7 @@ class EventValidation(pl.Callback):
       val_loop.run()
     finally:
       val_loop._max_batches = limits   # Lightning's own validations use trainer.limit_val_batches
-      datamodule.validation = "default"
+      datamodule.validation = "lightning"
     trainer.training = True
     trainer._logger_connector._first_loop_iter = first_loop_iter
     # A one-shot flag of Lightning's epoch loop (loops/training_epoch_loop.py): its on_advance_end, which runs
