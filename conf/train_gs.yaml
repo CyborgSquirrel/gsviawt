@@ -254,7 +254,8 @@ callbacks:
   # Validations run right after the step where their trigger_event is due (Lightning itself only validates on
   # trainer.val_check_interval / check_val_every_n_epoch, or when asked to stop); null = off. A step is
   # never validated twice: these win over Lightning's own check. Each scores `volumes` volumes of EACH
-  # validation set (an int: that many; a float in (0, 1]: that fraction of the set; null: the whole set),
+  # validation set (a whole number: that many; a percentage string like "50%": that proportion of the set;
+  # null: the whole set; decimals as a count are rejected),
   # taken from the start of the shuffling val dataloaders, so a fresh random sample every time (a set with
   # fewer volumes is scored whole). Metrics are logged as val/<name>/<set>/<metric>, with val/<name>/<set>/
   # n_volumes and loss_se (the standard error of the logged mean). A small one often, a big one rarely, e.g.

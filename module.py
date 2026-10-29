@@ -431,26 +431,50 @@ class EventValidation(pl.Callback):
 
   Several of these can run side by side, a small one often and a big one rarely: each has a `name` (the
   datamodule's `validation` while it runs, so the metrics are logged as val/<name>/<set>/<metric>) and its own
-  `volumes`, how many volumes of EACH validation set it scores: an int is a number of volumes, a float in
-  (0, 1] a fraction of the set, None the whole set. It takes batches from the start of each set's dataloader
+  `volumes`, how many volumes of EACH validation set it scores: a whole number (200, or the string "200") is
+  that many volumes, a percentage string ("50%") that proportion of the set, None the whole set (decimals
+  are rejected as a count: floats and ints get mixed up in configs). It takes batches from the start of each set's dataloader
   until it has that many (the val dataloaders shuffle, so every validation scores a fresh random sample); a
   set with fewer volumes is scored whole (trainer.limit_val_batches doesn't apply to these). Lightning's own
   validations (at the end of training, ...) are sized by trainer.limit_val_batches instead."""
 
   def __init__(self, *, name, trigger_event, volumes=None, at_end=False):
-    if volumes is not None and not (isinstance(volumes, int) and volumes > 0 or isinstance(volumes, float) and 0 < volumes <= 1):
-      raise ValueError(f"volumes={volumes!r} must be a positive int (volumes), a float in (0, 1] (a fraction) or None")
     self.name = name
     self.trigger = Trigger(trigger_event)
-    self.volumes = volumes
+    self.count, self.fraction = self._parse_volumes(volumes)
     self.at_end = at_end
+
+  @staticmethod
+  def _parse_volumes(volumes):
+    """volumes -> (count, fraction), one of them None (both None: the whole set): a whole number (int or digit
+    string) is a count, a "p%" string with 0 < p <= 100 a proportion; anything else raises."""
+    if volumes is None:
+      return None, None
+    if isinstance(volumes, bool) or isinstance(volumes, float):
+      raise ValueError(f"volumes={volumes!r}: use a whole number (a count) or a percentage string like \"50%\"")
+    if isinstance(volumes, int):
+      if volumes <= 0:
+        raise ValueError(f"volumes={volumes!r} must be positive")
+      return volumes, None
+    if isinstance(volumes, str):
+      text = volumes.strip()
+      if text.isdigit() and int(text) > 0:
+        return int(text), None
+      if text.endswith("%"):
+        try:
+          percent = float(text[:-1])
+        except ValueError:
+          percent = None
+        if percent is not None and 0 < percent <= 100:
+          return None, percent / 100
+    raise ValueError(f"volumes={volumes!r} must be a positive whole number, a percentage string like \"50%\" (0 < p <= 100) or None")
 
   def _batches(self, loader):
     """How many batches of `loader` to run for `volumes` (trainer.limit_val_batches is for Lightning's own)."""
     n = len(loader)
-    if self.volumes is None:
+    if self.count is None and self.fraction is None:
       return n
-    want = math.ceil(self.volumes * n) if isinstance(self.volumes, float) else math.ceil(self.volumes / loader.batch_size)
+    want = math.ceil(self.count / loader.batch_size) if self.count is not None else math.ceil(self.fraction * n)
     return min(want, n)
 
   def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
