@@ -109,6 +109,9 @@ model:
     num_blocks: 0           # 0 = just the linear projection
     num_heads: 24           # must divide feature_dim into heads whose size is a multiple of 4
     mlp_ratio: 4.0
+    # the blocks' attention: frame_ray_global (cycle frame -> ray -> global, FiLM before each frame block) or
+    # global (every block attends over all layers' patches; FiLM before the first block only)
+    attention_pattern: frame_ray_global
     layer_scale_init: 1.0e-4  # small -> the trunk starts close to the identity
     checkpoint_activations: false   # recompute the blocks in backward (less memory, same numerics)
   max_sh_degree: 0           # 0 = plain RGB, 1 = DC + 1 SH band (9 extra channels).
