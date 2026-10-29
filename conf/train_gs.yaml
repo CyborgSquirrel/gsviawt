@@ -330,6 +330,12 @@ wandb:
   mode: online                # online | offline | disabled
   tags: []
   name: ${output_dirname}
+  # Log into an EXISTING W&B run instead of creating one (e.g. when continuing a finished run from its checkpoint,
+  # see ckpt_path): id = that run's id (the last part of its URL), resume = "must" (fail if it doesn't exist),
+  # "allow" (resume it if it exists, else create it with this id) or "never". null (both): a new run. The
+  # run's config is updated with this run's values, its history is appended to.
+  id: null
+  resume: null
 
 hydra:
   job:

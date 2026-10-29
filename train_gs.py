@@ -828,13 +828,19 @@ def main(cfg: DictConfig) -> None:
       tags.remove(tag)
     tags = [tag, *tags]
 
+    resume = cfg.wandb.get("resume")
     wandb_run = wandb.init(
       project=cfg.wandb.project,
       mode=cfg.wandb.mode,
       tags=tags,
       name=cfg.wandb.name,
-      config=OmegaConf.to_container(cfg, resolve=True),
+      id=cfg.wandb.get("id"),
+      resume=resume,
+      # a resumed run's config already has values: it is updated below, allowing changes
+      config=None if resume else OmegaConf.to_container(cfg, resolve=True),
     )
+    if resume:   # the resumed run's config takes this segment's values (e.g. the extended max_seconds, ckpt_path)
+      wandb_run.config.update(OmegaConf.to_container(cfg, resolve=True), allow_val_change=True)
     logger = ProgressWandbLogger(
       experiment=wandb_run,
       progress_fn=lambda: {
