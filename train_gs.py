@@ -103,6 +103,7 @@ class GSModel(nn.Module):
       mlp_ratio=float(cfg.model.transformer.mlp_ratio),
       layer_scale_init=float(cfg.model.transformer.layer_scale_init),
       checkpoint_activations=bool(cfg.model.transformer.get("checkpoint_activations", False)),
+      split_fields=OmegaConf.to_container(cfg.model.split_fields) if cfg.model.get("split_fields") else None,
       layer_embed_dim=cfg.model.layer_embed_dim,
       input_proj_dim=cfg.model.get("input_proj_dim"),
       input_proj_identity_init=bool(cfg.model.get("input_proj_identity_init")),

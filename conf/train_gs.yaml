@@ -171,6 +171,12 @@ model:
   # unchanged behavior, and the decoder's output conv keeps its old shape, so
   # existing checkpoints still load.
   predict_mean_offset: false
+  # Separate decoders per group of Gaussian fields: a list of field-name groups, every field exactly once
+  # (opacity, scale, rotation, sh_dc[, offset]), e.g. [[opacity, sh_dc], [scale, rotation]] = one trunk +
+  # linear layer for opacity+color and another for the covariance. Each group has its own frame -> ray ->
+  # global trunk (model.transformer) and its own output Linear; the backbone and its mix are shared.
+  # null (default): one trunk and one Linear for everything, checkpoints unchanged.
+  split_fields: null
 
 loss:
   photom:
