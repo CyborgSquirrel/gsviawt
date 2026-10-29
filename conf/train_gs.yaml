@@ -6,6 +6,9 @@
 defaults:
   - data/mesh_split: fraction
   - data/view_split: fraction
+  # The image encoder in front of the head (data.input=image or features_image), e.g. model/backbone=moge_mix (see
+  # conf/model/backbone/*.yaml, instantiated by Hydra); none by default: the head's input is cached features.
+  - model/backbone: null
   # LR scheduler: step_cosine (warmup + cosine over total_steps), time_wsd (warmup-stable-decay over
   # max_seconds of training time; also stops the run -- see conf/sched/time_wsd.yaml), or sched=null for none
   - sched: step_cosine
@@ -67,7 +70,7 @@ data:
   # extracted at the model size from a larger render: 504 for r75b on a 512 render. null = off.
   depth_size: null
   # features: the head's input is read from features_h5. image: items carry the source view's RGB
-  # image instead (model.backbone must be set); features_h5 then only lists the volumes
+  # image instead (select a model/backbone); features_h5 then only lists the volumes
   # (view_indices, mesh_index, source_h5) -- its features are not read. features_image: both
   # (model.rgb_patch).
   input: features           # features | image | features_image (both: model.rgb_patch)
@@ -97,21 +100,8 @@ model:
   # With rgb_patch: only layer 0 gets the RGB patch; layers 1.. get N(0, 1) noise of the same shape
   # instead, freshly sampled on every forward pass (also at val and in the callbacks).
   rgb_patch_noise: false
-  # Trainable image encoder in front of the head: the DINOv2 ViT-L/14 of a pretrained MoGe-1
-  # (gs_backbone.MoGeBackbone), its last block's tokens as the head's input -- trained together
-  # with the head. Needs data.input=image, feature_dim=1024.
-  backbone:
-    weights: null           # null = off (features come from data.features_h5); a HF repo id such as Ruicheng/moge-vitl, or a local model.pt
-    image_size: ${data.image_size}
-    lr: 1.0e-5              # backbone learning rate (the head's is optim.lr)
-    checkpoint_activations: true   # recompute each block's activations in the backward pass (memory)
-    mix_blocks: false       # true: the encoder is frozen and its tokens are sum_k mix[k] * norm(block k output) over ALL
-                            # blocks, mix (blocks, 1024) learned (init: last block 1, others 0) -- gs_backbone.MoGeMixBackbone.
-                            # Set lr (below) to the head's LR: it is the learning rate of mix
-    mix_groups: shared      # with mix_blocks: how the Gaussian layers share the mix -- shared (one (blocks, 1024) mix, one token
-                            # map for all layers), first_rest (one mix for layer 0, one for layers 1..), per_layer (one per layer)
-    mix_init: last          # with mix_blocks: last (1 on the last block, 0 elsewhere) or gaussian (N(0, 1) / blocks)
-    freeze_blocks: 0        # freeze the patch embedding and the first N of the 24 blocks (no grad / optimizer memory for them)
+  # (An image encoder in front of the head is the model/backbone config group, see the defaults above; it needs
+  # data.input=image, feature_dim=1024.)
   # Optional transformer trunk in front of the per-patch linear projection (a
   # small version of World Tracing's head: blocks cycle frame -> ray -> global
   # attention, plus a per-layer FiLM; see gs_decoder.TransformerTrunk).
@@ -327,6 +317,11 @@ optim:
   _target_: torch.optim.AdamW
   _partial_: true
   lr: 1e-4
+# Optimizer settings that override `optim`'s for the parameters of ONE module of the model (model.<name>), e.g. the
+# pretrained backbone's own, lower learning rate. A module the model doesn't have (no backbone) is skipped.
+optim_groups:
+  backbone:
+    lr: 1.0e-5
 
 wandb:
   project: gsviawt

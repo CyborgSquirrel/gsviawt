@@ -61,7 +61,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
 from gs_dataset import (OPENGL_TO_OPENCV, H5Catalog, WTFeatureDataset,  # noqa: E402
                         _EmptyDataset, render_catalog, rotate_quats_wxyz,
                         sample_matching_sources)
-from gs_backbone import MoGeBackbone, MoGeMixBackbone  # noqa: E402
 from gs_decoder import PatchGaussianHead  # noqa: E402
 from module import (DSSIMLoss, Events, ProgressWandbLogger, TrainClock, _completed_steps,  # noqa: E402
                     make_scheduler, needs_clock)
@@ -110,17 +109,10 @@ class GSModel(nn.Module):
       input_proj_identity_init=bool(cfg.model.get("input_proj_identity_init")),
     )
 
-    # model.backbone.weights set: the encoder is part of the model and trained with the head
-    # (the batch carries the source "image" instead of cached "features")
+    # model/backbone selected: the encoder is part of the model and trained with the head (the batch carries the
+    # source "image" instead of cached "features"); Hydra builds it from the config group's _target_
     backbone = cfg.model.get("backbone")
-    if backbone is None or not backbone.get("weights"):
-      self.backbone = None
-    elif backbone.get("mix_blocks"):
-      self.backbone = MoGeMixBackbone(
-        backbone.weights, backbone.image_size, groups=backbone.get("mix_groups", "shared"),
-        init=backbone.get("mix_init", "last"), num_layers=cfg.data.num_layers)
-    else:
-      self.backbone = MoGeBackbone(backbone.weights, backbone.image_size, backbone.checkpoint_activations, backbone.get("freeze_blocks", 0))
+    self.backbone = None if backbone is None else hydra.utils.instantiate(backbone)
     self.input_key = "features" if self.backbone is None else "image"
 
     # model.rgb_patch: every patch token gets its own 14x14x3 RGB pixels concatenated (in [-1, 1],
@@ -445,13 +437,17 @@ class GSLightningModule(pl.LightningModule):
   def configure_optimizers(self):
     out = {}
 
-    if self.model.backbone is None:
+    # optim_groups: per-module optimizer settings (e.g. the pretrained backbone's own learning rate); the head
+    # and everything else use `optim`'s
+    groups = OmegaConf.to_container(self.cfg.get("optim_groups") or {}, resolve=True)
+    modules = {name: getattr(self.model, name, None) for name in groups}
+    modules = {name: module for name, module in modules.items() if module is not None}
+    if not modules:
       params = self.model.parameters()
     else:
-      # the pretrained backbone trains at its own (lower) learning rate
       params = [
         {"params": self.model.head.parameters()},
-        {"params": [p for p in self.model.backbone.parameters() if p.requires_grad], "lr": self.cfg.model.backbone.lr},
+        *({"params": [p for p in module.parameters() if p.requires_grad], **groups[name]} for name, module in modules.items()),
       ]
     out["optimizer"] = hydra.utils.instantiate(self.cfg.optim)(params)
     if OmegaConf.select(self.cfg, "sched") is not None:
