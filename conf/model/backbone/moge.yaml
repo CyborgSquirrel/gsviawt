@@ -1,0 +1,8 @@
+# @package model.backbone
+# The pretrained MoGe-1 DINOv2 encoder, trained together with the Gaussian head (select it with model/backbone=moge);
+# its tokens are the last block's. See gs_backbone.MoGeBackbone. Its learning rate is optim_groups.backbone.lr.
+_target_: gs_backbone.MoGeBackbone
+weights: Ruicheng/moge-vitl   # a HF repo id, or a local model.pt
+image_size: ${data.image_size}
+checkpoint_activations: true  # recompute each block's activations in the backward pass (memory)
+freeze_blocks: 0              # freeze the patch embedding and the first N of the 24 blocks (no grad / optimizer memory for them)

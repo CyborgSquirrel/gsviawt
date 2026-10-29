@@ -1,0 +1,11 @@
+# @package model.backbone
+# The FROZEN MoGe-1 DINOv2 encoder whose tokens are a learned per-channel mix of ALL its blocks (select it with
+# model/backbone=moge_mix): sum_k mix[k] * norm(block k output), mix (blocks, 1024) trained with the head -- see
+# gs_backbone.MoGeMixBackbone. Only mix trains; its learning rate is optim_groups.backbone.lr (set it to the head's).
+_target_: gs_backbone.MoGeMixBackbone
+weights: Ruicheng/moge-vitl   # a HF repo id, or a local model.pt
+image_size: ${data.image_size}
+groups: shared       # how the Gaussian layers share the mix: shared (one (blocks, 1024) mix, one token map for all layers),
+                     # first_rest (one mix for layer 0, one for layers 1..), per_layer (one per layer)
+init: last           # last (1 on the last block, 0 elsewhere) or gaussian (N(0, 1) / blocks)
+num_layers: ${data.num_layers}
