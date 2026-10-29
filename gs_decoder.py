@@ -332,7 +332,7 @@ class PatchGaussianHead(nn.Module):
     if self.input_proj is not None:
       features = self.input_proj(features)
     _, num_layers, num_patches, _ = features.shape
-    if self.layer_embed is not None and num_layers == 1:
+    if num_layers == 1 and (self.layer_embed is not None or self.trunk is not None):   # one token map for all layers: the layer embedding or the trunk's FiLM tells them apart
       features = features.expand(-1, self.num_layers, -1, -1)
       num_layers = self.num_layers
     if num_layers != self.num_layers:

@@ -26,6 +26,7 @@ make_viewmats/_scatter_grid) that used to live in fit_gsplat.py, now used
 by fit_3dgs.py's layered mode, orbit_video.py and gs_decoder.py.
 """
 
+import collections
 import contextlib as ctl
 import contextvars
 import inspect
@@ -426,20 +427,78 @@ class EventValidation(pl.Callback):
   training epoch loop's on_advance_end does for a due validation (lightning/pytorch/loops/
   training_epoch_loop.py), with its private state, and then tells that loop to skip its own check for
   this step, so a step is never validated twice. trigger_event=None turns it off.
-  The TrainClock doesn't count the validation (it counts the optimization pass of a batch only)."""
+  The TrainClock doesn't count the validation (it counts the optimization pass of a batch only).
 
-  def __init__(self, *, trigger_event):
+  Several of these can run side by side, a small one often and a big one rarely: each has a `name` (the
+  datamodule's `validation` while it runs, so the metrics are logged as val/<name>/<set>/<metric>) and its own
+  `volumes`, how many volumes of EACH validation set it scores: a whole number (200, or the string "200") is
+  that many volumes, a percentage string ("50%") that proportion of the set, None the whole set (decimals
+  are rejected as a count: floats and ints get mixed up in configs). It takes batches from the start of each set's dataloader
+  until it has that many (the val dataloaders shuffle, so every validation scores a fresh random sample); a
+  set with fewer volumes is scored whole (trainer.limit_val_batches doesn't apply to these). Lightning's own
+  validations (at the end of training, ...) are sized by trainer.limit_val_batches instead."""
+
+  def __init__(self, *, name, trigger_event, volumes=None, at_end=False):
+    self.name = name
     self.trigger = Trigger(trigger_event)
+    self.count, self.fraction = self._parse_volumes(volumes)
+    self.at_end = at_end
+
+  @staticmethod
+  def _parse_volumes(volumes):
+    """volumes -> (count, fraction), one of them None (both None: the whole set): a whole number (int or digit
+    string) is a count, a "p%" string with 0 < p <= 100 a proportion; anything else raises."""
+    if volumes is None:
+      return None, None
+    if isinstance(volumes, bool) or isinstance(volumes, float):
+      raise ValueError(f"volumes={volumes!r}: use a whole number (a count) or a percentage string like \"50%\"")
+    if isinstance(volumes, int):
+      if volumes <= 0:
+        raise ValueError(f"volumes={volumes!r} must be positive")
+      return volumes, None
+    if isinstance(volumes, str):
+      text = volumes.strip()
+      if text.isdigit() and int(text) > 0:
+        return int(text), None
+      if text.endswith("%"):
+        try:
+          percent = float(text[:-1])
+        except ValueError:
+          percent = None
+        if percent is not None and 0 < percent <= 100:
+          return None, percent / 100
+    raise ValueError(f"volumes={volumes!r} must be a positive whole number, a percentage string like \"50%\" (0 < p <= 100) or None")
+
+  def _batches(self, loader):
+    """How many batches of `loader` to run for `volumes` (trainer.limit_val_batches is for Lightning's own)."""
+    n = len(loader)
+    if self.count is None and self.fraction is None:
+      return n
+    want = math.ceil(self.count / loader.batch_size) if self.count is not None else math.ceil(self.fraction * n)
+    return min(want, n)
 
   def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-    if not self.trigger.due(trainer, pl_module, batch_idx):
+    due = self.trigger.due(trainer, pl_module, batch_idx)   # every step, for its own bookkeeping
+    if trainer.should_stop:   # the last step (TrainClock's max_seconds, ...)
+      due = self.at_end
+    if not due:
       return
     loop = trainer.fit_loop.epoch_loop
+    val_loop = loop.val_loop
+    val_loop.setup_data()   # makes the loaders and their batch limits the first time (a no-op after)
+    limits = val_loop._max_batches
+    val_loop._max_batches = [self._batches(dl) for dl in val_loop._combined_loader.flattened]
+    datamodule = trainer.datamodule
+    datamodule.validation = self.name
     trainer.validating = True   # picks the right trainer._active_loop
     first_loop_iter = trainer._logger_connector._first_loop_iter
-    if not loop._should_accumulate():
-      call._call_lightning_module_hook(trainer, "on_validation_model_zero_grad")
-    loop.val_loop.run()
+    try:
+      if not loop._should_accumulate():
+        call._call_lightning_module_hook(trainer, "on_validation_model_zero_grad")
+      val_loop.run()
+    finally:
+      val_loop._max_batches = limits   # Lightning's own validations use trainer.limit_val_batches
+      datamodule.validation = "lightning"
     trainer.training = True
     trainer._logger_connector._first_loop_iter = first_loop_iter
     # A one-shot flag of Lightning's epoch loop (loops/training_epoch_loop.py): its on_advance_end, which runs
@@ -450,6 +509,32 @@ class EventValidation(pl.Callback):
     # one), and the validation above is the step's only one. Running the val loop resets Lightning's
     # _last_val_time (evaluation_loop.py), so a time interval doesn't fire again right after.
     loop._skip_next_val = True
+
+
+class ValidationStats(pl.Callback):
+  """Logs, for every validation set of every validation (EventValidation's and Lightning's own), how many
+  volumes it scored (val/<name>/<set>/n_volumes) and the standard error of its mean loss
+  (val/<name>/<set>/loss_se, from the batch losses, which are independent random samples of the set when
+  the validation scores part of it), so a logged loss comes with its sample size and its noise."""
+
+  def on_validation_epoch_start(self, trainer, pl_module):
+    self._losses = collections.defaultdict(list)
+    self._volumes = collections.Counter()
+
+  def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
+    self._losses[dataloader_idx].append(float(outputs["loss"]))
+    self._volumes[dataloader_idx] += int(batch["batch_size"])
+
+  def on_validation_epoch_end(self, trainer, pl_module):
+    datamodule = trainer.datamodule
+    for idx, name in enumerate(datamodule.val_datasets):
+      losses = self._losses.get(idx)
+      if not losses:
+        continue
+      prefix = f"val/{datamodule.validation}/{name}"
+      pl_module.log(f"{prefix}/n_volumes", float(self._volumes[idx]), add_dataloader_idx=False)
+      if len(losses) > 1:
+        pl_module.log(f"{prefix}/loss_se", float(np.std(losses, ddof=1) / len(losses) ** 0.5), add_dataloader_idx=False)
 
 
 class TimeWSD(torch.optim.lr_scheduler.LRScheduler):
