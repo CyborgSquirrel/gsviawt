@@ -72,3 +72,55 @@ class MoGeBackbone(nn.Module):
         x = checkpoint(block, x, use_reentrant=False) if self.training and self.checkpoint_activations else block(x)
       x = bb.norm(x)[:, 1 + bb.num_register_tokens:]
     return x.float()[:, None]
+
+
+class MoGeMixBackbone(MoGeBackbone):
+  """Frozen MoGe-1 DINOv2 whose tokens are a learned per-channel mix of ALL its blocks: the output is
+  sum_k mix[k] * norm(block_k output), mix (blocks, 1024) trained with the head. The backbone runs without
+  autograd, so it costs no gradient or optimizer memory; each block's output goes through the backbone's
+  final LayerNorm (as get_intermediate_layers(norm=True) does) so their scales are comparable.
+
+  init: "last" (1 on the last block, 0 elsewhere = MoGeBackbone's output) or "gaussian" (N(0, 1) / blocks).
+  groups: how the Gaussian layers share the mix --
+    "shared":    one mix for all (mix is (blocks, 1024)); (B, 3, S, S) -> (B, 1, P, 1024), the head expands
+                 the one token map to its layers;
+    "first_rest": one mix for layer 0 and one shared by layers 1.., (2, blocks, 1024);
+    "per_layer": one mix per layer, (num_layers, blocks, 1024);
+  the last two give (B, num_layers, P, 1024), each layer its own token map."""
+
+  GROUPS = ("shared", "first_rest", "per_layer")
+
+  def __init__(self, weights="Ruicheng/moge-vitl", image_size=504, groups="shared", init="last", num_layers=6):
+    super().__init__(weights, image_size, checkpoint_activations=False, freeze_blocks=0)
+    if groups not in self.GROUPS:
+      raise ValueError(f"mix groups must be one of {self.GROUPS}, got {groups!r}")
+    if init not in ("last", "gaussian"):
+      raise ValueError(f"mix init must be 'last' or 'gaussian', got {init!r}")
+    for p in self.backbone.parameters():
+      p.requires_grad_(False)   # the whole encoder is frozen; only mix trains
+    n = len(self.backbone.blocks)
+    num_sets = {"shared": 1, "first_rest": 2, "per_layer": num_layers}[groups]
+    shape = (n, self.out_dim) if groups == "shared" else (num_sets, n, self.out_dim)
+    if init == "last":
+      mix = torch.zeros(shape)
+      mix[..., -1, :] = 1.0
+    else:
+      mix = torch.randn(shape) / n
+    self.mix = nn.Parameter(mix)
+    # which mix each Gaussian layer reads (None: the one token map is shared)
+    self.layer_sets = {"shared": None, "first_rest": [0] + [1] * (num_layers - 1), "per_layer": list(range(num_layers))}[groups]
+
+  def forward(self, image):
+    bb = self.backbone
+    x = (image - self.image_mean) / self.image_std
+    x = F.interpolate(x, (self.image_size, self.image_size), mode="bilinear")
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=x.is_cuda), torch.no_grad():
+      x = bb.prepare_tokens_with_masks(x)
+      outs = []
+      for block in bb.blocks:
+        x = block(x)
+        outs.append(bb.norm(x)[:, 1 + bb.num_register_tokens:])
+      outs = torch.stack(outs, 1)   # (B, blocks, P, D)
+    mix = self.mix if self.mix.dim() == 3 else self.mix[None]   # (sets, blocks, D)
+    tokens = torch.einsum("bkpd,gkd->bgpd", outs.float(), mix)    # (B, sets, P, D)
+    return tokens if self.layer_sets is None else tokens[:, self.layer_sets]
