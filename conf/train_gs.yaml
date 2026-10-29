@@ -64,9 +64,8 @@ data:
   #   val_views_sval:   train meshes, sources AND targets = val_views
   # See conf/data/mesh_split/*.yaml and conf/data/view_split/*.yaml. The defaults hold out 10% of the meshes
   # and no views.
-  # Size of each validation set in volumes (a fixed random subset, so a val pass stays cheap);
-  # null = all of them.
-  val_volumes: null
+  # The sets are always complete; how much of each a validation scores is set per validation (see
+  # callbacks.validation_small / validation_big, and trainer.limit_val_batches for Lightning's own).
   # Resample the source view's depth (nearest neighbour) to this square size, for features
   # extracted at the model size from a larger render: 504 for r75b on a 512 render. null = off.
   depth_size: null
@@ -215,7 +214,7 @@ loss:
 # trough_event (checked when training starts).
 events: {}
 
-# orbit / panel / scale_layers / event_checkpoint / event_validation each act on their trigger_event, e.g.
+# orbit / panel / scale_layers / event_checkpoint / validation_small / validation_big each act on their trigger_event, e.g.
 # callbacks.orbit.trigger_event={every_n_seconds:1800} or callbacks.orbit.trigger_event=trough. The Lightning
 # checkpoint below keeps ModelCheckpoint's own every_n_epochs / train_time_interval.
 callbacks:
@@ -242,12 +241,35 @@ callbacks:
     trigger_event: null
     filename: "checkpoint-{count}-step{step}.ckpt"
 
-  # A validation run right after the step where trigger_event is due (Lightning itself only validates on
+  # Validations run right after the step where their trigger_event is due (Lightning itself only validates on
   # trainer.val_check_interval / check_val_every_n_epoch, or when asked to stop); null = off. A step is
-  # never validated twice: this one wins over Lightning's own check.
-  event_validation:
+  # never validated twice: these win over Lightning's own check. Each scores `volumes` volumes of EACH
+  # validation set (a whole number: that many; a percentage string like "50%": that proportion of the set;
+  # null: the whole set; decimals as a count are rejected),
+  # taken from the start of the shuffling val dataloaders, so a fresh random sample every time (a set with
+  # fewer volumes is scored whole). Metrics are logged as val/<name>/<set>/<metric>, with val/<name>/<set>/
+  # n_volumes and loss_se (the standard error of the logged mean). A small one often, a big one rarely, e.g.
+  #   callbacks.validation_small.trigger_event=periodic  callbacks.validation_big.trigger_event=trough
+  # at_end: the validation also runs on the last step of the run (the TrainClock's max_seconds), so the
+  # final validation is the big one, with its name and size. (Lightning's own validations, which a run
+  # with an at_end validation doesn't have, are sized by trainer.limit_val_batches and logged as
+  # val/lightning/<set>/<metric>.)
+  validation_small:
     _target_: module.EventValidation
+    name: small
     trigger_event: null
+    volumes: 200
+    at_end: false
+  validation_big:
+    _target_: module.EventValidation
+    name: big
+    trigger_event: null
+    volumes: 1500
+    at_end: true
+
+  # n_volumes and loss_se of every validation (see module.ValidationStats)
+  validation_stats:
+    _target_: module.ValidationStats
 
   orbit:
     _target_: module.OrbitCallback
@@ -303,6 +325,12 @@ wandb:
   mode: online                # online | offline | disabled
   tags: []
   name: ${output_dirname}
+  # Log into an EXISTING W&B run instead of creating one (e.g. when continuing a finished run from its checkpoint,
+  # see ckpt_path): id = that run's id (the last part of its URL), resume = "must" (fail if it doesn't exist),
+  # "allow" (resume it if it exists, else create it with this id) or "never". null (both): a new run. The
+  # run's config is updated with this run's values, its history is appended to.
+  id: null
+  resume: null
 
 hydra:
   job:

@@ -328,14 +328,18 @@ class GSDataModule(pl.LightningDataModule):
     val_views_strain: volumes with a train-view source, as many per mesh as it has val views (see
                       gs_dataset.sample_matching_sources); targets from the val views
     val_views_sval:   volumes with a val-view source, targets from the val views
-  Each validation set is a fixed random subset of data.val_volumes volumes (null = all of them); the
-  empty sets are dropped. The datasets are in self.val_datasets, in that order, one val dataloader each."""
+  Every validation set is complete (the empty ones are dropped); how much of it a validation scores is
+  that validation's own choice (module.EventValidation volumes; trainer.limit_val_batches for Lightning's own
+  ones, which a run with an at_end validation doesn't have): the val dataloaders shuffle, so each validation scores a fresh random sample. The datasets are in
+  self.val_datasets, in that order, one val dataloader each. self.validation names the validation running
+  (module.EventValidation sets it; "lightning" is Lightning's own), it is part of the logged metric names."""
 
   def __init__(self, cfg):
     super().__init__()
     self.cfg = cfg
     self.train_ds = None
     self.val_datasets = None
+    self.validation = "lightning"
 
   def setup(self, stage=None):
     if self.train_ds is not None:
@@ -368,22 +372,16 @@ class GSDataModule(pl.LightningDataModule):
     train_rows = rows_in(train_views)
     if not train_rows:
       raise SystemExit("no training volumes: check data.item / data.mesh_split / data.view_split")
-    rng = np.random.default_rng(cfg.seed)
-
-    def subset(r):   # data.val_volumes of a set's volumes: a fixed random subset, so a val pass stays cheap
-      n = len(r) if d.val_volumes is None else min(int(d.val_volumes), len(r))
-      return sorted(rng.choice(r, size=n, replace=False).tolist()) if len(r) else []
-
     # val_meshes:       every view of the held-out meshes (source and targets)
     # val_views_strain: train meshes, sources = train views (as many per mesh as it has val views),
     #                   targets = val views
     # val_views_sval:   train meshes, sources and targets = val views
     sets = {}
     if len(val_meshes):
-      sets["val_meshes"] = (val_meshes, subset(rows_in(val_meshes)))
+      sets["val_meshes"] = (val_meshes, rows_in(val_meshes))
     if len(val_views):
-      sets["val_views_strain"] = (val_views, subset(rows_in(sample_matching_sources(train_views, val_views, seed=cfg.seed))))
-      sets["val_views_sval"] = (val_views, subset(rows_in(val_views)))
+      sets["val_views_strain"] = (val_views, rows_in(sample_matching_sources(train_views, val_views, seed=cfg.seed)))
+      sets["val_views_sval"] = (val_views, rows_in(val_views))
     self.train_ds = WTFeatureDataset(d.features_h5, train_views, rows=train_rows, **kwargs)
     self.val_datasets = {
       name: WTFeatureDataset(d.features_h5, v, rows=r, **kwargs) for name, (v, r) in sets.items() if len(r)}
@@ -405,7 +403,7 @@ class GSDataModule(pl.LightningDataModule):
     return [
       DataLoader(
         ds,
-        shuffle=False,
+        shuffle=True,   # every validation iterates it afresh: a new random order, so a partial one is a random sample
         collate_fn=collate_with_batch_size,
         num_workers=0,
         batch_size=self.cfg.loader.batch_size,
@@ -487,7 +485,8 @@ class GSLightningModule(pl.LightningModule):
 
     @ft.wraps(self.log)
     def _log(key, *args, **kwargs):
-      self.log(f"{stage}/{key}", *args, **kwargs, batch_size=B, add_dataloader_idx=False)
+      name = f"{stage}/{key}" if stage == "train" else f"val/{self.trainer.datamodule.validation}/{stage}/{key}"
+      self.log(name, *args, **kwargs, batch_size=B, add_dataloader_idx=False)
 
     cfg = self.cfg
     device = self.device
@@ -825,13 +824,19 @@ def main(cfg: DictConfig) -> None:
       tags.remove(tag)
     tags = [tag, *tags]
 
+    resume = cfg.wandb.get("resume")
     wandb_run = wandb.init(
       project=cfg.wandb.project,
       mode=cfg.wandb.mode,
       tags=tags,
       name=cfg.wandb.name,
-      config=OmegaConf.to_container(cfg, resolve=True),
+      id=cfg.wandb.get("id"),
+      resume=resume,
+      # a resumed run's config already has values: it is updated below, allowing changes
+      config=None if resume else OmegaConf.to_container(cfg, resolve=True),
     )
+    if resume:   # the resumed run's config takes this segment's values (e.g. the extended max_seconds, ckpt_path)
+      wandb_run.config.update(OmegaConf.to_container(cfg, resolve=True), allow_val_change=True)
     logger = ProgressWandbLogger(
       experiment=wandb_run,
       progress_fn=lambda: {
