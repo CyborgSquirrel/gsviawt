@@ -1,0 +1,14 @@
+# @package model.backbone
+# The FROZEN World Tracing decoder (r75b, 42 blocks, width 1536) whose per-depth-layer tokens are a learned per-channel mix
+# of ALL its decoder blocks (select it with model/backbone=wt_mix, and set model.feature_dim=1536): sum_k mix[k] * LN(block k
+# output) -- see gs_backbone.WTMixBackbone. WT runs at t=1 on pure noise + the image (fresh noise per training step, fixed
+# seed in eval); only the mix trains, its learning rate is optim_groups.backbone.lr.
+_target_: gs_backbone.WTMixBackbone
+config: r75b          # wt.checkpoint.CONFIGS key
+ckpt: r75b            # config name | hf://repo[/file.pt] | local .pt path
+image_size: ${data.image_size}
+num_layers: ${data.num_layers}
+groups: shared        # shared (one (blocks, 1536) mix for all layers), first_rest (layer 0 / layers 1..), per_layer
+init: last            # last (1 on the last block) or gaussian (N(0, 1) / blocks)
+bf16_weights: true    # keep the frozen WT weights in bf16 (needed on a 10 GB GPU; the extractor does the same)
+eval_seed: 0          # eval-time noise seed (training noise is fresh every step)

@@ -124,3 +124,105 @@ class MoGeMixBackbone(MoGeBackbone):
     mix = self.mix if self.mix.dim() == 3 else self.mix[None]   # (sets, blocks, D)
     tokens = torch.einsum("bkpd,gkd->bgpd", outs.float(), mix)    # (B, sets, P, D)
     return tokens if self.layer_sets is None else tokens[:, self.layer_sets]
+
+
+class WTMixBackbone(nn.Module):
+  """Frozen World Tracing decoder (r75b: 42 blocks, width 1536) whose tokens are a learned per-channel mix of ALL its
+  decoder blocks: out[l] = sum_k mix[set(l), k] * LN(block_k output[l]), mix (blocks, 1536) trained with the head.
+  WT's tokens are per depth layer ((B, num_layers, P, 1536), P = (S / 14)^2), so every layer reads its own token map.
+
+  Input regime (no geometry at inference): WT is run at flow time t=1 on pure Gaussian noise plus the RGB image, so its
+  tokens depend on the image alone. The noise is fresh on every training forward; in eval it comes from a fixed seed so
+  validation is reproducible. Only the decoder runs (WT's head is skipped). Each block's output goes through a
+  parameter-free per-token LayerNorm before mixing (WT has no final norm of its own; the stream norms are 100-1000).
+
+  groups / init: as MoGeMixBackbone -- shared (one mix for all layers), first_rest (one for layer 0, one for layers 1..),
+  per_layer; init "last" (1 on the last block) or "gaussian" (N(0, 1) / blocks).
+  The WT weights are not registered as parameters, so checkpoints hold only the mix; they are loaded again from
+  `ckpt` and kept in bf16 (bf16_weights=True) on the input's device at the first forward."""
+
+  GROUPS = ("shared", "first_rest", "per_layer")
+  PATCH_SIZE = 14
+
+  def __init__(self, config="r75b", ckpt="r75b", image_size=504, groups="shared", init="last", num_layers=6,
+               bf16_weights=True, eval_seed=0):
+    super().__init__()
+    if groups not in self.GROUPS:
+      raise ValueError(f"mix groups must be one of {self.GROUPS}, got {groups!r}")
+    if init not in ("last", "gaussian"):
+      raise ValueError(f"mix init must be 'last' or 'gaussian', got {init!r}")
+    from wt.checkpoint import build_model_and_load_ckpt
+    from wt.inference import _AC_ATTR, _bypass_activation_checkpointing
+
+    model, wt_cfg = build_model_and_load_ckpt(config, ckpt, torch.device("cpu"))
+    if int(image_size) != wt_cfg["image_size"] or int(num_layers) != wt_cfg["model_kwargs"]["num_layers"]:
+      raise ValueError(f"{config} runs at image_size={wt_cfg['image_size']}, num_layers={wt_cfg['model_kwargs']['num_layers']}; "
+                       f"got image_size={image_size}, num_layers={num_layers}")
+    if bf16_weights:
+      model = model.to(torch.bfloat16)
+    model.eval().requires_grad_(False)
+    self._wt = [model]   # a list: keeps the 1.7B frozen weights out of this module's parameters and state_dict
+    self._bypass = _bypass_activation_checkpointing
+    # the AC wrappers are unwrapped during the forward, so the hooks sit on the inner modules
+    self._blocks = [getattr(b, _AC_ATTR, None) or b for b in model.net.decoder_blocks]
+    self.image_size, self.num_layers, self.eval_seed = int(image_size), int(num_layers), int(eval_seed)
+    self.patch_grid = self.image_size // self.PATCH_SIZE
+    self.out_dim = int(wt_cfg["model_kwargs"]["decoder_embed_dim"])
+    n = len(self._blocks)
+    num_sets = {"shared": 1, "first_rest": 2, "per_layer": num_layers}[groups]
+    shape = (n, self.out_dim) if groups == "shared" else (num_sets, n, self.out_dim)
+    if init == "last":
+      mix = torch.zeros(shape)
+      mix[..., -1, :] = 1.0
+    else:
+      mix = torch.randn(shape) / n
+    self.mix = nn.Parameter(mix)
+    self.layer_sets = {"shared": [0] * num_layers, "first_rest": [0] + [1] * (num_layers - 1),
+                       "per_layer": list(range(num_layers))}[groups]
+
+  def train(self, mode=True):
+    super().train(mode)
+    self._wt[0].eval()
+    return self
+
+  def _tokens(self, image):
+    """-> (B, blocks, L, P, D) LayerNormed block outputs, bf16, no grad."""
+    wt = self._wt[0]
+    if next(wt.parameters()).device != image.device:
+      wt.to(image.device)
+    B, _, S, _ = image.shape
+    L, P, D, n = self.num_layers, self.patch_grid ** 2, self.out_dim, len(self._blocks)
+    gen = None
+    if not self.training:
+      gen = torch.Generator(device=image.device).manual_seed(self.eval_seed)
+    x_t = torch.randn(B, L * S * S, 3, device=image.device, generator=gen)   # pure noise: t = 1
+    outs = torch.empty(B, n, L, P, D, device=image.device, dtype=torch.bfloat16)
+
+    def hook(i):
+      kind = i % 3   # frame / ray / global, see wt TransformerTrunk pattern: tokens (B*L, P, D) / (B*P, L, D) / (B, L*P, D)
+      def f(_, __, out):
+        out = out[0] if isinstance(out, tuple) else out
+        out = out.reshape(B, P, L, D).transpose(1, 2) if kind == 1 else out.reshape(B, L, P, D)
+        outs[:, i] = F.layer_norm(out.float(), (D,), eps=1e-6).to(outs.dtype)
+      return f
+
+    handles = [b.register_forward_hook(hook(i)) for i, b in enumerate(self._blocks)]
+    cond = {"rgb": image[:, None].repeat(1, L, 1, 1, 1), "noise_height": S, "noise_width": S, "noise_nview": L,
+            "batch_size": B, "valid_mask": torch.ones(B, L * S * S, 1, device=image.device),
+            "invalid_fill_mode": "noise", "_context_only": True}
+    try:
+      with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=image.is_cuda), self._bypass(wt):
+        wt(x_t, torch.ones(B, device=image.device), cond)
+    finally:
+      for h in handles:
+        h.remove()
+    return outs
+
+  def forward(self, image):
+    """image: (B, 3, S, S) RGB in [0, 1] (black background, as MoGeExtractor/WTExtractor) -> (B, L, P, 1536)."""
+    outs = self._tokens(image)
+    mix = self.mix if self.mix.dim() == 3 else self.mix[None]   # (sets, blocks, D)
+    mix = mix[self.layer_sets]                                   # (L, blocks, D)
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=image.is_cuda):
+      tokens = torch.einsum("bklpd,lkd->blpd", outs, mix)
+    return tokens.float()
