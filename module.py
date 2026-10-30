@@ -847,13 +847,13 @@ def _build_panel(gt_rgb, pred_rgb):
   n = gt_rgb.shape[0]
   rows = []
   for i in range(n):
-    gc = gt_rgb[i].detach().cpu()
-    pc = pred_rgb[i].detach().cpu()
+    pc = pred_rgb[i].detach()
+    gc = gt_rgb[i].detach().to(pc.device)
     g = (gc * 255).to(torch.uint8)
     r = (pc * 255).to(torch.uint8)
     d = ((gc - pc).abs() * 255).to(torch.uint8)
     rows.append(pack([g, r, d], "c * w")[0])
-  return pack(rows, "c h *")[0]
+  return pack(rows, "c h *")[0].cpu()   # built on the input's device, one uint8 copy
 
 
 class PanelCallback(pl.Callback):
@@ -1130,7 +1130,7 @@ class OrbitCallback(pl.Callback):
       width=width, height=height,
       sh_degree=gauss["sh_degree"], render_mode="RGB", packed=True,
     )
-    frames = (rgb.clamp(0.0, 1.0).cpu().numpy() * 255).astype("uint8")
+    frames = (rgb.clamp(0.0, 1.0) * 255).to(torch.uint8).cpu().numpy()   # uint8 before the copy: 4x fewer bytes
     if not self.source_view:
       return frames
     # views["gt_rgb"][0] is the source view (premultiplied over black, like the orbit's background)
