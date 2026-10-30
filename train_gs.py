@@ -603,15 +603,18 @@ class GSLightningModule(pl.LightningModule):
 
   def _diffusion_photom(self, stage, batch, x0_hat, t, gated):
     """The photometric loss (loss.photom: L1 + D-SSIM on the views of loss.photom.for, against the dataset's rendered images) of
-    the diffusion model's x0 prediction, rendered. Per volume; gated: only the volumes whose mean timestep over the layers is in
-    diffusion.photom.t_range count (a mean over them; zero when there is none). Logs <prefix>/photom[_l1|_dssim] (over the
+    the diffusion model's x0 prediction, rendered. Per volume; gated: only the volumes whose timestep, reduced over the layers by
+    diffusion.photom.t_reduce (max: the noisiest layer, mean, layer0), is in diffusion.photom.t_range count (a mean over them; zero
+    when there is none). Logs <prefix>/photom[_l1|_dssim] (over the
     volumes that count) and, gated, photom_frac (the fraction of volumes that count). Returns the loss (with its graph)."""
     cfg, device, B = self.cfg, self.device, batch["batch_size"]
     V = batch["views"]["rgb"].shape[1]
     rvi = ([0] if "source" in cfg.loss.photom["for"] else []) + (list(range(1, V)) if "target" in cfg.loss.photom["for"] else [])
     if gated:
       lo, hi = cfg.diffusion.photom.t_range
-      keep = ((t.mean(dim=1) >= float(lo)) & (t.mean(dim=1) <= float(hi))).float()   # (B,)
+      reduce = cfg.diffusion.photom.t_reduce
+      tv = {"max": lambda: t.amax(dim=1), "mean": lambda: t.mean(dim=1), "layer0": lambda: t[:, 0]}[reduce]()   # (B,)
+      keep = ((tv >= float(lo)) & (tv <= float(hi))).float()
       self._log_metric(stage, "loss/photom_frac", keep.mean(), B)
     else:
       keep = torch.ones(B, device=device)
