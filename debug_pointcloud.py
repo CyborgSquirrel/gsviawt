@@ -63,7 +63,7 @@ def detect_format(f, datasets):
         "-f/--format explicitly")
 
 
-def unproject_depth_peel(depth_peel, intrinsics, pose, space):
+def unproject_depth_peel(depth_peel, intrinsics, pose, space, pixel_offset=0.5):
   """depth_peel: (H, W, L) float32, NaN marks no hit (older renders used
     -1.0; the `depth_peel > 0` test below rejects both).
   intrinsics: (3, 3) pinhole K matrix (pixel row 0 = top, standard
@@ -90,8 +90,12 @@ def unproject_depth_peel(depth_peel, intrinsics, pose, space):
 
   # K^-1 maps homogeneous pixel coords to a ray in OpenCV-style camera space
   # (X right, Y down, Z forward) at unit depth; scale by depth to place the
-  # point.
-  pixels_h = np.stack([u, v, np.ones_like(u)], axis=1)
+  # point. Pixel (u, v)'s sample sits at its centre (u + 0.5, v + 0.5): the
+  # renderer casts each pixel's ray through the centre (cx = W/2), and gsplat
+  # rasterizes at pixel centres too (cross-view check: bla/_pixel_convention_test.py).
+  # pixel_offset=0.0 reproduces World Tracing's own integer-index convention
+  # (wt/inference.py), for comparisons against its point maps.
+  pixels_h = np.stack([u + pixel_offset, v + pixel_offset, np.ones_like(u)], axis=1)
   rays_cv = pixels_h @ np.linalg.inv(intrinsics).T
   points_cv = rays_cv * depth[:, None]
 

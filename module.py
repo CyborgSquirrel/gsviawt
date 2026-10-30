@@ -111,8 +111,9 @@ def init_gaussians(depth_primary, K_primary, pose_primary, image_primary,
 
   dh, dw = depth_primary.shape[:2]
   ih, iw = image_primary.shape[:2]
-  iv = np.clip(np.round(v * (ih / dh)), 0, ih - 1).astype(np.int64)
-  iu = np.clip(np.round(u * (iw / dw)), 0, iw - 1).astype(np.int64)
+  # the image pixel containing the depth pixel's centre (pixel-centre convention, see unproject_depth_peel)
+  iv = np.clip(np.floor((v + 0.5) * (ih / dh)), 0, ih - 1).astype(np.int64)
+  iu = np.clip(np.floor((u + 0.5) * (iw / dw)), 0, iw - 1).astype(np.int64)
   colors = image_primary[iv, iu, :3].astype(np.float32) / 255.0      # front-pixel colour
 
   # isotropic initial scale = RMS distance to the knn_k nearest neighbours

@@ -73,7 +73,7 @@ def dense_unproject_camera(depth_peel, intrinsics):
   debug_pointcloud.unproject_depth_peel(space="camera"), densified."""
   h, w, l = depth_peel.shape
   uu, vv = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
-  pixels_h = np.stack([uu, vv, np.ones_like(uu)], axis=-1)          # (H,W,3)
+  pixels_h = np.stack([uu + 0.5, vv + 0.5, np.ones_like(uu)], axis=-1)   # (H,W,3), pixel centres
   rays_cv = pixels_h @ np.linalg.inv(intrinsics).T                  # (H,W,3), unit-depth rays
   hit = depth_peel > 0                                              # NaN and legacy -1.0 both fail
   xyz_cam = rays_cv[:, :, None, :] * depth_peel[:, :, :, None]      # (H,W,L,3)
