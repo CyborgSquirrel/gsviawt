@@ -464,10 +464,11 @@ class GSDiffusionModel(nn.Module):
       epss.append(torch.randn((1, *shape[1:]), device=device, generator=gen))
     return torch.cat(ts).to(device), torch.cat(epss)
 
-  def training_loss(self, image, hit, x0_raw, seeds=None):
+  def training_loss(self, image, hit, x0_raw, seeds=None, return_pred=False):
     """The masked x0 loss. Returns (loss, parts, counts): parts = per-field and per-t-bucket detached means, counts the number of valid
     slots each is a mean over (a bucket can be empty: it is not a mean then, and must not be logged). seeds: per-volume seeds
-    for the timesteps and the noise (validation); None: the global random stream."""
+    for the timesteps and the noise (validation); None: the global random stream. return_pred: also the prediction x0_hat
+    (B, L, C, H, W, normalized, with its graph) and the timesteps t (B, L), for the rendering loss (diffusion.photom)."""
     feats = self._feats(image)
     x0 = self.normalize(x0_raw)
     b, l = x0.shape[:2]
@@ -494,6 +495,8 @@ class GSDiffusionModel(nn.Module):
         name = f"t{lo:g}-{min(hi, 1):g}"
         counts[name] = in_bucket.sum()
         parts[name] = ((err * in_bucket).sum() / (counts[name].clamp_min(1) * CHANNELS)).detach()
+    if return_pred:
+      return loss, parts, counts, x0_hat, t
     return loss, parts, counts
 
   @torch.no_grad()
@@ -512,7 +515,11 @@ class GSDiffusionModel(nn.Module):
       t = ts[i]
       x0_hat = self.head(feats, a * x + (1 - a) * eps, t.expand(b, l)).float()
       x = x - (t - ts[i + 1]) * (x - x0_hat) / t.clamp(min=T_MIN_CLAMP)
-    return decode_x0(x, self.x0_mean, self.x0_std, self.x0_lo, self.x0_hi)
+    return self.decode(x)
+
+  def decode(self, x0):
+    """Normalized x0 (B, L, C, H, W) -> the Gaussian dict (differentiable inside the clamp range)."""
+    return decode_x0(x0.float(), self.x0_mean, self.x0_std, self.x0_lo, self.x0_hi)
 
   def forward(self, inputs):
     image, hit, seeds = inputs
