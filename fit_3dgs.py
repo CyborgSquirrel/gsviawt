@@ -748,13 +748,14 @@ class Fit3DGSLightningModule(pl.LightningModule):
       lr_delay_mult=float(cfg.lr.means_delay_mult),
       max_steps=int(cfg.lr.means_max_steps),
     )
+    # fused=True: one kernel per optimizer step instead of the foreach path's handful, same Adam update
     self.optimizers_dict = {
-      "means": torch.optim.Adam([self.params["means"]], lr=self.means_lr_fn(0), eps=1e-15),
-      "sh0": torch.optim.Adam([self.params["sh0"]], lr=float(cfg.lr.features_dc), eps=1e-15),
-      "shN": torch.optim.Adam([self.params["shN"]], lr=float(cfg.lr.features_rest), eps=1e-15),
-      "opacities": torch.optim.Adam([self.params["opacities"]], lr=float(cfg.lr.opacities), eps=1e-15),
-      "scales": torch.optim.Adam([self.params["scales"]], lr=float(cfg.lr.scales), eps=1e-15),
-      "quats": torch.optim.Adam([self.params["quats"]], lr=float(cfg.lr.quats), eps=1e-15),
+      "means": torch.optim.Adam([self.params["means"]], lr=self.means_lr_fn(0), eps=1e-15, fused=True),
+      "sh0": torch.optim.Adam([self.params["sh0"]], lr=float(cfg.lr.features_dc), eps=1e-15, fused=True),
+      "shN": torch.optim.Adam([self.params["shN"]], lr=float(cfg.lr.features_rest), eps=1e-15, fused=True),
+      "opacities": torch.optim.Adam([self.params["opacities"]], lr=float(cfg.lr.opacities), eps=1e-15, fused=True),
+      "scales": torch.optim.Adam([self.params["scales"]], lr=float(cfg.lr.scales), eps=1e-15, fused=True),
+      "quats": torch.optim.Adam([self.params["quats"]], lr=float(cfg.lr.quats), eps=1e-15, fused=True),
     }
     self.strategy.check_sanity(self.params, self.optimizers_dict)
     return list(self.optimizers_dict.values())
