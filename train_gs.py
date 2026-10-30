@@ -347,10 +347,11 @@ class GSDataModule(pl.LightningDataModule):
       return
     cfg = self.cfg
     d = cfg.data
-    features_h5 = d.features_h5
     self.diffusion_stats = None
     grid_index = None
-    if cfg.diffusion.enabled:
+    if not cfg.diffusion.enabled:
+      features_h5 = d.features_h5
+    else:
       # diffusion mode: the volumes are the fitted grids (one per source view), listed in a features-less listing file
       if d.input != "image":
         raise SystemExit("diffusion mode needs data.input=image")
