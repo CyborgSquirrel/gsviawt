@@ -1165,7 +1165,7 @@ class GaussH5ValDataset(Dataset):
   predicting to the real per-pixel fit instead of exposing untrained decoder
   heads on render. Used as GSDataModule's val_ds whenever data.gauss_h5 is
   set and there's no separate data.photom_h5_val corpus -- gives real
-  photometric val numbers (logged via the ordinary val/loss_l1 etc. path)
+  photometric val numbers (logged via the ordinary <set>/<name>/loss/photom_l1 etc. path)
   even for a direct-supervision-only training run, with no extra render
   corpus needed on disk."""
 

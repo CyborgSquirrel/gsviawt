@@ -430,7 +430,7 @@ class EventValidation(pl.Callback):
   The TrainClock doesn't count the validation (it counts the optimization pass of a batch only).
 
   Several of these can run side by side, a small one often and a big one rarely: each has a `name` (the
-  datamodule's `validation` while it runs, so the metrics are logged as val/<name>/<set>/<metric>) and its own
+  datamodule's `validation` while it runs, so the metrics are logged as <set>/<name>/<metric>) and its own
   `volumes`, how many volumes of EACH validation set it scores: a whole number (200, or the string "200") is
   that many volumes, a percentage string ("50%") that proportion of the set, None the whole set (decimals
   are rejected as a count: floats and ints get mixed up in configs). It takes batches from the start of each set's dataloader
@@ -513,8 +513,8 @@ class EventValidation(pl.Callback):
 
 class ValidationStats(pl.Callback):
   """Logs, for every validation set of every validation (EventValidation's and Lightning's own), how many
-  volumes it scored (val/<name>/<set>/n_volumes) and the standard error of its mean loss
-  (val/<name>/<set>/loss_se, from the batch losses, which are independent random samples of the set when
+  volumes it scored (<set>/<name>/n_volumes) and the standard error of its mean loss
+  (<set>/<name>/loss_se, from the batch losses, which are independent random samples of the set when
   the validation scores part of it), so a logged loss comes with its sample size and its noise."""
 
   def on_validation_epoch_start(self, trainer, pl_module):
@@ -531,7 +531,7 @@ class ValidationStats(pl.Callback):
       losses = self._losses.get(idx)
       if not losses:
         continue
-      prefix = f"val/{datamodule.validation}/{name}"
+      prefix = f"{name}/{datamodule.validation}"
       pl_module.log(f"{prefix}/n_volumes", float(self._volumes[idx]), add_dataloader_idx=False)
       if len(losses) > 1:
         pl_module.log(f"{prefix}/loss_se", float(np.std(losses, ddof=1) / len(losses) ** 0.5), add_dataloader_idx=False)
