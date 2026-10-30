@@ -12,7 +12,7 @@ Two phases:
   2  one t per sample shared by all layers, from the equal-weight mixture of the two densities.
 `LayerAwareSchedule.sample(batch_size, phase)` returns (B, L) timesteps in either phase.
 
-The plateau starts at the mode t* = 0.5 (mu = 0, sigma = 1) and runs towards t = 1; this was confirmed against the paper's figure
+The plateau starts at the mode t* = 0.5 (mu = 0, sigma = 1) and runs towards t = 1, as specified by the user
 (see `densities` and bla/_plot_schedule.py).
 """
 
