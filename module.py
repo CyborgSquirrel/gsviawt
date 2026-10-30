@@ -693,6 +693,9 @@ class DSSIMLoss(nn.Module):
     self.register_buffer("window", gaussian_window(window_size, sigma), persistent=False)
 
   def forward(self, x, y):
+    # A channels-last-strided view (e.g. rearrange(rgb, "b h w c -> b c h w") of a render) sends cuDNN's
+    # grouped conv backward down a ~5x slower path (~10 ms vs ~2 ms per call at 504x504); same values either way.
+    x, y = x.contiguous(), y.contiguous()
     c = x.shape[1]
     w = self.window.expand(c, 1, -1, -1)
     pad = w.shape[-1] // 2
