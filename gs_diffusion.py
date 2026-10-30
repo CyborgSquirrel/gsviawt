@@ -447,8 +447,10 @@ class EMAWeights:
     self.updates = int(state["updates"])
     missing = sorted(set(self.shadow) - set(state["shadow"]))
     unexpected = sorted(set(state["shadow"]) - set(self.shadow))
-    if missing:   # they keep their copy of the weights the average was built from
-      log.warning("EMA checkpoint has no average for %d parameters, they start from the live weights: %s", len(missing), missing)
+    if missing:   # runs before Lightning loads the model's weights: the copy made at __init__, not the checkpoint's weights
+      log.warning(
+        "EMA checkpoint has no average for %d parameters, they keep their initial copy (not the checkpoint's weights): %s",
+        len(missing), missing)
     if unexpected:
       log.warning("EMA checkpoint has %d parameters the model no longer has, dropped: %s", len(unexpected), unexpected)
     for n, s in state["shadow"].items():
