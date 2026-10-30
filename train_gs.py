@@ -39,6 +39,7 @@ gsplat JIT-compiles CUDA kernels on first import; see _setup_cuda_toolchain
 import contextlib as ctl
 import functools as ft
 import logging
+import math
 import os
 import sys
 
@@ -444,11 +445,14 @@ class GSLightningModule(pl.LightningModule):
 
     self.ema = None
     self._ema_fresh = True    # false once an EMA is restored from a checkpoint
-    self._loss_ema = None     # running average of the diffusion loss, for the spike skip
+    self.spike_skip = None
+    self._accepted_since_step = False   # a loss went into the gradients the next optimizer step applies
     with timed("build_model"):
       if cfg.diffusion.enabled:
         self.model = gs_diffusion.GSDiffusionModel(cfg, diffusion_stats)
         self.ema = gs_diffusion.EMAWeights(self.model, cfg.diffusion.ema.decay)
+        spike = cfg.diffusion.spike_skip
+        self.spike_skip = gs_diffusion.SpikeSkip(spike.factor, spike.decay, spike.warmup_steps)
       else:
         self.model = GSModel(cfg)
     self.dssim = DSSIMLoss(reduction="none")
@@ -492,6 +496,8 @@ class GSLightningModule(pl.LightningModule):
     checkpoint["pixels_seen"] = self.pixels_seen
     if self.ema is not None:
       checkpoint["ema"] = self.ema.state_dict()   # chained resumes must not restart the average from the raw weights
+    if self.spike_skip is not None:
+      checkpoint["spike_skip"] = self.spike_skip.state_dict()   # nor the loss average and its warmup
 
   def on_load_checkpoint(self, checkpoint):
     # .get: checkpoints written before this hook existed have no such key.
@@ -500,16 +506,28 @@ class GSLightningModule(pl.LightningModule):
     if self.ema is not None and "ema" in checkpoint:
       self.ema.load_state_dict(checkpoint["ema"])
       self._ema_fresh = False
+    if self.spike_skip is not None and "spike_skip" in checkpoint:   # without: a fresh filter, warming up from zero
+      self.spike_skip.load_state_dict(checkpoint["spike_skip"])
     if self.cfg.get("reset_scheduler"):
       checkpoint["lr_schedulers"] = []   # Lightning then restores no scheduler state: the config's scheduler stays as built
+
+  def on_fit_start(self):
+    if self.spike_skip is not None and self.spike_skip.factor is not None and self.trainer.world_size > 1:
+      raise ValueError(
+        "diffusion.spike_skip skips a step by returning None from training_step, which Lightning does not support with "
+        f"world_size > 1 (here {self.trainer.world_size}): set diffusion.spike_skip.factor=null")
 
   def on_train_start(self):
     if self.ema is not None and self._ema_fresh:
       self.ema = gs_diffusion.EMAWeights(self.model, self.cfg.diffusion.ema.decay)   # from the weights training starts with
 
-  def on_before_zero_grad(self, optimizer):
-    if self.ema is not None:   # right after the optimizer step
+  def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure=None):
+    super().optimizer_step(epoch, batch_idx, optimizer, optimizer_closure)   # the closure runs training_step + backward
+    # Right after the optimizer step (before on_train_batch_end, so validations there see the current average); not
+    # after a step whose loss was skipped, which left the weights as they were.
+    if self.ema is not None and self._accepted_since_step:
       self.ema.update(self.model)
+    self._accepted_since_step = False
 
   def training_step(self, batch, batch_idx):
     if self.cfg.diffusion.enabled:
@@ -534,18 +552,18 @@ class GSLightningModule(pl.LightningModule):
 
   def _diffusion_train_step(self, batch):
     """WT's loss: the squared distance of the predicted x0 to x0 on the valid slots. A loss above `factor` times its running
-    average is skipped (no optimizer step), as in WT's recipe."""
+    average is skipped (no optimizer step), as in WT's recipe, and so is a non-finite one (gs_diffusion.SpikeSkip)."""
     B = batch["batch_size"]
     loss, parts = self._diffusion_losses(batch)
-    spike = self.cfg.diffusion.spike_skip
     value = float(loss.detach())
-    skipped = (
-      spike.factor is not None and self._loss_ema is not None and self.global_step >= spike.warmup_steps
-      and value > spike.factor * self._loss_ema)
+    skipped = self.spike_skip.check(value)
     self._log_metric("train", "skipped", float(skipped), B)
+    self._log_metric("train", "nonfinite", float(not math.isfinite(value)), B)
+    if self.spike_skip.average is not None:
+      self._log_metric("train", "loss_ema", self.spike_skip.average, B)
     if skipped:
       return None
-    self._loss_ema = value if self._loss_ema is None else spike.decay * self._loss_ema + (1 - spike.decay) * value
+    self._accepted_since_step = True
     self.views_seen += B
     self.pixels_seen += B * int(np.prod(batch["x0_raw"].shape[-2:]))
     self._log_metric("train", "loss", loss.detach(), B)

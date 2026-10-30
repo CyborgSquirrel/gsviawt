@@ -445,6 +445,49 @@ class EMAWeights:
 
   def load_state_dict(self, state):
     self.updates = int(state["updates"])
+    missing = sorted(set(self.shadow) - set(state["shadow"]))
+    unexpected = sorted(set(state["shadow"]) - set(self.shadow))
+    if missing:   # they keep their copy of the weights the average was built from
+      log.warning("EMA checkpoint has no average for %d parameters, they start from the live weights: %s", len(missing), missing)
+    if unexpected:
+      log.warning("EMA checkpoint has %d parameters the model no longer has, dropped: %s", len(unexpected), unexpected)
     for n, s in state["shadow"].items():
       if n in self.shadow:
         self.shadow[n].copy_(s.to(self.shadow[n].device))
+
+
+class SpikeSkip:
+  """WT's loss-spike filter: a loss above `factor` times the running average of the accepted losses is skipped (no
+  optimizer step). A non-finite loss is always skipped and never enters the average. The filter only skips spikes once
+  `warmup` losses have been accepted -- counted by the filter itself and checkpointed with it, so a chained resume keeps
+  its average and does not restart the warmup. factor None: off, nothing is skipped (the average of the finite losses is
+  still kept, for logging)."""
+
+  def __init__(self, factor=4.0, decay=0.99, warmup=200):
+    self.factor = None if factor is None else float(factor)
+    self.decay = float(decay)
+    self.warmup = int(warmup)
+    self.average = None   # running average of the accepted losses
+    self.accepted = 0     # losses folded into it
+    self.nonfinite = 0    # non-finite losses seen (all skipped)
+
+  def check(self, value):
+    """True: skip this loss. False: it is accepted and folded into the average."""
+    value = float(value)
+    if not math.isfinite(value):
+      self.nonfinite += 1
+      return self.factor is not None   # off: the step goes ahead, but the average stays finite
+    if self.factor is not None and self.accepted >= self.warmup and value > self.factor * self.average:
+      return True
+    self.average = value if self.average is None else self.decay * self.average + (1 - self.decay) * value
+    self.accepted += 1
+    return False
+
+  def state_dict(self):
+    return {"average": self.average, "accepted": self.accepted, "nonfinite": self.nonfinite}
+
+  def load_state_dict(self, state):
+    # factor/decay/warmup stay the config's, so a resumed run can change them
+    self.average = state["average"]
+    self.accepted = int(state["accepted"])
+    self.nonfinite = int(state.get("nonfinite", 0))
