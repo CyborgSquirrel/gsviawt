@@ -30,7 +30,6 @@ import os
 import h5py
 import hydra
 import numpy as np
-import polars as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -70,9 +69,11 @@ def encode_grid(grid, source):
   `source`: the dataset item's "source" dict (xyz_cam (L, H, W, 3) with NaN where there is no hit, hit (L, H, W), pose_gl (4, 4))."""
   valid = grid["layer_valid"].transpose(2, 0, 1)                      # (L, H, W)
   hit = source["hit"].numpy()
-  mismatch = float((valid != hit).mean())
-  if mismatch > 1e-6:
-    log.warning("grid layer_valid disagrees with the point cloud's hit mask on %.4f%% of the slots", 100 * mismatch)
+  mismatch = int((valid != hit).sum())
+  if mismatch:   # one slot is enough: a Gaussian without a point (NaN offset) would poison the loss
+    raise ValueError(
+      f"the grid's layer_valid disagrees with the point cloud's hit mask on {mismatch} of {valid.size} slots: "
+      "is this grid from this render / this view?")
   c2w = source["pose_gl"].numpy() @ OPENGL_TO_OPENCV
   w2c = np.linalg.inv(c2w)
   means = grid["gaussian_means"].transpose(2, 0, 1, 3)               # (L, H, W, 3), world frame
@@ -80,7 +81,6 @@ def encode_grid(grid, source):
   offset = means_cam - source["xyz_cam"].numpy()
 
   quat = np.zeros(valid.shape + (4,), np.float32)
-  quat[..., 0] = 1.0
   if valid.any():
     q = rotate_quats_wxyz(grid["gaussian_quats"].transpose(2, 0, 1, 3)[valid], c2w[:3, :3].T)   # world -> source camera
     quat[valid] = np.where(q[:, :1] < 0, -q, q)                      # q and -q are one rotation: w >= 0
@@ -95,9 +95,13 @@ def encode_grid(grid, source):
   return np.ascontiguousarray(x0.transpose(3, 0, 1, 2))              # (CHANNELS, L, H, W)
 
 
-def decode_x0(x0, mean, std):
-  """Normalized x0 (B, L, CHANNELS, H, W) -> the Gaussian dict flatten_gaussians reads (gs_decoder.activate_gaussians' layout)."""
+def decode_x0(x0, mean, std, lo=None, hi=None):
+  """Normalized x0 (B, L, CHANNELS, H, W) -> the Gaussian dict flatten_gaussians reads (gs_decoder.activate_gaussians' layout).
+  lo / hi (CHANNELS,): the range of every channel in the training grids; a sample is clamped into it (an unbounded exp(scale) of a
+  half-trained sampler would otherwise become a scene-sized Gaussian)."""
   raw = x0 * std[None, None, :, None, None] + mean[None, None, :, None, None]
+  if lo is not None:
+    raw = torch.maximum(torch.minimum(raw, hi[None, None, :, None, None]), lo[None, None, :, None, None])
   opacity, scale, rotation, sh_dc, offset = raw.split(DIMS, dim=2)
   return {
     "opacity": torch.sigmoid(opacity),
@@ -113,8 +117,9 @@ def decode_x0(x0, mean, std):
 # data
 # ---------------------------------------------------------------------------
 
-def build_grid_index(grids_dir):
-  """{row of the render h5 of the grid's source view: path}, and the render h5 the grids were fit from."""
+def build_grid_index(grids_dir, source_h5=None):
+  """{row of the render h5 of the grid's source view: path}, and the render h5 the grids were fit from (the grids' own attribute,
+  a path on the machine that fit them; source_h5 overrides it, for another machine)."""
   index, sources = {}, set()
   for path in sorted(glob.glob(os.path.join(grids_dir, "*.h5"))):
     with h5py.File(path, "r") as f:
@@ -124,7 +129,18 @@ def build_grid_index(grids_dir):
     raise SystemExit(f"no finalized grids (*.h5 with primary_view_row) in {grids_dir!r}")
   if len(sources) != 1:
     raise SystemExit(f"the grids in {grids_dir!r} come from several render files: {sorted(sources)}")
-  return index, sources.pop()
+  return index, source_h5 or sources.pop()
+
+
+def check_grids(grid_index, image_size, patch_size, num_layers):
+  """The grids' (H, W, L) must be the model's grid: image_size square (a multiple of the patch size, so the patches tile it) and
+  num_layers layers. (data.depth_size must stay null: grids are at the depth peel's own resolution.)"""
+  with h5py.File(next(iter(grid_index.values())), "r") as f:
+    h, w, l = f["layer_valid"].shape
+  if (h, w) != (image_size, image_size) or h % patch_size or l != num_layers:
+    raise SystemExit(
+      f"the grids are {h}x{w} with {l} layers, but the model wants {image_size}x{image_size} (a multiple of the patch size "
+      f"{patch_size}) with {num_layers} layers: check data.image_size / data.num_layers")
 
 
 def make_listing(grid_index, source_h5, out_path):
@@ -159,34 +175,61 @@ class GridTargetDataset(Dataset):
   def __getitem__(self, idx):
     item = self.inner[idx]
     grid, _ = load_grid(self.grid_index[item["source_view"]])
-    item["x0_raw"] = torch.from_numpy(encode_grid(grid, item["source"]))
+    # half precision in transit (dense (14, 6, 504, 504) is 85 MB in float32): the log-scales (|x| < 17), logits, colours and offsets
+    # lose < 2% of the channel's std; the model upcasts it
+    item["x0_raw"] = torch.from_numpy(encode_grid(grid, item["source"])).half()
     return item
 
 
-def compute_stats(dataset, cache_path=None):
-  """Per-channel mean / std of the x0 channels over the VALID slots of `dataset`'s items; cached as json (keyed by the rows)."""
-  key = sorted(int(v) for v in dataset.volumes.df["view_idx"].to_list())
-  if cache_path and os.path.exists(cache_path):
-    with open(cache_path) as f:
-      cached = json.load(f)
-    if cached["rows"] == key:
-      return torch.tensor(cached["mean"]), torch.tensor(cached["std"])
-  total = torch.zeros(CHANNELS, dtype=torch.float64)
-  total2 = torch.zeros(CHANNELS, dtype=torch.float64)
+def _grid_moments(dataset, i, path, cache_dir):
+  """(sum, sum of squares, count, min, max) of the x0 channels over the valid slots of volume i; cached per grid file (size + mtime)."""
+  st = os.stat(path)
+  stamp = np.array([st.st_size, st.st_mtime_ns], np.int64)
+  cache = os.path.join(cache_dir, os.path.basename(path) + ".npz") if cache_dir else None
+  if cache and os.path.exists(cache):
+    z = np.load(cache)
+    if (z["stamp"] == stamp).all():
+      return z["s"], z["s2"], int(z["n"]), z["lo"], z["hi"]
+  item = dataset.inner[i]
+  grid, _ = load_grid(path)
+  x = torch.from_numpy(encode_grid(grid, item["source"]))[:, item["source"]["hit"]].double()   # (CHANNELS, valid slots), full precision
+  moments = (x.sum(1).numpy(), x.square().sum(1).numpy(), x.shape[1], x.amin(1).numpy(), x.amax(1).numpy())
+  if cache:
+    try:
+      os.makedirs(cache_dir, exist_ok=True)
+      np.savez(cache, stamp=stamp, s=moments[0], s2=moments[1], n=moments[2], lo=moments[3], hi=moments[4])
+    except OSError:
+      pass   # a read-only grids dir: just recompute next time
+  return moments
+
+
+def compute_stats(dataset, grid_index, cache_dir=None):
+  """Per-channel (mean, std, min, max) of the x0 channels over the VALID slots of `dataset`'s volumes (the training grids). The
+  moments of each grid are cached in cache_dir, so the pass over the grids happens once; the volumes are read without their
+  target views and image."""
+  inner = dataset.inner
+  saved = inner.num_views, inner.image_size
+  inner.num_views, inner.image_size = 0, None
+  total = np.zeros(CHANNELS)
+  total2 = np.zeros(CHANNELS)
+  lo = np.full(CHANNELS, np.inf)
+  hi = np.full(CHANNELS, -np.inf)
   count = 0
-  for i in range(len(dataset)):
-    item = dataset[i]
-    x = item["x0_raw"][:, item["source"]["hit"]].double()          # (CHANNELS, valid slots)
-    total += x.sum(1)
-    total2 += x.square().sum(1)
-    count += x.shape[1]
+  try:
+    for i in range(len(dataset)):
+      s, s2, n, lo_i, hi_i = _grid_moments(dataset, i, grid_index[int(dataset.volumes.df["view_idx"][i])], cache_dir)
+      total += s
+      total2 += s2
+      count += n
+      lo, hi = np.minimum(lo, lo_i), np.maximum(hi, hi_i)
+  finally:
+    inner.num_views, inner.image_size = saved
+  if count == 0:
+    raise ValueError("no valid Gaussian slot in the training grids")
   mean = total / count
-  std = (total2 / count - mean.square()).clamp_min(0).sqrt().clamp_min(1e-4)
-  log.info("x0 statistics over %d valid slots of %d grids: mean %s std %s", count, len(dataset), mean.numpy().round(3), std.numpy().round(3))
-  if cache_path:
-    with open(cache_path, "w") as f:
-      json.dump({"rows": key, "count": count, "mean": mean.tolist(), "std": std.tolist()}, f)
-  return mean.float(), std.float()
+  std = np.sqrt(np.maximum(total2 / count - mean ** 2, 0)).clip(min=1e-4)
+  log.info("x0 statistics over %d valid slots of %d grids: mean %s std %s", count, len(dataset), mean.round(3), std.round(3))
+  return tuple(torch.from_numpy(v).float() for v in (mean, std, lo, hi))
 
 
 # ---------------------------------------------------------------------------
@@ -218,11 +261,23 @@ class DiTBlock(AttentionBlock):
     out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
     return self.proj(out.transpose(1, 2).reshape(n, s, d))
 
+  def _attend_short(self, h):
+    """Attention over sequences of a handful of tokens (the L layers of a pixel): an explicit softmax(q k^T) v. The fused kernels are
+    built for long sequences: flash pads to 128 and its backward asks 9.3 GiB of scratch at batch 4 with 59 heads, this needs ~2 GiB
+    with the gradients and is faster."""
+    n, s, d = h.shape
+    hd = d // self.num_heads
+    q, k, v = self.qkv(h).reshape(n, s, 3, self.num_heads, hd).unbind(2)                    # (n, s, heads, hd)
+    q, k = self.q_norm(q), self.k_norm(k)
+    att = torch.einsum("nshd,nthd->nhst", q, k) * hd ** -0.5
+    out = torch.einsum("nhst,nthd->nshd", att.softmax(-1).to(v.dtype), v)
+    return self.proj(out.reshape(n, s, d))
+
   def _mix(self, h, cos, sin, b, l, p, d):
     if self.mode == "frame":
       return self._attend_normed(h.reshape(b * l, p, d), cos, sin).reshape(b, l, p, d)
     if self.mode == "ray":
-      return self._attend_normed(h.transpose(1, 2).reshape(b * p, l, d), None, None).reshape(b, p, l, d).transpose(1, 2)
+      return self._attend_short(h.transpose(1, 2).reshape(b * p, l, d)).reshape(b, p, l, d).transpose(1, 2)
     return self._attend_normed(h.reshape(b, l * p, d), cos.repeat(l, 1), sin.repeat(l, 1)).reshape(b, l, p, d)
 
   def forward(self, x, cos, sin, adaln):
@@ -337,15 +392,19 @@ class GSDiffusionModel(nn.Module):
       int(cfg.model.feature_dim), self.num_layers, patch_size=self.patch_size, dim=d.get("dim"), num_blocks=int(d.num_blocks),
       img_token_scale=float(d.img_token_scale), checkpoint_activations=bool(d.get("checkpoint_activations", False)),
       layer_scale_init=float(cfg.model.transformer.layer_scale_init))
-    mean, std = stats
+    mean, std, lo, hi = stats
     self.register_buffer("x0_mean", mean.clone().float())
     self.register_buffer("x0_std", std.clone().float())
+    self.register_buffer("x0_lo", lo.clone().float())     # the training grids' range of each channel: samples are clamped into it
+    self.register_buffer("x0_hi", hi.clone().float())
     self.schedule = LayerAwareSchedule(self.num_layers, standard=dict(d.schedule.standard), plateau=dict(d.schedule.plateau))
     self.steps = int(d.steps)
     self.eval_seed = int(d.eval_seed)
 
   def inputs(self, batch, device):
-    return batch["image"].to(device), batch["source"]["hit"].to(device)
+    """(image, hit mask, per-volume seeds): the noise of a sample is a function of its volume (see eval_noise)."""
+    seeds = [self.eval_seed + int(v) for v in batch["source_view"]]
+    return batch["image"].to(device), batch["source"]["hit"].to(device), seeds
 
   def _feats(self, image):
     feats = self.backbone(image)
@@ -356,13 +415,28 @@ class GSDiffusionModel(nn.Module):
     x0 = x0_raw.permute(0, 2, 1, 3, 4)
     return (x0 - self.x0_mean[None, None, :, None, None]) / self.x0_std[None, None, :, None, None]
 
-  def training_loss(self, image, hit, x0_raw, generator=None):
-    """The masked x0 loss. Returns (loss, parts): parts = per-field and per-t-bucket detached means."""
+  def eval_noise(self, seeds, shape, device):
+    """Per-volume reproducible randomness: the timesteps (B, L) and the noise (B, L, C, H, W) of volume i are a function of seeds[i]
+    only, so a volume gets the same ones in every validation, whatever the subset or the order."""
+    ts, epss = [], []
+    for seed in seeds:
+      ts.append(self.schedule.sample(1, phase=1, generator=torch.Generator().manual_seed(int(seed))))
+      gen = torch.Generator(device=device).manual_seed(int(seed))
+      epss.append(torch.randn((1, *shape[1:]), device=device, generator=gen))
+    return torch.cat(ts).to(device), torch.cat(epss)
+
+  def training_loss(self, image, hit, x0_raw, seeds=None):
+    """The masked x0 loss. Returns (loss, parts, counts): parts = per-field and per-t-bucket detached means, counts the number of valid
+    slots each is a mean over (a bucket can be empty: it is not a mean then, and must not be logged). seeds: per-volume seeds
+    for the timesteps and the noise (validation); None: the global random stream."""
     feats = self._feats(image)
     x0 = self.normalize(x0_raw)
     b, l = x0.shape[:2]
-    t = self.schedule.sample(b, phase=1, generator=generator).to(x0.device)          # (B, L)
-    eps = torch.randn(x0.shape, device=x0.device, dtype=x0.dtype, generator=generator)
+    if seeds is None:
+      t = self.schedule.sample(b, phase=1).to(x0.device)                              # (B, L)
+      eps = torch.randn(x0.shape, device=x0.device, dtype=x0.dtype)
+    else:
+      t, eps = self.eval_noise(seeds, x0.shape, x0.device)
     t5 = t[:, :, None, None, None]
     a = hit[:, :, None].to(x0.dtype)                                                 # (B, L, 1, H, W): the validity mask
     x_net = a * ((1 - t5) * x0 + t5 * eps) + (1 - a) * eps                          # WT Eq. 7: invalid slots see the max noise
@@ -371,23 +445,27 @@ class GSDiffusionModel(nn.Module):
     valid = a.sum().clamp_min(1)
     loss = (err * a).sum() / (valid * CHANNELS)
     with torch.no_grad():
-      parts = {}
+      parts, counts = {}, {}
       for name, sl in zip(FIELDS, np.cumsum((0,) + DIMS)[:-1].tolist()):
         dim = DIMS[FIELDS.index(name)]
         parts[name] = ((err[:, :, sl:sl + dim] * a).sum() / (valid * dim)).detach()
+        counts[name] = valid
       for lo, hi in ((0.0, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 1.01)):
         in_bucket = a * ((t5 >= lo) & (t5 < hi)).to(a.dtype)
-        parts[f"t{lo:g}-{min(hi, 1):g}"] = ((err * in_bucket).sum() / (in_bucket.sum().clamp_min(1) * CHANNELS)).detach()
-    return loss, parts
+        name = f"t{lo:g}-{min(hi, 1):g}"
+        counts[name] = in_bucket.sum()
+        parts[name] = ((err * in_bucket).sum() / (counts[name].clamp_min(1) * CHANNELS)).detach()
+    return loss, parts, counts
 
   @torch.no_grad()
-  def sample(self, image, hit, steps=None):
-    """20 Euler steps of the flow from pure noise (a fixed seed: reproducible) -> the Gaussian dict. Invalid slots stay at the noise."""
+  def sample(self, image, hit, seeds=None, steps=None):
+    """20 Euler steps of the flow from pure noise -> the Gaussian dict. The noise of volume i is a function of seeds[i] (default:
+    eval_seed + i): reproducible. Invalid slots stay at the noise."""
     steps = steps or self.steps
     feats = self._feats(image)
     b, l = hit.shape[:2]
-    gen = torch.Generator(device=image.device).manual_seed(self.eval_seed)
-    eps = torch.randn((b, l, CHANNELS, *hit.shape[-2:]), device=image.device, generator=gen)
+    seeds = seeds if seeds is not None else [self.eval_seed + i for i in range(b)]
+    _, eps = self.eval_noise(seeds, (b, l, CHANNELS, *hit.shape[-2:]), image.device)
     a = hit[:, :, None].to(eps.dtype)
     x = eps
     ts = torch.linspace(1.0, 0.0, steps + 1, device=image.device)
@@ -395,11 +473,11 @@ class GSDiffusionModel(nn.Module):
       t = ts[i]
       x0_hat = self.head(feats, a * x + (1 - a) * eps, t.expand(b, l)).float()
       x = x - (t - ts[i + 1]) * (x - x0_hat) / t.clamp(min=T_MIN_CLAMP)
-    return decode_x0(x, self.x0_mean, self.x0_std)
+    return decode_x0(x, self.x0_mean, self.x0_std, self.x0_lo, self.x0_hi)
 
   def forward(self, inputs):
-    image, hit = inputs
-    return self.sample(image, hit)
+    image, hit, seeds = inputs
+    return self.sample(image, hit, seeds)
 
 
 # ---------------------------------------------------------------------------
@@ -414,6 +492,7 @@ class EMAWeights:
     self.decay = float(decay)
     self.updates = 0
     self.shadow = {n: p.detach().clone().float() for n, p in module.named_parameters() if p.requires_grad}
+    self.stash = {}   # while applied(): the module's own tensors (a checkpoint saved then must hold these, not the average)
 
   @torch.no_grad()
   def update(self, module):
@@ -427,18 +506,23 @@ class EMAWeights:
 
   @contextlib.contextmanager
   def applied(self, module):
-    """Run with the averaged weights in the module; the live weights come back afterwards."""
+    """Run with the averaged weights in the module; the live weights come back afterwards. The two tensors are swapped (the
+    parameter's data points at the average and the average's slot keeps the live one's), no copy: nothing is allocated."""
     params = dict(module.named_parameters())
-    live = {n: params[n].detach().clone() for n in self.shadow}
     try:
       with torch.no_grad():
         for n, s in self.shadow.items():
-          params[n].copy_(s.to(params[n].device, params[n].dtype))
+          p = params[n]
+          if s.device != p.device or s.dtype != p.dtype:
+            s = self.shadow[n] = s.to(p.device, p.dtype)
+          self.stash[n] = p.data
+          p.data = s
       yield
     finally:
       with torch.no_grad():
-        for n, v in live.items():
-          params[n].copy_(v)
+        for n, live in self.stash.items():
+          params[n].data = live
+      self.stash = {}
 
   def state_dict(self):
     return {"decay": self.decay, "updates": self.updates, "shadow": {n: s.cpu() for n, s in self.shadow.items()}}

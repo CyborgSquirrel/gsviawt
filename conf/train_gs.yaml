@@ -334,6 +334,10 @@ trainer:
 diffusion:
   enabled: false
   grids_dir: null              # the finalized grids: <grids_dir>/mesh<M>_view<V>.h5
+  source_h5: null              # the render file the grids were fit from; null: the grids' own `source_h5` attribute, which is a path on
+                               # the machine that fit them -- set this to run elsewhere
+  # also needed: data.input=image, data.item=null (the default 0 trains on ONE listed grid), data.depth_size=null (the grids are at the
+  # depth peel's own resolution; 504 = the size is fine too), loader.batch_size etc. as usual; the grids' size must equal data.image_size
   dim: null                    # trunk width; null = feature_dim + 14 * patch^2 rounded up to a multiple of 64 (a lossless token)
   num_blocks: 3
   img_token_scale: 0.3         # WT's: the normalized image features are scaled before they are concatenated
