@@ -311,6 +311,29 @@ trainer:
   gradient_clip_val: 1.0
   gradient_clip_algorithm: norm
 
+# Diffusion mode: a diffusion model over the fitted layered 3DGS grids (gs_diffusion.py, World Tracing's recipe). Needs
+# model/backbone=moge_mix, data.input=image and the finalized grids of fit_3dgs.py (grids_dir/*.h5). The timesteps are
+# diffusion_schedule.LayerAwareSchedule's phase 1 (per-layer t; the shared-t mixture phase is off). The paper's optimizer
+# (AdamW, weight decay 0.01, gradient clipping 1.0) is `optim` / trainer.gradient_clip_val below; keep the repo's own LR schedule.
+diffusion:
+  enabled: false
+  grids_dir: null              # the finalized grids: <grids_dir>/mesh<M>_view<V>.h5
+  dim: null                    # trunk width; null = feature_dim + 14 * patch^2 rounded up to a multiple of 64 (a lossless token)
+  num_blocks: 3
+  img_token_scale: 0.3         # WT's: the normalized image features are scaled before they are concatenated
+  checkpoint_activations: true
+  steps: 20                    # Euler steps when sampling
+  eval_seed: 0                 # the noise of the samples, and of the validation loss
+  schedule:
+    standard: {mu: 0.0, sigma: 1.0}                         # layers 1.. (logit-normal)
+    plateau: {mu: 0.0, sigma: 1.0, mirror: false}           # layer 0: logit-normal up to its mode t* = 0.5, then flat towards t = 1
+  ema:
+    decay: 0.9995              # WT's, after a warmup ramp; validations with `ema: true` use these weights
+  spike_skip:
+    factor: 4.0                # a loss above factor * its running average is skipped (null: off)
+    decay: 0.99
+    warmup_steps: 200
+
 optim:
   _target_: torch.optim.AdamW
   _partial_: true
