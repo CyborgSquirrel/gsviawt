@@ -485,7 +485,7 @@ class EventValidation(pl.Callback):
     due = self.trigger.due(trainer, pl_module, batch_idx)   # every step, for its own bookkeeping
     if trainer.should_stop:   # the last step (TrainClock's max_seconds, ...)
       due = self.at_end
-    if not due:
+    if not due or (self.ema and getattr(pl_module, "ema", None) is None):   # an EMA validation of a model without an EMA: nothing to run
       return
     loop = trainer.fit_loop.epoch_loop
     val_loop = loop.val_loop

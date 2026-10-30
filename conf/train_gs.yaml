@@ -266,6 +266,22 @@ callbacks:
     trigger_event: null
     volumes: 1500
     at_end: true
+  # diffusion mode: the same validations with the EMA weights (diffusion.ema), logged as <set>/small_ema/..., <set>/big_ema/...
+  # (give them the same trigger_event as their raw-weights twins; no effect without diffusion.enabled)
+  validation_small_ema:
+    _target_: module.EventValidation
+    name: small_ema
+    trigger_event: null
+    volumes: 200
+    at_end: false
+    ema: true
+  validation_big_ema:
+    _target_: module.EventValidation
+    name: big_ema
+    trigger_event: null
+    volumes: 1500
+    at_end: true
+    ema: true
 
   # n_volumes and loss_se of every validation (see module.ValidationStats)
   validation_stats:
