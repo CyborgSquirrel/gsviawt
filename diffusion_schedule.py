@@ -81,8 +81,8 @@ def sample_plateau_logit_normal(shape, mu=0.0, sigma=1.0, mirror=False, generato
 class LayerAwareSchedule:
   def __init__(self, num_layers, standard=None, plateau=None):
     self.num_layers = int(num_layers)
-    self.standard = dict(mu=0.0, sigma=1.0, **(standard or {}))
-    self.plateau = dict(mu=0.0, sigma=1.0, mirror=False, **(plateau or {}))
+    self.standard = {**dict(mu=0.0, sigma=1.0), **(standard or {})}
+    self.plateau = {**dict(mu=0.0, sigma=1.0, mirror=False), **(plateau or {})}
 
   def densities(self, t):
     """The two base densities and their 50/50 mixture (phase 2's), on the grid t."""
