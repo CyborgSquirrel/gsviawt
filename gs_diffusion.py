@@ -401,6 +401,9 @@ class GSDiffusionModel(nn.Module):
     self.register_buffer("x0_lo", lo.clone().float())     # the training grids' range of each channel: samples are clamped into it
     self.register_buffer("x0_hi", hi.clone().float())
     fixed_t = d.schedule.get("fixed_t")
+    if fixed_t is not None and cfg.diffusion.get("photom") is not None and cfg.diffusion.photom.enabled:
+      raise SystemExit("diffusion.schedule.fixed_t with diffusion.photom: the rendering loss's t gate never opens at t = 1, the "
+                       "loss would silently be zero")
     if fixed_t is not None and (float(fixed_t) != 1.0 or int(d.steps) != 1):
       raise SystemExit("diffusion.schedule.fixed_t: only 1.0 (always pure noise: a deterministic regressor from the image, the "
                        f"same-architecture control), with diffusion.steps=1 (one step from noise = the x0 prediction); got "
@@ -434,6 +437,14 @@ class GSDiffusionModel(nn.Module):
       epss.append(torch.randn((1, *shape[1:]), device=device, generator=gen))
     return torch.cat(ts).to(device), torch.cat(epss)
 
+  def _net_input(self, x_net, a):
+    """The noisy grid the network sees. The deterministic control (schedule.fixed_t = 1) gets no noise at all, only the validity
+    mask (0 at valid slots, 1 at invalid): a diffusion model can tell valid from invalid slots in its input (invalid slots are
+    re-noised at every sampler step, valid ones carry the partial x0), so a regressor without the mask would be handicapped."""
+    if self.schedule.fixed_t is None:
+      return x_net
+    return (1 - a).expand_as(x_net).to(x_net.dtype)
+
   def training_loss(self, image, hit, x0_raw, seeds=None, return_pred=False):
     """The masked x0 loss. Returns (loss, parts, counts): parts = per-field and per-t-bucket detached means, counts the number of valid
     slots each is a mean over (a bucket can be empty: it is not a mean then, and must not be logged). seeds: per-volume seeds
@@ -449,7 +460,7 @@ class GSDiffusionModel(nn.Module):
       t, eps = self.eval_noise(seeds, x0.shape, x0.device)
     t5 = t[:, :, None, None, None]
     a = hit[:, :, None].to(x0.dtype)                                                 # (B, L, 1, H, W): the validity mask
-    x_net = a * ((1 - t5) * x0 + t5 * eps) + (1 - a) * eps                          # WT Eq. 7: invalid slots see the max noise
+    x_net = self._net_input(a * ((1 - t5) * x0 + t5 * eps) + (1 - a) * eps, a)     # WT Eq. 7: invalid slots see the max noise
     x0_hat = self.head(feats, x_net, t)
     err = (x0_hat.float() - x0).square()                                            # (B, L, C, H, W)
     valid = a.sum().clamp_min(1)
@@ -483,7 +494,7 @@ class GSDiffusionModel(nn.Module):
     ts = torch.linspace(1.0, 0.0, steps + 1, device=image.device)
     for i in range(steps):
       t = ts[i]
-      x0_hat = self.head(feats, a * x + (1 - a) * eps, t.expand(b, l)).float()
+      x0_hat = self.head(feats, self._net_input(a * x + (1 - a) * eps, a), t.expand(b, l)).float()
       x = x - (t - ts[i + 1]) * (x - x0_hat) / t.clamp(min=T_MIN_CLAMP)
     return self.decode(x)
 
