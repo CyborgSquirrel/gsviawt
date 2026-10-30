@@ -436,10 +436,14 @@ class EventValidation(pl.Callback):
   are rejected as a count: floats and ints get mixed up in configs). It takes batches from the start of each set's dataloader
   until it has that many (the val dataloaders shuffle, so every validation scores a fresh random sample); a
   set with fewer volumes is scored whole (trainer.limit_val_batches doesn't apply to these). Lightning's own
-  validations (at the end of training, ...) are sized by trainer.limit_val_batches instead."""
+  validations (at the end of training, ...) are sized by trainer.limit_val_batches instead.
 
-  def __init__(self, *, name, trigger_event, volumes=None, at_end=False):
+  ema: run the validation with the LightningModule's EMA weights (`pl_module.ema`, diffusion mode); give it its own
+  name, e.g. big_ema, so its metrics sit next to the raw weights' (<set>/big/..., <set>/big_ema/...)."""
+
+  def __init__(self, *, name, trigger_event, volumes=None, at_end=False, ema=False):
     self.name = name
+    self.ema = ema   # validate with the module's EMA weights (diffusion mode)
     self.trigger = Trigger(trigger_event)
     self.count, self.fraction = self._parse_volumes(volumes)
     self.at_end = at_end
@@ -481,7 +485,7 @@ class EventValidation(pl.Callback):
     due = self.trigger.due(trainer, pl_module, batch_idx)   # every step, for its own bookkeeping
     if trainer.should_stop:   # the last step (TrainClock's max_seconds, ...)
       due = self.at_end
-    if not due:
+    if not due or (self.ema and getattr(pl_module, "ema", None) is None):   # an EMA validation of a model without an EMA: nothing to run
       return
     loop = trainer.fit_loop.epoch_loop
     val_loop = loop.val_loop
@@ -495,7 +499,8 @@ class EventValidation(pl.Callback):
     try:
       if not loop._should_accumulate():
         call._call_lightning_module_hook(trainer, "on_validation_model_zero_grad")
-      val_loop.run()
+      with (pl_module.ema.applied(pl_module.model) if self.ema else ctl.nullcontext()):
+        val_loop.run()
     finally:
       val_loop._max_batches = limits   # Lightning's own validations use trainer.limit_val_batches
       datamodule.validation = "lightning"

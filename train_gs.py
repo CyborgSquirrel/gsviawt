@@ -39,6 +39,7 @@ gsplat JIT-compiles CUDA kernels on first import; see _setup_cuda_toolchain
 import contextlib as ctl
 import functools as ft
 import logging
+import math
 import os
 import sys
 
@@ -62,6 +63,7 @@ from gs_dataset import (OPENGL_TO_OPENCV, H5Catalog, WTFeatureDataset,  # noqa: 
                         _EmptyDataset, render_catalog, rotate_quats_wxyz,
                         sample_matching_sources)
 from gs_decoder import PatchGaussianHead  # noqa: E402
+import gs_diffusion  # noqa: E402
 from module import (DSSIMLoss, Events, ProgressWandbLogger, TrainClock, _completed_steps,  # noqa: E402
                     make_scheduler, needs_clock)
 from util import collate_with_batch_size, pipe, set_mode, timed  # noqa: E402
@@ -71,6 +73,29 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # model
 # ---------------------------------------------------------------------------
+
+def diffusion_enabled(cfg):
+  """cfg.diffusion.enabled; configs without the block (older ones) are not diffusion runs."""
+  return bool(OmegaConf.select(cfg, "diffusion.enabled", default=False))
+
+
+def check_val_targets(ds, name, cfg):
+  """A validation set whose volumes have no target view to render (loss.photom.for has no "source") would make gsplat render zero
+  cameras and crash, e.g. when a mesh has too few grid views left after the view split."""
+  if "source" in cfg.loss.photom["for"]:
+    return
+  inner = ds.inner
+  bad = []
+  for row in inner.volumes.df.iter_rows(named=True):
+    pool = inner.pool_sets[row["mesh_id"]]
+    n = len(pool) if inner.allow_source_as_target else len(pool - {row["view_idx"]})
+    if n == 0:
+      bad.append((row["mesh_id"], row["view_idx"]))
+  if bad:
+    raise SystemExit(
+      f"validation set {name}: {len(bad)} volumes have no target view to render (mesh, source view) {bad[:5]}...: a mesh has too few "
+      "grid views for data.view_split / data.num_views, or put 'source' in loss.photom.for")
+
 
 class GSModel(nn.Module):
   """Per-patch head (a linear layer, optionally behind a transformer trunk --
@@ -346,10 +371,30 @@ class GSDataModule(pl.LightningDataModule):
       return
     cfg = self.cfg
     d = cfg.data
-    with h5py.File(d.features_h5, "r") as f:
+    self.diffusion_stats = None
+    grid_index = None
+    if not diffusion_enabled(cfg):
+      features_h5 = d.features_h5
+    else:
+      # diffusion mode: the volumes are the fitted grids (one per source view), listed in a features-less listing file
+      if d.input != "image":
+        raise SystemExit("diffusion mode needs data.input=image")
+      if d.item is not None:
+        log.warning("data.item=%s: the diffusion run trains on that one listed grid only (data.item=null: all of them)", d.item)
+      if d.depth_size not in (None, d.image_size):
+        raise SystemExit("diffusion mode needs data.depth_size=null (or the grids' own size): the grids are at the depth peel's own resolution")
+      grid_index, grids_source = gs_diffusion.build_grid_index(cfg.diffusion.grids_dir, cfg.diffusion.get("source_h5"))
+      gs_diffusion.check_grids(grid_index, int(d.image_size), int(cfg.model.patch_size), int(d.num_layers))
+      os.makedirs(cfg.output_dir, exist_ok=True)   # the module makes it too, but later
+      features_h5 = gs_diffusion.make_listing(grid_index, grids_source, os.path.join(cfg.output_dir, "listing.h5"))
+    with h5py.File(features_h5, "r") as f:
       source_h5 = str(f.attrs.get("source_h5", f.attrs["input"]))
       volume_views, volume_meshes = f["view_indices"][:], f["mesh_index"][:]
     catalog = render_catalog(source_h5)
+    if grid_index is not None:
+      # the splits and the supervision views of the validation sets are over the views that have a grid
+      views_with_grid = set(grid_index)
+      catalog = catalog.take([pos for pos, v in enumerate(catalog.df["view_idx"].to_list()) if v in views_with_grid])
     rows = np.arange(len(volume_views)) if d.item is None else np.array(
       [d.item] if isinstance(d.item, int) else list(d.item))
     kwargs = dict(
@@ -382,9 +427,17 @@ class GSDataModule(pl.LightningDataModule):
     if len(val_views):
       sets["val_views_strain"] = (val_views, rows_in(sample_matching_sources(train_views, val_views, seed=cfg.seed)))
       sets["val_views_sval"] = (val_views, rows_in(val_views))
-    self.train_ds = WTFeatureDataset(d.features_h5, train_views, rows=train_rows, **kwargs)
+    self.train_ds = WTFeatureDataset(features_h5, train_views, rows=train_rows, **kwargs)
     self.val_datasets = {
-      name: WTFeatureDataset(d.features_h5, v, rows=r, **kwargs) for name, (v, r) in sets.items() if len(r)}
+      name: WTFeatureDataset(features_h5, v, rows=r, **kwargs) for name, (v, r) in sets.items() if len(r)}
+    if grid_index is not None:
+      self.train_ds = gs_diffusion.GridTargetDataset(self.train_ds, grid_index)
+      self.val_datasets = {n: gs_diffusion.GridTargetDataset(ds, grid_index) for n, ds in self.val_datasets.items()}
+      for name, ds in self.val_datasets.items():
+        check_val_targets(ds, name, cfg)
+      # normalization of the x0 channels: the valid slots of the TRAIN grids (moments cached per grid, next to the grids)
+      self.diffusion_stats = gs_diffusion.compute_stats(
+        self.train_ds, grid_index, os.path.join(cfg.diffusion.grids_dir, ".x0_moments"))
     log.info(
       "volumes: %d train, validation sets %s", len(self.train_ds),
       {n: len(ds) for n, ds in self.val_datasets.items()})
@@ -414,15 +467,25 @@ class GSDataModule(pl.LightningDataModule):
 
 
 class GSLightningModule(pl.LightningModule):
-  def __init__(self, cfg):
+  def __init__(self, cfg, diffusion_stats=None):
     super().__init__()
     self.cfg = cfg
     self.clock = None   # a module.TrainClock, set by main() for time-driven LR schedulers
     self.views_seen = 0
     self.pixels_seen = 0  # pixels of the supervised target images seen so far (views x H x W)
 
+    self.ema = None
+    self._ema_fresh = True    # false once an EMA is restored from a checkpoint
+    self.spike_skip = None
+    self._accepted_since_step = False   # a loss went into the gradients the next optimizer step applies
     with timed("build_model"):
-      self.model = GSModel(cfg)
+      if diffusion_enabled(cfg):
+        self.model = gs_diffusion.GSDiffusionModel(cfg, diffusion_stats)
+        self.ema = gs_diffusion.EMAWeights(self.model, cfg.diffusion.ema.decay)
+        spike = cfg.diffusion.spike_skip
+        self.spike_skip = gs_diffusion.SpikeSkip(spike.factor, spike.decay, spike.warmup_steps)
+      else:
+        self.model = GSModel(cfg)
     self.dssim = DSSIMLoss(reduction="none")
 
     # One directory for everything this run produces (currently just
@@ -462,21 +525,100 @@ class GSLightningModule(pl.LightningModule):
     # it explicitly so it keeps climbing (not resetting to 0) across resume.
     checkpoint["views_seen"] = self.views_seen
     checkpoint["pixels_seen"] = self.pixels_seen
+    if self.ema is not None:
+      checkpoint["ema"] = self.ema.state_dict()   # chained resumes must not restart the average from the raw weights
+      for name, live in self.ema.stash.items():   # saved while the average is swapped in (an EMA validation): hold the live weights
+        checkpoint["state_dict"][f"model.{name}"] = live.detach()
+    if self.spike_skip is not None:
+      checkpoint["spike_skip"] = self.spike_skip.state_dict()   # nor the loss average and its warmup
 
   def on_load_checkpoint(self, checkpoint):
     # .get: checkpoints written before this hook existed have no such key.
     self.views_seen = checkpoint.get("views_seen", 0)
     self.pixels_seen = checkpoint.get("pixels_seen", 0)
+    if self.ema is not None and "ema" in checkpoint:
+      self.ema.load_state_dict(checkpoint["ema"])
+      self._ema_fresh = False
+    if self.spike_skip is not None and "spike_skip" in checkpoint:   # without: a fresh filter, warming up from zero
+      self.spike_skip.load_state_dict(checkpoint["spike_skip"])
     if self.cfg.get("reset_scheduler"):
       checkpoint["lr_schedulers"] = []   # Lightning then restores no scheduler state: the config's scheduler stays as built
 
+  def on_fit_start(self):
+    if self.spike_skip is not None and self.spike_skip.factor is not None and self.trainer.world_size > 1:
+      raise ValueError(
+        "diffusion.spike_skip skips a step by returning None from training_step, which Lightning does not support with "
+        f"world_size > 1 (here {self.trainer.world_size}): set diffusion.spike_skip.factor=null")
+
+  def on_train_start(self):
+    if self.ema is not None and self._ema_fresh:
+      self.ema = gs_diffusion.EMAWeights(self.model, self.cfg.diffusion.ema.decay)   # from the weights training starts with
+
+  def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure=None):
+    super().optimizer_step(epoch, batch_idx, optimizer, optimizer_closure)   # the closure runs training_step + backward
+    # Right after the optimizer step (before on_train_batch_end, so validations there see the current average); not
+    # after a step whose loss was skipped, which left the weights as they were.
+    if self.ema is not None and self._accepted_since_step:
+      self.ema.update(self.model)
+    self._accepted_since_step = False
+
   def training_step(self, batch, batch_idx):
+    if diffusion_enabled(self.cfg):
+      return self._diffusion_train_step(batch)
     return self._step("train", batch, batch_idx)
 
   def validation_step(self, batch, batch_idx, dataloader_idx=0):
     # dataloader_idx: Lightning omits it with a single val loader, hence the default.
     stage = list(self.trainer.datamodule.val_datasets)[dataloader_idx]
-    return self._step(stage, batch, batch_idx)
+    out = self._step(stage, batch, batch_idx)   # the sampled Gaussians, rendered and compared with the views
+    if diffusion_enabled(self.cfg):
+      self._diffusion_val_loss(stage, batch)
+    return out
+
+  def _log_metric(self, stage, key, value, batch_size):
+    name = f"{stage}/{key}" if stage == "train" else f"{stage}/{self.trainer.datamodule.validation}/{key}"
+    self.log(name, value, batch_size=batch_size, add_dataloader_idx=False)
+
+  def _diffusion_losses(self, batch, seeded=False):
+    """(loss, parts, counts); seeded: the timesteps and noise of each volume are a function of the volume (validation)."""
+    image, hit, seeds = self.model.inputs(batch, self.device)
+    return self.model.training_loss(image, hit, batch["x0_raw"].to(self.device), seeds=seeds if seeded else None)
+
+  def _log_parts(self, stage, prefix, parts, counts):
+    """Per-field / per-t-bucket losses, each weighted by its number of valid slots (epoch means are then slot means); a bucket
+    that no slot fell in is not a mean of anything and is not logged."""
+    for name, v in parts.items():
+      n = int(counts[name])
+      if n:
+        self._log_metric(stage, f"{prefix}/{name}", v, n)
+
+  def _diffusion_train_step(self, batch):
+    """WT's loss: the squared distance of the predicted x0 to x0 on the valid slots. A loss above `factor` times its running
+    average is skipped (no optimizer step), as in WT's recipe, and so is a non-finite one (gs_diffusion.SpikeSkip)."""
+    B = batch["batch_size"]
+    loss, parts, counts = self._diffusion_losses(batch)
+    value = float(loss.detach())
+    skipped = self.spike_skip.check(value)
+    self._log_metric("train", "skipped", float(skipped), B)
+    self._log_metric("train", "nonfinite", float(not math.isfinite(value)), B)
+    if self.spike_skip.average is not None:
+      self._log_metric("train", "loss_ema", self.spike_skip.average, B)
+    if skipped:
+      return None
+    self._accepted_since_step = True
+    self.views_seen += B
+    self.pixels_seen += B * int(np.prod(batch["x0_raw"].shape[-2:]))
+    self._log_metric("train", "loss", loss.detach(), B)
+    self._log_parts("train", "loss", parts, counts)
+    return loss
+
+  @torch.no_grad()
+  def _diffusion_val_loss(self, stage, batch):
+    """The same loss on a validation batch. The timesteps and noise of a volume are a function of the volume (its source view and
+    diffusion.eval_seed), so every validation scores each volume at the same noise levels, whatever the subset or the order."""
+    loss, parts, counts = self._diffusion_losses(batch, seeded=True)
+    self._log_metric(stage, "loss/x0", loss.detach(), batch["batch_size"])
+    self._log_parts(stage, "loss/x0", parts, counts)
 
   def _step(self, stage, batch, batch_idx):
     B = batch["batch_size"]
@@ -790,7 +932,7 @@ def main(cfg: DictConfig) -> None:
     # TODO: Grad accum logic
     cfg.total_steps = len(datamodule.train_dataloader()) * cfg.trainer.max_epochs
 
-  model = GSLightningModule(cfg)
+  model = GSLightningModule(cfg, datamodule.diffusion_stats)
 
   # Stashed into cfg (not just logged) so it lands in wandb's persisted run
   # config below (OmegaConf.to_container(cfg, ...)) -- unlike the console-only
