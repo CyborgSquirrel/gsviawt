@@ -347,6 +347,11 @@ diffusion:
   schedule:
     standard: {mu: 0.0, sigma: 1.0}                         # layers 1.. (logit-normal)
     plateau: {mu: 0.0, sigma: 1.0, mirror: false}           # layer 0: logit-normal up to its mode t* = 0.5, then flat towards t = 1
+  # How the fitted scales become x0 (gs_diffusion.encode_grid); both render the same as the grid. The statistics are cached per
+  # encoding (<grids_dir>/.x0_moments/<tag>/).
+  scale_encoding:
+    scale_sort: false          # every Gaussian's axes ordered largest -> smallest (rotation permuted to match)
+    scale_floor_px: null       # every axis raised to at least this fraction of a pixel at its source-camera depth, e.g. 0.1
   ema:
     decay: 0.9995              # WT's, after a warmup ramp; validations with `ema: true` use these weights
   spike_skip:
