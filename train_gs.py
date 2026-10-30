@@ -356,6 +356,7 @@ class GSDataModule(pl.LightningDataModule):
       if d.input != "image":
         raise SystemExit("diffusion mode needs data.input=image")
       grid_index, grids_source = gs_diffusion.build_grid_index(cfg.diffusion.grids_dir)
+      os.makedirs(cfg.output_dir, exist_ok=True)   # the module makes it too, but later
       features_h5 = gs_diffusion.make_listing(grid_index, grids_source, os.path.join(cfg.output_dir, "listing.h5"))
     with h5py.File(features_h5, "r") as f:
       source_h5 = str(f.attrs.get("source_h5", f.attrs["input"]))
