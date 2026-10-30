@@ -39,11 +39,13 @@ ckpt_path: null
 reset_scheduler: false
 
 data:
-  features_h5: ???          # required -- a wt_features.py output h5
-  # Which feature volumes (rows of features_h5) the datasets hold: one row, a
-  # list like [0,1,2], or null for all. The render h5 they came from is read
-  # from the file's `source_h5` attr. An epoch is one pass over these volumes.
-  item: 0
+  # The volumes (one per source view; an epoch is one pass over them): EITHER cached features / a listing of
+  # source views (features_h5, a wt_features.py output h5; the render h5 it came from is its `source_h5` attr),
+  # OR the render shards themselves (render_h5, needs input: image): a path, a list or a glob(s) of
+  # render_objaverse.py h5 files, no merging -- every view of every shard is a volume, and its supervision views are
+  # the other views of its mesh in its own shard. The mesh/view splits below act on the meshes of all the shards.
+  features_h5: null
+  render_h5: null
   num_layers: 6             # must match the file(s)' depth_peel layer count
   # Random views of the volume's mesh sampled per access and supervised on
   # ("target" in loss.photom.for), in addition to the volume's own source view.
@@ -336,7 +338,7 @@ diffusion:
   grids_dir: null              # the finalized grids: <grids_dir>/mesh<M>_view<V>.h5
   source_h5: null              # the render file the grids were fit from; null: the grids' own `source_h5` attribute, which is a path on
                                # the machine that fit them -- set this to run elsewhere
-  # also needed: data.input=image, data.item=null (the default 0 trains on ONE listed grid), data.depth_size=null (the grids are at the
+  # also needed: data.input=image, data.depth_size=null (the grids are at the
   # depth peel's own resolution; 504 = the size is fine too), loader.batch_size etc. as usual; the grids' size must equal data.image_size
   dim: null                    # trunk width; null = feature_dim + 14 * patch^2 rounded up to a multiple of 64 (a lossless token)
   num_blocks: 3
