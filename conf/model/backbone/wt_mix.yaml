@@ -12,3 +12,4 @@ groups: shared        # shared (one (blocks, 1536) mix for all layers), first_re
 init: last            # last (1 on the last block) or gaussian (N(0, 1) / blocks)
 bf16_weights: true    # keep the frozen WT weights in bf16 (needed on a 10 GB GPU; the extractor does the same)
 eval_seed: 0          # eval-time noise seed (training noise is fresh every step)
+noise: random         # random (pure Gaussian noise, t=1) or zeros (an all-zero geometry input: no noise at all)

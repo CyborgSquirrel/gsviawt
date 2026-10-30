@@ -133,7 +133,7 @@ class WTMixBackbone(nn.Module):
 
   Input regime (no geometry at inference): WT is run at flow time t=1 on pure Gaussian noise plus the RGB image, so its
   tokens depend on the image alone. The noise is fresh on every training forward; in eval it comes from a fixed seed so
-  validation is reproducible. Only the decoder runs (WT's head is skipped). Each block's output goes through a
+  validation is reproducible. noise="zeros" feeds an all-zero geometry input instead (still t=1): no noise at all. Only the decoder runs (WT's head is skipped). Each block's output goes through a
   parameter-free per-token LayerNorm before mixing (WT has no final norm of its own; the stream norms are 100-1000).
 
   groups / init: as MoGeMixBackbone -- shared (one mix for all layers), first_rest (one for layer 0, one for layers 1..),
@@ -145,8 +145,11 @@ class WTMixBackbone(nn.Module):
   PATCH_SIZE = 14
 
   def __init__(self, config="r75b", ckpt="r75b", image_size=504, groups="shared", init="last", num_layers=6,
-               bf16_weights=True, eval_seed=0):
+               bf16_weights=True, eval_seed=0, noise="random"):
     super().__init__()
+    if noise not in ("random", "zeros"):
+      raise ValueError(f"noise must be 'random' or 'zeros', got {noise!r}")
+    self.noise = noise
     if groups not in self.GROUPS:
       raise ValueError(f"mix groups must be one of {self.GROUPS}, got {groups!r}")
     if init not in ("last", "gaussian"):
@@ -195,7 +198,10 @@ class WTMixBackbone(nn.Module):
     gen = None
     if not self.training:
       gen = torch.Generator(device=image.device).manual_seed(self.eval_seed)
-    x_t = torch.randn(B, L * S * S, 3, device=image.device, generator=gen)   # pure noise: t = 1
+    if self.noise == "zeros":
+      x_t = torch.zeros(B, L * S * S, 3, device=image.device)   # no noise at all: the (z-scored) mean point everywhere, t = 1
+    else:
+      x_t = torch.randn(B, L * S * S, 3, device=image.device, generator=gen)   # pure noise: t = 1
     outs = torch.empty(B, n, L, P, D, device=image.device, dtype=torch.bfloat16)
 
     def hook(i):
