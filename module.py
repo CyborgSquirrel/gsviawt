@@ -1065,6 +1065,10 @@ class OrbitCallback(pl.Callback):
   whole video, so each cell gets resolution // max(width, height) (rounded to even); None: each
   cell is the preview view's own size.
 
+  source_view: with True (default) every object's cell shows its source view -- the image the model got as
+  input -- to the LEFT of its orbit, the same size as an orbit frame and held still for every frame. The
+  cell, and so the video, is then twice as wide; `resolution` still sizes the orbit frames (not the pair).
+
   path_format: where each mp4 is written, as a str.format() template over
   {stage} ("train"/"val"), {mode} (always "step") and {n} (completed
   steps; format specs like {n:06d} work). Parent directories are
@@ -1074,8 +1078,10 @@ class OrbitCallback(pl.Callback):
 
   def __init__(self, *, trigger_event,
               num_frames: int = 24, fps: int = 12, crf: int = 28, elevation_deg: float = 20.0,
-              path_format: str | None = None, resolution: int | None = None, grid: tuple[int, int] = (1, 1)):
+              path_format: str | None = None, resolution: int | None = None, grid: tuple[int, int] = (1, 1),
+              source_view: bool = True):
     self.trigger = Trigger(trigger_event)
+    self.source_view = bool(source_view)
     grid = tuple(int(g) for g in grid)
     if len(grid) != 2 or min(grid) < 1:
       raise ValueError(f"OrbitCallback: grid must be [width, height] with both >= 1, got {list(grid)}")
@@ -1101,7 +1107,8 @@ class OrbitCallback(pl.Callback):
     self._step(trainer, pl_module, batch_idx)
 
   def _render_object(self, entry, gsplat, resolution):
-    """The num_frames frames, (F, H, W, 3) uint8, of one object's orbit at `resolution` (longer side)."""
+    """The num_frames frames, (F, H, W, 3) uint8, of one object's orbit at `resolution` (longer side); with
+    source_view, (F, H, 2W, 3): the object's source view (still) to the left of the orbit."""
     gauss, views = entry["gauss"], entry["views"]
     device = gauss["means"].device
     viewmats = torch.from_numpy(
@@ -1115,7 +1122,13 @@ class OrbitCallback(pl.Callback):
       width=width, height=height,
       sh_degree=gauss["sh_degree"], render_mode="RGB", packed=True,
     )
-    return (rgb.clamp(0.0, 1.0).cpu().numpy() * 255).astype("uint8")
+    frames = (rgb.clamp(0.0, 1.0).cpu().numpy() * 255).astype("uint8")
+    if not self.source_view:
+      return frames
+    # views["gt_rgb"][0] is the source view (premultiplied over black, like the orbit's background)
+    source = F.interpolate(views["gt_rgb"][:1].float(), size=(height, width), mode="bilinear", antialias=True)
+    source = (source.clamp(0.0, 1.0)[0].permute(1, 2, 0).cpu().numpy() * 255).round().astype("uint8")
+    return np.concatenate([np.broadcast_to(source, frames.shape), frames], axis=2)
 
   def _render_stage(self, entries, gsplat):
     """(frames, mesh_indices) of a stage, from an iterable of its entries (a generator: one entry lives at a
