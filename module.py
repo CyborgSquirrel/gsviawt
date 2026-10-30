@@ -693,6 +693,12 @@ class DSSIMLoss(nn.Module):
     self.register_buffer("window", gaussian_window(window_size, sigma), persistent=False)
 
   def forward(self, x, y):
+    # fp32, autocast off: the variances below are differences of nearly equal numbers; in bf16 their gradient is noise (cosine
+    # ~0.002 to the fp32 gradient on real renders, bla/review/01_photom_dssim_real.py) although the loss value looks fine
+    with torch.autocast(device_type=x.device.type, enabled=False):
+      return self._forward(x.float(), y.float())
+
+  def _forward(self, x, y):
     c = x.shape[1]
     w = self.window.expand(c, 1, -1, -1)
     pad = w.shape[-1] // 2

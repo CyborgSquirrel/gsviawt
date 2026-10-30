@@ -384,8 +384,8 @@ class GSDataModule(pl.LightningDataModule):
         raise SystemExit("diffusion mode needs data.input=image")
       ph = cfg.diffusion.get("photom")
       if ph is not None and ph.enabled:
-        if "target" in cfg.loss.photom["for"] and int(d.num_views) < 2:
-          raise SystemExit("diffusion.photom renders the target views: it needs data.num_views >= 2 (the source view + targets)")
+        if "target" in cfg.loss.photom["for"] and int(d.num_views) < 1:
+          raise SystemExit("diffusion.photom renders the target views: it needs data.num_views >= 1 (target views per volume)")
         if cfg.loss.background is not None:
           raise SystemExit("diffusion.photom compares with the images as rendered (over black): loss.background must be null")
       if d.item is not None:
@@ -606,7 +606,8 @@ class GSLightningModule(pl.LightningModule):
     the diffusion model's x0 prediction, rendered. Per volume; gated: only the volumes whose timestep, reduced over the layers by
     diffusion.photom.t_reduce (max: the noisiest layer, mean, layer0), is in diffusion.photom.t_range count (a mean over them; zero
     when there is none). Logs <prefix>/photom[_l1|_dssim] (over the
-    volumes that count) and, gated, photom_frac (the fraction of volumes that count). Returns the loss (with its graph)."""
+    volumes that count) and, gated, photom_frac (the fraction of volumes that count); ungated (validation) the keys are
+    <prefix>/photom_x0[_l1|_dssim]. Returns the loss (with its graph)."""
     cfg, device, B = self.cfg, self.device, batch["batch_size"]
     V = batch["views"]["rgb"].shape[1]
     rvi = ([0] if "source" in cfg.loss.photom["for"] else []) + (list(range(1, V)) if "target" in cfg.loss.photom["for"] else [])
@@ -631,9 +632,11 @@ class GSLightningModule(pl.LightningModule):
       per["dssim"] = self.dssim(pred_rgb.flatten(0, 1), gt_rgb.flatten(0, 1)).reshape(B, -1).mean(1)
     total = cfg.loss.photom.l1_weight * per.get("l1", 0) + cfg.loss.photom.dssim_weight * per.get("dssim", 0)
     loss = (keep * total).sum() / n
+    # validation: "photom_x0" -- the validation's own loss/photom (_step) is the render of the full SAMPLE, a different quantity
+    key = "loss/photom" if gated else "loss/photom_x0"
     for name, v in per.items():
-      self._log_metric(stage, f"loss/photom_{name}", ((keep * v).sum() / n).detach(), int(n))
-    self._log_metric(stage, "loss/photom", loss.detach(), int(n))
+      self._log_metric(stage, f"{key}_{name}", ((keep * v).sum() / n).detach(), int(n))
+    self._log_metric(stage, key, loss.detach(), int(n))
     return loss
 
   def _log_parts(self, stage, prefix, parts, counts):
@@ -649,7 +652,7 @@ class GSLightningModule(pl.LightningModule):
     average is skipped (no optimizer step), as in WT's recipe, and so is a non-finite one (gs_diffusion.SpikeSkip)."""
     B = batch["batch_size"]
     loss, parts, counts, x0_hat, t = self._diffusion_losses(batch)
-    self._log_metric("train", "loss/x0", loss.detach(), B)
+    x0_loss = loss.detach()
     if self._photom_active():
       loss = loss + float(self.cfg.diffusion.photom.weight) * self._diffusion_photom("train", batch, x0_hat, t, gated=True)
     value = float(loss.detach())
@@ -664,6 +667,7 @@ class GSLightningModule(pl.LightningModule):
     self.views_seen += B
     self.pixels_seen += B * int(np.prod(batch["x0_raw"].shape[-2:]))
     self._log_metric("train", "loss", loss.detach(), B)
+    self._log_metric("train", "loss/x0", x0_loss, B)   # like train/loss and its parts: accepted steps only
     self._log_parts("train", "loss", parts, counts)
     return loss
 

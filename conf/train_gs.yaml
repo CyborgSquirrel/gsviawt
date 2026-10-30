@@ -354,7 +354,7 @@ diffusion:
     decay: 0.99
     warmup_steps: 200          # no spike skipped before this many losses were accepted into the average (checkpointed: a resume keeps counting)
   # Rendering loss on the x0 prediction: decoded, rendered at the views of loss.photom.for, compared with the dataset's rendered
-  # images by loss.photom's L1 + D-SSIM (its weights), added to the x0 loss times `weight`. Needs data.num_views >= 2 for "target".
+  # images by loss.photom's L1 + D-SSIM (its weights), added to the x0 loss times `weight`. Needs data.num_views >= 1 (target views) for "target".
   photom:
     enabled: false
     weight: 1.0
