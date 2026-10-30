@@ -1,4 +1,9 @@
 # Config for finalize_fit_dataset.py -- see its docstring.
+defaults:
+  - _self_
+  - override hydra/job_logging: none      # the script logs through logging.basicConfig; no <job>.log in the working directory
+  - override hydra/hydra_logging: none
+
 root: ???            # the directory holding the fit run dirs mesh<M>_view<V>/
 overwrite: false     # replace an existing grids/<name>.h5
 

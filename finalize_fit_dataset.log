@@ -1,6 +1,0 @@
-[2026-10-30 14:33:20,619][__main__][INFO] - finalized 1 fits into /tmp/fin_test/grids; 2 left where they are
-[2026-10-30 14:33:20,620][__main__][INFO] -   mesh0_view1: grids/ already has it (overwrite=true to replace)
-[2026-10-30 14:33:20,620][__main__][INFO] -   mesh0_view2: incomplete (no gaussians.ply)
-[2026-10-30 14:33:21,056][__main__][INFO] - finalized 0 fits into /tmp/fin_test/grids; 2 left where they are
-[2026-10-30 14:33:21,056][__main__][INFO] -   mesh0_view1: grids/ already has it (overwrite=true to replace)
-[2026-10-30 14:33:21,056][__main__][INFO] -   mesh0_view2: incomplete (no gaussians.ply)
