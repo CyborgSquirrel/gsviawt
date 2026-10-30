@@ -193,7 +193,10 @@ def _grid_moments(dataset, i, path, cache_dir):
   item = dataset.inner[i]
   grid, _ = load_grid(path)
   x = torch.from_numpy(encode_grid(grid, item["source"]))[:, item["source"]["hit"]].double()   # (CHANNELS, valid slots), full precision
-  moments = (x.sum(1).numpy(), x.square().sum(1).numpy(), x.shape[1], x.amin(1).numpy(), x.amax(1).numpy())
+  if x.shape[1]:
+    moments = (x.sum(1).numpy(), x.square().sum(1).numpy(), x.shape[1], x.amin(1).numpy(), x.amax(1).numpy())
+  else:   # a grid without a Gaussian: no moments (compute_stats raises when no grid has any)
+    moments = (np.zeros(CHANNELS), np.zeros(CHANNELS), 0, np.full(CHANNELS, np.inf), np.full(CHANNELS, -np.inf))
   if cache:
     try:
       os.makedirs(cache_dir, exist_ok=True)
