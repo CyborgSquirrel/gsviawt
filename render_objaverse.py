@@ -554,7 +554,7 @@ def run(cfg):
         {k: cfg[k] for k in ("depth_width", "depth_height", "device",
                              "output_path", "source_path", "render_engine",
                              "eevee", "eevee_materials", "source_rerender_rgb",
-                             "source_max_meshes")})
+                             "source_max_meshes", "depth_peel_rgb")})
       if cfg.source_max_meshes is not None and not cfg.source_rerender_rgb:
         raise ValueError("source_max_meshes needs source_rerender_rgb=true "
                          "(copied images can't be subset)")
