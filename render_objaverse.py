@@ -240,11 +240,12 @@ def build_depth_peel_material():
   return mat, tex, eps
 
 
-def build_gated_material(src_mat, prev_img, eps_value):
+def build_gated_material(src_mat, eps_value):
   """A copy of `src_mat` (None = Blender's default grey) whose surface is transparent wherever
   View Z <= prev depth + eps and the original shader elsewhere: build_depth_peel_material's gate,
   but around the real material. Principled metallic / transmission / alpha are forced to 0 / 0 /
-  1 so the Diffuse Color pass is the plain base colour."""
+  1 so the Diffuse Color pass is the plain base colour. Returns (material, previous-depth image
+  texture node)."""
   mat = bpy.data.materials.new("DepthPeelColorMaterial") if src_mat is None else src_mat.copy()
   mat.use_nodes = True
   nt = mat.node_tree
@@ -254,7 +255,6 @@ def build_gated_material(src_mat, prev_img, eps_value):
   tex = nt.nodes.new("ShaderNodeTexImage")
   tex.interpolation = "Closest"
   tex.extension = "EXTEND"
-  tex.image = prev_img
   eps = nt.nodes.new("ShaderNodeMath")
   eps.operation = "ADD"
   eps.inputs[1].default_value = eps_value
@@ -282,7 +282,7 @@ def build_gated_material(src_mat, prev_img, eps_value):
     L.new(transp.outputs["BSDF"], mix.inputs[1])
     L.new(orig, mix.inputs[2])
     L.new(mix.outputs["Shader"], surf)
-  return mat
+  return mat, tex
 
 
 def setup_depth_compositor(scene, view_layer):
@@ -297,13 +297,19 @@ def setup_depth_compositor(scene, view_layer):
   return rl, comp
 
 
-def _write_depth_image(img, depth):
+def _prev_depth_image(depth, images):
+  """A new float image holding `depth` (appended to `images`; the caller removes them). The peel
+  renders with persistent data, under which Cycles keeps serving an image it has already loaded
+  even after its pixels change, so every render gets a fresh image instead of a rewritten one."""
   h, w = depth.shape
+  img = bpy.data.images.new(f"DepthPeelPrev{len(images)}", width=w, height=h, float_buffer=True)
+  images.append(img)
   rgba = np.empty((h, w, 4), np.float32)
   rgba[..., 0] = rgba[..., 1] = rgba[..., 2] = depth
   rgba[..., 3] = 1.0
   img.pixels.foreach_set(rgba.ravel())
   img.update()
+  return img
 
 
 def _read_exr_channel0(path, w, h):
@@ -332,7 +338,7 @@ def _linear_to_srgb8(lin):
   return np.clip(srgb * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
 
-def _peel_colors(saved_slots, prev_img, rl, comp, vol, found, scratch_dir, eps_value):
+def _peel_colors(saved_slots, prev_imgs, rl, comp, vol, found, scratch_dir, eps_value):
   """Second sweep over the layers found in `vol` (called from depth_peel, with its Cycles / EXR
   settings in place; `saved_slots` are the slots' original materials): each mesh slot is swapped for a gated copy of its original material and
   the Diffuse Color pass is rendered with the same previous-depth feedback as the depth sweep,
@@ -345,17 +351,19 @@ def _peel_colors(saved_slots, prev_img, rl, comp, vol, found, scratch_dir, eps_v
   view_layer.use_pass_diffuse_color = True
   ims.color_mode = "RGB"
   scene.node_tree.links.new(rl.outputs["DiffCol"], comp.inputs["Image"])
-  gated = {}
+  gated = {}  # original material -> (gated copy, its previous-depth texture node)
   rgb = np.zeros((height, width, vol.shape[2], 3), np.uint8)
   try:
     for obj, orig_mats, _ in saved_slots:
       for i, orig in enumerate(orig_mats):
         if orig not in gated:
-          gated[orig] = build_gated_material(orig, prev_img, eps_value)
-        obj.data.materials[i] = gated[orig]
+          gated[orig] = build_gated_material(orig, eps_value)
+        obj.data.materials[i] = gated[orig][0]
     prev = np.full((height, width), -1e6, np.float32)
     for k in range(found):
-      _write_depth_image(prev_img, prev)
+      img = _prev_depth_image(prev, prev_imgs)
+      for _, tex in gated.values():
+        tex.image = img
       p = os.path.join(scratch_dir, f"_peel_rgb_{k}.exr")
       scene.render.filepath = p
       bpy.ops.render.render(write_still=True)
@@ -367,7 +375,7 @@ def _peel_colors(saved_slots, prev_img, rl, comp, vol, found, scratch_dir, eps_v
   finally:
     view_layer.use_pass_diffuse_color = saved_pass
     ims.color_mode = saved_mode
-    for mat in gated.values():
+    for mat, _ in gated.values():
       bpy.data.materials.remove(mat)
   return rgb
 
@@ -387,6 +395,10 @@ def depth_peel(mesh_objs, peel_mat, peel_tex, peel_eps, rl, comp,
   saved_fp, saved_ff, saved_cd, saved_cm = (
     scene.render.filepath, ims.file_format, ims.color_depth, ims.color_mode)
   saved_res = (scene.render.resolution_x, scene.render.resolution_y)
+  # Persistent data keeps the Cycles session (device, kernels, BVH) alive between the sweep's
+  # renders; without it every render pays a few hundred ms of GPU setup / teardown.
+  saved_persistent = scene.render.use_persistent_data
+  scene.render.use_persistent_data = True
   ims.file_format, ims.color_depth, ims.color_mode = "OPEN_EXR", "32", "BW"
   scene.render.resolution_x, scene.render.resolution_y = width, height
   scene.node_tree.links.new(rl.outputs["Depth"], comp.inputs["Image"])
@@ -418,11 +430,10 @@ def depth_peel(mesh_objs, peel_mat, peel_tex, peel_eps, rl, comp,
   vol = np.full((height, width, max_layers), np.nan, np.float32)  # NaN = no hit at this layer
   found = 0
   rgb = None
-  prev_img = bpy.data.images.new("DepthPeelPrev", width=width, height=height, float_buffer=True)
-  peel_tex.image = prev_img
+  prev_imgs = []
   try:
     for k in range(max_layers):
-      _write_depth_image(prev_img, prev)
+      peel_tex.image = _prev_depth_image(prev, prev_imgs)
       p = os.path.join(scratch_dir, f"_peel_{k}.exr")
       scene.render.filepath = p
       bpy.ops.render.render(write_still=True)
@@ -435,7 +446,7 @@ def depth_peel(mesh_objs, peel_mat, peel_tex, peel_eps, rl, comp,
       found = k + 1
       prev = np.where(hit, d, prev)
     if with_rgb:
-      rgb = _peel_colors(saved_slots, prev_img, rl, comp, vol, found, scratch_dir,
+      rgb = _peel_colors(saved_slots, prev_imgs, rl, comp, vol, found, scratch_dir,
                          peel_eps.inputs[1].default_value)
   finally:
     for obj, saved, added in saved_slots:
@@ -452,7 +463,11 @@ def depth_peel(mesh_objs, peel_mat, peel_tex, peel_eps, rl, comp,
     ims.file_format, ims.color_depth, ims.color_mode = saved_ff, saved_cd, saved_cm
     scene.render.resolution_x, scene.render.resolution_y = saved_res
     peel_tex.image = None
-    bpy.data.images.remove(prev_img)
+    # switching persistent data off frees the session, so the images (whose addresses a later
+    # sweep's images may reuse) can't outlive it in Cycles' image cache
+    scene.render.use_persistent_data = saved_persistent
+    for img in prev_imgs:
+      bpy.data.images.remove(img)
 
   return np.flip(vol, axis=0), found, None if rgb is None else np.flip(rgb, axis=0)
 
