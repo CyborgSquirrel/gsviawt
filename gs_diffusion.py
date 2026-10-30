@@ -400,7 +400,13 @@ class GSDiffusionModel(nn.Module):
     self.register_buffer("x0_std", std.clone().float())
     self.register_buffer("x0_lo", lo.clone().float())     # the training grids' range of each channel: samples are clamped into it
     self.register_buffer("x0_hi", hi.clone().float())
-    self.schedule = LayerAwareSchedule(self.num_layers, standard=dict(d.schedule.standard), plateau=dict(d.schedule.plateau))
+    fixed_t = d.schedule.get("fixed_t")
+    if fixed_t is not None and (float(fixed_t) != 1.0 or int(d.steps) != 1):
+      raise SystemExit("diffusion.schedule.fixed_t: only 1.0 (always pure noise: a deterministic regressor from the image, the "
+                       f"same-architecture control), with diffusion.steps=1 (one step from noise = the x0 prediction); got "
+                       f"fixed_t={fixed_t}, steps={d.steps}")
+    self.schedule = LayerAwareSchedule(self.num_layers, standard=dict(d.schedule.standard), plateau=dict(d.schedule.plateau),
+                                       fixed_t=fixed_t)
     self.steps = int(d.steps)
     self.eval_seed = int(d.eval_seed)
 
