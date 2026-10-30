@@ -440,8 +440,9 @@ class GSDataModule(pl.LightningDataModule):
     self.val_datasets = {
       name: WTFeatureDataset(features_h5, v, rows=r, **kwargs) for name, (v, r) in sets.items() if len(r)}
     if grid_index is not None:
-      self.train_ds = gs_diffusion.GridTargetDataset(self.train_ds, grid_index)
-      self.val_datasets = {n: gs_diffusion.GridTargetDataset(ds, grid_index) for n, ds in self.val_datasets.items()}
+      enc = OmegaConf.to_container(cfg.diffusion.scale_encoding) if cfg.diffusion.get("scale_encoding") is not None else None
+      self.train_ds = gs_diffusion.GridTargetDataset(self.train_ds, grid_index, enc)
+      self.val_datasets = {n: gs_diffusion.GridTargetDataset(ds, grid_index, enc) for n, ds in self.val_datasets.items()}
       for name, ds in self.val_datasets.items():
         check_val_targets(ds, name, cfg)
       # normalization of the x0 channels: the valid slots of the TRAIN grids (moments cached per grid, next to the grids)
