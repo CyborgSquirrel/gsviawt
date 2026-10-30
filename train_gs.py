@@ -194,15 +194,18 @@ def model_forward(
   need_render: bool=False,
   render_view_idx = None,
   bg_colors = None,
+  gauss = None,
   device,
 ):
+  """gauss: the Gaussian dict to render instead of the model's own prediction (diffusion.photom renders the diffusion model's x0
+  prediction; the model is not called then)."""
   if render_view_idx is None:
     render_view_idx = slice(None)
 
   B = batch["batch_size"]
 
   out = {}
-  out["gauss"] = model(model.inputs(batch, device))
+  out["gauss"] = model(model.inputs(batch, device)) if gauss is None else gauss
   _check_grid(out["gauss"], batch["source"]["xyz_cam"])
 
   # render 3DGS if necessary
@@ -379,6 +382,12 @@ class GSDataModule(pl.LightningDataModule):
       # diffusion mode: the volumes are the fitted grids (one per source view), listed in a features-less listing file
       if d.input != "image":
         raise SystemExit("diffusion mode needs data.input=image")
+      ph = cfg.diffusion.get("photom")
+      if ph is not None and ph.enabled:
+        if "target" in cfg.loss.photom["for"] and int(d.num_views) < 2:
+          raise SystemExit("diffusion.photom renders the target views: it needs data.num_views >= 2 (the source view + targets)")
+        if cfg.loss.background is not None:
+          raise SystemExit("diffusion.photom compares with the images as rendered (over black): loss.background must be null")
       if d.item is not None:
         log.warning("data.item=%s: the diffusion run trains on that one listed grid only (data.item=null: all of them)", d.item)
       if d.depth_size not in (None, d.image_size):
@@ -580,9 +589,52 @@ class GSLightningModule(pl.LightningModule):
     self.log(name, value, batch_size=batch_size, add_dataloader_idx=False)
 
   def _diffusion_losses(self, batch, seeded=False):
-    """(loss, parts, counts); seeded: the timesteps and noise of each volume are a function of the volume (validation)."""
+    """(loss, parts, counts, x0_hat, t); seeded: the timesteps and noise of each volume are a function of the volume (validation)."""
     image, hit, seeds = self.model.inputs(batch, self.device)
-    return self.model.training_loss(image, hit, batch["x0_raw"].to(self.device), seeds=seeds if seeded else None)
+    return self.model.training_loss(image, hit, batch["x0_raw"].to(self.device), seeds=seeds if seeded else None, return_pred=True)
+
+  def _photom_active(self):
+    """diffusion.photom is on, and the train clock is past its start_seconds."""
+    p = self.cfg.diffusion.get("photom")
+    if p is None or not p.enabled:
+      return False
+    seconds = self.clock.seconds() if self.clock is not None else 0.0
+    return seconds >= float(p.start_seconds)
+
+  def _diffusion_photom(self, stage, batch, x0_hat, t, gated):
+    """The photometric loss (loss.photom: L1 + D-SSIM on the views of loss.photom.for, against the dataset's rendered images) of
+    the diffusion model's x0 prediction, rendered. Per volume; gated: only the volumes whose timestep, reduced over the layers by
+    diffusion.photom.t_reduce (max: the noisiest layer, mean, layer0), is in diffusion.photom.t_range count (a mean over them; zero
+    when there is none). Logs <prefix>/photom[_l1|_dssim] (over the
+    volumes that count) and, gated, photom_frac (the fraction of volumes that count). Returns the loss (with its graph)."""
+    cfg, device, B = self.cfg, self.device, batch["batch_size"]
+    V = batch["views"]["rgb"].shape[1]
+    rvi = ([0] if "source" in cfg.loss.photom["for"] else []) + (list(range(1, V)) if "target" in cfg.loss.photom["for"] else [])
+    if gated:
+      lo, hi = cfg.diffusion.photom.t_range
+      reduce = cfg.diffusion.photom.t_reduce
+      tv = {"max": lambda: t.amax(dim=1), "mean": lambda: t.mean(dim=1), "layer0": lambda: t[:, 0]}[reduce]()   # (B,)
+      keep = ((tv >= float(lo)) & (tv <= float(hi))).float()
+      self._log_metric(stage, "loss/photom_frac", keep.mean(), B)
+    else:
+      keep = torch.ones(B, device=device)
+    n = keep.sum()
+    if n == 0:
+      return torch.zeros((), device=device)
+    pred = model_forward(self.model, batch, need_render=True, render_view_idx=rvi, gauss=self.model.decode(x0_hat), device=device)
+    pred_rgb = pred["rgb"]                                                              # (B, RV, 3, H, W)
+    gt_rgb = batch["views"]["rgb"][:, rvi].to(device)
+    per = {}
+    if cfg.loss.photom.l1_weight > 0:
+      per["l1"] = (pred_rgb - gt_rgb).abs().flatten(1).mean(1)                          # (B,)
+    if cfg.loss.photom.dssim_weight > 0:
+      per["dssim"] = self.dssim(pred_rgb.flatten(0, 1), gt_rgb.flatten(0, 1)).reshape(B, -1).mean(1)
+    total = cfg.loss.photom.l1_weight * per.get("l1", 0) + cfg.loss.photom.dssim_weight * per.get("dssim", 0)
+    loss = (keep * total).sum() / n
+    for name, v in per.items():
+      self._log_metric(stage, f"loss/photom_{name}", ((keep * v).sum() / n).detach(), int(n))
+    self._log_metric(stage, "loss/photom", loss.detach(), int(n))
+    return loss
 
   def _log_parts(self, stage, prefix, parts, counts):
     """Per-field / per-t-bucket losses, each weighted by its number of valid slots (epoch means are then slot means); a bucket
@@ -596,7 +648,10 @@ class GSLightningModule(pl.LightningModule):
     """WT's loss: the squared distance of the predicted x0 to x0 on the valid slots. A loss above `factor` times its running
     average is skipped (no optimizer step), as in WT's recipe, and so is a non-finite one (gs_diffusion.SpikeSkip)."""
     B = batch["batch_size"]
-    loss, parts, counts = self._diffusion_losses(batch)
+    loss, parts, counts, x0_hat, t = self._diffusion_losses(batch)
+    self._log_metric("train", "loss/x0", loss.detach(), B)
+    if self._photom_active():
+      loss = loss + float(self.cfg.diffusion.photom.weight) * self._diffusion_photom("train", batch, x0_hat, t, gated=True)
     value = float(loss.detach())
     skipped = self.spike_skip.check(value)
     self._log_metric("train", "skipped", float(skipped), B)
@@ -616,9 +671,12 @@ class GSLightningModule(pl.LightningModule):
   def _diffusion_val_loss(self, stage, batch):
     """The same loss on a validation batch. The timesteps and noise of a volume are a function of the volume (its source view and
     diffusion.eval_seed), so every validation scores each volume at the same noise levels, whatever the subset or the order."""
-    loss, parts, counts = self._diffusion_losses(batch, seeded=True)
+    loss, parts, counts, x0_hat, t = self._diffusion_losses(batch, seeded=True)
     self._log_metric(stage, "loss/x0", loss.detach(), batch["batch_size"])
     self._log_parts(stage, "loss/x0", parts, counts)
+    if self.cfg.diffusion.photom.enabled and self.cfg.diffusion.photom.validate:
+      # every volume (ungated): the render-space error of the one-step x0 prediction at the seeded timesteps
+      self._diffusion_photom(stage, batch, x0_hat, t, gated=False)
 
   def _step(self, stage, batch, batch_idx):
     B = batch["batch_size"]

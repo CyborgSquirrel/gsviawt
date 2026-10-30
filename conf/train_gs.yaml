@@ -353,6 +353,15 @@ diffusion:
     factor: 4.0                # a loss above factor * its running average is skipped, a non-finite one always (null: off)
     decay: 0.99
     warmup_steps: 200          # no spike skipped before this many losses were accepted into the average (checkpointed: a resume keeps counting)
+  # Rendering loss on the x0 prediction: decoded, rendered at the views of loss.photom.for, compared with the dataset's rendered
+  # images by loss.photom's L1 + D-SSIM (its weights), added to the x0 loss times `weight`. Needs data.num_views >= 2 for "target".
+  photom:
+    enabled: false
+    weight: 1.0
+    t_range: [0.0, 0.7]        # only the volumes whose timestep (reduced over the layers by t_reduce) is in this range (t = 1: pure noise)
+    t_reduce: max              # max (the noisiest layer) | mean | layer0
+    start_seconds: 0           # off until the train clock reaches this
+    validate: true             # also log <set>/<name>/loss/photom (every volume, ungated) in the validations, when enabled
 
 optim:
   _target_: torch.optim.AdamW
