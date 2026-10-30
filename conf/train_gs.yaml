@@ -282,6 +282,7 @@ callbacks:
                                 # not a re-fit bounding-sphere framing -- see GSLightningModule._preview_entry
     grid: [1, 1]               # [width, height]: objects (different meshes) per video, each orbiting in its own cell; resolution is then the whole video's longer side
     resolution: 1024           # longer side of the turntable frames in px (aspect kept); null -> the preview views' own size
+    source_view: true          # each object's source (input) view to the left of its orbit; the video is then twice as wide (resolution sizes the orbit frames, not the pair)
     path_format: ${output_dir}/orbits/{stage}_orbit_{mode}{n:06d}.mp4   # null -> temp dir, deleted at fit end ({mode} is always "step")
 
   panel:
