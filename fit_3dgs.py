@@ -125,7 +125,7 @@ import wandb
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _REPO_ROOT)
 from module import DSSIMLoss, OPENGL_TO_OPENCV, ProgressWandbLogger, _completed_steps  # noqa: E402
-from gs_dataset import _EmptyDataset, render_catalog, split_by_view  # noqa: E402
+from gs_dataset import _EmptyDataset, render_catalog  # noqa: E402
 from util import timed  # noqa: E402
 
 sys.path.insert(0, os.path.join(_REPO_ROOT, "gaussian-splatting"))
@@ -234,7 +234,7 @@ def rescale_camera(cam, scale):
           "width": new_w, "height": new_h}
 
 
-def resolve_views(hdf5_path, primary, secondary, validation, val_fraction, seed):
+def resolve_views(hdf5_path, primary, secondary, validation, split_fn, seed):
   """Resolves cfg.data.primary_view / secondary_views / validation_views
   (each None == unset) into a full (primary: int, secondary: list[int],
   validation: list[int]) of h5 row indices. Train = primary + secondary;
@@ -244,14 +244,14 @@ def resolve_views(hdf5_path, primary, secondary, validation, val_fraction, seed)
   none of the three groups) is the "inverse dataset", and anything unset
   comes from it:
     - secondary AND validation (and/or primary) unset: the inverse dataset
-      is split with gs_dataset.split_by_view(val_fraction, seed) -- its
+      is split with data.split_fn (e.g. split_by_view, val_fraction, seed) -- its
       train side is the train pool, its val side is validation.
     - only secondary/primary unset: the whole inverse dataset is the train
       pool. Only validation unset: it is all validation.
     - primary unset: the smallest view index in the train pool (a pool
       derived from the inverse dataset, never carved out of an explicit
       secondary_views), removed from the pool; secondary gets the rest.
-  With all three unset this is exactly the old behaviour: split_by_view
+  With all three unset this is exactly the old behaviour: data.split_fn
   over the whole catalog, primary == its smallest train index.
   Views in the inverse dataset that end up in no group are just unused."""
   catalog = render_catalog(hdf5_path)
@@ -279,7 +279,7 @@ def resolve_views(hdf5_path, primary, secondary, validation, val_fraction, seed)
     inverse = catalog if not given_set else catalog.take(
       [pos for pos, i in enumerate(all_idx) if i not in given_set])
     if needs_train and needs_val:
-      train_side, val_side = split_by_view(inverse, val_fraction=val_fraction, seed=seed)
+      train_side, val_side = split_fn(inverse, seed=seed)
       train_pool, validation = _ids(train_side), _ids(val_side)
     elif needs_train:
       train_pool = _ids(inverse)
@@ -550,7 +550,7 @@ def save_output_layered(path, params_np, meta):
   scales = np.exp(params_np["scales"])
   quats = params_np["quats"] / np.linalg.norm(params_np["quats"], axis=-1, keepdims=True)
   opac = 1.0 / (1.0 + np.exp(-params_np["opacities"]))
-  colors = np.clip(SH_C0 * params_np["sh0"][:, 0, :] + 0.5, 0.0, 1.0)
+  colors = np.clip(SH_C0 * params_np["sh0"][:, 0, :] + 0.5, 0.0, None)   # gsplat clamps at 0 only
 
   v, u, layer = meta["v"], meta["u"], meta["layer"]
   H, W, L = meta["H"], meta["W"], meta["L"]
@@ -815,8 +815,6 @@ class Fit3DGSLightningModule(pl.LightningModule):
         bg = torch.ones(3, device=gt_rgb.device)
       case ("random", "train"):
         bg = torch.rand(3, device=gt_rgb.device)
-      case ("random", "val"):
-        bg = torch.ones(3, device=gt_rgb.device)
       case _:
         bg = None
     if bg is not None:
@@ -887,7 +885,8 @@ class Fit3DGSLightningModule(pl.LightningModule):
       mse = (rgb - gt_rgb).pow(2).mean()
       lpips_val = lpips(rearrange(rgb, "b h w c -> b c h w"), rearrange(gt_rgb, "b h w c -> b c h w"), net_type="vgg")
       return {
-        "PSNR": float(-10 * torch.log10(mse)), "SSIM": float(1.0 - parts["dssim"]), "LPIPS": float(lpips_val),
+        "PSNR": float(-10 * torch.log10(mse)), "PSNR_masked": float(_masked_psnr(rgb, gt_rgb, gt_alpha)),
+        "SSIM": float(1.0 - parts["dssim"]), "LPIPS": float(lpips_val),
       }
 
     if stage == "train":
@@ -926,6 +925,10 @@ class Fit3DGSLightningModule(pl.LightningModule):
       _log(f"loss/photom_{k}", v.detach())
     if offset_reg is not None:
       _log("loss/mean_offset_reg", offset_reg.detach())
+    if stage == "val":
+      _log("PSNR", -10 * torch.log10((rgb - gt_rgb).pow(2).mean()))
+      _log("PSNR_masked", _masked_psnr(rgb, gt_rgb, gt_alpha))
+      _log("SSIM", 1.0 - parts["dssim"].detach())
     if stage == "train":
       self.log("train/num_gaussians", float(len(self.params["means"])), batch_size=B)
       self.log("train/active_sh_degree", float(self.active_sh_degree), batch_size=B)
@@ -986,6 +989,13 @@ class Fit3DGSLightningModule(pl.LightningModule):
 # gaussian-splatting/metrics.py (per-image PSNR/SSIM/LPIPS(vgg), then mean).
 # ---------------------------------------------------------------------------
 
+def _masked_psnr(rgb, gt_rgb, gt_alpha):
+  """PSNR over the pixels the object covers (GT alpha > 0) only: with ~90% empty background, the full-image
+  PSNR is dominated by black-on-black pixels."""
+  m = (gt_alpha > 0).to(rgb.dtype).expand_as(rgb)
+  return -10 * torch.log10(((rgb - gt_rgb).pow(2) * m).sum() / m.sum().clamp_min(1))
+
+
 def run_final_eval(model, test_cams, device):
   """Drives Fit3DGSLightningModule._step(stage="final_eval") one test view
   at a time -- same bg-select/composite/render/photom_loss pipeline train/
@@ -994,18 +1004,19 @@ def run_final_eval(model, test_cams, device):
   returns the per-view {"PSNR"/"SSIM"/"LPIPS"} dict for this stage; this
   function only averages them over the split."""
   loader = DataLoader(Fit3DGSViewDataset(test_cams), batch_size=1, shuffle=False)
-  psnrs, ssims, lpipss = [], [], []
+  psnrs, psnrs_masked, ssims, lpipss = [], [], [], []
   model.eval()
   with torch.no_grad():
     for i, batch in enumerate(loader):
       batch = {k: v.to(device) for k, v in batch.items()}
       out = model._step("final_eval", batch, i)
       psnrs.append(out["PSNR"])
+      psnrs_masked.append(out["PSNR_masked"])
       ssims.append(out["SSIM"])
       lpipss.append(out["LPIPS"])
   return {
-    "PSNR": float(np.mean(psnrs)), "SSIM": float(np.mean(ssims)), "LPIPS": float(np.mean(lpipss)),
-    "num_test_views": len(test_cams),
+    "PSNR": float(np.mean(psnrs)), "PSNR_masked": float(np.mean(psnrs_masked)), "SSIM": float(np.mean(ssims)),
+    "LPIPS": float(np.mean(lpipss)), "num_test_views": len(test_cams),
   }
 
 
@@ -1041,7 +1052,7 @@ def main(cfg: DictConfig) -> None:
   data_views = (cfg.data.primary_view, cfg.data.secondary_views, cfg.data.validation_views)
   if use_h5:
     cfg.data.primary_view, cfg.data.secondary_views, cfg.data.validation_views = resolve_views(
-      cfg.hdf5_path, *data_views, float(cfg.data.split_fn.val_fraction), int(cfg.seed))
+      cfg.hdf5_path, *data_views, hydra.utils.instantiate(cfg.data.split_fn), int(cfg.seed))
   elif any(v is not None for v in data_views):
     raise SystemExit("data.primary_view/secondary_views/validation_views need hdf5_path "
                      "(COLMAP scenes split by llffhold, not by view index)")
@@ -1062,7 +1073,7 @@ def main(cfg: DictConfig) -> None:
     else:
       pcd, scene_extent, train_cams, test_cams = load_scene(
         cfg.source_path, cfg.images, bool(cfg.eval), _coerce_resolution(cfg.resolution))
-  log.info("%d train views, %d test views (llffhold), scene_extent=%.4f",
+  log.info("%d train views, %d test views, scene_extent=%.4f",
            len(train_cams), len(test_cams), scene_extent)
   train_scale = float(cfg.train_scale)
   if train_scale <= 0:
@@ -1095,6 +1106,11 @@ def main(cfg: DictConfig) -> None:
 
   callbacks = list(hydra.utils.instantiate(cfg.callbacks).values())
   trainer = pl.Trainer(logger=logger, callbacks=callbacks, **OmegaConf.to_container(cfg.trainer, resolve=True))
+  if test_cams:
+    # validate the seeded Gaussians before any optimizer step, so the init's own quality is the val curve's
+    # step-0 point (Lightning's sanity check doesn't log; self.log from on_train_start is epoch-level only)
+    with timed("validate step 0"):
+      trainer.validate(model, datamodule=datamodule, verbose=False)
   with timed("optimize"):
     trainer.fit(model, datamodule=datamodule)
 
@@ -1119,8 +1135,8 @@ def main(cfg: DictConfig) -> None:
       device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
       model = model.to(device)
       results = run_final_eval(model, test_cams, device)
-    log.info("final eval (test split, llffhold=8): PSNR %.4f  SSIM %.4f  LPIPS %.4f  (%d views)",
-             results["PSNR"], results["SSIM"], results["LPIPS"], results["num_test_views"])
+    log.info("final eval (test split): PSNR %.4f (object pixels only %.4f)  SSIM %.4f  LPIPS %.4f  (%d views)",
+             results["PSNR"], results["PSNR_masked"], results["SSIM"], results["LPIPS"], results["num_test_views"])
     with open(os.path.join(output_dir, "results.json"), "w") as f:
       json.dump({"ours_final": results}, f, indent=1)
 
