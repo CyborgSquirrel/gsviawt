@@ -581,30 +581,38 @@ class Fit3DGSViewDataset(Dataset):
   loaded/resized by load_scene()/load_scene_h5(), viewmat/K precomputed.
   gt_alpha is always 1 for COLMAP captures (no matte); cfg.background !=
   "none" recomposites gt_rgb onto the configured colour using it (see
-  Fit3DGSLightningModule._step) -- a no-op wherever alpha is all-1."""
+  Fit3DGSLightningModule._step) -- a no-op wherever alpha is all-1.
 
-  def __init__(self, cams):
-    self.cams = cams
+  device: where the items' tensors live, all of them moved there once up
+  front (e.g. the GPU, so a step's batch needs no host->device copy)."""
+
+  def __init__(self, cams, device="cpu"):
+    self.items = [{
+      "gt_rgb": torch.from_numpy(c["image"]).to(device),
+      "gt_alpha": torch.from_numpy(c["alpha"]).to(device),
+      "K": torch.from_numpy(c["K"]).to(device),
+      "viewmat": torch.from_numpy(c["viewmat"]).to(device),
+    } for c in cams]
 
   def __len__(self):
-    return len(self.cams)
+    return len(self.items)
 
   def __getitem__(self, i):
-    c = self.cams[i]
-    return {
-      "gt_rgb": torch.from_numpy(c["image"]),
-      "gt_alpha": torch.from_numpy(c["alpha"]),
-      "K": torch.from_numpy(c["K"]),
-      "viewmat": torch.from_numpy(c["viewmat"]),
-    }
+    return self.items[i]
 
 
 class Fit3DGSDataModule(pl.LightningDataModule):
   def __init__(self, cfg, train_cams, test_cams):
     super().__init__()
     self.cfg = cfg
-    self.train_ds = Fit3DGSViewDataset(train_cams)
-    self.val_ds = Fit3DGSViewDataset(test_cams) if test_cams else _EmptyDataset()
+    self.train_cams, self.test_cams = train_cams, test_cams
+
+  def setup(self, stage):
+    # In-process loading (num_workers=0): every view sits on the training device for the whole fit
+    # (a ~3 MB pageable copy per step otherwise); worker processes can't hand out CUDA tensors.
+    device = self.trainer.strategy.root_device if int(self.cfg.loader.num_workers) == 0 else "cpu"
+    self.train_ds = Fit3DGSViewDataset(self.train_cams, device)
+    self.val_ds = Fit3DGSViewDataset(self.test_cams, device) if self.test_cams else _EmptyDataset()
 
   def train_dataloader(self):
     return DataLoader(self.train_ds, shuffle=True, **OmegaConf.to_container(self.cfg.loader, resolve=True))
