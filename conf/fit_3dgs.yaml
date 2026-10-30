@@ -145,12 +145,12 @@ callbacks:
   panel:
     _target_: module.PanelCallback
     trigger_event:
-      every_n_steps: ${eval:'${iters} // 100'}
+      every_n_steps: ${eval:'${iters} // 20'}    # ~0.2 s per panel (mostly wandb's PNG encode); was iters // 100
 
   orbit:
     _target_: module.OrbitCallback
     trigger_event:
-      every_n_steps: ${eval:'${iters} // 20'}
+      every_n_steps: ${eval:'${iters} // 4'}     # ~0.6 s per orbit (mostly the mp4 encode); was iters // 20
     num_frames: 24
     fps: 12
     crf: 18
