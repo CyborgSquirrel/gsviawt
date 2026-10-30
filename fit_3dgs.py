@@ -915,6 +915,10 @@ class Fit3DGSLightningModule(pl.LightningModule):
       self._last_loss = loss.detach()  # not .item(): a host sync every step
       if iteration % int(self.cfg.densify.interval) == 0:
         log.info("iter %d: loss=%.5f  %d Gaussians", iteration, loss.item(), len(self.params["means"]))
+      # train metrics are on_step only: Lightning hands the logger just the ones logged on a
+      # log_every_n_steps step and drops the rest, so skip the ~9 self.log calls (~1 ms) on every other step
+      if not self.trainer._logger_connector.should_update_logs:
+        return loss
 
     _log("loss", loss, prog_bar=(stage == "train"))
     _log("loss/photom", photom_loss.detach())
