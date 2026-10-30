@@ -485,7 +485,7 @@ class GSLightningModule(pl.LightningModule):
 
     @ft.wraps(self.log)
     def _log(key, *args, **kwargs):
-      name = f"{stage}/{key}" if stage == "train" else f"val/{self.trainer.datamodule.validation}/{stage}/{key}"
+      name = f"{stage}/{key}" if stage == "train" else f"{stage}/{self.trainer.datamodule.validation}/{key}"
       self.log(name, *args, **kwargs, batch_size=B, add_dataloader_idx=False)
 
     cfg = self.cfg
