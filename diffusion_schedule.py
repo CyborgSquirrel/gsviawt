@@ -12,7 +12,7 @@ Two phases:
   2  one t per sample shared by all layers, from the equal-weight mixture of the two densities.
 `LayerAwareSchedule.sample(batch_size, phase)` returns (B, L) timesteps in either phase.
 
-The paper text gives no mu / sigma for the plateaued one; the defaults here are a guess to be checked against its density figure
+The plateau starts at the mode t* = 0.5 (mu = 0, sigma = 1) and runs towards t = 1; this was confirmed against the paper's figure
 (see `densities` and bla/_plot_schedule.py).
 """
 
@@ -34,7 +34,7 @@ def _logit(t):
   return torch.log(t) - torch.log1p(-t)
 
 
-def plateau_mode(mu=-0.5, sigma=1.0, iters=50):
+def plateau_mode(mu=0.0, sigma=1.0, iters=50):
   """Mode t* of the logit-normal density in t: the root of logit(t) - mu - sigma^2 * (2t - 1) = 0 (Newton, as in BFL's
   tpPln, for sigma = 1). Needs sigma^2 < 2 for a single mode."""
   if sigma * sigma >= 2:
@@ -54,7 +54,7 @@ def _plateau_consts(mu, sigma):
   return t_star, p_star, mass_below, mass_below + (1 - t_star) * p_star   # t*, p_ln(t*), P_ln(t*), Z
 
 
-def plateau_logit_normal_pdf(t, mu=-0.5, sigma=1.0, mirror=False):
+def plateau_logit_normal_pdf(t, mu=0.0, sigma=1.0, mirror=False):
   """Plateaued logit-normal density: logit-normal for t <= t*, the constant p_ln(t*) for t > t*, over Z."""
   t = torch.as_tensor(t, dtype=torch.float64)
   if mirror:
@@ -68,7 +68,7 @@ def sample_logit_normal(shape, mu=0.0, sigma=1.0, generator=None, device=None):
   return torch.sigmoid(u).clamp(T_MIN, 1 - T_MIN)
 
 
-def sample_plateau_logit_normal(shape, mu=-0.5, sigma=1.0, mirror=False, generator=None, device=None):
+def sample_plateau_logit_normal(shape, mu=0.0, sigma=1.0, mirror=False, generator=None, device=None):
   """Exact inverse-CDF sampling: below t* the CDF is P_ln(t) / Z, above it grows linearly at p_ln(t*) / Z."""
   t_star, p_star, mass_below, z = _plateau_consts(mu, sigma)
   v = torch.rand(shape, generator=generator, device=device, dtype=torch.float64)
@@ -82,7 +82,7 @@ class LayerAwareSchedule:
   def __init__(self, num_layers, standard=None, plateau=None):
     self.num_layers = int(num_layers)
     self.standard = dict(mu=0.0, sigma=1.0, **(standard or {}))
-    self.plateau = dict(mu=-0.5, sigma=1.0, mirror=False, **(plateau or {}))
+    self.plateau = dict(mu=0.0, sigma=1.0, mirror=False, **(plateau or {}))
 
   def densities(self, t):
     """The two base densities and their 50/50 mixture (phase 2's), on the grid t."""
