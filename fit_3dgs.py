@@ -702,6 +702,10 @@ class Fit3DGSLightningModule(pl.LightningModule):
     # the render `info` is on) -- no manual device placement needed here,
     # unlike a plain dict of eagerly-created tensors would.
     self.strategy_state = self.strategy.initialize_state(scene_scale=scene_extent)
+    # Layered, with no opacity reset inside the run (no step in [1, iters) is a multiple of reset_every):
+    # step_pre/post_backward would only keep up grad2d/count statistics for a grow/prune that never runs
+    # -- skip both (a means2d.retain_grad and a few bookkeeping kernels every step), same result.
+    self.strategy_active = not (self.gaussian_layout == "layered" and reset_every >= int(cfg.iters))
 
     # A fixed handful of preview cameras (module.PanelCallback/OrbitCallback,
     # via preview_entries() below) -- not the full train/val split (that's
@@ -850,7 +854,7 @@ class Fit3DGSLightningModule(pl.LightningModule):
       # they operate on the trainable leaf, not the resolved position.
       render_params = {**self.params, "means": self._active_means()}
       rgb, alpha, info = render(render_params, self.active_sh_degree, viewmat, K, W, H, backgrounds=bg)
-      if stage == "train":
+      if stage == "train" and self.strategy_active:
         # step_pre_backward calls info["means2d"].retain_grad() -- must
         # run before backward for a non-leaf tensor to keep its .grad
         # populated.
@@ -900,9 +904,10 @@ class Fit3DGSLightningModule(pl.LightningModule):
       # this one's). Always called, in both gaussian_layout modes:
       # __init__ is what actually disables grow/prune for "layered"
       # (refine_start_iter pushed past cfg.iters), not a guard here --
-      # opacity reset still needs to run.
-      self.strategy.step_post_backward(
-        self.params, self.optimizers_dict, self.strategy_state, it, info, packed=True)
+      # opacity reset still needs to run (strategy_active: off only when nothing in here can fire).
+      if self.strategy_active:
+        self.strategy.step_post_backward(
+          self.params, self.optimizers_dict, self.strategy_state, it, info, packed=True)
 
       self.views_seen += B
       self.pixels_seen += B * H * W
