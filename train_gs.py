@@ -12,8 +12,9 @@ anchored to the source view's own depth-peel point cloud (see gs_dataset.py's
 dense_unproject_camera); with model.predict_mean_offset the head also
 predicts a residual offset on top of that anchor (see flatten_gaussians).
 
-For now this is overfitting only: data.item picks ONE row of the features h5
-(gs_dataset.WTFeatureDataset) and the model trains on it alone.
+The data: data.features_h5 (cached features, or a listing of source views for data.input=image), or
+data.render_h5 -- the render_objaverse.py shards themselves (a path, a list or a glob), no features file and
+no merging; every view is a volume (gs_dataset.WTFeatureDataset).
 
 Training objective (Flash3D's cross-view photometric setup): decode the
 source view's Gaussians, render them into the source view itself
@@ -25,7 +26,7 @@ gs_dataset.relative_viewmats) -- no world coordinates involved.
 Usage:
     docker exec -w /app gsviawt-app-gpu-1 /home/user/venv/bin/python train_gs.py \\
         data.features_h5=/app/bla/porsche_250views.wt_features.5views10seeds.h5 \\
-        data.item=0 trainer.max_epochs=1000
+        trainer.max_epochs=1000
 
     # Resume from an earlier run's checkpoint (model/optimizer/scheduler +
     # epoch/step state; continues into a fresh output_dir):
@@ -87,7 +88,7 @@ def check_val_targets(ds, name, cfg):
   inner = ds.inner
   bad = []
   for row in inner.volumes.df.iter_rows(named=True):
-    pool = inner.pool_sets[row["mesh_id"]]
+    pool = inner.pool_sets[inner.pool_key(row)]
     n = len(pool) if inner.allow_source_as_target else len(pool - {row["view_idx"]})
     if n == 0:
       bad.append((row["mesh_id"], row["view_idx"]))
@@ -342,8 +343,10 @@ def flatten_gaussians(b, gauss, xyz_cam, hit):
 # ---------------------------------------------------------------------------
 
 class GSDataModule(pl.LightningDataModule):
-  """Train/val over cached feature volumes (data.item: one row, a list of rows, or null for all of them),
-  split with master's two stages on the render catalog the volumes' source views are rows of:
+  """Train/val over the volumes of data.features_h5 (cached features, or a listing of source views), or, with
+  data.render_h5 (input: image), over every view of the render shards it names -- a path, a list or a glob(s); no
+  merging needed, a mesh's views come from its own shard. Split with master's two stages on the render catalog
+  the volumes' source views are rows of:
     data/mesh_split: all meshes -> train_meshes + val_meshes
     data/view_split: the train meshes' views -> train_views + val_views
   (see conf/data/mesh_split/*.yaml and conf/data/view_split/*.yaml). A volume goes where its SOURCE view is,
@@ -373,30 +376,39 @@ class GSDataModule(pl.LightningDataModule):
     d = cfg.data
     self.diffusion_stats = None
     grid_index = None
-    if not diffusion_enabled(cfg):
+    render_h5 = d.get("render_h5")
+    if render_h5 is not None:
+      render_h5 = OmegaConf.to_container(render_h5) if OmegaConf.is_config(render_h5) else render_h5
+      if d.get("features_h5") is not None or diffusion_enabled(cfg):
+        raise SystemExit("data.render_h5 replaces data.features_h5 (and is not for diffusion mode): set only one")
+      if d.input != "image":
+        raise SystemExit("data.render_h5 needs data.input=image (there are no cached features)")
+      features_h5 = None
+    elif not diffusion_enabled(cfg):
+      if d.get("features_h5") is None:
+        raise SystemExit("set data.features_h5 (cached features / a listing of source views) or data.render_h5 (the render shards)")
       features_h5 = d.features_h5
     else:
       # diffusion mode: the volumes are the fitted grids (one per source view), listed in a features-less listing file
       if d.input != "image":
         raise SystemExit("diffusion mode needs data.input=image")
-      if d.item is not None:
-        log.warning("data.item=%s: the diffusion run trains on that one listed grid only (data.item=null: all of them)", d.item)
       if d.depth_size not in (None, d.image_size):
         raise SystemExit("diffusion mode needs data.depth_size=null (or the grids' own size): the grids are at the depth peel's own resolution")
       grid_index, grids_source = gs_diffusion.build_grid_index(cfg.diffusion.grids_dir, cfg.diffusion.get("source_h5"))
       gs_diffusion.check_grids(grid_index, int(d.image_size), int(cfg.model.patch_size), int(d.num_layers))
       os.makedirs(cfg.output_dir, exist_ok=True)   # the module makes it too, but later
       features_h5 = gs_diffusion.make_listing(grid_index, grids_source, os.path.join(cfg.output_dir, "listing.h5"))
-    with h5py.File(features_h5, "r") as f:
-      source_h5 = str(f.attrs.get("source_h5", f.attrs["input"]))
-      volume_views, volume_meshes = f["view_indices"][:], f["mesh_index"][:]
+    if features_h5 is not None:
+      with h5py.File(features_h5, "r") as f:
+        source_h5 = str(f.attrs.get("source_h5", f.attrs["input"]))
+        volume_views, volume_meshes = f["view_indices"][:], f["mesh_index"][:]
+    else:
+      source_h5 = render_h5
     catalog = render_catalog(source_h5)
     if grid_index is not None:
       # the splits and the supervision views of the validation sets are over the views that have a grid
       views_with_grid = set(grid_index)
       catalog = catalog.take([pos for pos, v in enumerate(catalog.df["view_idx"].to_list()) if v in views_with_grid])
-    rows = np.arange(len(volume_views)) if d.item is None else np.array(
-      [d.item] if isinstance(d.item, int) else list(d.item))
     kwargs = dict(
       num_layers=d.num_layers, num_views=d.num_views,
       allow_source_as_target=d.allow_source_as_target, depth_size=d.depth_size,
@@ -408,15 +420,20 @@ class GSDataModule(pl.LightningDataModule):
     # a volume goes where its SOURCE view is, and samples its supervision views from the half's views
     train_meshes, val_meshes = hydra.utils.instantiate(d.mesh_split)(catalog, seed=cfg.seed)
     train_views, val_views = hydra.utils.instantiate(d.view_split)(train_meshes, seed=cfg.seed)
-    volume_keys = list(zip(volume_meshes[rows].tolist(), volume_views[rows].tolist()))
+    if features_h5 is not None:
+      rows = np.arange(len(volume_views))
+      volume_keys = list(zip(volume_meshes[rows].tolist(), volume_views[rows].tolist()))
 
-    def rows_in(half):
-      keys = set(zip(half.df["mesh_id"].to_list(), half.df["view_idx"].to_list()))
-      return [r for r, k in zip(rows, volume_keys) if k in keys]
+      def rows_in(half):
+        keys = set(zip(half.df["mesh_id"].to_list(), half.df["view_idx"].to_list()))
+        return [r for r, k in zip(rows, volume_keys) if k in keys]
+    else:
+      def rows_in(half):   # render shards: the volumes of a half are its views (a catalog), not rows of a features file
+        return half
 
     train_rows = rows_in(train_views)
-    if not train_rows:
-      raise SystemExit("no training volumes: check data.item / data.mesh_split / data.view_split")
+    if not len(train_rows):
+      raise SystemExit("no training volumes: check data.mesh_split / data.view_split")
     # val_meshes:       every view of the held-out meshes (source and targets)
     # val_views_strain: train meshes, sources = train views (as many per mesh as it has val views),
     #                   targets = val views
@@ -427,9 +444,13 @@ class GSDataModule(pl.LightningDataModule):
     if len(val_views):
       sets["val_views_strain"] = (val_views, rows_in(sample_matching_sources(train_views, val_views, seed=cfg.seed)))
       sets["val_views_sval"] = (val_views, rows_in(val_views))
-    self.train_ds = WTFeatureDataset(features_h5, train_views, rows=train_rows, **kwargs)
-    self.val_datasets = {
-      name: WTFeatureDataset(features_h5, v, rows=r, **kwargs) for name, (v, r) in sets.items() if len(r)}
+    def make(views, r):
+      if features_h5 is not None:
+        return WTFeatureDataset(features_h5, views, rows=r, **kwargs)
+      return WTFeatureDataset(None, views, volumes=r, **kwargs)
+
+    self.train_ds = make(train_views, train_rows)
+    self.val_datasets = {name: make(v, r) for name, (v, r) in sets.items() if len(r)}
     if grid_index is not None:
       self.train_ds = gs_diffusion.GridTargetDataset(self.train_ds, grid_index)
       self.val_datasets = {n: gs_diffusion.GridTargetDataset(ds, grid_index) for n, ds in self.val_datasets.items()}

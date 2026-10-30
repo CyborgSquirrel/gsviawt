@@ -941,6 +941,11 @@ class WTFeatureDataset(Dataset):
   `rows`: which volumes (row indices of the features h5) the dataset holds;
   None = all of them. len(dataset) == the number of volumes.
 
+  `volumes` (instead of `features_h5`, which is then None): an H5Catalog over render h5 files
+  (render_catalog; any number of shards) whose rows are the volumes, each a source view -- no features are
+  read, so `read_features` must be False (input: image). A volume's supervision views come from the views of
+  its own mesh in its own shard, so a mesh_id that repeats in another shard is a different mesh.
+
   `image_size`: if set, items carry the source view's RGB image (`image`, (3, S, S) in [0, 1]), instead
   of its cached `features` if `read_features` is false (a trainable encoder, gs_backbone.py), else next to
   them (model.rgb_patch).
@@ -957,23 +962,28 @@ class WTFeatureDataset(Dataset):
   """
 
   def __init__(self, features_h5, views, rows=None, num_layers=6, num_views=1,
-               allow_source_as_target=False, depth_size=None, image_size=None, read_features=True):
-    with h5py.File(features_h5, "r") as f:
-      if "mesh_index" not in f:
-        raise ValueError(f"{features_h5!r} has no per-row `mesh_index`; re-run wt_features.py")
-      self.source_h5 = str(f.attrs.get("source_h5", f.attrs["input"]))
-      self.bits = bool(f["features"].attrs.get("stored_as_uint16_bits", False))
-    # one row per volume: its own row in the features file, its source view (`view_idx`, a row of the render
-    # h5; this catalog's row() is not used) and its mesh
-    volumes = H5Catalog(features_h5, ["features"], lambda c: pl.DataFrame({
-      "path": c.path(), "row": c.index(),
-      "view_idx": c.dataset("view_indices"), "mesh_id": c.dataset("mesh_index")}))
-    if rows is not None:
-      rows = [int(r) for r in rows]
-      bad = [r for r in rows if not 0 <= r < len(volumes)]
-      if bad:
-        raise IndexError(f"rows {bad} out of range for {features_h5!r} ({len(volumes)} volumes)")
-      volumes = volumes.take(rows)
+               allow_source_as_target=False, depth_size=None, image_size=None, read_features=True, volumes=None):
+    if features_h5 is not None:
+      with h5py.File(features_h5, "r") as f:
+        if "mesh_index" not in f:
+          raise ValueError(f"{features_h5!r} has no per-row `mesh_index`; re-run wt_features.py")
+        self.source_h5 = str(f.attrs.get("source_h5", f.attrs["input"]))
+        self.bits = bool(f["features"].attrs.get("stored_as_uint16_bits", False))
+      # one row per volume: its own row in the features file, its source view (`view_idx`, a row of the render
+      # h5; this catalog's row() is not used) and its mesh
+      volumes = H5Catalog(features_h5, ["features"], lambda c: pl.DataFrame({
+        "path": c.path(), "row": c.index(),
+        "view_idx": c.dataset("view_indices"), "mesh_id": c.dataset("mesh_index")}))
+      if rows is not None:
+        rows = [int(r) for r in rows]
+        bad = [r for r in rows if not 0 <= r < len(volumes)]
+        if bad:
+          raise IndexError(f"rows {bad} out of range for {features_h5!r} ({len(volumes)} volumes)")
+        volumes = volumes.take(rows)
+    else:
+      if volumes is None or rows is not None or read_features:
+        raise ValueError("WTFeatureDataset without features_h5 needs `volumes` (a render catalog), no `rows`, and read_features=False")
+      self.source_h5, self.bits = None, False
     self.features_h5 = features_h5
     self.volumes = volumes
     self.num_layers = num_layers
@@ -983,29 +993,34 @@ class WTFeatureDataset(Dataset):
     self.image_size = image_size
     self.read_features = read_features
 
-    groups = (
-      views.df.filter(pl.col("path") == self.source_h5)
-      .group_by("mesh_id", maintain_order=True).agg(pl.col("view_idx"))
-    )
-    self.pool = {row["mesh_id"]: row["view_idx"] for row in groups.iter_rows(named=True)}
-    self.pool_sets = {mesh_id: set(vs) for mesh_id, vs in self.pool.items()}
-    missing = sorted(set(volumes.df["mesh_id"].unique().to_list()) - set(self.pool))
+    # the views a volume's supervision views are drawn from, per (render file, mesh): mesh ids are only unique in their own file
+    vdf = views.df if self.source_h5 is None else views.df.filter(pl.col("path") == self.source_h5)
+    groups = vdf.group_by(["path", "mesh_id"], maintain_order=True).agg(pl.col("view_idx"))
+    self.pool = {(row["path"], row["mesh_id"]): row["view_idx"] for row in groups.iter_rows(named=True)}
+    self.pool_sets = {key: set(vs) for key, vs in self.pool.items()}
+    missing = sorted({self.pool_key(row) for row in volumes.df.iter_rows(named=True)} - set(self.pool))
     if missing:
       raise ValueError(
-        f"meshes {missing} have feature volumes but no views in `views` "
-        f"(source h5 {self.source_h5!r})")
+        f"(render file, mesh) {missing[:5]} have volumes but no views in `views`")
 
     log.info(
       "WTFeatureDataset: %d volumes of %s over %d meshes, %d views to sample from, %d sampled per item",
-      len(self), features_h5, len(self.pool), sum(len(v) for v in self.pool.values()), num_views,
+      len(self), features_h5 or f"{len(set(volumes.df['path'].to_list()))} render file(s)", len(self.pool),
+      sum(len(v) for v in self.pool.values()), num_views,
     )
+
+  def pool_key(self, vol):
+    """(render file, mesh_id) of a volume row: the key of its supervision-view pool (pool, pool_sets)."""
+    return (self.source_h5 if self.source_h5 is not None else vol["path"], vol["mesh_id"])
 
   def __len__(self):
     return len(self.volumes)
 
   def __getitem__(self, idx):
     vol = self.volumes[idx]
-    pool = self.pool[vol["mesh_id"]]
+    key = self.pool_key(vol)
+    render_h5 = key[0]
+    pool = self.pool[key]
     source_view = vol["view_idx"]
     if self.allow_source_as_target:
       k = min(self.num_views, len(pool))
@@ -1015,7 +1030,7 @@ class WTFeatureDataset(Dataset):
       # instead of filtering it out of the whole pool every call (same trick
       # as GSPairDataset). k+1 never exceeds len(pool): k is capped at the
       # number of non-source views.
-      in_pool = source_view in self.pool_sets[vol["mesh_id"]]
+      in_pool = source_view in self.pool_sets[key]
       k = min(self.num_views, len(pool) - in_pool)
       if k <= 0:
         targets = []
@@ -1023,7 +1038,7 @@ class WTFeatureDataset(Dataset):
         sampled = random.sample(pool, min(k + 1, len(pool)))
         targets = [v for v in sampled if v != source_view][:k]
     out = _build_item(
-      _get_h5(self.source_h5), self.source_h5, source_view, targets, self.num_layers, vol["mesh_id"],
+      _get_h5(render_h5), render_h5, source_view, targets, self.num_layers, vol["mesh_id"],
       depth_size=self.depth_size)
 
     if self.image_size is not None:
@@ -1033,7 +1048,7 @@ class WTFeatureDataset(Dataset):
       from wt_infer_layers import rgba_from_render
 
       rgb, _, _ = preprocess_rgba_for_model(
-        rgba_from_render(_get_h5(self.source_h5), source_view), image_size=self.image_size,
+        rgba_from_render(_get_h5(render_h5), source_view), image_size=self.image_size,
         num_layers=1, center_crop=False, bg_color=(0, 0, 0))
       out["image"] = rgb[0]   # (3, S, S) in [0, 1]
       if not self.read_features:
