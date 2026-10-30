@@ -30,6 +30,12 @@ depth_height: ${height}
 
 max_peel_layers: 6
 
+# Also write `depth_peel_rgb` (N x Hd x Wd x max_peel_layers x 3 uint8): the unlit sRGB base colour
+# (Cycles Diffuse Color pass, Principled metallic / transmission / alpha forced to 0 / 0 / 1) of
+# the surface at each depth_peel hit, 0 where depth_peel is NaN. Costs one extra Cycles render
+# per found layer.
+depth_peel_rgb: false
+
 # Depth-only re-render: path to an existing render_objaverse h5. When set,
 # the view/mesh strategies and scene settings above are ignored -- meshes,
 # camera poses, lens, normalize_object, depth_scale and peel layer count all

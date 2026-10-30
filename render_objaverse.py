@@ -240,6 +240,51 @@ def build_depth_peel_material():
   return mat, tex, eps
 
 
+def build_gated_material(src_mat, prev_img, eps_value):
+  """A copy of `src_mat` (None = Blender's default grey) whose surface is transparent wherever
+  View Z <= prev depth + eps and the original shader elsewhere: build_depth_peel_material's gate,
+  but around the real material. Principled metallic / transmission / alpha are forced to 0 / 0 /
+  1 so the Diffuse Color pass is the plain base colour."""
+  mat = bpy.data.materials.new("DepthPeelColorMaterial") if src_mat is None else src_mat.copy()
+  mat.use_nodes = True
+  nt = mat.node_tree
+  L = nt.links
+  cam = nt.nodes.new("ShaderNodeCameraData")
+  tc = nt.nodes.new("ShaderNodeTexCoord")
+  tex = nt.nodes.new("ShaderNodeTexImage")
+  tex.interpolation = "Closest"
+  tex.extension = "EXTEND"
+  tex.image = prev_img
+  eps = nt.nodes.new("ShaderNodeMath")
+  eps.operation = "ADD"
+  eps.inputs[1].default_value = eps_value
+  gt = nt.nodes.new("ShaderNodeMath")
+  gt.operation = "GREATER_THAN"
+  L.new(tc.outputs["Window"], tex.inputs["Vector"])
+  L.new(tex.outputs["Color"], eps.inputs[0])
+  L.new(cam.outputs["View Z Depth"], gt.inputs[0])
+  L.new(eps.outputs[0], gt.inputs[1])
+  for node in list(nt.nodes):
+    if node.type == "BSDF_PRINCIPLED":
+      for name, value in (("Metallic", 0.0), ("Transmission Weight", 0.0), ("Alpha", 1.0)):
+        for link in list(node.inputs[name].links):
+          L.remove(link)
+        node.inputs[name].default_value = value
+  for out in [n for n in nt.nodes if n.type == "OUTPUT_MATERIAL"]:
+    surf = out.inputs["Surface"]
+    if surf.links:
+      orig = surf.links[0].from_socket
+    else:
+      orig = nt.nodes.new("ShaderNodeBsdfDiffuse").outputs["BSDF"]
+    transp = nt.nodes.new("ShaderNodeBsdfTransparent")
+    mix = nt.nodes.new("ShaderNodeMixShader")
+    L.new(gt.outputs[0], mix.inputs[0])
+    L.new(transp.outputs["BSDF"], mix.inputs[1])
+    L.new(orig, mix.inputs[2])
+    L.new(mix.outputs["Shader"], surf)
+  return mat
+
+
 def setup_depth_compositor(scene, view_layer):
   view_layer.use_pass_z = True
   scene.use_nodes = True
@@ -271,8 +316,67 @@ def _read_exr_channel0(path, w, h):
     bpy.data.images.remove(img)
 
 
+def _read_exr_rgb(path, w, h):
+  img = bpy.data.images.load(path, check_existing=False)
+  try:
+    px = np.empty(w * h * 4, np.float32)
+    img.pixels.foreach_get(px)
+    return px.reshape(h, w, 4)[:, :, :3]
+  finally:
+    bpy.data.images.remove(img)
+
+
+def _linear_to_srgb8(lin):
+  lin = np.clip(lin, 0.0, 1.0)
+  srgb = np.where(lin <= 0.0031308, lin * 12.92, 1.055 * np.power(lin, 1 / 2.4) - 0.055)
+  return np.clip(srgb * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+
+def _peel_colors(saved_slots, prev_img, rl, comp, vol, found, scratch_dir, eps_value):
+  """Second sweep over the layers found in `vol` (called from depth_peel, with its Cycles / EXR
+  settings in place; `saved_slots` are the slots' original materials): each mesh slot is swapped for a gated copy of its original material and
+  the Diffuse Color pass is rendered with the same previous-depth feedback as the depth sweep,
+  so layer k shows the same surface as vol[..., k]."""
+  scene = bpy.context.scene
+  view_layer = bpy.context.view_layer
+  ims = scene.render.image_settings
+  height, width = vol.shape[:2]
+  saved_pass, saved_mode = view_layer.use_pass_diffuse_color, ims.color_mode
+  view_layer.use_pass_diffuse_color = True
+  ims.color_mode = "RGB"
+  scene.node_tree.links.new(rl.outputs["DiffCol"], comp.inputs["Image"])
+  gated = {}
+  rgb = np.zeros((height, width, vol.shape[2], 3), np.uint8)
+  try:
+    for obj, orig_mats, _ in saved_slots:
+      for i, orig in enumerate(orig_mats):
+        if orig not in gated:
+          gated[orig] = build_gated_material(orig, prev_img, eps_value)
+        obj.data.materials[i] = gated[orig]
+    prev = np.full((height, width), -1e6, np.float32)
+    for k in range(found):
+      _write_depth_image(prev_img, prev)
+      p = os.path.join(scratch_dir, f"_peel_rgb_{k}.exr")
+      scene.render.filepath = p
+      bpy.ops.render.render(write_still=True)
+      c = _read_exr_rgb(p, width, height)
+      os.remove(p)
+      hit = np.isfinite(vol[:, :, k])
+      rgb[:, :, k] = np.where(hit[..., None], _linear_to_srgb8(c), 0)
+      prev = np.where(hit, vol[:, :, k], prev)
+  finally:
+    view_layer.use_pass_diffuse_color = saved_pass
+    ims.color_mode = saved_mode
+    for mat in gated.values():
+      bpy.data.materials.remove(mat)
+  return rgb
+
+
 def depth_peel(mesh_objs, peel_mat, peel_tex, peel_eps, rl, comp,
-               width, height, max_layers, scratch_dir):
+               width, height, max_layers, scratch_dir, with_rgb=False):
+  """Returns (depth (H, W, max_layers) float32, NaN = no hit; layers found; rgb). With `with_rgb`,
+  rgb is (H, W, max_layers, 3) uint8: the sRGB base colour (Diffuse Color pass, no lighting) of
+  the surface at each depth hit, 0 where depth is NaN; else None."""
   scene = bpy.context.scene
   cyc = scene.cycles
   ims = scene.render.image_settings
@@ -313,6 +417,7 @@ def depth_peel(mesh_objs, peel_mat, peel_tex, peel_eps, rl, comp,
   prev = np.full((height, width), -1e6, np.float32)  # fed back to the peel shader; not the output
   vol = np.full((height, width, max_layers), np.nan, np.float32)  # NaN = no hit at this layer
   found = 0
+  rgb = None
   prev_img = bpy.data.images.new("DepthPeelPrev", width=width, height=height, float_buffer=True)
   peel_tex.image = prev_img
   try:
@@ -329,6 +434,9 @@ def depth_peel(mesh_objs, peel_mat, peel_tex, peel_eps, rl, comp,
       vol[:, :, k] = np.where(hit, d, np.nan)
       found = k + 1
       prev = np.where(hit, d, prev)
+    if with_rgb:
+      rgb = _peel_colors(saved_slots, prev_img, rl, comp, vol, found, scratch_dir,
+                         peel_eps.inputs[1].default_value)
   finally:
     for obj, saved, added in saved_slots:
       mats = obj.data.materials
@@ -346,7 +454,7 @@ def depth_peel(mesh_objs, peel_mat, peel_tex, peel_eps, rl, comp,
     peel_tex.image = None
     bpy.data.images.remove(prev_img)
 
-  return np.flip(vol, axis=0), found
+  return np.flip(vol, axis=0), found, None if rgb is None else np.flip(rgb, axis=0)
 
 
 # ---------------------------------------------------------------------------
@@ -516,6 +624,8 @@ def run(cfg):
     if cfg.render:
       writer.init("image_intrinsics")  # matches images
     writer.init("depth_peel", dataset_kwargs=depth_kw)
+    if cfg.depth_peel_rgb:
+      writer.init("depth_peel_rgb", dataset_kwargs=depth_kw)  # pixel- and layer-aligned with depth_peel
     writer.init("mesh_index", chunks=size_chunks)
     writer.init("depth_scale")
 
@@ -629,8 +739,9 @@ def _render_mesh(cfg, scene, mi, mesh_path, views, W, H, DW, DH, Lmax, tmp, writ
       with timed(f"{label} rgb ({scene.render.engine})"):
         rgba = render_rgba(os.path.join(tmp, "rgb.png"), W, H)
     with timed(f"{label} depth peel"):
-      depth_vol, _ = depth_peel(mesh_objs, peel_mat, peel_tex, peel_eps,
-                                rl, comp, DW, DH, Lmax, tmp)
+      depth_vol, _, peel_rgb = depth_peel(mesh_objs, peel_mat, peel_tex, peel_eps,
+                                          rl, comp, DW, DH, Lmax, tmp,
+                                          with_rgb="depth_peel_rgb" in writer.datasets)
 
     pose = np.array(cam.matrix_world, np.float32)
     depth_intr = camera_intrinsics(cam.data, DW, DH)  # matches depth_vol
@@ -651,6 +762,8 @@ def _render_mesh(cfg, scene, mi, mesh_path, views, W, H, DW, DH, Lmax, tmp, writ
     writer.append("camera_pose", pose)
     writer.append("depth_intrinsics", depth_intr)
     writer.append("depth_peel", depth_vol.astype(np.float32))
+    if peel_rgb is not None:
+      writer.append("depth_peel_rgb", peel_rgb)
     writer.append("mesh_index", np.int64(mi))
     writer.append("depth_scale", np.float32(depth_scale))
 
