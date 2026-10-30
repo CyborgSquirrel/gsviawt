@@ -624,7 +624,7 @@ class Fit3DGSLightningModule(pl.LightningModule):
     self.active_sh_degree = 0
     self.views_seen = 0
     self.pixels_seen = 0  # total pixels of the train-view targets supervised on so far (B * H * W per step)
-    self.final_loss = float("nan")
+    self._last_loss = None  # the last train step's loss, kept on the GPU (see final_loss)
     self.step_count = 0
     self.gaussian_layout = str(cfg.gaussian_layout)
 
@@ -706,6 +706,10 @@ class Fit3DGSLightningModule(pl.LightningModule):
       }
       for k, cams in preview_cams.items() if cams
     }
+
+  @property
+  def final_loss(self):
+    return float("nan") if self._last_loss is None else float(self._last_loss)
 
   def _active_means(self):
     """The actual world-space Gaussian positions -- self.params["means"]
@@ -894,7 +898,7 @@ class Fit3DGSLightningModule(pl.LightningModule):
 
       self.views_seen += B
       self.pixels_seen += B * H * W
-      self.final_loss = loss.item()
+      self._last_loss = loss.detach()  # not .item(): a host sync every step
       if iteration % int(self.cfg.densify.interval) == 0:
         log.info("iter %d: loss=%.5f  %d Gaussians", iteration, loss.item(), len(self.params["means"]))
 
