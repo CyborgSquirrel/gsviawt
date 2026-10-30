@@ -37,6 +37,14 @@ max_peel_layers: 6
 # view than depth only); depth_peel itself is the same with or without it.
 depth_peel_rgb: false
 
+# Also write `depth_peel_normals` (N x Hd x Wd x max_peel_layers x 3 float16): the unit surface
+# normal at each depth_peel hit, NaN where depth_peel is NaN. World space (Blender axes, Z up; the
+# frame camera_pose maps into), flipped to face the camera (dot(n, ray) < 0, also for the
+# back faces deeper layers hit). It's the smooth/custom-split shading normal of the mesh (flat
+# face normal for flat-shaded faces), never a material's normal map / bump: an AOV the peel
+# materials write in the depth renders themselves, so no extra renders -- one more EXR read per layer.
+depth_peel_normals: false
+
 # Depth-only re-render: path to an existing render_objaverse h5. When set,
 # the view/mesh strategies and scene settings above are ignored -- meshes,
 # camera poses, lens, normalize_object, depth_scale and peel layer count all

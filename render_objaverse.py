@@ -209,6 +209,27 @@ def camera_intrinsics(cam_data, w, h):
 # depth peeling
 # ---------------------------------------------------------------------------
 
+# view-layer AOV the peel materials write the hit's shading normal to (depth_peel with_normals)
+PEEL_NORMAL_AOV = "peel_normal"
+
+
+def _add_normal_aov(nt, gate):
+  """Adds to node tree `nt` an AOV Output writing Geometry Normal * `gate` (the peel's 0 / 1 opaque
+  socket) to PEEL_NORMAL_AOV. Geometry Normal is the interpolated shading normal; normal map / bump
+  nodes only feed closure Normal inputs and never change it (a Displacement output would, which
+  _make_opaque unlinks). Cycles writes AOVs at every camera-path hit until it writes the data
+  passes, adding them up, so the gate keeps the peeled-off transparent hits out: the AOV is the
+  normal at the same hit as the Z pass. Writes nothing unless the view layer has the AOV."""
+  geo = nt.nodes.new("ShaderNodeNewGeometry")
+  scale = nt.nodes.new("ShaderNodeVectorMath")
+  scale.operation = "SCALE"
+  aov = nt.nodes.new("ShaderNodeOutputAOV")
+  aov.aov_name = PEEL_NORMAL_AOV
+  nt.links.new(geo.outputs["Normal"], scale.inputs[0])
+  nt.links.new(gate, scale.inputs["Scale"])
+  nt.links.new(scale.outputs["Vector"], aov.inputs["Color"])
+
+
 def build_depth_peel_material():
   mat = bpy.data.materials.new("DepthPeelMaterial")
   mat.use_nodes = True
@@ -237,6 +258,7 @@ def build_depth_peel_material():
   L.new(transp.outputs["BSDF"], mix.inputs[1])
   L.new(diff.outputs["BSDF"], mix.inputs[2])
   L.new(mix.outputs["Shader"], out.inputs["Surface"])
+  _add_normal_aov(nt, gt.outputs[0])
   return mat, tex, eps
 
 
@@ -277,7 +299,7 @@ def build_gated_material(src_mat, eps_value, groups):
   """A copy of `src_mat` (None = Blender's default grey) whose surface is transparent wherever
   View Z <= prev depth + eps and the original shader (made opaque by _make_opaque, which appends
   its node-group copies to `groups`) elsewhere: build_depth_peel_material's gate, but around the
-  real material. Returns (material, previous-depth image texture node)."""
+  real material, and the same normal AOV. Returns (material, previous-depth image texture node)."""
   mat = bpy.data.materials.new("DepthPeelColorMaterial") if src_mat is None else src_mat.copy()
   mat.use_nodes = True
   nt = mat.node_tree
@@ -297,6 +319,7 @@ def build_gated_material(src_mat, eps_value, groups):
   L.new(cam.outputs["View Z Depth"], gt.inputs[0])
   L.new(eps.outputs[0], gt.inputs[1])
   _make_opaque(nt, groups)
+  _add_normal_aov(nt, gt.outputs[0])
   for out in [n for n in nt.nodes if n.type == "OUTPUT_MATERIAL"]:
     surf = out.inputs["Surface"]
     if surf.links:
@@ -365,14 +388,42 @@ def _linear_to_srgb8(lin):
   return np.clip(srgb * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
 
+def _camera_rays_world(cam_obj, width, height):
+  """(H, W, 3) world-space direction of the camera ray through each pixel centre, bottom row
+  first (the row order of a render read back via image.pixels)."""
+  cam_data = cam_obj.data
+  K = camera_intrinsics(cam_data, width, height)
+  u = np.arange(width, dtype=np.float32) + 0.5
+  v = height - (np.arange(height, dtype=np.float32) + 0.5)  # row 0 = bottom
+  x = (u[None, :] - K[0, 2]) / K[0, 0]
+  y = (v[:, None] - K[1, 2]) / K[1, 1]
+  local = np.stack(np.broadcast_arrays(x, -y, np.full_like(x, -1.0)), axis=-1)  # Blender: -Z fwd
+  R = np.array(cam_obj.matrix_world, np.float32)[:3, :3]
+  return local @ R.T
+
+
+def _peel_file_output(scene, socket, scratch_dir, prefix):
+  """A 32-bit RGB EXR File Output node writing `socket`; returns (node, path it writes to)."""
+  out = scene.node_tree.nodes.new("CompositorNodeOutputFile")
+  out.base_path = scratch_dir
+  out.format.file_format, out.format.color_depth = "OPEN_EXR", "32"
+  out.format.color_mode = "RGB"
+  out.file_slots[0].path = prefix
+  scene.node_tree.links.new(socket, out.inputs[0])
+  return out, os.path.join(scratch_dir, f"{prefix}{scene.frame_current:04d}.exr")
+
+
 def depth_peel(mesh_objs, peel_mat, peel_tex, peel_eps, rl, comp,
-               width, height, max_layers, scratch_dir, with_rgb=False):
-  """Returns (depth (H, W, max_layers) float32, NaN = no hit; layers found; rgb). With `with_rgb`,
-  rgb is (H, W, max_layers, 3) uint8: the sRGB base colour (Diffuse Color pass, no lighting) of
-  the surface at each depth hit, 0 where depth is NaN; else None. The colour comes from the same
-  renders as the depth: the sweep then runs on gated copies of the original materials
-  (build_gated_material) instead of `peel_mat`, the Diffuse Color pass going to a File Output
-  node next to the depth EXR."""
+               width, height, max_layers, scratch_dir, with_rgb=False, with_normals=False):
+  """Returns (depth (H, W, max_layers) float32, NaN = no hit; layers found; rgb; normals). With
+  `with_rgb`, rgb is (H, W, max_layers, 3) uint8: the sRGB base colour (Diffuse Color pass, no
+  lighting) of the surface at each depth hit, 0 where depth is NaN; else None. The colour comes
+  from the same renders as the depth: the sweep then runs on gated copies of the original
+  materials (build_gated_material) instead of `peel_mat`, the Diffuse Color pass going to a File
+  Output node next to the depth EXR. With `with_normals`, normals is (H, W, max_layers, 3)
+  float32: the world-space unit shading normal at each depth hit (the PEEL_NORMAL_AOV both peel
+  materials write, likewise from the same renders; never a material's normal map) flipped to face
+  the camera, NaN where depth is NaN; else None."""
   scene = bpy.context.scene
   view_layer = bpy.context.view_layer
   cyc = scene.cycles
@@ -418,12 +469,12 @@ def depth_peel(mesh_objs, peel_mat, peel_tex, peel_eps, rl, comp,
   prev = np.full((height, width), -1e6, np.float32)  # fed back to the peel shader; not the output
   vol = np.full((height, width, max_layers), np.nan, np.float32)  # NaN = no hit at this layer
   found = 0
-  rgb = None
+  rgb = normals = None
   prev_imgs = []
   gated = {}  # original material -> (gated copy, its previous-depth texture node)
   groups = []  # node-group copies the gated materials use
   saved_pass = view_layer.use_pass_diffuse_color
-  col_out = None
+  col_out = normal_out = aov = None
   try:
     texs = [peel_tex]
     if with_rgb:
@@ -434,14 +485,15 @@ def depth_peel(mesh_objs, peel_mat, peel_tex, peel_eps, rl, comp,
           obj.data.materials[i] = gated[orig][0]
       texs = [tex for _, tex in gated.values()]
       view_layer.use_pass_diffuse_color = True
-      col_out = scene.node_tree.nodes.new("CompositorNodeOutputFile")
-      col_out.base_path = scratch_dir
-      col_out.format.file_format, col_out.format.color_depth = "OPEN_EXR", "32"
-      col_out.format.color_mode = "RGB"
-      col_out.file_slots[0].path = "_peel_rgb_"
-      scene.node_tree.links.new(rl.outputs["DiffCol"], col_out.inputs[0])
-      col_path = os.path.join(scratch_dir, f"_peel_rgb_{scene.frame_current:04d}.exr")
+      col_out, col_path = _peel_file_output(scene, rl.outputs["DiffCol"], scratch_dir, "_peel_rgb_")
       rgb = np.zeros((height, width, max_layers, 3), np.uint8)
+    if with_normals:
+      aov = view_layer.aovs.add()
+      aov.name, aov.type = PEEL_NORMAL_AOV, "COLOR"
+      normal_out, normal_path = _peel_file_output(
+        scene, rl.outputs[PEEL_NORMAL_AOV], scratch_dir, "_peel_normal_")
+      normals = np.full((height, width, max_layers, 3), np.nan, np.float32)
+      rays = _camera_rays_world(scene.camera, width, height)
     for k in range(max_layers):
       img = _prev_depth_image(prev, prev_imgs)
       for tex in texs:
@@ -455,11 +507,19 @@ def depth_peel(mesh_objs, peel_mat, peel_tex, peel_eps, rl, comp,
       if with_rgb:
         c = _read_exr_rgb(col_path, width, height)
         os.remove(col_path)
+      if with_normals:
+        n = _read_exr_rgb(normal_path, width, height)
+        os.remove(normal_path)
       if not hit.any():
         break
       vol[:, :, k] = np.where(hit, d, np.nan)
       if with_rgb:
         rgb[:, :, k] = np.where(hit[..., None], _linear_to_srgb8(c), 0)
+      if with_normals:
+        with np.errstate(invalid="ignore", divide="ignore"):  # no-hit pixels are 0 -> NaN
+          n = n / np.linalg.norm(n, axis=-1, keepdims=True)
+        n = np.where(np.sum(n * rays, axis=-1, keepdims=True) > 0, -n, n)
+        normals[:, :, k] = np.where(hit[..., None], n, np.nan)
       found = k + 1
       prev = np.where(hit, d, prev)
   finally:
@@ -478,8 +538,11 @@ def depth_peel(mesh_objs, peel_mat, peel_tex, peel_eps, rl, comp,
     scene.render.resolution_x, scene.render.resolution_y = saved_res
     peel_tex.image = None
     view_layer.use_pass_diffuse_color = saved_pass
-    if col_out is not None:
-      scene.node_tree.nodes.remove(col_out)
+    for node in (col_out, normal_out):
+      if node is not None:
+        scene.node_tree.nodes.remove(node)
+    if aov is not None:
+      view_layer.aovs.remove(aov)
     # switching persistent data off frees the session, so the images (whose addresses a later
     # sweep's images may reuse) can't outlive it in Cycles' image cache
     scene.render.use_persistent_data = saved_persistent
@@ -490,7 +553,8 @@ def depth_peel(mesh_objs, peel_mat, peel_tex, peel_eps, rl, comp,
     for group in groups:
       bpy.data.node_groups.remove(group)
 
-  return np.flip(vol, axis=0), found, None if rgb is None else np.flip(rgb, axis=0)
+  flip = lambda a: None if a is None else np.flip(a, axis=0)
+  return flip(vol), found, flip(rgb), flip(normals)
 
 
 # ---------------------------------------------------------------------------
@@ -590,7 +654,7 @@ def run(cfg):
         {k: cfg[k] for k in ("depth_width", "depth_height", "device",
                              "output_path", "source_path", "render_engine",
                              "eevee", "eevee_materials", "source_rerender_rgb",
-                             "source_max_meshes", "depth_peel_rgb")})
+                             "source_max_meshes", "depth_peel_rgb", "depth_peel_normals")})
       if cfg.source_max_meshes is not None and not cfg.source_rerender_rgb:
         raise ValueError("source_max_meshes needs source_rerender_rgb=true "
                          "(copied images can't be subset)")
@@ -662,6 +726,8 @@ def run(cfg):
     writer.init("depth_peel", dataset_kwargs=depth_kw)
     if cfg.depth_peel_rgb:
       writer.init("depth_peel_rgb", dataset_kwargs=depth_kw)  # pixel- and layer-aligned with depth_peel
+    if cfg.depth_peel_normals:
+      writer.init("depth_peel_normals", dataset_kwargs=depth_kw)  # likewise
     writer.init("mesh_index", chunks=size_chunks)
     writer.init("depth_scale")
 
@@ -775,9 +841,10 @@ def _render_mesh(cfg, scene, mi, mesh_path, views, W, H, DW, DH, Lmax, tmp, writ
       with timed(f"{label} rgb ({scene.render.engine})"):
         rgba = render_rgba(os.path.join(tmp, "rgb.png"), W, H)
     with timed(f"{label} depth peel"):
-      depth_vol, _, peel_rgb = depth_peel(mesh_objs, peel_mat, peel_tex, peel_eps,
-                                          rl, comp, DW, DH, Lmax, tmp,
-                                          with_rgb="depth_peel_rgb" in writer.datasets)
+      depth_vol, _, peel_rgb, peel_normals = depth_peel(
+        mesh_objs, peel_mat, peel_tex, peel_eps, rl, comp, DW, DH, Lmax, tmp,
+        with_rgb="depth_peel_rgb" in writer.datasets,
+        with_normals="depth_peel_normals" in writer.datasets)
 
     pose = np.array(cam.matrix_world, np.float32)
     depth_intr = camera_intrinsics(cam.data, DW, DH)  # matches depth_vol
@@ -800,6 +867,8 @@ def _render_mesh(cfg, scene, mi, mesh_path, views, W, H, DW, DH, Lmax, tmp, writ
     writer.append("depth_peel", depth_vol.astype(np.float32))
     if peel_rgb is not None:
       writer.append("depth_peel_rgb", peel_rgb)
+    if peel_normals is not None:
+      writer.append("depth_peel_normals", peel_normals.astype(np.float16))
     writer.append("mesh_index", np.int64(mi))
     writer.append("depth_scale", np.float32(depth_scale))
 
