@@ -1,0 +1,20 @@
+# eval_diffusion.py: render-space evaluation of diffusion-mode train_gs.py checkpoints on fixed validation volumes.
+run_config: ???          # the run's resolved config: <hydra run dir>/.hydra/config.yaml
+checkpoints: ???         # list of .ckpt paths of that run; "init" = the freshly initialized model (pipeline test only)
+weights: [raw, ema]      # raw: the trained weights; ema: diffusion.ema's average (from the checkpoint's "ema" entry)
+samples: 4               # K sampler runs per volume (seeds eval_seed + k), rendered: single (k = 0), mean of K renders, best of K
+steps: null              # sampler steps; null: the run's diffusion.steps
+val_sets: null           # list of validation set names; null: all of the run's
+max_volumes: null        # per set; null: all (say so when reporting a subset)
+seed: 0                  # the target views of a volume and the noise are functions of (seed, set, volume)
+grids_dir: null          # overrides for running somewhere else than the run did (null: the run's)
+source_h5: null
+out: ???                 # output directory: volumes.csv (one row per volume x method) and summary.json
+hydra:
+  output_subdir: null
+  run:
+    dir: .
+defaults:
+  - _self_
+  - override hydra/job_logging: none
+  - override hydra/hydra_logging: disabled
