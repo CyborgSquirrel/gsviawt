@@ -335,7 +335,7 @@ def fit_combined(params, anchors_t, cams, cfg, scene_extent, rng, log_step=None)
       o.step()
     photo_log[it - 1], loss_log[it - 1] = photo.detach(), loss.detach()
     if log_step is not None:
-      log_step(it, photo, loss)
+      log_step(it, photo.detach(), loss.detach())
   return photo_log.numpy(), loss_log.numpy()
 
 
@@ -365,7 +365,7 @@ def finetune(flat, cams, cfg, scene_extent, rng, log_step=None):
       o.step()
     photo_log[it - 1], loss_log[it - 1] = photo.detach(), loss.detach()
     if log_step is not None:
-      log_step(it, photo, loss)
+      log_step(it, photo.detach(), loss.detach())
   for k in PARAM_KEYS:
     flat[k] = flat[k].detach()
   return photo_log.numpy(), loss_log.numpy()
