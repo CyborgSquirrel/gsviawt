@@ -383,6 +383,8 @@ class GSDataModule(pl.LightningDataModule):
       if d.input != "image":
         raise SystemExit("diffusion mode needs data.input=image")
       ph = cfg.diffusion.get("photom")
+      if float(cfg.diffusion.get("x0_weight", 1.0)) == 0 and (ph is None or not ph.enabled):
+        raise SystemExit("diffusion.x0_weight=0 without diffusion.photom: nothing would train the model")
       if ph is not None and ph.enabled:
         if "target" in cfg.loss.photom["for"] and int(d.num_views) < 1:
           raise SystemExit("diffusion.photom renders the target views: it needs data.num_views >= 1 (target views per volume)")
@@ -653,6 +655,7 @@ class GSLightningModule(pl.LightningModule):
     B = batch["batch_size"]
     loss, parts, counts, x0_hat, t = self._diffusion_losses(batch)
     x0_loss = loss.detach()
+    loss = float(self.cfg.diffusion.get("x0_weight", 1.0)) * loss   # 0: the x0 loss is only logged (diffusion.photom alone trains)
     if self._photom_active():
       loss = loss + float(self.cfg.diffusion.photom.weight) * self._diffusion_photom("train", batch, x0_hat, t, gated=True)
     value = float(loss.detach())
