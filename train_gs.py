@@ -400,6 +400,7 @@ class GSDataModule(pl.LightningDataModule):
       source_h5 = str(f.attrs.get("source_h5", f.attrs["input"]))
       volume_views, volume_meshes = f["view_indices"][:], f["mesh_index"][:]
     catalog = render_catalog(source_h5)
+    full_catalog = catalog
     if grid_index is not None:
       # the splits and the supervision views of the validation sets are over the views that have a grid
       views_with_grid = set(grid_index)
@@ -436,7 +437,18 @@ class GSDataModule(pl.LightningDataModule):
     if len(val_views):
       sets["val_views_strain"] = (val_views, rows_in(sample_matching_sources(train_views, val_views, seed=cfg.seed)))
       sets["val_views_sval"] = (val_views, rows_in(val_views))
-    self.train_ds = WTFeatureDataset(features_h5, train_views, rows=train_rows, **kwargs)
+    train_pool = train_views
+    if grid_index is not None and cfg.diffusion.get("train_targets", "grid") == "all":
+      # diffusion.train_targets=all: the training volumes' supervision views are ALL renders of their mesh except the held-out
+      # (validation) grid views -- the views without a grid are never a source and never validated
+      held_out = set(zip(val_views.df["mesh_id"].to_list(), val_views.df["view_idx"].to_list()))
+      train_mesh_ids = set(train_views.df["mesh_id"].to_list())
+      train_pool = full_catalog.take([
+        pos for pos, (m, v) in enumerate(zip(full_catalog.df["mesh_id"].to_list(), full_catalog.df["view_idx"].to_list()))
+        if m in train_mesh_ids and (m, v) not in held_out])
+    elif cfg.diffusion.get("train_targets", "grid") not in ("grid", "all"):
+      raise SystemExit(f"diffusion.train_targets must be grid or all, got {cfg.diffusion.train_targets!r}")
+    self.train_ds = WTFeatureDataset(features_h5, train_pool, rows=train_rows, **kwargs)
     self.val_datasets = {
       name: WTFeatureDataset(features_h5, v, rows=r, **kwargs) for name, (v, r) in sets.items() if len(r)}
     if grid_index is not None:
