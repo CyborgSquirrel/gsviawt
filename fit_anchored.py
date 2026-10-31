@@ -139,11 +139,13 @@ def main(cfg: DictConfig) -> None:
 
   # --- combined fit
   combined_path, done_path = os.path.join(state, "combined.npz"), os.path.join(state, "combined.done")
+  # everything else the combined fit depends on (a saved fit is only reused when this matches exactly)
+  combined_setup = {k: OmegaConf.to_container(cfg, resolve=True)[k]
+                    for k in ("levels", "init_opacity", "seed", "combined", "lr", "loss")}
   if os.path.exists(done_path):
     z = np.load(combined_path)
-    _check(combined_path, {"labels_sha1": str(z["labels_sha1"]), "n_anchors": int(z["n_anchors"]), "levels": int(z["levels"]),
-                           "steps": int(z["steps"])},
-           {"labels_sha1": digest, "n_anchors": n_anchor, "levels": int(cfg.levels), "steps": int(cfg.combined.steps)})
+    _check(combined_path, {"labels_sha1": str(z["labels_sha1"]), "n_anchors": int(z["n_anchors"]), **json.loads(str(z["setup"]))},
+           {"labels_sha1": digest, "n_anchors": n_anchor, **combined_setup})
     params = {k: torch.tensor(z[k], device=dev) for k in an.PARAM_KEYS}
     combined_loss = z["loss"]
     log.info("combined fit: %s", combined_path)
@@ -154,8 +156,8 @@ def main(cfg: DictConfig) -> None:
     photo, combined_loss = an.fit_combined(params, anchors_t, cams, cfg, scene_extent, np.random.default_rng(int(cfg.seed)),
                                            _log_step("combined"))
     params = {k: v.detach() for k, v in params.items()}
-    an.save_npz_atomic(combined_path, labels_sha1=digest, n_anchors=n_anchor, levels=int(cfg.levels),
-                       steps=int(cfg.combined.steps), photom=photo, loss=combined_loss,
+    an.save_npz_atomic(combined_path, labels_sha1=digest, n_anchors=n_anchor, setup=json.dumps(combined_setup),
+                       photom=photo, loss=combined_loss,
                        **{k: v.cpu().numpy() for k, v in params.items()})
     with open(done_path, "w") as f:
       f.write(digest + "\n")
