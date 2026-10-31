@@ -409,10 +409,30 @@ def write_view(root, name, params_np, view, meta, config, scene_extent, final_lo
       raise RuntimeError(f"{name}: layer_valid != depth_peel > 0")
   if losses is not None:
     np.savez(os.path.join(tmp, "losses.npz"), **losses)
+  verify_written(tmp)
   final = os.path.join(root, name)
   if os.path.exists(final):   # an older, grid-less dir (view_done was false): replaced
     shutil.rmtree(final)
   os.replace(tmp, final)
+
+
+def verify_written(d):
+  """fsync every file in d (surfaces delayed write errors, e.g. a full disk, that close() did not report) and read
+  every h5 dataset back, so a truncated file is never renamed into place as a finished view."""
+  min_free = 2 << 30
+  if shutil.disk_usage(d).free < min_free:
+    raise RuntimeError(f"{d}: less than {min_free >> 30} GB free on the output disk")
+  for f in sorted(os.listdir(d)):
+    p = os.path.join(d, f)
+    fd = os.open(p, os.O_RDONLY)
+    try:
+      os.fsync(fd)
+    finally:
+      os.close(fd)
+    if f.endswith(".h5"):
+      with h5py.File(p, "r") as h:
+        h.visititems(lambda _, obj: obj[...] if isinstance(obj, h5py.Dataset) else None)
+        dict(h.attrs)
 
 
 def save_npz_atomic(path, **arrays):
