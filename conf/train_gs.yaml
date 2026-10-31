@@ -349,6 +349,8 @@ diffusion:
     plateau: {mu: 0.0, sigma: 1.0, mirror: false}           # layer 0: logit-normal up to its mode t* = 0.5, then flat towards t = 1
   ema:
     decay: 0.9995              # WT's, after a warmup ramp; validations with `ema: true` use these weights
+  x0_weight: 1.0               # weight of the x0 loss in training; 0: only diffusion.photom trains (the x0 loss is still logged,
+                               # train/loss/x0 and the validations' loss/x0)
   spike_skip:
     factor: 4.0                # a loss above factor * its running average is skipped, a non-finite one always (null: off)
     decay: 0.99
