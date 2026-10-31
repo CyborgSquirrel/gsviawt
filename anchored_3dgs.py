@@ -318,7 +318,7 @@ def fit_combined(params, anchors_t, cams, cfg, scene_extent, rng, log_step=None)
   opt = make_adam(params, lrs)
   dssim = DSSIMLoss().to(cams.gt.device)
   views = list(range(len(cams)))
-  photo_log, loss_log = torch.zeros(steps), torch.zeros(steps)
+  photo_log, loss_log = [], []   # detached GPU scalars, copied to the host once at the end (no per-step sync)
   for it in range(1, steps + 1):
     sv = int(rng.choice(views))
     cam = int(rng.choice(views))
@@ -333,10 +333,10 @@ def fit_combined(params, anchors_t, cams, cfg, scene_extent, rng, log_step=None)
     loss.backward()
     for o in opt.values():
       o.step()
-    photo_log[it - 1], loss_log[it - 1] = photo.detach(), loss.detach()
+    photo_log.append(photo.detach()); loss_log.append(loss.detach())
     if log_step is not None:
       log_step(it, photo.detach(), loss.detach())
-  return photo_log.numpy(), loss_log.numpy()
+  return torch.stack(photo_log).cpu().numpy(), torch.stack(loss_log).cpu().numpy()
 
 
 def finetune(flat, cams, cfg, scene_extent, rng, log_step=None):
@@ -350,7 +350,7 @@ def finetune(flat, cams, cfg, scene_extent, rng, log_step=None):
   opt = make_adam(params, lrs)
   dssim = DSSIMLoss().to(cams.gt.device)
   views = list(range(len(cams)))
-  photo_log, loss_log = torch.zeros(steps), torch.zeros(steps)
+  photo_log, loss_log = [], []   # detached GPU scalars, copied to the host once at the end (no per-step sync)
   for it in range(1, steps + 1):
     cam = int(rng.choice(views))
     rgb = cams.render(flat_render_params(flat), cam)
@@ -363,12 +363,12 @@ def finetune(flat, cams, cfg, scene_extent, rng, log_step=None):
     loss.backward()
     for o in opt.values():
       o.step()
-    photo_log[it - 1], loss_log[it - 1] = photo.detach(), loss.detach()
+    photo_log.append(photo.detach()); loss_log.append(loss.detach())
     if log_step is not None:
       log_step(it, photo.detach(), loss.detach())
   for k in PARAM_KEYS:
     flat[k] = flat[k].detach()
-  return photo_log.numpy(), loss_log.numpy()
+  return torch.stack(photo_log).cpu().numpy(), torch.stack(loss_log).cpu().numpy()
 
 
 # ---------------------------------------------------------------------------
@@ -376,9 +376,15 @@ def finetune(flat, cams, cfg, scene_extent, rng, log_step=None):
 # ---------------------------------------------------------------------------
 
 def view_done(root, name):
-  """A view's grid already exists: in the run dir, or collected by finalize_fit_dataset.py into grids/."""
-  return (os.path.exists(os.path.join(root, name, "gaussians.grid.h5"))
-          or os.path.exists(os.path.join(root, "grids", name + ".h5")))
+  """A view's grid already exists: in the run dir, or collected by finalize_fit_dataset.py into grids/. A run-dir fit
+  that is not an anchored one (e.g. a fit_3dgs.py fit in the same root) is an error, not a finished view."""
+  run = os.path.join(root, name)
+  if os.path.exists(os.path.join(run, "gaussians.grid.h5")):
+    with h5py.File(os.path.join(run, "gaussians.h5"), "r") as f:
+      if "anchored" not in json.loads(f.attrs["config_json"]):
+        raise SystemExit(f"{run} holds a fit that is not an anchored one -- use a separate output_dir")
+    return True
+  return os.path.exists(os.path.join(root, "grids", name + ".h5"))
 
 
 def write_view(root, name, params_np, view, meta, config, scene_extent, final_loss, losses=None):
