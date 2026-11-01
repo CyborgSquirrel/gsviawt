@@ -30,7 +30,7 @@ Usage:
     # Resume from an earlier run's checkpoint (model/optimizer/scheduler +
     # epoch/step state; continues into a fresh output_dir):
     docker exec -w /app gsviawt-app-gpu-1 /home/user/venv/bin/python train_gs.py \\
-        ckpt_path=/app/outputs/3dgs-model-2026-09-01_12-00-00/last.ckpt
+        ckpt_path=/app/outputs/3dgs-model-2026-09-01_12-00-00/final.ckpt
 
 gsplat JIT-compiles CUDA kernels on first import; see _setup_cuda_toolchain
 (copied from fit_gsplat.py, which needs the same env setup).
