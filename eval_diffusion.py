@@ -52,6 +52,16 @@ def metrics(pred, gt, dssim):
   return {"l1": l1, "dssim": ds, "psnr": psnr, "loss": l1 + 0.85 * ds}
 
 
+def volume_subset(n, max_volumes, seed, set_name):
+  """The dataset indices of a set to score: all of them, or max_volumes of them drawn at random but reproducibly (a function
+  of seed and the set's name only), so a subset is spread over all of the set's meshes and is the same for every run with
+  the same split. Sorted."""
+  if max_volumes is None or int(max_volumes) >= n:
+    return list(range(n))
+  rng = np.random.default_rng([int(seed), *map(ord, set_name)])
+  return sorted(rng.choice(n, int(max_volumes), replace=False).tolist())
+
+
 def load_checkpoint(module, path):
   ckpt = torch.load(path, map_location="cpu", weights_only=False)
   missing, unexpected = module.load_state_dict(ckpt["state_dict"], strict=False)
@@ -96,8 +106,9 @@ def main(cfg):
       with ctx, torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         for set_name in sets:
           ds = dm.val_datasets[set_name]
-          n = len(ds) if cfg.max_volumes is None else min(len(ds), int(cfg.max_volumes))
-          for i in range(n):
+          idx = volume_subset(len(ds), cfg.max_volumes, cfg.seed, set_name)
+          n = len(idx)
+          for k, i in enumerate(idx):
             random.seed(f"{cfg.seed}/{set_name}/{i}")       # the dataset draws the target views from the global `random`
             item = ds[i]
             batch = collate_with_batch_size([item])
@@ -121,7 +132,7 @@ def main(cfg):
                            "mesh": int(item["mesh_index"]), "source_view": int(item["source_view"]),
                            "target_views": " ".join(map(str, item["target_views"])), "method": method,
                            **{k: float(v.mean()) for k, v in m.items()}})
-            print(f"{os.path.basename(str(ckpt_path))} {weights} {set_name} {i + 1}/{n}:",
+            print(f"{os.path.basename(str(ckpt_path))} {weights} {set_name} {k + 1}/{n} (volume {i}):",
                   {m: round(float(v["loss"].mean()), 4) for m, v in per.items()}, flush=True)
 
   with open(os.path.join(cfg.out, "volumes.csv"), "w", newline="") as f:

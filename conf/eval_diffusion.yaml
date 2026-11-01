@@ -5,7 +5,8 @@ weights: [raw, ema]      # raw: the trained weights; ema: diffusion.ema's averag
 samples: 4               # K sampler runs per volume (seeds eval_seed + k), rendered: single (k = 0), mean of K renders, best of K
 steps: null              # sampler steps; null: the run's diffusion.steps
 val_sets: null           # list of validation set names; null: all of the run's
-max_volumes: null        # per set; null: all (say so when reporting a subset)
+max_volumes: null        # per set: a reproducible random subset of that many volumes (same for every run with the same split);
+                         # null: all (say so when reporting a subset)
 seed: 0                  # the target views of a volume and the noise are functions of (seed, set, volume)
 grids_dir: null          # overrides for running somewhere else than the run did (null: the run's)
 source_h5: null
