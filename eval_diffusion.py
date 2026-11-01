@@ -5,8 +5,9 @@ seed, set and volume, so every run and checkpoint sees the same ones) and with m
 the same numbers whatever code version trained the run. Per target view, of renders premultiplied over black against the
 dataset images:
   l1, dssim (module.DSSIMLoss), psnr, loss = l1 + 0.85 dssim   the whole frame (dominated by the black background)
-  fg_l1, fg_psnr       over the foreground: the union of the target's and the render's silhouettes (alpha > 0.5), so missing
-                       and extra coverage both count
+  fg_l1, fg_psnr       over the TARGET's silhouette (alpha > 0.5) only -- a fixed region per view, so spreading coverage
+                       (haze) cannot dilute the error (a union with the render's silhouette would reward it)
+  bg_l1                over the rest of the frame: what the render puts where the target is empty (floaters, haze)
   lpips                LPIPS (VGG, torchmetrics), whole frame
   alpha_iou            IoU of the render's silhouette with the target's (alpha > 0.5)
   depth_absrel         raw (unaligned) |depth - mesh depth| / mesh depth, the render's expected depth against the target view's
@@ -40,7 +41,7 @@ from module import DSSIMLoss
 from util import collate_with_batch_size
 
 
-METRICS = ("l1", "dssim", "psnr", "loss", "fg_l1", "fg_psnr", "lpips", "alpha_iou", "depth_absrel")
+METRICS = ("l1", "dssim", "psnr", "loss", "fg_l1", "fg_psnr", "bg_l1", "lpips", "alpha_iou", "depth_absrel")
 
 
 def render(model, batch, gauss, views, device):
@@ -68,17 +69,19 @@ def metrics(pred, gt, dssim, lpips, alpha=None, gt_alpha=None, depth=None, gt_de
     mse = (pred - gt).square().flatten(1).mean(1)
     lp = torch.stack([lpips(pred[v:v + 1], gt[v:v + 1]) for v in range(pred.shape[0])]).float()
     out = {"l1": l1, "dssim": ds, "psnr": -10 * torch.log10(mse.clamp_min(1e-10)), "loss": l1 + 0.85 * ds, "lpips": lp,
-           "fg_l1": nan, "fg_psnr": nan, "alpha_iou": nan, "depth_absrel": nan}
+           "fg_l1": nan, "fg_psnr": nan, "bg_l1": nan, "alpha_iou": nan, "depth_absrel": nan}
     if gt_alpha is not None:
       g = gt_alpha.float() > 0.5
       p = alpha.float() > 0.5 if alpha is not None else g
-      union = (g | p).float()
-      n = union.flatten(1).sum(1).clamp_min(1)
-      out["fg_l1"] = ((pred - gt).abs().mean(1, keepdim=True) * union).flatten(1).sum(1) / n
-      fg_mse = ((pred - gt).square().mean(1, keepdim=True) * union).flatten(1).sum(1) / n
+      fg, bg = g.float(), (~g).float()
+      nf, nb = fg.flatten(1).sum(1).clamp_min(1), bg.flatten(1).sum(1).clamp_min(1)
+      err1 = (pred - gt).abs().mean(1, keepdim=True)
+      out["fg_l1"] = (err1 * fg).flatten(1).sum(1) / nf
+      out["bg_l1"] = (err1 * bg).flatten(1).sum(1) / nb
+      fg_mse = ((pred - gt).square().mean(1, keepdim=True) * fg).flatten(1).sum(1) / nf
       out["fg_psnr"] = -10 * torch.log10(fg_mse.clamp_min(1e-10))
       if alpha is not None:
-        out["alpha_iou"] = (g & p).float().flatten(1).sum(1) / n
+        out["alpha_iou"] = (g & p).float().flatten(1).sum(1) / (g | p).float().flatten(1).sum(1).clamp_min(1)
       if depth is not None and gt_depth is not None:
         both = (torch.isfinite(gt_depth) & (gt_depth > 0) & p)
         rel = ((depth.float() - gt_depth).abs() / gt_depth).nan_to_num(0) * both
