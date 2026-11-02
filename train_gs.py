@@ -74,6 +74,22 @@ log = logging.getLogger(__name__)
 # model
 # ---------------------------------------------------------------------------
 
+def image_quality(pred_rgb, gt_rgb, gt_alpha):
+  """Per view (B, V), in fp32 and without a graph: psnr, fg_psnr (over the target silhouette, gt_alpha > 0.5; 100 dB for a view
+  without one) and bg_l1 (the L1 outside it) -- eval_diffusion.metrics' definitions. pred_rgb / gt_rgb (B, V, 3, H, W), gt_alpha
+  (B, V, [1,] H, W)."""
+  with torch.no_grad(), torch.autocast(device_type=pred_rgb.device.type, enabled=False):
+    diff = pred_rgb.detach().float() - gt_rgb.float()
+    sq, ab = diff.square().mean(2), diff.abs().mean(2)                                 # (B, V, H, W)
+    fg = (gt_alpha.float().reshape(sq.shape) > 0.5).float()
+    nf, nb = fg.flatten(2).sum(2).clamp_min(1), (1 - fg).flatten(2).sum(2).clamp_min(1)
+    return {
+      "psnr": -10 * torch.log10(sq.flatten(2).mean(2).clamp_min(1e-10)),
+      "fg_psnr": -10 * torch.log10(((sq * fg).flatten(2).sum(2) / nf).clamp_min(1e-10)),
+      "bg_l1": (ab * (1 - fg)).flatten(2).sum(2) / nb,
+    }
+
+
 def x0_encoding(cfg):
   """cfg.diffusion.scale_encoding, completed with the defaults of a config without it (sort off, no floor: runs before it existed)."""
   enc = OmegaConf.select(cfg, "diffusion.scale_encoding", default=None)
@@ -632,28 +648,31 @@ class GSLightningModule(pl.LightningModule):
     seconds = self.clock.seconds() if self.clock is not None else 0.0
     return seconds >= float(p.start_seconds)
 
-  def _diffusion_photom(self, stage, batch, x0_hat, t):
+  def _diffusion_photom(self, stage, batch, x0_hat, t, log=None):
     """The photometric loss of the diffusion model's x0 prediction (at the timesteps t), rendered: per volume, only the volumes
     whose timestep, reduced over the layers by diffusion.photom.t_reduce (max: the noisiest layer, mean, layer0), is in
     diffusion.photom.t_range count (a mean over them; zero when there is none). Logs <prefix>/photom[_l1|_dssim] (over the
     volumes that count) and photom_frac (the fraction of volumes that count); the validations log it the same way, so
-    train/loss/photom and <set>/<name>/loss/photom are one quantity. Returns the loss (with its graph)."""
+    train/loss/photom and <set>/<name>/loss/photom are one quantity. log: called instead of _log_metric (the train step holds
+    its logs until the step is accepted). Returns the loss (with its graph)."""
+    log = log or self._log_metric
     lo, hi = self.cfg.diffusion.photom.t_range
     reduce = self.cfg.diffusion.photom.t_reduce
     tv = {"max": lambda: t.amax(dim=1), "mean": lambda: t.mean(dim=1), "layer0": lambda: t[:, 0]}[reduce]()   # (B,)
     keep = ((tv >= float(lo)) & (tv <= float(hi))).float()
-    self._log_metric(stage, "loss/photom_frac", keep.mean(), batch["batch_size"])
-    return self._render_photom(stage, batch, self.model.decode(x0_hat), keep, "loss/photom")
+    log(stage, "loss/photom_frac", keep.mean(), batch["batch_size"])
+    return self._render_photom(stage, batch, self.model.decode(x0_hat), keep, "loss/photom", log)
 
-  def _render_photom(self, stage, batch, gauss, keep, key):
+  def _render_photom(self, stage, batch, gauss, keep, key, log=None):
     """loss.photom (L1 + D-SSIM on the views of loss.photom.for, against the dataset's rendered images) of the Gaussian dict gauss,
-    rendered, over the volumes with keep (B,) = 1. Logs <key>[_l1|_dssim]; returns the loss (with its graph)."""
+    rendered, over the volumes with keep (B,) = 1. Logs <key>[_l1|_dssim|_psnr|_fg_psnr|_bg_l1]; returns the loss (with its graph)."""
     if keep.sum() == 0:
       return torch.zeros((), device=self.device)
-    return self._log_photom(stage, self._photom_per_volume(batch, gauss), keep, key)
+    return self._log_photom(stage, self._photom_per_volume(batch, gauss), keep, key, log)
 
   def _photom_per_volume(self, batch, gauss):
-    """{"l1", "dssim" (the terms with a weight), "total"}: the per-volume (B,) loss.photom terms of gauss, rendered."""
+    """{"l1", "dssim" (the terms with a weight), "total", and the image_quality metrics (no graph)}: per volume (B,), of gauss
+    rendered; the image metrics are means over the volume's views of the per-view values, as in eval_diffusion."""
     cfg, device, B = self.cfg, self.device, batch["batch_size"]
     V = batch["views"]["rgb"].shape[1]
     rvi = ([0] if "source" in cfg.loss.photom["for"] else []) + (list(range(1, V)) if "target" in cfg.loss.photom["for"] else [])
@@ -666,18 +685,21 @@ class GSLightningModule(pl.LightningModule):
     if cfg.loss.photom.dssim_weight > 0:
       per["dssim"] = self.dssim(pred_rgb.flatten(0, 1), gt_rgb.flatten(0, 1)).reshape(B, -1).mean(1)
     per["total"] = cfg.loss.photom.l1_weight * per.get("l1", 0) + cfg.loss.photom.dssim_weight * per.get("dssim", 0)
+    for name, v in image_quality(pred_rgb, gt_rgb, batch["views"]["alpha"][:, rvi].to(device)).items():
+      per[name] = v.mean(1)
     return per
 
-  def _log_photom(self, stage, per, keep, key):
-    """Logs the mean of _photom_per_volume's terms over the volumes with keep = 1 as <key>[_l1|_dssim]; returns the total's."""
+  def _log_photom(self, stage, per, keep, key, log=None):
+    """Logs the mean of _photom_per_volume's terms over the volumes with keep = 1 as <key>[_<term>]; returns the total's."""
+    log = log or self._log_metric
     n = keep.sum()
     if n == 0:
       return torch.zeros((), device=self.device)
     loss = (keep * per["total"]).sum() / n
     for name, v in per.items():
       if name != "total":
-        self._log_metric(stage, f"{key}_{name}", ((keep * v).sum() / n).detach(), int(n))
-    self._log_metric(stage, key, loss.detach(), int(n))
+        log(stage, f"{key}_{name}", ((keep * v).sum() / n).detach(), int(n))
+    log(stage, key, loss.detach(), int(n))
     return loss
 
   def _log_parts(self, stage, prefix, parts, counts):
@@ -694,8 +716,10 @@ class GSLightningModule(pl.LightningModule):
     B = batch["batch_size"]
     loss, parts, counts, x0_hat, t = self._diffusion_losses(batch)
     x0_loss = loss.detach()
+    held = []   # the rendering loss's logs: like train/loss and the x0 loss's, accepted steps only
     if self._photom_active():
-      loss = loss + float(self.cfg.diffusion.photom.weight) * self._diffusion_photom("train", batch, x0_hat, t)
+      loss = loss + float(self.cfg.diffusion.photom.weight) * self._diffusion_photom(
+        "train", batch, x0_hat, t, log=lambda *a: held.append(a))
     value = float(loss.detach())
     skipped = self.spike_skip.check(value)
     self._log_metric("train", "skipped", float(skipped), B)
@@ -709,7 +733,9 @@ class GSLightningModule(pl.LightningModule):
     self.pixels_seen += B * int(np.prod(batch["x0_raw"].shape[-2:]))
     self._log_metric("train", "loss", loss.detach(), B)
     self._log_metric("train", "loss/x0", x0_loss, B)   # like train/loss and its parts: accepted steps only
-    self._log_parts("train", "loss", parts, counts)
+    self._log_parts("train", "loss/x0", parts, counts)   # the validations' keys: <set>/<name>/loss/x0/<part>
+    for a in held:
+      self._log_metric(*a)
     return loss
 
   @torch.no_grad()
@@ -867,6 +893,8 @@ class GSLightningModule(pl.LightningModule):
       _splatter_metric(f"{photom_key}_dssim", _photom_dssim)
       photom_loss = photom_loss + cfg.loss.photom.dssim_weight * _photom_dssim.mean()
 
+    for name, v in image_quality(pred_rgb, gt_rgb, gt_alpha).items():   # (B, V): psnr, fg_psnr, bg_l1
+      _splatter_metric(f"{photom_key}_{name}", v)
     _log(photom_key, photom_loss.detach())
     loss = loss + photom_loss
 
