@@ -343,6 +343,9 @@ diffusion:
   schedule:
     standard: {mu: 0.0, sigma: 1.0}                         # layers 1.. (logit-normal)
     plateau: {mu: 0.0, sigma: 1.0, mirror: false}           # layer 0: logit-normal up to its mode t* = 0.5, then flat towards t = 1
+    phase: 1                   # 1: an independent t per layer (layer 0 plateaued, the rest standard); 2: one t per volume shared by
+                               # all its layers (as in the sampler), from the 50/50 mixture of the two. The validations' seeded
+                               # timesteps (loss/x0, the gated loss/photom) follow it
     fixed_t: null              # 1.0: a deterministic regressor from the image with the same architecture / data / loss (the control
                                # for "does diffusion help"): t = 1 always, and the network input is only the validity mask (no
                                # noise); needs diffusion.steps=1
