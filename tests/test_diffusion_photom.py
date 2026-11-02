@@ -52,16 +52,18 @@ def setup():
   batch = collate_with_batch_size([w[i] for i in range(len(w))])
   x0 = (batch["x0_raw"].to(dev).float().permute(0, 2, 1, 3, 4) - mean.to(dev)[None, None, :, None, None]) \
        / std.to(dev)[None, None, :, None, None]
-  photom = lambda *a, **k: train_gs.GSLightningModule._diffusion_photom(fake, *a, **k)
+  for name in ("_render_photom", "_photom_per_volume", "_log_photom"):   # the helpers _diffusion_photom calls
+    setattr(fake, name, (lambda f: lambda *a: f(fake, *a))(getattr(train_gs.GSLightningModule, name)))
+  photom = lambda *a: train_gs.GSLightningModule._diffusion_photom(fake, *a)
   return types.SimpleNamespace(batch=batch, x0=x0, photom=photom, logged=logged, B=batch["batch_size"], dev=dev)
 
 
 def test_fit_renders_better_than_noise_and_gradient_flows(setup):
   s = setup
   t_lo = torch.full((s.B, 6), 0.1, device=s.dev)
-  good = float(s.photom("train", s.batch, s.x0, t_lo, gated=True))
+  good = float(s.photom("train", s.batch, s.x0, t_lo))
   noisy = (s.x0 + 0.5 * torch.randn_like(s.x0)).requires_grad_(True)
-  bad = s.photom("train", s.batch, noisy, t_lo, gated=True)
+  bad = s.photom("train", s.batch, noisy, t_lo)
   assert good < float(bad.detach()) / 2
   bad.backward()
   assert torch.isfinite(noisy.grad).all() and noisy.grad.abs().sum() > 0
@@ -71,9 +73,9 @@ def test_gate_on_the_noisiest_layer(setup):
   s = setup
   t_hi = torch.full((s.B, 6), 0.9, device=s.dev)
   s.logged.clear()
-  assert float(s.photom("train", s.batch, s.x0, t_hi, gated=True)) == 0 and s.logged["train/loss/photom_frac"] == 0
+  assert float(s.photom("train", s.batch, s.x0, t_hi)) == 0 and s.logged["train/loss/photom_frac"] == 0
   t = torch.full((s.B, 6), 0.1, device=s.dev)
   t[0, 3] = 0.9                                                     # one noisy layer closes volume 0
   s.logged.clear()
-  s.photom("train", s.batch, s.x0, t, gated=True)
+  s.photom("train", s.batch, s.x0, t)
   assert abs(s.logged["train/loss/photom_frac"] - (s.B - 1) / s.B) < 1e-6
