@@ -25,6 +25,8 @@ output_dirname: 3dgs-model-${now:%Y-%m-%d_%H-%M-%S}
 output_dir: outputs/${output_dirname}
 
 seed: 42
+train_seed: null   # the torch seed (weights init, noise, data order); null: seed. The train/val splits always use `seed`, so a
+                   # different train_seed is a replicate of a run on the same data
 
 torch_detect_anomaly: false
 

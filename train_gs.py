@@ -1027,10 +1027,17 @@ class GSLightningModule(pl.LightningModule):
       yield self._preview_entry(ds[i], with_layers=with_layers and rank == 0)
 
 
+def torch_seed(cfg):
+  """The torch seed: train_seed -- the training randomness alone (weights init, noise, data order), a replicate of a run on the
+  same splits -- or, when it is null or absent, seed (which the train/val splits always use)."""
+  train_seed = OmegaConf.select(cfg, "train_seed", default=None)
+  return int(cfg.seed if train_seed is None else train_seed)
+
+
 @hydra.main(version_base=None, config_path="conf", config_name="train_gs")
 def main(cfg: DictConfig) -> None:
   logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
-  torch.manual_seed(int(cfg.seed))
+  torch.manual_seed(torch_seed(cfg))
   torch.autograd.set_detect_anomaly(cfg.torch_detect_anomaly)
 
   # The run's events by name (module.Events): fired by cfg.events' cadences and the scheduler's
