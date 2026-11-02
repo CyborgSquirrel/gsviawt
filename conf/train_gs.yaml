@@ -334,6 +334,10 @@ diffusion:
   checkpoint_activations: true
   steps: 20                    # Euler steps when sampling
   eval_seed: 0                 # the noise of the samples, and of the validation loss
+  # the validations' rendering loss at a SHARED timestep (every layer at the same t, as in the sampler): each volume gets one t
+  # of these (a shuffled bag per validation set, so a validation splits its volumes evenly over them), logged as
+  # <set>/<name>/loss/photom_t<t> (t = 1: the 1-step sample, from pure noise). Empty / null: off
+  val_t: [0.25, 0.5, 0.75, 1.0]
   schedule:
     standard: {mu: 0.0, sigma: 1.0}                         # layers 1.. (logit-normal)
     plateau: {mu: 0.0, sigma: 1.0, mirror: false}           # layer 0: logit-normal up to its mode t* = 0.5, then flat towards t = 1
