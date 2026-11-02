@@ -1,0 +1,63 @@
+# Config for fit_anchored.py -- anchored layered 3DGS for one mesh of a render_objaverse.py h5 (see anchored_3dgs.py's
+# docstring for the pipeline). One run = one mesh; rerunning the same command resumes (finished stages / views are skipped).
+defaults:
+  - _self_
+  - override hydra/job_logging: none      # the script logs through logging.basicConfig
+  - override hydra/hydra_logging: none
+
+hdf5_path: ???          # render_objaverse.py h5 with depth_peel (+ depth_peel_normals for the spacing levels)
+mesh_index: ???         # the mesh: its rows are the h5 rows with this mesh_index, local view v = its v-th row
+output_dir: ???         # <output_dir>/mesh<M>_view<V>/ per training view (fit_3dgs layered format, finalize_fit_dataset.py
+                        # root); per-mesh state (anchors, combined fit, timings) in <output_dir>/_anchored/mesh<M>/
+shared_output_dir: null # also write each training view's subset straight from the combined fit (no fine-tune) here, same
+                        # format; null = don't
+# the last round(val_fraction x n) views of the mesh are excluded entirely (not merged, no camera, no grid)
+val_fraction: 0.1
+seed: 0
+device: cuda
+
+merge:
+  r: 1.0                # merge radius / RMS-spread limit, x the clusters' mean footprint
+  k: 8                  # nearest clusters considered per round
+  max_rounds: 200
+levels: 3               # density levels (log-scale + opacity sets) per anchor, one octave apart
+init_opacity: 0.1
+
+combined:
+  steps: 30000
+  offset_lr_start: 1.0  # offset lr factor (x lr.offset), exponential start -> end over the run
+  offset_lr_end: 0.01
+finetune:
+  steps: 300
+  pos_lr_start: 0.1     # offset lr factor (x lr.offset), exponential start -> end over the fine-tune
+  pos_lr_end: 0.01
+
+lr:
+  offset: 0.00016       # x scene_extent (fit_3dgs.load_scene_h5's, over the training cameras)
+  offset_weight_decay: 3.0   # AdamW decoupled weight decay on the offsets (combined fit and fine-tune): pull toward the anchor
+  sh0: 0.0025
+  opacities: 0.025
+  scales: 0.005
+  quats: 0.001
+
+loss:
+  lambda_dssim: 0.2
+
+# regression mode: these local views are held out instead of the val_fraction split, and every written view's held-out PSNR
+# (mean over these views, full image, like fit_3dgs's val/PSNR) is reported for the shared and the fine-tuned grids
+regression:
+  held_views: null
+
+log_every: 1000         # console loss line every this many steps (the per-step losses are saved, and go to wandb when on)
+wandb:
+  project: gsviawt
+  mode: disabled        # online | offline | disabled
+  tags: [fit-anchored]
+  name: null            # null: anchored-mesh<M>
+
+hydra:
+  job:
+    chdir: false
+  output_subdir: null
+  run:
+    dir: .
