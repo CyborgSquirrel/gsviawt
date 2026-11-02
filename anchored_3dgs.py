@@ -15,8 +15,8 @@ Per mesh (the rows of a render_objaverse.py h5 with one `mesh_index`):
   - per-view fine-tune (finetune): the view's subset at its levels, flattened to one Gaussian per slot, from the combined fit's
     parameters (never from another view's fine-tune: anchors are shared), fresh optimizer, a few hundred steps with the cameras of
     all training views.
-  - outputs (write_view): <root>/mesh<M>_view<V>/ with gaussians.h5 / gaussians.ply / gaussians.grid.h5, written by fit_3dgs.py's
-    own writers, so finalize_fit_dataset.py and gs_diffusion.encode_grid take them unchanged.
+  - outputs (write_view): <root>/mesh<M>_view<V>/gaussians.grid.h5 only (fit metadata in its attributes), written by
+    fit_3dgs.py's own grid writer, so finalize_fit_dataset.py and gs_diffusion.encode_grid take it unchanged.
 
 The Hydra entry point (stages, resume, config) is fit_anchored.py; this module is the per-stage library.
 """

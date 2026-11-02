@@ -44,7 +44,7 @@ def _check(what, saved, now):
 
 
 def _view_config(cfg, hdf5_path, rows, train, held, v, stage, iters, extra):
-  """config_json of a view's gaussians.h5: the fit_3dgs keys finalize_fit_dataset.py reads, + the full anchored config."""
+  """config_json of a view's gaussians.grid.h5: the fit_3dgs keys finalize_fit_dataset.py reads, + the full anchored config."""
   return {
     "gaussian_layout": "layered", "hdf5_path": hdf5_path,
     "data": {"primary_view": rows[v], "secondary_views": [rows[w] for w in train if w != v],
