@@ -52,7 +52,10 @@ def finalize_one(root, name, overwrite):
         "num_supervision_views": len(cfg["data"]["secondary_views"]) + 1,       # + the primary
         "iters": int(cfg["iters"]),
         "sh_degree": int(cfg["sh_degree"]),
-        "mean_offset_reg_weight": float(cfg["mean_offset_reg_weight"]),
+        # how the layered offsets were pulled toward their slot: AdamW weight decay (current) or, in fits made
+        # before it replaced it, an L2 loss weight
+        **({"means_weight_decay": float(cfg["lr"]["means_weight_decay"])} if "means_weight_decay" in cfg.get("lr", {})
+           else {"mean_offset_reg_weight": float(cfg["mean_offset_reg_weight"])}),
         "means_optimized": True,   # layered: means = the depth-peel seed + a trained offset
         "final_loss": float(attrs["final_loss"]),
         "num_gaussians": int(attrs["num_gaussians"]),

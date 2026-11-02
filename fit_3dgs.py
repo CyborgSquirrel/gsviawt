@@ -42,10 +42,10 @@ training starts exactly at the seed), not a single free tensor like
 trainable, still what gsplat.strategy's optimizer/check_sanity plumbing
 expects at that key); Fit3DGSLightningModule._active_means() is the one
 place that resolves means_original + offset into the actual position
-every render/preview/eval/output call needs. cfg.mean_offset_reg_weight
-adds an L2 penalty on the offset (not the resolved position) to the
-train loss, pulling Gaussians back toward their seeded origin instead of
-letting the offset drift unconstrained.
+every render/preview/eval/output call needs. The offset is optimized with
+AdamW, weight decay cfg.lr.means_weight_decay (decoupled: each step shrinks
+the offset by lr * wd), pulling Gaussians back toward their seeded origin
+instead of letting the offset drift unconstrained.
 
 cfg.background (none/white/random) picks what's composited under the
 render and, wherever real alpha exists (hdf5_path; COLMAP photos have
@@ -651,7 +651,6 @@ class Fit3DGSLightningModule(pl.LightningModule):
     # the position -- _active_means() is the one place that resolves
     # the two into the actual position every render call needs; nothing
     # else should read self.params["means"] directly as if it were one.
-    self.mean_offset_reg_weight = float(cfg.mean_offset_reg_weight)
     self.params = nn.ParameterDict()
     for k, v in g.items():
       if k == "means" and self.gaussian_layout == "layered":
@@ -750,7 +749,11 @@ class Fit3DGSLightningModule(pl.LightningModule):
     )
     # fused=True: one kernel per optimizer step instead of the foreach path's handful, same Adam update
     self.optimizers_dict = {
-      "means": torch.optim.Adam([self.params["means"]], lr=self.means_lr_fn(0), eps=1e-15, fused=True),
+      # layered: AdamW on the offset (decoupled weight decay pulls it back toward the slot); set: absolute means, Adam
+      "means": (torch.optim.AdamW([self.params["means"]], lr=self.means_lr_fn(0), eps=1e-15, fused=True,
+                                  weight_decay=float(cfg.lr.means_weight_decay))
+                if self.gaussian_layout == "layered" else
+                torch.optim.Adam([self.params["means"]], lr=self.means_lr_fn(0), eps=1e-15, fused=True)),
       "sh0": torch.optim.Adam([self.params["sh0"]], lr=float(cfg.lr.features_dc), eps=1e-15, fused=True),
       "shN": torch.optim.Adam([self.params["shN"]], lr=float(cfg.lr.features_rest), eps=1e-15, fused=True),
       "opacities": torch.optim.Adam([self.params["opacities"]], lr=float(cfg.lr.opacities), eps=1e-15, fused=True),
@@ -860,21 +863,13 @@ class Fit3DGSLightningModule(pl.LightningModule):
         self.strategy.step_pre_backward(self.params, self.optimizers_dict, self.strategy_state, it, info)
       # photom_loss: the L1+D-SSIM combo alone, logged as its own metric
       # (loss/photom below) so it stays readable independent of whatever
-      # non-photometric terms (currently just mean_offset_reg) get folded
-      # into the full `loss` that's actually optimized -- fold additional
-      # terms into `loss` here, never back into photom_loss itself.
+      # non-photometric terms get folded into the full `loss` that's
+      # actually optimized -- fold additional terms into `loss` here,
+      # never back into photom_loss itself. (The pull of layered offsets
+      # back toward their slot is the means optimizer's AdamW weight
+      # decay, not a loss term.)
       photom_loss, parts = self._photom_loss(rgb, gt_rgb)
       loss = photom_loss
-      offset_reg = None
-      if stage == "train" and self.gaussian_layout == "layered" and self.mean_offset_reg_weight > 0:
-        # L2 penalty on the offset itself (not the resolved position) --
-        # pulls Gaussians back toward their depth-peel-seeded origin,
-        # the whole point of splitting means into a frozen original +
-        # an optimizable offset instead of leaving means fully free.
-        # NOT folded into `parts` (that loop below logs everything in it
-        # under "loss/photom_*" -- this isn't a photometric term).
-        offset_reg = self.params["means"].pow(2).sum(-1).mean()
-        loss = loss + self.mean_offset_reg_weight * offset_reg
 
     if stage == "final_eval":
       # Same methodology as gaussian-splatting/metrics.py: per-image
@@ -923,8 +918,6 @@ class Fit3DGSLightningModule(pl.LightningModule):
     _log("loss/photom", photom_loss.detach())
     for k, v in parts.items():
       _log(f"loss/photom_{k}", v.detach())
-    if offset_reg is not None:
-      _log("loss/mean_offset_reg", offset_reg.detach())
     if stage == "val":
       _log("PSNR", -10 * torch.log10((rgb - gt_rgb).pow(2).mean()))
       _log("PSNR_masked", _masked_psnr(rgb, gt_rgb, gt_alpha))
