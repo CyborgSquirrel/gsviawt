@@ -1,6 +1,9 @@
 """diffusion.scale_encoding (gs_diffusion.sort_scale_axes, encode_grid's scale_sort / scale_floor_px, encoding_tag,
 GridTargetDataset's encoding) on synthetic data."""
+import os
+
 import numpy as np
+import pytest
 import torch
 from scipy.spatial.transform import Rotation
 
@@ -69,3 +72,30 @@ def test_encoding_tag_and_dataset_encoding():
       df = pl.DataFrame({"view_idx": [3]})
   ds = gd.GridTargetDataset(Inner(), {3: "unused.h5"}, {"scale_sort": True})   # overriding a default must not raise
   assert ds.encoding == {"scale_sort": True, "scale_floor_px": None}
+
+
+def test_default_is_sort_floor_and_checkpoints_keep_their_encoding():
+  """conf/train_gs.yaml defaults to sort + 0.1 px floor; a config without the block (older runs, eval's saved configs) means
+  off; a checkpoint records its encoding and refuses to resume under another one (checkpoints without the key: off)."""
+  import types
+  from omegaconf import OmegaConf
+  import train_gs
+  root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+  conf = OmegaConf.load(os.path.join(root, "conf", "train_gs.yaml"))
+  assert train_gs.x0_encoding(conf) == {"scale_sort": True, "scale_floor_px": 0.1}
+  off = {"scale_sort": False, "scale_floor_px": None}
+  assert train_gs.x0_encoding(OmegaConf.create({"diffusion": {"enabled": True}})) == off
+
+  def module(enc):
+    d = {"enabled": True, "scale_encoding": enc} if enc is not None else {"enabled": True}
+    return types.SimpleNamespace(cfg=OmegaConf.create({"diffusion": d}), views_seen=0, pixels_seen=0, ema=None, spike_skip=None)
+  M = train_gs.GSLightningModule
+  ckpt = {}
+  M.on_save_checkpoint(module({"scale_sort": True, "scale_floor_px": 0.1}), ckpt)
+  assert ckpt["x0_encoding"] == {"scale_sort": True, "scale_floor_px": 0.1}
+  M.on_load_checkpoint(module({"scale_sort": True, "scale_floor_px": 0.1}), dict(ckpt))
+  with pytest.raises(SystemExit, match="scale_sort=true diffusion.scale_encoding.scale_floor_px=0.1"):
+    M.on_load_checkpoint(module(off), dict(ckpt))
+  M.on_load_checkpoint(module(off), {})                                   # an old checkpoint, resumed with the encoding off
+  with pytest.raises(SystemExit, match="scale_floor_px=null"):
+    M.on_load_checkpoint(module({"scale_sort": True, "scale_floor_px": 0.1}), {})

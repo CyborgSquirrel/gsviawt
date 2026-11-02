@@ -74,6 +74,12 @@ log = logging.getLogger(__name__)
 # model
 # ---------------------------------------------------------------------------
 
+def x0_encoding(cfg):
+  """cfg.diffusion.scale_encoding, completed with the defaults of a config without it (sort off, no floor: runs before it existed)."""
+  enc = OmegaConf.select(cfg, "diffusion.scale_encoding", default=None)
+  return {"scale_sort": False, "scale_floor_px": None, **(OmegaConf.to_container(enc) if enc is not None else {})}
+
+
 def diffusion_enabled(cfg):
   """cfg.diffusion.enabled; configs without the block (older ones) are not diffusion runs."""
   return bool(OmegaConf.select(cfg, "diffusion.enabled", default=False))
@@ -452,7 +458,7 @@ class GSDataModule(pl.LightningDataModule):
     self.val_datasets = {
       name: WTFeatureDataset(features_h5, v, rows=r, **kwargs) for name, (v, r) in sets.items() if len(r)}
     if grid_index is not None:
-      enc = OmegaConf.to_container(cfg.diffusion.scale_encoding) if cfg.diffusion.get("scale_encoding") is not None else None
+      enc = x0_encoding(cfg)
       self.train_ds = gs_diffusion.GridTargetDataset(self.train_ds, grid_index, enc)
       self.val_datasets = {n: gs_diffusion.GridTargetDataset(ds, grid_index, enc) for n, ds in self.val_datasets.items()}
       for name, ds in self.val_datasets.items():
@@ -547,6 +553,8 @@ class GSLightningModule(pl.LightningModule):
     # it explicitly so it keeps climbing (not resetting to 0) across resume.
     checkpoint["views_seen"] = self.views_seen
     checkpoint["pixels_seen"] = self.pixels_seen
+    if diffusion_enabled(self.cfg):
+      checkpoint["x0_encoding"] = x0_encoding(self.cfg)   # the x0 statistics in state_dict are this encoding's
     if self.ema is not None:
       checkpoint["ema"] = self.ema.state_dict()   # chained resumes must not restart the average from the raw weights
       for name, live in self.ema.stash.items():   # saved while the average is swapped in (an EMA validation): hold the live weights
@@ -558,6 +566,14 @@ class GSLightningModule(pl.LightningModule):
     # .get: checkpoints written before this hook existed have no such key.
     self.views_seen = checkpoint.get("views_seen", 0)
     self.pixels_seen = checkpoint.get("pixels_seen", 0)
+    if diffusion_enabled(self.cfg):
+      # checkpoints from before x0_encoding was saved were all trained without the scale encoding
+      saved, now = checkpoint.get("x0_encoding", x0_encoding(OmegaConf.create({}))), x0_encoding(self.cfg)
+      if saved != now:
+        raise SystemExit(
+          f"the checkpoint was trained with diffusion.scale_encoding={saved}, this config has {now}: its x0 statistics and targets "
+          f"would not match. Resume with the checkpoint's own encoding, e.g. diffusion.scale_encoding.scale_sort="
+          f"{str(saved['scale_sort']).lower()} diffusion.scale_encoding.scale_floor_px={saved['scale_floor_px'] if saved['scale_floor_px'] is not None else 'null'}")
     if self.ema is not None and "ema" in checkpoint:
       self.ema.load_state_dict(checkpoint["ema"])
       self._ema_fresh = False
