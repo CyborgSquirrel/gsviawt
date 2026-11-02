@@ -343,6 +343,9 @@ diffusion:
   schedule:
     standard: {mu: 0.0, sigma: 1.0}                         # layers 1.. (logit-normal)
     plateau: {mu: 0.0, sigma: 1.0, mirror: false}           # layer 0: logit-normal up to its mode t* = 0.5, then flat towards t = 1
+    fixed_t: null              # 1.0: a deterministic regressor from the image with the same architecture / data / loss (the control
+                               # for "does diffusion help"): t = 1 always, and the network input is only the validity mask (no
+                               # noise); needs diffusion.steps=1
   train_targets: grid           # the training volumes' supervision (target) views: grid = the training grid views of the mesh;
                                # all = every render of the mesh except the held-out grid views (validation pools unchanged)
   ema:

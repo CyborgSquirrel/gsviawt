@@ -79,8 +79,10 @@ def sample_plateau_logit_normal(shape, mu=0.0, sigma=1.0, mirror=False, generato
 
 
 class LayerAwareSchedule:
-  def __init__(self, num_layers, standard=None, plateau=None):
+  def __init__(self, num_layers, standard=None, plateau=None, fixed_t=None):
+    """fixed_t: every timestep is this value, in both phases (1.0: always pure noise -- the deterministic control)."""
     self.num_layers = int(num_layers)
+    self.fixed_t = None if fixed_t is None else float(fixed_t)
     self.standard = {**dict(mu=0.0, sigma=1.0), **(standard or {})}
     self.plateau = {**dict(mu=0.0, sigma=1.0, mirror=False), **(plateau or {})}
 
@@ -94,6 +96,10 @@ class LayerAwareSchedule:
     """(B, L) float32 timesteps. phase 1: independent per layer (layer 0 plateaued, the rest standard);
     phase 2: one t per sample, from the 50/50 mixture, repeated over the layers."""
     kw = dict(generator=generator, device=device)
+    if self.fixed_t is not None:
+      if phase not in (1, 2):
+        raise ValueError(f"phase must be 1 or 2, got {phase!r}")
+      return torch.full((batch_size, self.num_layers), self.fixed_t, dtype=torch.float32, device=device)
     if phase == 1:
       t0 = sample_plateau_logit_normal((batch_size, 1), **self.plateau, **kw)
       rest = sample_logit_normal((batch_size, self.num_layers - 1), **self.standard, **kw)
