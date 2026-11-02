@@ -619,12 +619,15 @@ class GSLightningModule(pl.LightningModule):
   def _render_photom(self, stage, batch, gauss, keep, key):
     """loss.photom (L1 + D-SSIM on the views of loss.photom.for, against the dataset's rendered images) of the Gaussian dict gauss,
     rendered, over the volumes with keep (B,) = 1. Logs <key>[_l1|_dssim]; returns the loss (with its graph)."""
+    if keep.sum() == 0:
+      return torch.zeros((), device=self.device)
+    return self._log_photom(stage, self._photom_per_volume(batch, gauss), keep, key)
+
+  def _photom_per_volume(self, batch, gauss):
+    """{"l1", "dssim" (the terms with a weight), "total"}: the per-volume (B,) loss.photom terms of gauss, rendered."""
     cfg, device, B = self.cfg, self.device, batch["batch_size"]
     V = batch["views"]["rgb"].shape[1]
     rvi = ([0] if "source" in cfg.loss.photom["for"] else []) + (list(range(1, V)) if "target" in cfg.loss.photom["for"] else [])
-    n = keep.sum()
-    if n == 0:
-      return torch.zeros((), device=device)
     pred = model_forward(self.model, batch, need_render=True, render_view_idx=rvi, gauss=gauss, device=device)
     pred_rgb = pred["rgb"]                                                              # (B, RV, 3, H, W)
     gt_rgb = batch["views"]["rgb"][:, rvi].to(device)
@@ -633,10 +636,18 @@ class GSLightningModule(pl.LightningModule):
       per["l1"] = (pred_rgb - gt_rgb).abs().flatten(1).mean(1)                          # (B,)
     if cfg.loss.photom.dssim_weight > 0:
       per["dssim"] = self.dssim(pred_rgb.flatten(0, 1), gt_rgb.flatten(0, 1)).reshape(B, -1).mean(1)
-    total = cfg.loss.photom.l1_weight * per.get("l1", 0) + cfg.loss.photom.dssim_weight * per.get("dssim", 0)
-    loss = (keep * total).sum() / n
+    per["total"] = cfg.loss.photom.l1_weight * per.get("l1", 0) + cfg.loss.photom.dssim_weight * per.get("dssim", 0)
+    return per
+
+  def _log_photom(self, stage, per, keep, key):
+    """Logs the mean of _photom_per_volume's terms over the volumes with keep = 1 as <key>[_l1|_dssim]; returns the total's."""
+    n = keep.sum()
+    if n == 0:
+      return torch.zeros((), device=self.device)
+    loss = (keep * per["total"]).sum() / n
     for name, v in per.items():
-      self._log_metric(stage, f"{key}_{name}", ((keep * v).sum() / n).detach(), int(n))
+      if name != "total":
+        self._log_metric(stage, f"{key}_{name}", ((keep * v).sum() / n).detach(), int(n))
     self._log_metric(stage, key, loss.detach(), int(n))
     return loss
 
@@ -681,11 +692,35 @@ class GSLightningModule(pl.LightningModule):
     self._log_parts(stage, "loss/x0", parts, counts)
     if self.cfg.diffusion.photom.enabled and self.cfg.diffusion.photom.validate:
       self._diffusion_photom(stage, batch, x0_hat, t)   # the training's own rendering term, gated the same way
-    # 1-step generation: the x0 prediction from pure noise (t = 1 on every layer), one sampler step, with the noise of the full
-    # sample (validation_step's loss/photom_full), every volume
+    if self.cfg.diffusion.get("val_t"):
+      self._diffusion_val_t(stage, batch)
+
+  def on_validation_epoch_start(self):
+    self._val_t_bags = {}   # a fresh bag per validation set at every validation: each splits its volumes evenly over diffusion.val_t
+
+  def _pop_val_t(self, stage):
+    """The next timestep of the validation set's bag of diffusion.val_t (refilled, shuffled, when empty)."""
+    bags = self.__dict__.setdefault("_val_t_bags", {})
+    if not bags.get(stage):
+      if not hasattr(self, "_val_t_rng"):
+        self._val_t_rng = np.random.default_rng(int(self.cfg.diffusion.eval_seed))
+      bags[stage] = [float(v) for v in self._val_t_rng.permutation(list(self.cfg.diffusion.val_t))]
+    return bags[stage].pop()
+
+  @torch.no_grad()
+  def _diffusion_val_t(self, stage, batch):
+    """The rendering loss of the x0 prediction at a SHARED timestep per volume (every layer at the same t, as in the sampler), one
+    t per volume from the validation set's bag of diffusion.val_t: logs loss/photom_t<t>[_l1|_dssim] over the volumes that got that
+    t (t = 1: the 1-step sample, the x0 prediction from pure noise). One forward and one render for the whole batch."""
+    B = batch["batch_size"]
+    tv = torch.tensor([self._pop_val_t(stage) for _ in range(B)], device=self.device)   # (B,)
     image, hit, seeds = self.model.inputs(batch, self.device)
-    gauss = self.model.sample(image, hit, seeds, steps=1)
-    self._render_photom(stage, batch, gauss, torch.ones(batch["batch_size"], device=self.device), "loss/photom_1step")
+    L = hit.shape[1]
+    x0_hat = self.model.training_loss(image, hit, batch["x0_raw"].to(self.device), seeds=seeds, return_pred=True,
+                                      t=tv[:, None].expand(B, L))[3]
+    per = self._photom_per_volume(batch, self.model.decode(x0_hat))
+    for v in sorted(set(tv.tolist())):
+      self._log_photom(stage, per, (tv == v).float(), f"loss/photom_t{v:g}")
 
   def _step(self, stage, batch, batch_idx, photom_key="loss/photom"):
     B = batch["batch_size"]

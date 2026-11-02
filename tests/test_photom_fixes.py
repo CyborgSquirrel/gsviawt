@@ -1,6 +1,6 @@
 """The PR #97 fixes: D-SSIM in fp32 (its gradient under bf16 autocast was noise), the validation's rendering keys
-(loss/photom: the training's term, gated the same way; loss/photom_1step: one step from pure noise; loss/photom_full: the full
-sample -- none colliding), and train/loss/x0 logged only for accepted steps."""
+(loss/photom: the training's term, gated the same way; loss/photom_t<t>: at a shared timestep from a shuffled bag of
+diffusion.val_t; loss/photom_full: the full sample -- none colliding), and train/loss/x0 logged only for accepted steps."""
 import os
 import tempfile
 import types
@@ -60,18 +60,47 @@ def test_validation_photom_keys():
     train_gs.GSLightningModule.validation_step(fake, {}, 0)
     assert calls[-1] == key
 
-  logged, sampled = [], []
+  logged = []
   fake = types.SimpleNamespace(
-    cfg=OmegaConf.create({"diffusion": {"photom": {"enabled": True, "validate": True}}}), device=torch.device("cpu"),
+    cfg=OmegaConf.create({"diffusion": {"photom": {"enabled": True, "validate": True}, "val_t": [0.5]}}),
     _diffusion_losses=lambda batch, seeded: (torch.tensor(1.0), {}, {}, "x0_hat", "t"),
     _log_metric=lambda *a: None, _log_parts=lambda *a: None,
-    _diffusion_photom=lambda stage, batch, x0_hat, t: logged.append(("loss/photom", x0_hat, t)),
-    _render_photom=lambda stage, batch, gauss, keep, key: logged.append((key, gauss, keep.tolist())),
-    model=types.SimpleNamespace(inputs=lambda batch, dev: ("img", "hit", [7, 8]),
-                                sample=lambda image, hit, seeds, steps: sampled.append((seeds, steps)) or "gauss1"))
+    _diffusion_photom=lambda stage, batch, x0_hat, t: logged.append("photom"),
+    _diffusion_val_t=lambda stage, batch: logged.append("val_t"))
   train_gs.GSLightningModule._diffusion_val_loss(fake, "val", {"batch_size": 2})
-  assert logged == [("loss/photom", "x0_hat", "t"), ("loss/photom_1step", "gauss1", [1.0, 1.0])]
-  assert sampled == [([7, 8], 1)]
+  assert logged == ["photom", "val_t"]
+
+
+def test_val_t_bag_balances_each_validation_set():
+  """Every validation set's volumes split evenly over diffusion.val_t (a fresh shuffled bag per set and validation), one shared t
+  per volume over all its layers, one forward + one render per batch, logged as loss/photom_t<t> with its own count."""
+  M = train_gs.GSLightningModule
+  logged, forwards = [], []
+
+  def training_loss(image, hit, x0_raw, seeds, return_pred, t):
+    forwards.append(t.clone())
+    return None, None, None, torch.zeros(t.shape[0]), t
+
+  fake = types.SimpleNamespace(
+    cfg=OmegaConf.create({"diffusion": {"eval_seed": 0, "val_t": [0.25, 0.5, 0.75, 1.0]}}), device=torch.device("cpu"),
+    model=types.SimpleNamespace(inputs=lambda batch, dev: ("img", torch.ones(batch["batch_size"], 6, 4, 4), [0] * batch["batch_size"]),
+                                training_loss=training_loss, decode=lambda x: x),
+    _photom_per_volume=lambda batch, gauss: {"l1": gauss + 1, "total": gauss + 1},
+    _log_metric=lambda stage, k, v, n: logged.append((stage, k, n)))
+  fake._pop_val_t = lambda stage: M._pop_val_t(fake, stage)
+  fake._log_photom = lambda *a: M._log_photom(fake, *a)
+  for _ in range(2):   # two validations
+    M.on_validation_epoch_start(fake)
+    for stage in ("val_a", "val_b"):
+      for B in (3, 5):   # 8 volumes per set
+        M._diffusion_val_t(fake, stage, {"batch_size": B, "x0_raw": torch.zeros(B)})
+  assert len(forwards) == 8 and all(f.shape[1] == 6 and (f == f[:, :1]).all() for f in forwards)   # shared over the layers
+  for k in range(2):
+    for s_i, stage in enumerate(("val_a", "val_b")):
+      ts = torch.cat(forwards[4 * k + 2 * s_i: 4 * k + 2 * s_i + 2])[:, 0].tolist()
+      assert sorted(ts) == [0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0], (stage, ts)
+  keys = {k for _, k, _ in logged}
+  assert keys == {f"loss/photom_t{t}" for t in ("0.25", "0.5", "0.75", "1")} | {f"loss/photom_t{t}_l1" for t in ("0.25", "0.5", "0.75", "1")}
 
 
 @pytest.mark.cuda
@@ -114,9 +143,34 @@ def test_validation_photom_is_gated_like_training():
   x0 = ((batch["x0_raw"].to(dev).float().permute(0, 2, 1, 3, 4) - mean.to(dev)[None, None, :, None, None])
         / std.to(dev)[None, None, :, None, None])
   fake._render_photom = lambda *a: train_gs.GSLightningModule._render_photom(fake, *a)
+  fake._photom_per_volume = lambda *a: train_gs.GSLightningModule._photom_per_volume(fake, *a)
+  fake._log_photom = lambda *a: train_gs.GSLightningModule._log_photom(fake, *a)
   B = batch["batch_size"]
   train_gs.GSLightningModule._diffusion_photom(fake, "val", batch, x0, torch.full((B, 6), 0.9, device=dev))   # max t 0.9: out
   assert logged == {"val/loss/photom_frac": 0.0}
   train_gs.GSLightningModule._diffusion_photom(fake, "val", batch, x0, torch.full((B, 6), 0.5, device=dev))   # in t_range
   assert logged["val/loss/photom_frac"] == 1.0 and {"val/loss/photom", "val/loss/photom_l1", "val/loss/photom_dssim"} <= set(logged)
   assert logged["val/loss/photom"] < 0.15   # the fitted grids themselves (about 0.08): a sane render, not noise
+
+
+def test_shared_t1_is_the_one_step_sample():
+  """loss/photom_t1 (training_loss at t = 1 on every layer, with the volume's seeded noise) renders exactly what the 1-step
+  sample (sample(steps=1), the eval's onestep) does: the x0 prediction from the same pure noise."""
+  import gs_diffusion as gd
+  m = gd.GSDiffusionModel.__new__(gd.GSDiffusionModel)
+  torch.nn.Module.__init__(m)
+  w = torch.randn(14, generator=torch.Generator().manual_seed(0))
+  m.head = lambda feats, x, t: x * w[None, None, :, None, None] + t[:, :, None, None, None]   # a stand-in network
+  m._feats = lambda image: None
+  m.normalize = lambda x: x
+  m.decode = lambda x: x
+  m.eval_seed = 0
+  m.schedule = types.SimpleNamespace(sample=lambda b, phase, generator=None: torch.rand(b, 6, generator=generator))
+  if hasattr(gd.GSDiffusionModel, "_net_input"):
+    m.schedule.fixed_t = None
+  B, L = 2, 6
+  hit = torch.rand(B, L, 4, 4, generator=torch.Generator().manual_seed(1)) > 0.3
+  image, seeds = torch.zeros(B, 3, 8, 8), [3, 9]
+  x0_hat = m.training_loss(image, hit, torch.zeros(B, L, 14, 4, 4), seeds=seeds, return_pred=True, t=torch.ones(B, L))[3]
+  one_step = m.sample(image, hit, seeds=seeds, steps=1)
+  torch.testing.assert_close(x0_hat.float(), one_step.float())
