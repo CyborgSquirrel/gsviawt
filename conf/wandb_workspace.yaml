@@ -1,0 +1,12 @@
+# wandb_workspace.py: a saved W&B view (workspace) for the grid-diffusion runs, built from code.
+entity: null                 # null: the API key's default entity
+project: gsviawt
+name: grid diffusion         # the view's name (a NEW view is created every time it is saved)
+query: "^new100"             # runs shown: a regex on the run name (the runset; a filter, so new runs appear without re-saving)
+validation: big_ema          # which validation's keys to plot: <set>/<validation>/...
+sets: [val_meshes, val_views_sval, val_views_strain]
+val_t: [0.25, 0.5, 0.75, 1]  # diffusion.val_t of the runs
+x_axis: train_seconds        # the runs' x-axis (logged on every row by train_gs.py's ProgressWandbLogger)
+max_runs: 20
+train_smoothing: 0.9         # exponential smoothing of the per-step train panels (0: off); validation panels are never smoothed
+save: false                  # false: print the layout only; true: save the view to W&B (writes to the project)
