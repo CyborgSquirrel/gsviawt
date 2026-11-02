@@ -9,8 +9,9 @@ Per mesh (the rows of a render_objaverse.py h5 with one `mesh_index`):
   - combined fit (fit_combined): per-anchor offset (free 3D, from the anchor = its slots' mean), quaternion, SH0 colour, and
     `levels` density levels of log-scale + opacity logit; a view renders its subset at, per anchor, the level of its own spacing
     relative to the anchor's mean spacing (view_levels). Each step: a random training view's subset, rendered into an independent
-    random training camera, 0.8 L1 + 0.2 D-SSIM + offset_reg_weight x mean |offset|^2 over the subset; plain dense Adam over all
-    anchors; the offset lr decays exponentially offset_lr_start -> offset_lr_end (x base) over the run.
+    random training camera, 0.8 L1 + 0.2 D-SSIM over the subset; dense Adam over all anchors, AdamW with decoupled weight decay
+    lr.offset_weight_decay for the offsets (pulls them back toward the anchor; an L2 loss term barely acts under Adam's
+    per-parameter scaling); the offset lr decays exponentially offset_lr_start -> offset_lr_end (x base) over the run.
   - per-view fine-tune (finetune): the view's subset at its levels, flattened to one Gaussian per slot, from the combined fit's
     parameters (never from another view's fine-tune: anchors are shared), fresh optimizer, a few hundred steps with the cameras of
     all training views.
@@ -300,8 +301,10 @@ def exp_factor(it, steps, start, end):
   return start * (end / start) ** ((it - 1) / max(1, steps - 1))
 
 
-def make_adam(params, lrs):
-  return {k: torch.optim.Adam([params[k]], lr=float(lrs[k]), eps=1e-15) for k in params}
+def make_adam(params, lrs, offset_wd):
+  """dense Adam per parameter group; the offsets AdamW with decoupled weight decay offset_wd (pull toward offset 0)"""
+  return {k: (torch.optim.AdamW([params[k]], lr=float(lrs[k]), eps=1e-15, weight_decay=float(offset_wd)) if k == "offset"
+              else torch.optim.Adam([params[k]], lr=float(lrs[k]), eps=1e-15)) for k in params}
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +318,7 @@ def fit_combined(params, anchors_t, cams, cfg, scene_extent, rng, log_step=None)
   steps = int(cfg.combined.steps)
   lrs = {k: float(cfg.lr[k]) for k in PARAM_KEYS}
   lrs["offset"] *= scene_extent
-  opt = make_adam(params, lrs)
+  opt = make_adam(params, lrs, cfg.lr.offset_weight_decay)
   dssim = DSSIMLoss().to(cams.gt.device)
   views = list(range(len(cams)))
   photo_log, loss_log = [], []   # detached GPU scalars, copied to the host once at the end (no per-step sync)
@@ -327,7 +330,7 @@ def fit_combined(params, anchors_t, cams, cfg, scene_extent, rng, log_step=None)
     photo = photometric(dssim, rgb, cams.gt[cam], float(cfg.loss.lambda_dssim))
     opt["offset"].param_groups[0]["lr"] = lrs["offset"] * exp_factor(
       it, steps, float(cfg.combined.offset_lr_start), float(cfg.combined.offset_lr_end))
-    loss = photo + float(cfg.loss.offset_reg_weight) * params["offset"][idx].pow(2).sum(-1).mean()
+    loss = photo
     for o in opt.values():
       o.zero_grad(set_to_none=True)
     loss.backward()
@@ -347,7 +350,7 @@ def finetune(flat, cams, cfg, scene_extent, rng, log_step=None):
   params = {k: flat[k].requires_grad_(True) for k in PARAM_KEYS}
   lrs = {k: float(cfg.lr[k]) for k in PARAM_KEYS}
   lrs["offset"] *= scene_extent
-  opt = make_adam(params, lrs)
+  opt = make_adam(params, lrs, cfg.lr.offset_weight_decay)
   dssim = DSSIMLoss().to(cams.gt.device)
   views = list(range(len(cams)))
   photo_log, loss_log = [], []   # detached GPU scalars, copied to the host once at the end (no per-step sync)
@@ -357,7 +360,7 @@ def finetune(flat, cams, cfg, scene_extent, rng, log_step=None):
     photo = photometric(dssim, rgb, cams.gt[cam], float(cfg.loss.lambda_dssim))
     opt["offset"].param_groups[0]["lr"] = lrs["offset"] * exp_factor(
       it, steps, float(cfg.finetune.pos_lr_start), float(cfg.finetune.pos_lr_end))
-    loss = photo + float(cfg.loss.offset_reg_weight) * flat["offset"].pow(2).sum(-1).mean()
+    loss = photo
     for o in opt.values():
       o.zero_grad(set_to_none=True)
     loss.backward()

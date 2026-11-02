@@ -34,6 +34,7 @@ finetune:
 
 lr:
   offset: 0.00016       # x scene_extent (fit_3dgs.load_scene_h5's, over the training cameras)
+  offset_weight_decay: 3.0   # AdamW decoupled weight decay on the offsets (combined fit and fine-tune): pull toward the anchor
   sh0: 0.0025
   opacities: 0.025
   scales: 0.005
@@ -41,7 +42,6 @@ lr:
 
 loss:
   lambda_dssim: 0.2
-  offset_reg_weight: 0.01   # x mean |offset|^2 over the rendered Gaussians
 
 # regression mode: these local views are held out instead of the val_fraction split, and every written view's held-out PSNR
 # (mean over these views, full image, like fit_3dgs's val/PSNR) is reported for the shared and the fine-tuned grids

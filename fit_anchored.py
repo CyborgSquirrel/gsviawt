@@ -49,7 +49,7 @@ def _view_config(cfg, hdf5_path, rows, train, held, v, stage, iters, extra):
     "gaussian_layout": "layered", "hdf5_path": hdf5_path,
     "data": {"primary_view": rows[v], "secondary_views": [rows[w] for w in train if w != v],
              "validation_views": [rows[w] for w in held]},
-    "iters": int(iters), "sh_degree": 0, "mean_offset_reg_weight": float(cfg.loss.offset_reg_weight),
+    "iters": int(iters), "sh_degree": 0, "lr": {"means_weight_decay": float(cfg.lr.offset_weight_decay)},
     "lambda_dssim": float(cfg.loss.lambda_dssim), "seed": int(cfg.seed),
     "anchored": {**OmegaConf.to_container(cfg, resolve=True), "stage": stage, "view_in_mesh": int(v), **extra},
   }
