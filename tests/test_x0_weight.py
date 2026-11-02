@@ -18,7 +18,7 @@ def step(x0_weight):
     spike_skip=types.SimpleNamespace(check=lambda v: False, average=None),
     _diffusion_losses=lambda batch: (a * 0.5, {}, {}, None, None),       # x0 loss = 1.0
     _photom_active=lambda: True,
-    _diffusion_photom=lambda stage, batch, x0_hat, t, gated: b * 0.1,     # rendering loss = 0.3
+    _diffusion_photom=lambda stage, batch, x0_hat, t, log=None: b * 0.1,     # rendering loss = 0.3
     _log_metric=lambda stage, k, v, n: logged.__setitem__(k, float(v)), _log_parts=lambda *x: None)
   loss = train_gs.GSLightningModule._diffusion_train_step(fake, {"batch_size": 4, "x0_raw": torch.zeros(1, 14, 6, 8, 8)})
   loss.backward()
