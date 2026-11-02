@@ -445,19 +445,24 @@ class GSDiffusionModel(nn.Module):
       return x_net
     return (1 - a).expand_as(x_net).to(x_net.dtype)
 
-  def training_loss(self, image, hit, x0_raw, seeds=None, return_pred=False):
+  def training_loss(self, image, hit, x0_raw, seeds=None, return_pred=False, t=None):
     """The masked x0 loss. Returns (loss, parts, counts): parts = per-field and per-t-bucket detached means, counts the number of valid
     slots each is a mean over (a bucket can be empty: it is not a mean then, and must not be logged). seeds: per-volume seeds
     for the timesteps and the noise (validation); None: the global random stream. return_pred: also the prediction x0_hat
-    (B, L, C, H, W, normalized, with its graph) and the timesteps t (B, L), for the rendering loss (diffusion.photom)."""
+    (B, L, C, H, W, normalized, with its graph) and the timesteps t (B, L), for the rendering loss (diffusion.photom). t: these
+    timesteps (B, L) instead of the schedule's (the noise is still the seeds')."""
     feats = self._feats(image)
     x0 = self.normalize(x0_raw)
     b, l = x0.shape[:2]
     if seeds is None:
+      if t is not None:
+        raise ValueError("training_loss: t needs seeds (the given timesteps are a validation's, with its seeded noise)")
       t = self.schedule.sample(b, phase=1).to(x0.device)                              # (B, L)
       eps = torch.randn(x0.shape, device=x0.device, dtype=x0.dtype)
     else:
-      t, eps = self.eval_noise(seeds, x0.shape, x0.device)
+      t_seeded, eps = self.eval_noise(seeds, x0.shape, x0.device)
+      # the deterministic control (schedule.fixed_t) has no other timestep: its prediction doesn't depend on one
+      t = t_seeded if t is None or self.schedule.fixed_t is not None else t.to(x0.device, t_seeded.dtype)
     t5 = t[:, :, None, None, None]
     a = hit[:, :, None].to(x0.dtype)                                                 # (B, L, 1, H, W): the validity mask
     x_net = self._net_input(a * ((1 - t5) * x0 + t5 * eps) + (1 - a) * eps, a)     # WT Eq. 7: invalid slots see the max noise

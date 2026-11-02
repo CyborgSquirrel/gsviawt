@@ -111,8 +111,9 @@ def init_gaussians(depth_primary, K_primary, pose_primary, image_primary,
 
   dh, dw = depth_primary.shape[:2]
   ih, iw = image_primary.shape[:2]
-  iv = np.clip(np.round(v * (ih / dh)), 0, ih - 1).astype(np.int64)
-  iu = np.clip(np.round(u * (iw / dw)), 0, iw - 1).astype(np.int64)
+  # the image pixel containing the depth pixel's centre (pixel-centre convention, see unproject_depth_peel)
+  iv = np.clip(np.floor((v + 0.5) * (ih / dh)), 0, ih - 1).astype(np.int64)
+  iu = np.clip(np.floor((u + 0.5) * (iw / dw)), 0, iw - 1).astype(np.int64)
   colors = image_primary[iv, iu, :3].astype(np.float32) / 255.0      # front-pixel colour
 
   # isotropic initial scale = RMS distance to the knn_k nearest neighbours
@@ -693,6 +694,14 @@ class DSSIMLoss(nn.Module):
     self.register_buffer("window", gaussian_window(window_size, sigma), persistent=False)
 
   def forward(self, x, y):
+    # fp32, autocast off: the variances below are differences of nearly equal numbers; in bf16 their gradient is noise (cosine
+    # ~0.002 to the fp32 gradient on real renders, bla/review/01_photom_dssim_real.py) although the loss value looks fine.
+    # Contiguous: a channels-last-strided view (e.g. rearrange(rgb, "b h w c -> b c h w") of a render) sends cuDNN's
+    # grouped conv backward down a ~5x slower path (~10 ms vs ~2 ms per call at 504x504); same values either way.
+    with torch.autocast(device_type=x.device.type, enabled=False):
+      return self._forward(x.float().contiguous(), y.float().contiguous())
+
+  def _forward(self, x, y):
     c = x.shape[1]
     w = self.window.expand(c, 1, -1, -1)
     pad = w.shape[-1] // 2
@@ -844,13 +853,13 @@ def _build_panel(gt_rgb, pred_rgb):
   n = gt_rgb.shape[0]
   rows = []
   for i in range(n):
-    gc = gt_rgb[i].detach().cpu()
-    pc = pred_rgb[i].detach().cpu()
+    pc = pred_rgb[i].detach()
+    gc = gt_rgb[i].detach().to(pc.device)
     g = (gc * 255).to(torch.uint8)
     r = (pc * 255).to(torch.uint8)
     d = ((gc - pc).abs() * 255).to(torch.uint8)
     rows.append(pack([g, r, d], "c * w")[0])
-  return pack(rows, "c h *")[0]
+  return pack(rows, "c h *")[0].cpu()   # built on the input's device, one uint8 copy
 
 
 class PanelCallback(pl.Callback):
@@ -1127,7 +1136,7 @@ class OrbitCallback(pl.Callback):
       width=width, height=height,
       sh_degree=gauss["sh_degree"], render_mode="RGB", packed=True,
     )
-    frames = (rgb.clamp(0.0, 1.0).cpu().numpy() * 255).astype("uint8")
+    frames = (rgb.clamp(0.0, 1.0) * 255).to(torch.uint8).cpu().numpy()   # uint8 before the copy: 4x fewer bytes
     if not self.source_view:
       return frames
     # views["gt_rgb"][0] is the source view (premultiplied over black, like the orbit's background)

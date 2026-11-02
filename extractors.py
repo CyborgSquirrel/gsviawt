@@ -68,7 +68,9 @@ def forward_fill_depth(depth):
 def unproject_stack(depth, K):
     """depth: (H, W, L) with NaN where invalid; K: (3, 3). Returns (H, W, L, 3)
     camera-space XYZ (OpenCV axes), NaN where depth is NaN. Pixel (u, v) are the
-    integer indices, same convention as debug_pointcloud.unproject_depth_peel."""
+    integer indices: World Tracing's own unprojection convention (wt/inference.py),
+    which is what its input point maps are built with -- unlike
+    debug_pointcloud.unproject_depth_peel, which uses the render's pixel centres."""
     height, width, _ = depth.shape
     v, u = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
     pixels = np.stack([u, v, np.ones_like(u)], axis=-1).astype(np.float32)  # (H, W, 3)

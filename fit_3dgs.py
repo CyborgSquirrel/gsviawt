@@ -42,10 +42,10 @@ training starts exactly at the seed), not a single free tensor like
 trainable, still what gsplat.strategy's optimizer/check_sanity plumbing
 expects at that key); Fit3DGSLightningModule._active_means() is the one
 place that resolves means_original + offset into the actual position
-every render/preview/eval/output call needs. cfg.mean_offset_reg_weight
-adds an L2 penalty on the offset (not the resolved position) to the
-train loss, pulling Gaussians back toward their seeded origin instead of
-letting the offset drift unconstrained.
+every render/preview/eval/output call needs. The offset is optimized with
+AdamW, weight decay cfg.lr.means_weight_decay (decoupled: each step shrinks
+the offset by lr * wd), pulling Gaussians back toward their seeded origin
+instead of letting the offset drift unconstrained.
 
 cfg.background (none/white/random) picks what's composited under the
 render and, wherever real alpha exists (hdf5_path; COLMAP photos have
@@ -125,7 +125,7 @@ import wandb
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _REPO_ROOT)
 from module import DSSIMLoss, OPENGL_TO_OPENCV, ProgressWandbLogger, _completed_steps  # noqa: E402
-from gs_dataset import _EmptyDataset, render_catalog, split_by_view  # noqa: E402
+from gs_dataset import _EmptyDataset, render_catalog  # noqa: E402
 from util import timed  # noqa: E402
 
 sys.path.insert(0, os.path.join(_REPO_ROOT, "gaussian-splatting"))
@@ -234,7 +234,7 @@ def rescale_camera(cam, scale):
           "width": new_w, "height": new_h}
 
 
-def resolve_views(hdf5_path, primary, secondary, validation, val_fraction, seed):
+def resolve_views(hdf5_path, primary, secondary, validation, split_fn, seed):
   """Resolves cfg.data.primary_view / secondary_views / validation_views
   (each None == unset) into a full (primary: int, secondary: list[int],
   validation: list[int]) of h5 row indices. Train = primary + secondary;
@@ -244,14 +244,14 @@ def resolve_views(hdf5_path, primary, secondary, validation, val_fraction, seed)
   none of the three groups) is the "inverse dataset", and anything unset
   comes from it:
     - secondary AND validation (and/or primary) unset: the inverse dataset
-      is split with gs_dataset.split_by_view(val_fraction, seed) -- its
+      is split with data.split_fn (e.g. split_by_view, val_fraction, seed) -- its
       train side is the train pool, its val side is validation.
     - only secondary/primary unset: the whole inverse dataset is the train
       pool. Only validation unset: it is all validation.
     - primary unset: the smallest view index in the train pool (a pool
       derived from the inverse dataset, never carved out of an explicit
       secondary_views), removed from the pool; secondary gets the rest.
-  With all three unset this is exactly the old behaviour: split_by_view
+  With all three unset this is exactly the old behaviour: data.split_fn
   over the whole catalog, primary == its smallest train index.
   Views in the inverse dataset that end up in no group are just unused."""
   catalog = render_catalog(hdf5_path)
@@ -279,7 +279,7 @@ def resolve_views(hdf5_path, primary, secondary, validation, val_fraction, seed)
     inverse = catalog if not given_set else catalog.take(
       [pos for pos, i in enumerate(all_idx) if i not in given_set])
     if needs_train and needs_val:
-      train_side, val_side = split_by_view(inverse, val_fraction=val_fraction, seed=seed)
+      train_side, val_side = split_fn(inverse, seed=seed)
       train_pool, validation = _ids(train_side), _ids(val_side)
     elif needs_train:
       train_pool = _ids(inverse)
@@ -550,7 +550,7 @@ def save_output_layered(path, params_np, meta):
   scales = np.exp(params_np["scales"])
   quats = params_np["quats"] / np.linalg.norm(params_np["quats"], axis=-1, keepdims=True)
   opac = 1.0 / (1.0 + np.exp(-params_np["opacities"]))
-  colors = np.clip(SH_C0 * params_np["sh0"][:, 0, :] + 0.5, 0.0, 1.0)
+  colors = np.clip(SH_C0 * params_np["sh0"][:, 0, :] + 0.5, 0.0, None)   # gsplat clamps at 0 only
 
   v, u, layer = meta["v"], meta["u"], meta["layer"]
   H, W, L = meta["H"], meta["W"], meta["L"]
@@ -581,30 +581,38 @@ class Fit3DGSViewDataset(Dataset):
   loaded/resized by load_scene()/load_scene_h5(), viewmat/K precomputed.
   gt_alpha is always 1 for COLMAP captures (no matte); cfg.background !=
   "none" recomposites gt_rgb onto the configured colour using it (see
-  Fit3DGSLightningModule._step) -- a no-op wherever alpha is all-1."""
+  Fit3DGSLightningModule._step) -- a no-op wherever alpha is all-1.
 
-  def __init__(self, cams):
-    self.cams = cams
+  device: where the items' tensors live, all of them moved there once up
+  front (e.g. the GPU, so a step's batch needs no host->device copy)."""
+
+  def __init__(self, cams, device="cpu"):
+    self.items = [{
+      "gt_rgb": torch.from_numpy(c["image"]).to(device),
+      "gt_alpha": torch.from_numpy(c["alpha"]).to(device),
+      "K": torch.from_numpy(c["K"]).to(device),
+      "viewmat": torch.from_numpy(c["viewmat"]).to(device),
+    } for c in cams]
 
   def __len__(self):
-    return len(self.cams)
+    return len(self.items)
 
   def __getitem__(self, i):
-    c = self.cams[i]
-    return {
-      "gt_rgb": torch.from_numpy(c["image"]),
-      "gt_alpha": torch.from_numpy(c["alpha"]),
-      "K": torch.from_numpy(c["K"]),
-      "viewmat": torch.from_numpy(c["viewmat"]),
-    }
+    return self.items[i]
 
 
 class Fit3DGSDataModule(pl.LightningDataModule):
   def __init__(self, cfg, train_cams, test_cams):
     super().__init__()
     self.cfg = cfg
-    self.train_ds = Fit3DGSViewDataset(train_cams)
-    self.val_ds = Fit3DGSViewDataset(test_cams) if test_cams else _EmptyDataset()
+    self.train_cams, self.test_cams = train_cams, test_cams
+
+  def setup(self, stage):
+    # In-process loading (num_workers=0): every view sits on the training device for the whole fit
+    # (a ~3 MB pageable copy per step otherwise); worker processes can't hand out CUDA tensors.
+    device = self.trainer.strategy.root_device if int(self.cfg.loader.num_workers) == 0 else "cpu"
+    self.train_ds = Fit3DGSViewDataset(self.train_cams, device)
+    self.val_ds = Fit3DGSViewDataset(self.test_cams, device) if self.test_cams else _EmptyDataset()
 
   def train_dataloader(self):
     return DataLoader(self.train_ds, shuffle=True, **OmegaConf.to_container(self.cfg.loader, resolve=True))
@@ -624,7 +632,7 @@ class Fit3DGSLightningModule(pl.LightningModule):
     self.active_sh_degree = 0
     self.views_seen = 0
     self.pixels_seen = 0  # total pixels of the train-view targets supervised on so far (B * H * W per step)
-    self.final_loss = float("nan")
+    self._last_loss = None  # the last train step's loss, kept on the GPU (see final_loss)
     self.step_count = 0
     self.gaussian_layout = str(cfg.gaussian_layout)
 
@@ -643,7 +651,6 @@ class Fit3DGSLightningModule(pl.LightningModule):
     # the position -- _active_means() is the one place that resolves
     # the two into the actual position every render call needs; nothing
     # else should read self.params["means"] directly as if it were one.
-    self.mean_offset_reg_weight = float(cfg.mean_offset_reg_weight)
     self.params = nn.ParameterDict()
     for k, v in g.items():
       if k == "means" and self.gaussian_layout == "layered":
@@ -694,6 +701,10 @@ class Fit3DGSLightningModule(pl.LightningModule):
     # the render `info` is on) -- no manual device placement needed here,
     # unlike a plain dict of eagerly-created tensors would.
     self.strategy_state = self.strategy.initialize_state(scene_scale=scene_extent)
+    # Layered, with no opacity reset inside the run (no step in [1, iters) is a multiple of reset_every):
+    # step_pre/post_backward would only keep up grad2d/count statistics for a grow/prune that never runs
+    # -- skip both (a means2d.retain_grad and a few bookkeeping kernels every step), same result.
+    self.strategy_active = not (self.gaussian_layout == "layered" and reset_every >= int(cfg.iters))
 
     # A fixed handful of preview cameras (module.PanelCallback/OrbitCallback,
     # via preview_entries() below) -- not the full train/val split (that's
@@ -706,6 +717,10 @@ class Fit3DGSLightningModule(pl.LightningModule):
       }
       for k, cams in preview_cams.items() if cams
     }
+
+  @property
+  def final_loss(self):
+    return float("nan") if self._last_loss is None else float(self._last_loss)
 
   def _active_means(self):
     """The actual world-space Gaussian positions -- self.params["means"]
@@ -732,13 +747,18 @@ class Fit3DGSLightningModule(pl.LightningModule):
       lr_delay_mult=float(cfg.lr.means_delay_mult),
       max_steps=int(cfg.lr.means_max_steps),
     )
+    # fused=True: one kernel per optimizer step instead of the foreach path's handful, same Adam update
     self.optimizers_dict = {
-      "means": torch.optim.Adam([self.params["means"]], lr=self.means_lr_fn(0), eps=1e-15),
-      "sh0": torch.optim.Adam([self.params["sh0"]], lr=float(cfg.lr.features_dc), eps=1e-15),
-      "shN": torch.optim.Adam([self.params["shN"]], lr=float(cfg.lr.features_rest), eps=1e-15),
-      "opacities": torch.optim.Adam([self.params["opacities"]], lr=float(cfg.lr.opacities), eps=1e-15),
-      "scales": torch.optim.Adam([self.params["scales"]], lr=float(cfg.lr.scales), eps=1e-15),
-      "quats": torch.optim.Adam([self.params["quats"]], lr=float(cfg.lr.quats), eps=1e-15),
+      # layered: AdamW on the offset (decoupled weight decay pulls it back toward the slot); set: absolute means, Adam
+      "means": (torch.optim.AdamW([self.params["means"]], lr=self.means_lr_fn(0), eps=1e-15, fused=True,
+                                  weight_decay=float(cfg.lr.means_weight_decay))
+                if self.gaussian_layout == "layered" else
+                torch.optim.Adam([self.params["means"]], lr=self.means_lr_fn(0), eps=1e-15, fused=True)),
+      "sh0": torch.optim.Adam([self.params["sh0"]], lr=float(cfg.lr.features_dc), eps=1e-15, fused=True),
+      "shN": torch.optim.Adam([self.params["shN"]], lr=float(cfg.lr.features_rest), eps=1e-15, fused=True),
+      "opacities": torch.optim.Adam([self.params["opacities"]], lr=float(cfg.lr.opacities), eps=1e-15, fused=True),
+      "scales": torch.optim.Adam([self.params["scales"]], lr=float(cfg.lr.scales), eps=1e-15, fused=True),
+      "quats": torch.optim.Adam([self.params["quats"]], lr=float(cfg.lr.quats), eps=1e-15, fused=True),
     }
     self.strategy.check_sanity(self.params, self.optimizers_dict)
     return list(self.optimizers_dict.values())
@@ -798,8 +818,6 @@ class Fit3DGSLightningModule(pl.LightningModule):
         bg = torch.ones(3, device=gt_rgb.device)
       case ("random", "train"):
         bg = torch.rand(3, device=gt_rgb.device)
-      case ("random", "val"):
-        bg = torch.ones(3, device=gt_rgb.device)
       case _:
         bg = None
     if bg is not None:
@@ -838,28 +856,20 @@ class Fit3DGSLightningModule(pl.LightningModule):
       # they operate on the trainable leaf, not the resolved position.
       render_params = {**self.params, "means": self._active_means()}
       rgb, alpha, info = render(render_params, self.active_sh_degree, viewmat, K, W, H, backgrounds=bg)
-      if stage == "train":
+      if stage == "train" and self.strategy_active:
         # step_pre_backward calls info["means2d"].retain_grad() -- must
         # run before backward for a non-leaf tensor to keep its .grad
         # populated.
         self.strategy.step_pre_backward(self.params, self.optimizers_dict, self.strategy_state, it, info)
       # photom_loss: the L1+D-SSIM combo alone, logged as its own metric
       # (loss/photom below) so it stays readable independent of whatever
-      # non-photometric terms (currently just mean_offset_reg) get folded
-      # into the full `loss` that's actually optimized -- fold additional
-      # terms into `loss` here, never back into photom_loss itself.
+      # non-photometric terms get folded into the full `loss` that's
+      # actually optimized -- fold additional terms into `loss` here,
+      # never back into photom_loss itself. (The pull of layered offsets
+      # back toward their slot is the means optimizer's AdamW weight
+      # decay, not a loss term.)
       photom_loss, parts = self._photom_loss(rgb, gt_rgb)
       loss = photom_loss
-      offset_reg = None
-      if stage == "train" and self.gaussian_layout == "layered" and self.mean_offset_reg_weight > 0:
-        # L2 penalty on the offset itself (not the resolved position) --
-        # pulls Gaussians back toward their depth-peel-seeded origin,
-        # the whole point of splitting means into a frozen original +
-        # an optimizable offset instead of leaving means fully free.
-        # NOT folded into `parts` (that loop below logs everything in it
-        # under "loss/photom_*" -- this isn't a photometric term).
-        offset_reg = self.params["means"].pow(2).sum(-1).mean()
-        loss = loss + self.mean_offset_reg_weight * offset_reg
 
     if stage == "final_eval":
       # Same methodology as gaussian-splatting/metrics.py: per-image
@@ -870,7 +880,8 @@ class Fit3DGSLightningModule(pl.LightningModule):
       mse = (rgb - gt_rgb).pow(2).mean()
       lpips_val = lpips(rearrange(rgb, "b h w c -> b c h w"), rearrange(gt_rgb, "b h w c -> b c h w"), net_type="vgg")
       return {
-        "PSNR": float(-10 * torch.log10(mse)), "SSIM": float(1.0 - parts["dssim"]), "LPIPS": float(lpips_val),
+        "PSNR": float(-10 * torch.log10(mse)), "PSNR_masked": float(_masked_psnr(rgb, gt_rgb, gt_alpha)),
+        "SSIM": float(1.0 - parts["dssim"]), "LPIPS": float(lpips_val),
       }
 
     if stage == "train":
@@ -888,22 +899,29 @@ class Fit3DGSLightningModule(pl.LightningModule):
       # this one's). Always called, in both gaussian_layout modes:
       # __init__ is what actually disables grow/prune for "layered"
       # (refine_start_iter pushed past cfg.iters), not a guard here --
-      # opacity reset still needs to run.
-      self.strategy.step_post_backward(
-        self.params, self.optimizers_dict, self.strategy_state, it, info, packed=True)
+      # opacity reset still needs to run (strategy_active: off only when nothing in here can fire).
+      if self.strategy_active:
+        self.strategy.step_post_backward(
+          self.params, self.optimizers_dict, self.strategy_state, it, info, packed=True)
 
       self.views_seen += B
       self.pixels_seen += B * H * W
-      self.final_loss = loss.item()
+      self._last_loss = loss.detach()  # not .item(): a host sync every step
       if iteration % int(self.cfg.densify.interval) == 0:
         log.info("iter %d: loss=%.5f  %d Gaussians", iteration, loss.item(), len(self.params["means"]))
+      # train metrics are on_step only: Lightning hands the logger just the ones logged on a
+      # log_every_n_steps step and drops the rest, so skip the ~9 self.log calls (~1 ms) on every other step
+      if not self.trainer._logger_connector.should_update_logs:
+        return loss
 
     _log("loss", loss, prog_bar=(stage == "train"))
     _log("loss/photom", photom_loss.detach())
     for k, v in parts.items():
       _log(f"loss/photom_{k}", v.detach())
-    if offset_reg is not None:
-      _log("loss/mean_offset_reg", offset_reg.detach())
+    if stage == "val":
+      _log("PSNR", -10 * torch.log10((rgb - gt_rgb).pow(2).mean()))
+      _log("PSNR_masked", _masked_psnr(rgb, gt_rgb, gt_alpha))
+      _log("SSIM", 1.0 - parts["dssim"].detach())
     if stage == "train":
       self.log("train/num_gaussians", float(len(self.params["means"])), batch_size=B)
       self.log("train/active_sh_degree", float(self.active_sh_degree), batch_size=B)
@@ -964,6 +982,13 @@ class Fit3DGSLightningModule(pl.LightningModule):
 # gaussian-splatting/metrics.py (per-image PSNR/SSIM/LPIPS(vgg), then mean).
 # ---------------------------------------------------------------------------
 
+def _masked_psnr(rgb, gt_rgb, gt_alpha):
+  """PSNR over the pixels the object covers (GT alpha > 0) only: with ~90% empty background, the full-image
+  PSNR is dominated by black-on-black pixels."""
+  m = (gt_alpha > 0).to(rgb.dtype).expand_as(rgb)
+  return -10 * torch.log10(((rgb - gt_rgb).pow(2) * m).sum() / m.sum().clamp_min(1))
+
+
 def run_final_eval(model, test_cams, device):
   """Drives Fit3DGSLightningModule._step(stage="final_eval") one test view
   at a time -- same bg-select/composite/render/photom_loss pipeline train/
@@ -972,18 +997,19 @@ def run_final_eval(model, test_cams, device):
   returns the per-view {"PSNR"/"SSIM"/"LPIPS"} dict for this stage; this
   function only averages them over the split."""
   loader = DataLoader(Fit3DGSViewDataset(test_cams), batch_size=1, shuffle=False)
-  psnrs, ssims, lpipss = [], [], []
+  psnrs, psnrs_masked, ssims, lpipss = [], [], [], []
   model.eval()
   with torch.no_grad():
     for i, batch in enumerate(loader):
       batch = {k: v.to(device) for k, v in batch.items()}
       out = model._step("final_eval", batch, i)
       psnrs.append(out["PSNR"])
+      psnrs_masked.append(out["PSNR_masked"])
       ssims.append(out["SSIM"])
       lpipss.append(out["LPIPS"])
   return {
-    "PSNR": float(np.mean(psnrs)), "SSIM": float(np.mean(ssims)), "LPIPS": float(np.mean(lpipss)),
-    "num_test_views": len(test_cams),
+    "PSNR": float(np.mean(psnrs)), "PSNR_masked": float(np.mean(psnrs_masked)), "SSIM": float(np.mean(ssims)),
+    "LPIPS": float(np.mean(lpipss)), "num_test_views": len(test_cams),
   }
 
 
@@ -1019,7 +1045,7 @@ def main(cfg: DictConfig) -> None:
   data_views = (cfg.data.primary_view, cfg.data.secondary_views, cfg.data.validation_views)
   if use_h5:
     cfg.data.primary_view, cfg.data.secondary_views, cfg.data.validation_views = resolve_views(
-      cfg.hdf5_path, *data_views, float(cfg.data.split_fn.val_fraction), int(cfg.seed))
+      cfg.hdf5_path, *data_views, hydra.utils.instantiate(cfg.data.split_fn), int(cfg.seed))
   elif any(v is not None for v in data_views):
     raise SystemExit("data.primary_view/secondary_views/validation_views need hdf5_path "
                      "(COLMAP scenes split by llffhold, not by view index)")
@@ -1040,7 +1066,7 @@ def main(cfg: DictConfig) -> None:
     else:
       pcd, scene_extent, train_cams, test_cams = load_scene(
         cfg.source_path, cfg.images, bool(cfg.eval), _coerce_resolution(cfg.resolution))
-  log.info("%d train views, %d test views (llffhold), scene_extent=%.4f",
+  log.info("%d train views, %d test views, scene_extent=%.4f",
            len(train_cams), len(test_cams), scene_extent)
   train_scale = float(cfg.train_scale)
   if train_scale <= 0:
@@ -1073,6 +1099,11 @@ def main(cfg: DictConfig) -> None:
 
   callbacks = list(hydra.utils.instantiate(cfg.callbacks).values())
   trainer = pl.Trainer(logger=logger, callbacks=callbacks, **OmegaConf.to_container(cfg.trainer, resolve=True))
+  if test_cams:
+    # validate the seeded Gaussians before any optimizer step, so the init's own quality is the val curve's
+    # step-0 point (Lightning's sanity check doesn't log; self.log from on_train_start is epoch-level only)
+    with timed("validate step 0"):
+      trainer.validate(model, datamodule=datamodule, verbose=False)
   with timed("optimize"):
     trainer.fit(model, datamodule=datamodule)
 
@@ -1097,8 +1128,8 @@ def main(cfg: DictConfig) -> None:
       device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
       model = model.to(device)
       results = run_final_eval(model, test_cams, device)
-    log.info("final eval (test split, llffhold=8): PSNR %.4f  SSIM %.4f  LPIPS %.4f  (%d views)",
-             results["PSNR"], results["SSIM"], results["LPIPS"], results["num_test_views"])
+    log.info("final eval (test split): PSNR %.4f (object pixels only %.4f)  SSIM %.4f  LPIPS %.4f  (%d views)",
+             results["PSNR"], results["PSNR_masked"], results["SSIM"], results["LPIPS"], results["num_test_views"])
     with open(os.path.join(output_dir, "results.json"), "w") as f:
       json.dump({"ours_final": results}, f, indent=1)
 

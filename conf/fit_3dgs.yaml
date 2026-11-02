@@ -68,16 +68,6 @@ background: none                      # none | white | random
 # init_gaussians_layered/save_output_layered in fit_3dgs.py.
 gaussian_layout: set                  # set | layered
 
-# layered mode only: means = means_original (frozen, the depth-peel seed)
-# + this optimizable offset -- see Fit3DGSLightningModule._active_means.
-# Weight on an L2 penalty (offset.pow(2).sum(-1).mean()) added to the
-# train loss, pulling Gaussians back toward their seeded origin instead
-# of letting the offset drift unconstrained. 0 disables the penalty term
-# (offset still optimizable, just unregularized). No effect in "set" mode
-# (means has no offset split there at all). Untuned default -- adjust to
-# taste.
-mean_offset_reg_weight: 0.01
-
 # --- optimization (== arguments/OptimizationParams' defaults, verbatim) ---
 iters: 30000
 seed: 42
@@ -91,6 +81,11 @@ lr:
                                        # hyperparameter, not tied to `iters` (a short debug run
                                        # with a lower `iters` is then just the first part of a
                                        # real run's LR schedule, not a fully-decayed short one)
+  # layered mode only: the means optimizer is AdamW with this decoupled weight decay on the offset (means =
+  # means_original, the frozen depth-peel seed, + the offset): each step shrinks the offset by lr * wd, pulling
+  # Gaussians back toward their slot. Replaces the old L2 penalty in the loss, which Adam's per-parameter scaling made
+  # ineffective. Set mode (absolute means) always uses plain Adam (wd would pull toward the world origin).
+  means_weight_decay: 3.0
   features_dc: 0.0025
   features_rest: 0.000125             # == features_dc / 20
   opacities: 0.025
@@ -145,12 +140,12 @@ callbacks:
   panel:
     _target_: module.PanelCallback
     trigger_event:
-      every_n_steps: ${eval:'${iters} // 100'}
+      every_n_steps: ${eval:'${iters} // 20'}    # ~0.2 s per panel (mostly wandb's PNG encode); was iters // 100
 
   orbit:
     _target_: module.OrbitCallback
     trigger_event:
-      every_n_steps: ${eval:'${iters} // 20'}
+      every_n_steps: ${eval:'${iters} // 4'}     # ~0.6 s per orbit (mostly the mp4 encode); was iters // 20
     num_frames: 24
     fps: 12
     crf: 18
