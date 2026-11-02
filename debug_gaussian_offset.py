@@ -24,6 +24,7 @@ from argparse import ArgumentParser
 import h5py
 import numpy as np
 import trimesh
+import hydra
 from omegaconf import OmegaConf
 
 import fit_3dgs
@@ -61,7 +62,7 @@ def main():
   # Replay the exact seeding the training run did.
   primary_view_idx, _secondary, _validation = fit_3dgs.resolve_views(
     cfg.hdf5_path, cfg.data.get("primary_view"), cfg.data.get("secondary_views"),
-    cfg.data.get("validation_views"), float(cfg.data.split_fn.val_fraction), int(cfg.seed))
+    cfg.data.get("validation_views"), hydra.utils.instantiate(cfg.data.split_fn), int(cfg.seed))
   seed, _meta = fit_3dgs.init_gaussians_layered(
     cfg.hdf5_path, primary_view_idx, int(cfg.sh_degree), float(cfg.init_opacity), int(cfg.knn_k))
   means_original = seed["means"]
