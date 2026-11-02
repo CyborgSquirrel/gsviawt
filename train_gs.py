@@ -579,7 +579,9 @@ class GSLightningModule(pl.LightningModule):
   def validation_step(self, batch, batch_idx, dataloader_idx=0):
     # dataloader_idx: Lightning omits it with a single val loader, hence the default.
     stage = list(self.trainer.datamodule.val_datasets)[dataloader_idx]
-    out = self._step(stage, batch, batch_idx)   # the sampled Gaussians, rendered and compared with the views
+    # the sampled Gaussians, rendered and compared with the views; diffusion: the full sample, as loss/photom_full (loss/photom is
+    # the training's rendering term, see _diffusion_val_loss)
+    out = self._step(stage, batch, batch_idx, photom_key="loss/photom_full" if diffusion_enabled(self.cfg) else "loss/photom")
     if diffusion_enabled(self.cfg):
       self._diffusion_val_loss(stage, batch)
     return out
@@ -601,28 +603,29 @@ class GSLightningModule(pl.LightningModule):
     seconds = self.clock.seconds() if self.clock is not None else 0.0
     return seconds >= float(p.start_seconds)
 
-  def _diffusion_photom(self, stage, batch, x0_hat, t, gated):
-    """The photometric loss (loss.photom: L1 + D-SSIM on the views of loss.photom.for, against the dataset's rendered images) of
-    the diffusion model's x0 prediction, rendered. Per volume; gated: only the volumes whose timestep, reduced over the layers by
-    diffusion.photom.t_reduce (max: the noisiest layer, mean, layer0), is in diffusion.photom.t_range count (a mean over them; zero
-    when there is none). Logs <prefix>/photom[_l1|_dssim] (over the
-    volumes that count) and, gated, photom_frac (the fraction of volumes that count); ungated (validation) the keys are
-    <prefix>/photom_x0[_l1|_dssim]. Returns the loss (with its graph)."""
+  def _diffusion_photom(self, stage, batch, x0_hat, t):
+    """The photometric loss of the diffusion model's x0 prediction (at the timesteps t), rendered: per volume, only the volumes
+    whose timestep, reduced over the layers by diffusion.photom.t_reduce (max: the noisiest layer, mean, layer0), is in
+    diffusion.photom.t_range count (a mean over them; zero when there is none). Logs <prefix>/photom[_l1|_dssim] (over the
+    volumes that count) and photom_frac (the fraction of volumes that count); the validations log it the same way, so
+    train/loss/photom and <set>/<name>/loss/photom are one quantity. Returns the loss (with its graph)."""
+    lo, hi = self.cfg.diffusion.photom.t_range
+    reduce = self.cfg.diffusion.photom.t_reduce
+    tv = {"max": lambda: t.amax(dim=1), "mean": lambda: t.mean(dim=1), "layer0": lambda: t[:, 0]}[reduce]()   # (B,)
+    keep = ((tv >= float(lo)) & (tv <= float(hi))).float()
+    self._log_metric(stage, "loss/photom_frac", keep.mean(), batch["batch_size"])
+    return self._render_photom(stage, batch, self.model.decode(x0_hat), keep, "loss/photom")
+
+  def _render_photom(self, stage, batch, gauss, keep, key):
+    """loss.photom (L1 + D-SSIM on the views of loss.photom.for, against the dataset's rendered images) of the Gaussian dict gauss,
+    rendered, over the volumes with keep (B,) = 1. Logs <key>[_l1|_dssim]; returns the loss (with its graph)."""
     cfg, device, B = self.cfg, self.device, batch["batch_size"]
     V = batch["views"]["rgb"].shape[1]
     rvi = ([0] if "source" in cfg.loss.photom["for"] else []) + (list(range(1, V)) if "target" in cfg.loss.photom["for"] else [])
-    if gated:
-      lo, hi = cfg.diffusion.photom.t_range
-      reduce = cfg.diffusion.photom.t_reduce
-      tv = {"max": lambda: t.amax(dim=1), "mean": lambda: t.mean(dim=1), "layer0": lambda: t[:, 0]}[reduce]()   # (B,)
-      keep = ((tv >= float(lo)) & (tv <= float(hi))).float()
-      self._log_metric(stage, "loss/photom_frac", keep.mean(), B)
-    else:
-      keep = torch.ones(B, device=device)
     n = keep.sum()
     if n == 0:
       return torch.zeros((), device=device)
-    pred = model_forward(self.model, batch, need_render=True, render_view_idx=rvi, gauss=self.model.decode(x0_hat), device=device)
+    pred = model_forward(self.model, batch, need_render=True, render_view_idx=rvi, gauss=gauss, device=device)
     pred_rgb = pred["rgb"]                                                              # (B, RV, 3, H, W)
     gt_rgb = batch["views"]["rgb"][:, rvi].to(device)
     per = {}
@@ -632,8 +635,6 @@ class GSLightningModule(pl.LightningModule):
       per["dssim"] = self.dssim(pred_rgb.flatten(0, 1), gt_rgb.flatten(0, 1)).reshape(B, -1).mean(1)
     total = cfg.loss.photom.l1_weight * per.get("l1", 0) + cfg.loss.photom.dssim_weight * per.get("dssim", 0)
     loss = (keep * total).sum() / n
-    # validation: "photom_x0" -- the validation's own loss/photom (_step) is the render of the full SAMPLE, a different quantity
-    key = "loss/photom" if gated else "loss/photom_x0"
     for name, v in per.items():
       self._log_metric(stage, f"{key}_{name}", ((keep * v).sum() / n).detach(), int(n))
     self._log_metric(stage, key, loss.detach(), int(n))
@@ -654,7 +655,7 @@ class GSLightningModule(pl.LightningModule):
     loss, parts, counts, x0_hat, t = self._diffusion_losses(batch)
     x0_loss = loss.detach()
     if self._photom_active():
-      loss = loss + float(self.cfg.diffusion.photom.weight) * self._diffusion_photom("train", batch, x0_hat, t, gated=True)
+      loss = loss + float(self.cfg.diffusion.photom.weight) * self._diffusion_photom("train", batch, x0_hat, t)
     value = float(loss.detach())
     skipped = self.spike_skip.check(value)
     self._log_metric("train", "skipped", float(skipped), B)
@@ -679,10 +680,14 @@ class GSLightningModule(pl.LightningModule):
     self._log_metric(stage, "loss/x0", loss.detach(), batch["batch_size"])
     self._log_parts(stage, "loss/x0", parts, counts)
     if self.cfg.diffusion.photom.enabled and self.cfg.diffusion.photom.validate:
-      # every volume (ungated): the render-space error of the one-step x0 prediction at the seeded timesteps
-      self._diffusion_photom(stage, batch, x0_hat, t, gated=False)
+      self._diffusion_photom(stage, batch, x0_hat, t)   # the training's own rendering term, gated the same way
+    # 1-step generation: the x0 prediction from pure noise (t = 1 on every layer), one sampler step, with the noise of the full
+    # sample (validation_step's loss/photom_full), every volume
+    image, hit, seeds = self.model.inputs(batch, self.device)
+    gauss = self.model.sample(image, hit, seeds, steps=1)
+    self._render_photom(stage, batch, gauss, torch.ones(batch["batch_size"], device=self.device), "loss/photom_1step")
 
-  def _step(self, stage, batch, batch_idx):
+  def _step(self, stage, batch, batch_idx, photom_key="loss/photom"):
     B = batch["batch_size"]
     _, V, *_ = batch["views"]["rgb"].shape
     H, W = batch["views"]["rgb"].shape[-2:]
@@ -789,16 +794,16 @@ class GSLightningModule(pl.LightningModule):
     photom_loss = torch.zeros((), device=device)
     if cfg.loss.photom.l1_weight > 0:
       _photom_l1 = g((f(pred_rgb) - f(gt_rgb)).abs()) # (B,V,C,H,W)
-      _splatter_metric("loss/photom_l1", _photom_l1)
+      _splatter_metric(f"{photom_key}_l1", _photom_l1)
       photom_loss = photom_loss + cfg.loss.photom.l1_weight * _photom_l1.mean()
 
     ## D-SSIM Loss
     if cfg.loss.photom.dssim_weight > 0:
       _photom_dssim = g(self.dssim(f(pred_rgb), f(gt_rgb))) # (B,V,C,H,W)
-      _splatter_metric("loss/photom_dssim", _photom_dssim)
+      _splatter_metric(f"{photom_key}_dssim", _photom_dssim)
       photom_loss = photom_loss + cfg.loss.photom.dssim_weight * _photom_dssim.mean()
 
-    _log("loss/photom", photom_loss.detach())
+    _log(photom_key, photom_loss.detach())
     loss = loss + photom_loss
 
     # regularization

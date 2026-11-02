@@ -361,7 +361,7 @@ diffusion:
     t_range: [0.0, 0.7]        # only the volumes whose timestep (reduced over the layers by t_reduce) is in this range (t = 1: pure noise)
     t_reduce: max              # max (the noisiest layer) | mean | layer0
     start_seconds: 0           # off until the train clock reaches this
-    validate: true             # also log <set>/<name>/loss/photom (every volume, ungated) in the validations, when enabled
+    validate: true             # also log <set>/<name>/loss/photom in the validations (gated like the training's), when enabled
 
 optim:
   _target_: torch.optim.AdamW

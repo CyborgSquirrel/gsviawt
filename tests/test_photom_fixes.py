@@ -1,5 +1,6 @@
-"""The PR #97 fixes: D-SSIM in fp32 (its gradient under bf16 autocast was noise), the validation's one-step render logged as
-loss/photom_x0 (not colliding with the sample render's loss/photom), and train/loss/x0 logged only for accepted steps."""
+"""The PR #97 fixes: D-SSIM in fp32 (its gradient under bf16 autocast was noise), the validation's rendering keys
+(loss/photom: the training's term, gated the same way; loss/photom_1step: one step from pure noise; loss/photom_full: the full
+sample -- none colliding), and train/loss/x0 logged only for accepted steps."""
 import os
 import tempfile
 import types
@@ -46,9 +47,36 @@ def test_train_x0_logged_for_accepted_steps_only():
   assert out is None and "loss/x0" not in logged and "loss" not in logged
 
 
+def test_validation_photom_keys():
+  """validation_step: the full sample as loss/photom_full (diffusion) / loss/photom (not); _diffusion_val_loss: the training's
+  term (loss/photom) and the 1-step sample (loss/photom_1step, every volume, the sampler's own noise seeds)."""
+  calls = []
+  for enabled, key in ((True, "loss/photom_full"), (False, "loss/photom")):
+    fake = types.SimpleNamespace(
+      cfg=OmegaConf.create({"diffusion": {"enabled": enabled}}),
+      trainer=types.SimpleNamespace(datamodule=types.SimpleNamespace(val_datasets={"val": None})),
+      _step=lambda stage, batch, idx, photom_key: calls.append(photom_key) or {"loss": 0.0},
+      _diffusion_val_loss=lambda stage, batch: None)
+    train_gs.GSLightningModule.validation_step(fake, {}, 0)
+    assert calls[-1] == key
+
+  logged, sampled = [], []
+  fake = types.SimpleNamespace(
+    cfg=OmegaConf.create({"diffusion": {"photom": {"enabled": True, "validate": True}}}), device=torch.device("cpu"),
+    _diffusion_losses=lambda batch, seeded: (torch.tensor(1.0), {}, {}, "x0_hat", "t"),
+    _log_metric=lambda *a: None, _log_parts=lambda *a: None,
+    _diffusion_photom=lambda stage, batch, x0_hat, t: logged.append(("loss/photom", x0_hat, t)),
+    _render_photom=lambda stage, batch, gauss, keep, key: logged.append((key, gauss, keep.tolist())),
+    model=types.SimpleNamespace(inputs=lambda batch, dev: ("img", "hit", [7, 8]),
+                                sample=lambda image, hit, seeds, steps: sampled.append((seeds, steps)) or "gauss1"))
+  train_gs.GSLightningModule._diffusion_val_loss(fake, "val", {"batch_size": 2})
+  assert logged == [("loss/photom", "x0_hat", "t"), ("loss/photom_1step", "gauss1", [1.0, 1.0])]
+  assert sampled == [([7, 8], 1)]
+
+
 @pytest.mark.cuda
 @pytest.mark.data
-def test_validation_logs_one_step_render_as_photom_x0():
+def test_validation_photom_is_gated_like_training():
   root = os.environ.get("GSVIAWT_TEST_DATA", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bla"))
   grids = os.path.join(root, "grids_test", "fit", "grids")
   if not os.path.isdir(grids):
@@ -85,6 +113,10 @@ def test_validation_logs_one_step_render_as_photom_x0():
   batch = collate_with_batch_size([w[i] for i in range(len(w))])
   x0 = ((batch["x0_raw"].to(dev).float().permute(0, 2, 1, 3, 4) - mean.to(dev)[None, None, :, None, None])
         / std.to(dev)[None, None, :, None, None])
-  train_gs.GSLightningModule._diffusion_photom(fake, "val", batch, x0, torch.full((batch["batch_size"], 6), 0.9, device=dev),
-                                               gated=False)
-  assert "val/loss/photom_x0" in logged and "val/loss/photom" not in logged and "val/loss/photom_frac" not in logged
+  fake._render_photom = lambda *a: train_gs.GSLightningModule._render_photom(fake, *a)
+  B = batch["batch_size"]
+  train_gs.GSLightningModule._diffusion_photom(fake, "val", batch, x0, torch.full((B, 6), 0.9, device=dev))   # max t 0.9: out
+  assert logged == {"val/loss/photom_frac": 0.0}
+  train_gs.GSLightningModule._diffusion_photom(fake, "val", batch, x0, torch.full((B, 6), 0.5, device=dev))   # in t_range
+  assert logged["val/loss/photom_frac"] == 1.0 and {"val/loss/photom", "val/loss/photom_l1", "val/loss/photom_dssim"} <= set(logged)
+  assert logged["val/loss/photom"] < 0.15   # the fitted grids themselves (about 0.08): a sane render, not noise
