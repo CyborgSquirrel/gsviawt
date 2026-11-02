@@ -125,7 +125,8 @@ def main():
 
   # unproject the FULL peel, then filter by point->layer (slicing depth_peel
   # by `sel` would renumber the layers)
-  gt, _, _, gt_layer = unproject_depth_peel(depth_peel, K, None, "camera")
+  # WT's points use integer pixel indices (wt/inference.py), so the GT cloud does too here
+  gt, _, _, gt_layer = unproject_depth_peel(depth_peel, K, None, "camera", pixel_offset=0.0)
   wt, _, _, wt_layer = extract_valid_points(pts_grid)
 
   scale = 1.0

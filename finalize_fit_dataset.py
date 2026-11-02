@@ -3,8 +3,10 @@
 into the form gs_diffusion.py reads:
     <root>/grids/<name>.h5       the fit's gaussian grid (H, W, L, .) with the fit's metadata stamped into its attributes
     <root>/extra/<name>/...      everything else the run wrote (flat gaussians.h5, .ply, logs, .hydra); moved, not deleted
+                                 (grid-only fits, e.g. fit_anchored.py's, get no extra/ entry when nothing else is left)
 
-Only complete fits are collected (grid, flat h5 and ply all there, and no writer holding the files); the others are listed and left
+Only complete fits are collected (grid, flat h5 and ply all there -- or, for a grid-only fit, the grid with the fit's metadata
+(config_json, final_loss, num_gaussians) in its own attributes -- and no writer holding the files); the others are listed and left
 where they are, so it can be run again later, also while fits are still running. An existing grids/<name>.h5 is never overwritten
 (overwrite=true to replace it).
 
@@ -28,7 +30,14 @@ NEEDED = ("gaussians.grid.h5", "gaussians.h5", "gaussians.ply")
 def finalize_one(root, name, overwrite):
   """Moves one fit into grids/ + extra/. Returns None when done, else the reason it was left alone."""
   run = os.path.join(root, name)
-  missing = [f for f in NEEDED if not os.path.exists(os.path.join(run, f))]
+  grid_only = os.path.exists(os.path.join(run, NEEDED[0])) and not os.path.exists(os.path.join(run, "gaussians.h5"))
+  if grid_only:
+    try:
+      with h5py.File(os.path.join(run, NEEDED[0]), "r") as g:
+        grid_only = "config_json" in g.attrs
+    except OSError as e:   # e.g. still being written
+      return f"{type(e).__name__}: {e}"
+  missing = [f for f in (NEEDED[:1] if grid_only else NEEDED) if not os.path.exists(os.path.join(run, f))]
   if missing:
     return f"incomplete (no {', '.join(missing)})"
   target = os.path.join(root, "grids", name + ".h5")
@@ -36,7 +45,7 @@ def finalize_one(root, name, overwrite):
     return "grids/ already has it (overwrite=true to replace)"
   grid, flat = os.path.join(run, "gaussians.grid.h5"), os.path.join(run, "gaussians.h5")
   try:
-    with h5py.File(flat, "r") as f:
+    with h5py.File(grid if grid_only else flat, "r") as f:
       attrs = dict(f.attrs)
     cfg = json.loads(attrs["config_json"])
     if cfg.get("gaussian_layout") != "layered":
@@ -52,7 +61,10 @@ def finalize_one(root, name, overwrite):
         "num_supervision_views": len(cfg["data"]["secondary_views"]) + 1,       # + the primary
         "iters": int(cfg["iters"]),
         "sh_degree": int(cfg["sh_degree"]),
-        "mean_offset_reg_weight": float(cfg["mean_offset_reg_weight"]),
+        # how the layered offsets were pulled toward their slot: AdamW weight decay (current) or, in fits made
+        # before it replaced it, an L2 loss weight
+        **({"means_weight_decay": float(cfg["lr"]["means_weight_decay"])} if "means_weight_decay" in cfg.get("lr", {})
+           else {"mean_offset_reg_weight": float(cfg["mean_offset_reg_weight"])}),
         "means_optimized": True,   # layered: means = the depth-peel seed + a trained offset
         "final_loss": float(attrs["final_loss"]),
         "num_gaussians": int(attrs["num_gaussians"]),
@@ -65,8 +77,11 @@ def finalize_one(root, name, overwrite):
   if os.path.exists(extra):
     shutil.rmtree(extra)
   shutil.move(grid, target)
-  os.makedirs(os.path.dirname(extra), exist_ok=True)
-  shutil.move(run, extra)
+  if os.listdir(run):
+    os.makedirs(os.path.dirname(extra), exist_ok=True)
+    shutil.move(run, extra)
+  else:
+    os.rmdir(run)
   return None
 
 

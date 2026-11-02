@@ -25,11 +25,13 @@ output_dirname: 3dgs-model-${now:%Y-%m-%d_%H-%M-%S}
 output_dir: outputs/${output_dirname}
 
 seed: 42
+train_seed: null   # the torch seed (weights init, noise, data order); null: seed. The train/val splits always use `seed`, so a
+                   # different train_seed is a replicate of a run on the same data
 
 torch_detect_anomaly: false
 
 # Path to a Lightning checkpoint (e.g. an earlier run's
-# ${output_dir}/last.ckpt or model-{epoch}-{step}.ckpt) to resume from --
+# ${output_dir}/final.ckpt or an event_checkpoint) to resume from --
 # restores model/optimizer/scheduler state and the trainer's epoch/step
 # counters, then continues training into a fresh output_dir. null: fresh run.
 ckpt_path: null
@@ -215,22 +217,12 @@ loss:
 events: {}
 
 # orbit / panel / scale_layers / event_checkpoint / validation_small / validation_big each act on their trigger_event, e.g.
-# callbacks.orbit.trigger_event={every_n_seconds:1800} or callbacks.orbit.trigger_event=trough. The Lightning
-# checkpoint below keeps ModelCheckpoint's own every_n_epochs / train_time_interval.
+# callbacks.orbit.trigger_event={every_n_seconds:1800} or callbacks.orbit.trigger_event=trough. Checkpoints are only
+# event_checkpoint's and the TrainClock's final.ckpt (Lightning's own checkpointing is off: trainer.enable_checkpointing).
 callbacks:
   # https://pytorch-lightning.readthedocs.io/en/2.6.1/pytorch/api/lightning.pytorch.callbacks.LearningRateMonitor.html
   lr_monitor:
     _target_: lightning.pytorch.callbacks.LearningRateMonitor
-
-  # https://lightning.ai/docs/pytorch/stable/optional-api/api/lightning.pytorch.callbacks.ModelCheckpoint
-  checkpoint:
-    _target_: lightning.pytorch.callbacks.ModelCheckpoint
-    dirpath: ${output_dir}
-    filename: "model-{epoch}-{step}"
-    every_n_epochs: ${eval:'${trainer.max_epochs} // 10'}
-    save_last: true
-    save_on_exception: true
-    save_weights_only: false
 
   # A checkpoint in the output dir whenever trigger_event is due, named by filename ({count}: how many so
   # far, {step}: the completed optimizer steps). null = off. (final.ckpt is written by the TrainClock when
@@ -320,7 +312,7 @@ trainer:
   max_epochs: 20000
   accelerator: auto
   devices: 1
-  # enable_checkpointing: false
+  enable_checkpointing: false   # no Lightning ModelCheckpoint (it would save every epoch by default); see event_checkpoint
   check_val_every_n_epoch: 1
   log_every_n_steps: 1
   default_root_dir: ${output_dir}
@@ -344,14 +336,23 @@ diffusion:
   checkpoint_activations: true
   steps: 20                    # Euler steps when sampling
   eval_seed: 0                 # the noise of the samples, and of the validation loss
+  # the validations' rendering loss at a SHARED timestep (every layer at the same t, as in the sampler): each volume gets one t
+  # of these (a shuffled bag per validation set, so a validation splits its volumes evenly over them), logged as
+  # <set>/<name>/loss/photom_t<t> (t = 1: the 1-step sample, from pure noise). Empty / null: off
+  val_t: [0.25, 0.5, 0.75, 1.0]
   schedule:
     standard: {mu: 0.0, sigma: 1.0}                         # layers 1.. (logit-normal)
     plateau: {mu: 0.0, sigma: 1.0, mirror: false}           # layer 0: logit-normal up to its mode t* = 0.5, then flat towards t = 1
+    fixed_t: null              # 1.0: a deterministic regressor from the image with the same architecture / data / loss (the control
+                               # for "does diffusion help"): t = 1 always, and the network input is only the validity mask (no
+                               # noise); needs diffusion.steps=1
   # How the fitted scales become x0 (gs_diffusion.encode_grid); both render the same as the grid. The statistics are cached per
   # encoding (<grids_dir>/.x0_moments/<tag>/).
   scale_encoding:
     scale_sort: false          # every Gaussian's axes ordered largest -> smallest (rotation permuted to match)
     scale_floor_px: null       # every axis raised to at least this fraction of a pixel at its source-camera depth, e.g. 0.1
+  train_targets: grid           # the training volumes' supervision (target) views: grid = the training grid views of the mesh;
+                               # all = every render of the mesh except the held-out grid views (validation pools unchanged)
   ema:
     decay: 0.9995              # WT's, after a warmup ramp; validations with `ema: true` use these weights
   spike_skip:
@@ -359,14 +360,14 @@ diffusion:
     decay: 0.99
     warmup_steps: 200          # no spike skipped before this many losses were accepted into the average (checkpointed: a resume keeps counting)
   # Rendering loss on the x0 prediction: decoded, rendered at the views of loss.photom.for, compared with the dataset's rendered
-  # images by loss.photom's L1 + D-SSIM (its weights), added to the x0 loss times `weight`. Needs data.num_views >= 2 for "target".
+  # images by loss.photom's L1 + D-SSIM (its weights), added to the x0 loss times `weight`. Needs data.num_views >= 1 (target views) for "target".
   photom:
     enabled: false
     weight: 1.0
     t_range: [0.0, 0.7]        # only the volumes whose timestep (reduced over the layers by t_reduce) is in this range (t = 1: pure noise)
     t_reduce: max              # max (the noisiest layer) | mean | layer0
     start_seconds: 0           # off until the train clock reaches this
-    validate: true             # also log <set>/<name>/loss/photom (every volume, ungated) in the validations, when enabled
+    validate: true             # also log <set>/<name>/loss/photom in the validations (gated like the training's), when enabled
 
 optim:
   _target_: torch.optim.AdamW
