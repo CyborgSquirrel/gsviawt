@@ -64,9 +64,28 @@ def load_grid(path):
   return grid, attrs
 
 
-def encode_grid(grid, source):
+def sort_scale_axes(scale, quat):
+  """(N, 3) scales, (N, 4) wxyz quaternions -> the same Gaussians with their axes ordered largest -> smallest: the scales sorted and
+  the rotation's columns permuted to match (a column negated where the permutation is a reflection -- a Gaussian is symmetric under
+  axis negation). Covariance R diag(s^2) R^T unchanged."""
+  from scipy.spatial.transform import Rotation
+  order = np.argsort(-scale, axis=1)
+  R = Rotation.from_quat(quat[:, [1, 2, 3, 0]]).as_matrix()                        # (N, 3, 3)
+  R = np.take_along_axis(R, order[:, None, :], axis=2)
+  R[np.linalg.det(R) < 0, :, 2] *= -1
+  q = Rotation.from_matrix(R).as_quat()[:, [3, 0, 1, 2]]
+  return np.take_along_axis(scale, order, axis=1), q.astype(np.float32)
+
+
+def encode_grid(grid, source, scale_sort=False, scale_floor_px=None):
   """The grid's Gaussians as raw (un-normalized) x0 channels, (CHANNELS, L, H, W) float32, zero at the slots without a Gaussian.
-  `source`: the dataset item's "source" dict (xyz_cam (L, H, W, 3) with NaN where there is no hit, hit (L, H, W), pose_gl (4, 4))."""
+  `source`: the dataset item's "source" dict (xyz_cam (L, H, W, 3) with NaN where there is no hit, hit (L, H, W), pose_gl (4, 4),
+  K_depth (3, 3)).
+  scale_floor_px: every scale axis is raised to at least this fraction of the pixel footprint at the Gaussian's depth in the source
+  camera (z / fx): an axis thinner than ~1/10 px is invisible, but its log value (where the fit happened to leave it) is a wide,
+  unpredictable target. scale_sort: the axes of every Gaussian ordered largest -> smallest (sort_scale_axes), so a scale channel
+  means the same axis in every slot. Both render the same as the grid (bla/_test_scale_reencode.py: floor 0.1 px >= 56 dB PSNR
+  against the original render over 5000 renders)."""
   valid = grid["layer_valid"].transpose(2, 0, 1)                      # (L, H, W)
   hit = source["hit"].numpy()
   mismatch = int((valid != hit).sum())
@@ -81,13 +100,19 @@ def encode_grid(grid, source):
   offset = means_cam - source["xyz_cam"].numpy()
 
   quat = np.zeros(valid.shape + (4,), np.float32)
+  scales = grid["gaussian_scales"].transpose(2, 0, 1, 3).astype(np.float32)
+  if scale_floor_px is not None:
+    footprint = means_cam[..., 2] / float(source["K_depth"][0, 0])                 # (L, H, W): one pixel's size at that depth
+    scales = np.maximum(scales, float(scale_floor_px) * np.nan_to_num(footprint)[..., None])
   if valid.any():
     q = rotate_quats_wxyz(grid["gaussian_quats"].transpose(2, 0, 1, 3)[valid], c2w[:3, :3].T)   # world -> source camera
+    if scale_sort:
+      scales[valid], q = sort_scale_axes(scales[valid], q)
     quat[valid] = np.where(q[:, :1] < 0, -q, q)                      # q and -q are one rotation: w >= 0
 
   opacity = np.clip(grid["gaussian_opacities"].transpose(2, 0, 1), 1e-6, 1 - 1e-6)
   opacity = np.clip(np.log(opacity / (1 - opacity)), -OPACITY_LOGIT_CLAMP, OPACITY_LOGIT_CLAMP)
-  scale = np.log(np.maximum(grid["gaussian_scales"].transpose(2, 0, 1, 3), 1e-8))
+  scale = np.log(np.maximum(scales, 1e-8))
   color = (grid["gaussian_colors"].transpose(2, 0, 1, 3) - 0.5) / SH_C0
 
   x0 = np.concatenate([opacity[..., None], scale, quat, color, offset], axis=-1)   # (L, H, W, CHANNELS)
@@ -159,11 +184,12 @@ def make_listing(grid_index, source_h5, out_path):
 
 class GridTargetDataset(Dataset):
   """Wraps a dataset of render items (gs_dataset.WTFeatureDataset) and adds each item's ground-truth Gaussians, "x0_raw"
-  (CHANNELS, L, H, W) (see encode_grid), read from the grid file of its source view."""
+  (CHANNELS, L, H, W) (see encode_grid, with `encoding`: its scale_sort / scale_floor_px), read from the grid file of its source view."""
 
-  def __init__(self, inner, grid_index):
+  def __init__(self, inner, grid_index, encoding=None):
     self.inner = inner
     self.grid_index = grid_index
+    self.encoding = {**dict(scale_sort=False, scale_floor_px=None), **(encoding or {})}
     self.volumes = inner.volumes   # the preview code reads the volumes' mesh/view columns
     missing = sorted(set(int(v) for v in inner.volumes.df["view_idx"].to_list()) - set(grid_index))
     if missing:
@@ -177,12 +203,22 @@ class GridTargetDataset(Dataset):
     grid, _ = load_grid(self.grid_index[item["source_view"]])
     # half precision in transit (dense (14, 6, 504, 504) is 85 MB in float32): the log-scales (|x| < 17), logits, colours and offsets
     # lose < 2% of the channel's std; the model upcasts it
-    item["x0_raw"] = torch.from_numpy(encode_grid(grid, item["source"])).half()
+    item["x0_raw"] = torch.from_numpy(encode_grid(grid, item["source"], **self.encoding)).half()
     return item
 
 
+def encoding_tag(encoding):
+  """The cache subdirectory of an encoding's moments: "" for the default encoding (the caches written before encodings existed)."""
+  e = {**dict(scale_sort=False, scale_floor_px=None), **(encoding or {})}
+  parts = (["sort"] if e["scale_sort"] else []) + ([f"floor{float(e['scale_floor_px']):g}px"] if e["scale_floor_px"] is not None else [])
+  return "_".join(parts)
+
+
 def _grid_moments(dataset, i, path, cache_dir):
-  """(sum, sum of squares, count, min, max) of the x0 channels over the valid slots of volume i; cached per grid file (size + mtime)."""
+  """(sum, sum of squares, count, min, max) of the x0 channels over the valid slots of volume i; cached per grid file (size + mtime)
+  and per encoding (dataset.encoding: its own subdirectory of cache_dir)."""
+  if cache_dir and encoding_tag(dataset.encoding):
+    cache_dir = os.path.join(cache_dir, encoding_tag(dataset.encoding))
   st = os.stat(path)
   stamp = np.array([st.st_size, st.st_mtime_ns], np.int64)
   cache = os.path.join(cache_dir, os.path.basename(path) + ".npz") if cache_dir else None
@@ -192,7 +228,7 @@ def _grid_moments(dataset, i, path, cache_dir):
       return z["s"], z["s2"], int(z["n"]), z["lo"], z["hi"]
   item = dataset.inner[i]
   grid, _ = load_grid(path)
-  x = torch.from_numpy(encode_grid(grid, item["source"]))[:, item["source"]["hit"]].double()   # (CHANNELS, valid slots), full precision
+  x = torch.from_numpy(encode_grid(grid, item["source"], **dataset.encoding))[:, item["source"]["hit"]].double()   # (CHANNELS, valid slots), full precision
   if x.shape[1]:
     moments = (x.sum(1).numpy(), x.square().sum(1).numpy(), x.shape[1], x.amin(1).numpy(), x.amax(1).numpy())
   else:   # a grid without a Gaussian: no moments (compute_stats raises when no grid has any)

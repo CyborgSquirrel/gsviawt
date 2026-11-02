@@ -346,6 +346,11 @@ diffusion:
     fixed_t: null              # 1.0: a deterministic regressor from the image with the same architecture / data / loss (the control
                                # for "does diffusion help"): t = 1 always, and the network input is only the validity mask (no
                                # noise); needs diffusion.steps=1
+  # How the fitted scales become x0 (gs_diffusion.encode_grid); both render the same as the grid. The statistics are cached per
+  # encoding (<grids_dir>/.x0_moments/<tag>/).
+  scale_encoding:
+    scale_sort: false          # every Gaussian's axes ordered largest -> smallest (rotation permuted to match)
+    scale_floor_px: null       # every axis raised to at least this fraction of a pixel at its source-camera depth, e.g. 0.1
   train_targets: grid           # the training volumes' supervision (target) views: grid = the training grid views of the mesh;
                                # all = every render of the mesh except the held-out grid views (validation pools unchanged)
   ema:
