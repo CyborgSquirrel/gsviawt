@@ -34,7 +34,7 @@ from omegaconf import OmegaConf
 from scipy.spatial import cKDTree
 
 from debug_pointcloud import unproject_depth_peel
-from fit_3dgs import render, save_output, save_output_layered, write_ply
+from fit_3dgs import render, save_output_layered
 from module import DSSIMLoss, OPENGL_TO_OPENCV, SH_C0
 
 log = logging.getLogger(__name__)
@@ -383,17 +383,19 @@ def view_done(root, name):
   that is not an anchored one (e.g. a fit_3dgs.py fit in the same root) is an error, not a finished view."""
   run = os.path.join(root, name)
   if os.path.exists(os.path.join(run, "gaussians.grid.h5")):
-    with h5py.File(os.path.join(run, "gaussians.h5"), "r") as f:
-      if "anchored" not in json.loads(f.attrs["config_json"]):
+    meta = os.path.join(run, "gaussians.h5")
+    with h5py.File(meta if os.path.exists(meta) else os.path.join(run, "gaussians.grid.h5"), "r") as f:
+      if "config_json" not in f.attrs or "anchored" not in json.loads(f.attrs["config_json"]):
         raise SystemExit(f"{run} holds a fit that is not an anchored one -- use a separate output_dir")
     return True
   return os.path.exists(os.path.join(root, "grids", name + ".h5"))
 
 
-def write_view(root, name, params_np, view, meta, config, scene_extent, final_loss, losses=None):
-  """<root>/<name>/ in fit_3dgs.py's layered format: gaussians.h5 (flat raw params + attrs, config_json = `config`),
-  gaussians.ply, gaussians.grid.h5 (save_output_layered; layer_valid == the view's depth_peel > 0, checked), + losses.npz.
-  Written into <root>/.tmp_<name> (a name finalize_fit_dataset.py skips) and renamed into place."""
+def write_view(root, name, params_np, view, meta, config, scene_extent, final_loss):
+  """<root>/<name>/gaussians.grid.h5 only (save_output_layered; layer_valid == the view's depth_peel > 0, checked), with the
+  fit's metadata in its attributes (config_json = `config`, final_loss, num_gaussians, num_gaussians_seeded, scene_extent) --
+  the grid-only form finalize_fit_dataset.py collects; no flat gaussians.h5 / .ply copies. Written into <root>/.tmp_<name> (a
+  name finalize_fit_dataset.py skips) and renamed into place."""
   if not all(np.isfinite(v).all() for v in params_np.values()):
     raise RuntimeError(f"{name}: non-finite parameters")
   tmp = os.path.join(root, ".tmp_" + name)
@@ -402,16 +404,14 @@ def write_view(root, name, params_np, view, meta, config, scene_extent, final_lo
   os.makedirs(tmp)
   grid_meta = {"u": view["u"], "v": view["v"], "layer": view["layer"], "H": view["valid"].shape[0],
                "W": view["valid"].shape[1], "L": view["valid"].shape[2], **meta}
-  save_output(os.path.join(tmp, "gaussians.h5"), OmegaConf.create(config), params_np, scene_extent, final_loss,
-              len(params_np["means"]))
-  write_ply(os.path.join(tmp, "gaussians.ply"), params_np)
   grid_path = os.path.join(tmp, "gaussians.grid.h5")
   save_output_layered(grid_path, params_np, grid_meta)
-  with h5py.File(grid_path, "r") as g:
+  with h5py.File(grid_path, "r+") as g:
     if not np.array_equal(np.asarray(g["layer_valid"]), view["valid"]):
       raise RuntimeError(f"{name}: layer_valid != depth_peel > 0")
-  if losses is not None:
-    np.savez(os.path.join(tmp, "losses.npz"), **losses)
+    n = len(params_np["means"])
+    g.attrs.update({"config_json": json.dumps(config), "final_loss": float(final_loss), "num_gaussians": n,
+                    "num_gaussians_seeded": n, "scene_extent": float(scene_extent)})
   verify_written(tmp)
   final = os.path.join(root, name)
   if os.path.exists(final):   # an older, grid-less dir (view_done was false): replaced

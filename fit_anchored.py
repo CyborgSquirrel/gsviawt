@@ -198,8 +198,7 @@ def main(cfg: DictConfig) -> None:
       reg.setdefault("finetuned", {})[str(v)] = an.heldout_psnr(an.flat_render_params(flat), held_cams)
     config = _view_config(cfg, hdf5_path, rows, train, held, v, "finetune",
                           int(cfg.combined.steps) + int(cfg.finetune.steps), _extra(j))
-    an.write_view(out, name[v], an.flat_numpy(flat), views[j], meta, config, scene_extent, float(loss[-1]),
-                  {"photom": photo, "loss": loss})
+    an.write_view(out, name[v], an.flat_numpy(flat), views[j], meta, config, scene_extent, float(loss[-1]))
     log.info("mesh %d view %d fine-tuned (%d/%d): loss %.5f%s", M, v, n_done + 1, len(todo_ft), float(loss[-1]),
              f", held-out PSNR {reg['finetuned'][str(v)]:.3f}" if regression else "")
   if todo_ft:
