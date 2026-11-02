@@ -149,7 +149,8 @@ def test_validation_photom_is_gated_like_training():
   train_gs.GSLightningModule._diffusion_photom(fake, "val", batch, x0, torch.full((B, 6), 0.9, device=dev))   # max t 0.9: out
   assert logged == {"val/loss/photom_frac": 0.0}
   train_gs.GSLightningModule._diffusion_photom(fake, "val", batch, x0, torch.full((B, 6), 0.5, device=dev))   # in t_range
-  assert logged["val/loss/photom_frac"] == 1.0 and {"val/loss/photom", "val/loss/photom_l1", "val/loss/photom_dssim"} <= set(logged)
+  assert logged["val/loss/photom_frac"] == 1.0 and {"val/loss/photom", "val/loss/photom_l1", "val/loss/photom_dssim", "val/loss/photom_psnr", "val/loss/photom_fg_psnr", "val/loss/photom_bg_l1"} <= set(logged)
+  assert 20 < logged["val/loss/photom_psnr"] < 60 and logged["val/loss/photom_bg_l1"] < 0.05   # the fits themselves: sane values
   assert logged["val/loss/photom"] < 0.15   # the fitted grids themselves (about 0.08): a sane render, not noise
 
 
