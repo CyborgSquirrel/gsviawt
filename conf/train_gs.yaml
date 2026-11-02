@@ -29,7 +29,7 @@ seed: 42
 torch_detect_anomaly: false
 
 # Path to a Lightning checkpoint (e.g. an earlier run's
-# ${output_dir}/last.ckpt or model-{epoch}-{step}.ckpt) to resume from --
+# ${output_dir}/final.ckpt or an event_checkpoint) to resume from --
 # restores model/optimizer/scheduler state and the trainer's epoch/step
 # counters, then continues training into a fresh output_dir. null: fresh run.
 ckpt_path: null
@@ -215,22 +215,12 @@ loss:
 events: {}
 
 # orbit / panel / scale_layers / event_checkpoint / validation_small / validation_big each act on their trigger_event, e.g.
-# callbacks.orbit.trigger_event={every_n_seconds:1800} or callbacks.orbit.trigger_event=trough. The Lightning
-# checkpoint below keeps ModelCheckpoint's own every_n_epochs / train_time_interval.
+# callbacks.orbit.trigger_event={every_n_seconds:1800} or callbacks.orbit.trigger_event=trough. Checkpoints are only
+# event_checkpoint's and the TrainClock's final.ckpt (Lightning's own checkpointing is off: trainer.enable_checkpointing).
 callbacks:
   # https://pytorch-lightning.readthedocs.io/en/2.6.1/pytorch/api/lightning.pytorch.callbacks.LearningRateMonitor.html
   lr_monitor:
     _target_: lightning.pytorch.callbacks.LearningRateMonitor
-
-  # https://lightning.ai/docs/pytorch/stable/optional-api/api/lightning.pytorch.callbacks.ModelCheckpoint
-  checkpoint:
-    _target_: lightning.pytorch.callbacks.ModelCheckpoint
-    dirpath: ${output_dir}
-    filename: "model-{epoch}-{step}"
-    every_n_epochs: ${eval:'${trainer.max_epochs} // 10'}
-    save_last: true
-    save_on_exception: true
-    save_weights_only: false
 
   # A checkpoint in the output dir whenever trigger_event is due, named by filename ({count}: how many so
   # far, {step}: the completed optimizer steps). null = off. (final.ckpt is written by the TrainClock when
@@ -320,7 +310,7 @@ trainer:
   max_epochs: 20000
   accelerator: auto
   devices: 1
-  # enable_checkpointing: false
+  enable_checkpointing: false   # no Lightning ModelCheckpoint (it would save every epoch by default); see event_checkpoint
   check_val_every_n_epoch: 1
   log_every_n_steps: 1
   default_root_dir: ${output_dir}
