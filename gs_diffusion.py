@@ -417,6 +417,7 @@ class GSDiffusionModel(nn.Module):
   that renders (inputs(), forward() -> the Gaussian dict, max_sh_degree, backbone, head): forward() SAMPLES."""
 
   max_sh_degree = 0
+  phase = 1   # diffusion.schedule.phase (set in __init__)
 
   def __init__(self, cfg, stats):
     super().__init__()
@@ -446,6 +447,9 @@ class GSDiffusionModel(nn.Module):
                        f"fixed_t={fixed_t}, steps={d.steps}")
     self.schedule = LayerAwareSchedule(self.num_layers, standard=dict(d.schedule.standard), plateau=dict(d.schedule.plateau),
                                        fixed_t=fixed_t)
+    self.phase = int(d.schedule.get("phase", 1))
+    if self.phase not in (1, 2):
+      raise SystemExit(f"diffusion.schedule.phase must be 1 or 2, got {self.phase}")
     self.steps = int(d.steps)
     self.eval_seed = int(d.eval_seed)
 
@@ -468,7 +472,7 @@ class GSDiffusionModel(nn.Module):
     only, so a volume gets the same ones in every validation, whatever the subset or the order."""
     ts, epss = [], []
     for seed in seeds:
-      ts.append(self.schedule.sample(1, phase=1, generator=torch.Generator().manual_seed(int(seed))))
+      ts.append(self.schedule.sample(1, phase=self.phase, generator=torch.Generator().manual_seed(int(seed))))
       gen = torch.Generator(device=device).manual_seed(int(seed))
       epss.append(torch.randn((1, *shape[1:]), device=device, generator=gen))
     return torch.cat(ts).to(device), torch.cat(epss)
@@ -493,7 +497,7 @@ class GSDiffusionModel(nn.Module):
     if seeds is None:
       if t is not None:
         raise ValueError("training_loss: t needs seeds (the given timesteps are a validation's, with its seeded noise)")
-      t = self.schedule.sample(b, phase=1).to(x0.device)                              # (B, L)
+      t = self.schedule.sample(b, phase=self.phase).to(x0.device)                     # (B, L)
       eps = torch.randn(x0.shape, device=x0.device, dtype=x0.dtype)
     else:
       t_seeded, eps = self.eval_noise(seeds, x0.shape, x0.device)
