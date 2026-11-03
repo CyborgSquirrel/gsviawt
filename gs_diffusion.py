@@ -179,6 +179,78 @@ def encode_grid(grid, source, scale_order=None, scale_floor_px=None, rot_form="k
   return np.ascontiguousarray(x0.transpose(3, 0, 1, 2))              # (CHANNELS, L, H, W)
 
 
+def quat_to_matrix(q):
+  """(N, 4) unit wxyz quaternions -> (N, 3, 3) rotation matrices (torch; scipy's convention)."""
+  w, x, y, z = q.unbind(-1)
+  return torch.stack([
+    1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y),
+    2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
+    2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], -1).reshape(-1, 3, 3)
+
+
+def matrix_to_quat(R):
+  """(N, 3, 3) rotation matrices -> (N, 4) unit wxyz quaternions with w >= 0 (torch; the largest-component branch per row)."""
+  m = R
+  t = torch.stack([1 + m[:, 0, 0] + m[:, 1, 1] + m[:, 2, 2], 1 + m[:, 0, 0] - m[:, 1, 1] - m[:, 2, 2],
+                   1 - m[:, 0, 0] + m[:, 1, 1] - m[:, 2, 2], 1 - m[:, 0, 0] - m[:, 1, 1] + m[:, 2, 2]], 1).clamp_min(1e-12)
+  r = t.sqrt()                                                       # 2|w|, 2|x|, 2|y|, 2|z|
+  a, b, c = m[:, 2, 1] - m[:, 1, 2], m[:, 0, 2] - m[:, 2, 0], m[:, 1, 0] - m[:, 0, 1]
+  d, e, f = m[:, 0, 1] + m[:, 1, 0], m[:, 0, 2] + m[:, 2, 0], m[:, 1, 2] + m[:, 2, 1]
+  cand = torch.stack([
+    torch.stack([r[:, 0] / 2, a / (2 * r[:, 0]), b / (2 * r[:, 0]), c / (2 * r[:, 0])], 1),
+    torch.stack([a / (2 * r[:, 1]), r[:, 1] / 2, d / (2 * r[:, 1]), e / (2 * r[:, 1])], 1),
+    torch.stack([b / (2 * r[:, 2]), d / (2 * r[:, 2]), r[:, 2] / 2, f / (2 * r[:, 2])], 1),
+    torch.stack([c / (2 * r[:, 3]), e / (2 * r[:, 3]), f / (2 * r[:, 3]), r[:, 3] / 2], 1)], 1)   # (N, 4 branches, 4)
+  q = cand[torch.arange(len(m), device=m.device), t.argmax(1)]
+  q = F.normalize(q, dim=1)
+  return torch.where(q[:, :1] < 0, -q, q)
+
+
+def format_projection(mean, std, hit, anchor_z, fx, scale_sort=False, scale_floor_px=None, scale_order=None, rot_form="keep"):
+  """A function on normalized x0 predictions (B, L, CHANNELS, H, W) that puts the valid slots' Gaussians into the training grids'
+  format (encode_grid with this encoding): the scale axes ordered largest -> smallest (the rotation permuted to match, as
+  sort_scale_axes), every axis at least scale_floor_px pixel footprints, the rotation a unit quaternion with w >= 0. For the sampler's
+  intermediate predictions (GSDiffusionModel.sample's `project`): render-invariant apart from the floor. hit (B or 1, L, H, W);
+  anchor_z (L, H, W) the anchors' depth (the floor is at the Gaussian's mean depth: anchor + offset z); fx the depth camera's
+  focal length. Takes the run's encoding as keywords: scale_order (keep | sorted | random; only sorted is projected) or the legacy
+  scale_sort, rot_form (canonical: the quaternion form with the largest |w|; keep / random: left as predicted)."""
+  if scale_order is not None:
+    scale_sort = scale_order == "sorted"
+  o = np.cumsum((0,) + DIMS)
+  sc, ro = slice(int(o[1]), int(o[2])), slice(int(o[2]), int(o[3]))   # the scale and rotation channels
+
+  def project(x0):
+    x = x0.clone()
+    v = hit.expand(x.shape[0], *hit.shape[1:]).bool()                # (B, L, H, W)
+    raw = x * std[None, None, :, None, None] + mean[None, None, :, None, None]
+    s = raw[:, :, sc].permute(0, 1, 3, 4, 2)[v].float()               # (N, 3) log-scales
+    q = F.normalize(raw[:, :, ro].permute(0, 1, 3, 4, 2)[v].float(), dim=1)
+    if scale_sort:
+      order = torch.argsort(-s, dim=1, stable=True)   # stable: tied axes (the floor ties many) keep their order -- as encode_grid's
+                                                      # sort, so an encoded grid is a fixed point (CUDA's unstable sort reverses ties)
+      R = torch.gather(quat_to_matrix(q), 2, order[:, None, :].expand(-1, 3, -1))
+      R[torch.linalg.det(R) < 0, :, 2] *= -1
+      q, s = matrix_to_quat(R), torch.gather(s, 1, order)
+    else:
+      q = torch.where(q[:, :1] < 0, -q, q)
+    if rot_form == "canonical":   # q times 1, i, j, k: the same Gaussian; keep the one with the largest |w|
+      w, x_, y, z = q.unbind(-1)
+      forms = torch.stack([q, torch.stack([-x_, w, z, -y], 1), torch.stack([-y, -z, w, x_], 1), torch.stack([-z, y, -x_, w], 1)], 1)
+      q = forms[torch.arange(len(q), device=q.device), forms[:, :, 0].abs().argmax(1)]
+      q = torch.where(q[:, :1] < 0, -q, q)
+    if scale_floor_px is not None:
+      z = anchor_z.expand(*v.shape)[v].float() + raw[:, :, int(o[4]) + 2].permute(0, 1, 2, 3)[v].float()   # the mean's depth, as encode_grid
+      floor = torch.log(float(scale_floor_px) * z.clamp_min(1e-3) / float(fx))   # (a wild predicted offset must not make it NaN)
+      s = torch.maximum(s, floor[:, None])
+    out = raw.permute(0, 1, 3, 4, 2).clone()                          # (B, L, H, W, C)
+    out[..., sc][v] = s.to(out.dtype)
+    out[..., ro][v] = q.to(out.dtype)
+    sub = out.permute(0, 1, 4, 2, 3)
+    return (sub - mean[None, None, :, None, None]) / std[None, None, :, None, None]
+
+  return project
+
+
 def decode_x0(x0, mean, std, lo=None, hi=None):
   """Normalized x0 (B, L, CHANNELS, H, W) -> the Gaussian dict flatten_gaussians reads (gs_decoder.activate_gaussians' layout).
   lo / hi (CHANNELS,): the range of every channel in the training grids; a sample is clamped into it (an unbounded exp(scale) of a
@@ -591,9 +663,10 @@ class GSDiffusionModel(nn.Module):
     return loss, parts, counts
 
   @torch.no_grad()
-  def sample(self, image, hit, seeds=None, steps=None):
+  def sample(self, image, hit, seeds=None, steps=None, project=None):
     """20 Euler steps of the flow from pure noise -> the Gaussian dict. The noise of volume i is a function of seeds[i] (default:
-    eval_seed + i): reproducible. Invalid slots stay at the noise."""
+    eval_seed + i): reproducible. Invalid slots stay at the noise. project: applied to every step's x0 prediction before it is used
+    (e.g. format_projection; the last step's x0 prediction is the output)."""
     steps = steps or self.steps
     feats = self._feats(image)
     b, l = hit.shape[:2]
@@ -605,6 +678,8 @@ class GSDiffusionModel(nn.Module):
     for i in range(steps):
       t = ts[i]
       x0_hat = self.head(feats, self._net_input(a * x + (1 - a) * eps, a), t.expand(b, l)).float()
+      if project is not None:
+        x0_hat = project(x0_hat)
       x = x - (t - ts[i + 1]) * (x - x0_hat) / t.clamp(min=T_MIN_CLAMP)
     return self.decode(x)
 
