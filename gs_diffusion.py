@@ -82,15 +82,67 @@ def sort_scale_axes(scale, quat):
   return permute_scale_axes(scale, quat, np.argsort(-scale, axis=1))
 
 
-def encode_grid(grid, source, scale_sort=False, scale_floor_px=None):
+ENCODING_DEFAULTS = dict(scale_order="keep", scale_floor_px=None, rot_form="keep")   # what a config without the key means
+SCALE_ORDERS = ("keep", "sorted", "random")
+ROT_FORMS = ("keep", "canonical", "random")
+
+
+def normalize_encoding(encoding):
+  """diffusion.scale_encoding (or a checkpoint's x0_encoding) -> the complete, validated encoding dict. The defaults fill missing keys;
+  the legacy boolean scale_sort (configs and checkpoints before scale_order) maps to scale_order sorted / keep."""
+  e = dict(encoding or {})
+  if "scale_sort" in e:
+    legacy = "sorted" if e.pop("scale_sort") else "keep"
+    if e.setdefault("scale_order", legacy) != legacy:
+      raise ValueError(f"scale_encoding: scale_sort and scale_order disagree ({legacy} vs {e['scale_order']})")
+  e = {**ENCODING_DEFAULTS, **e}
+  unknown = sorted(set(e) - set(ENCODING_DEFAULTS))
+  if unknown:
+    raise ValueError(f"scale_encoding: unknown keys {unknown}")
+  if e["scale_order"] not in SCALE_ORDERS:
+    raise ValueError(f"scale_order must be one of {SCALE_ORDERS}, got {e['scale_order']!r}")
+  if e["rot_form"] not in ROT_FORMS:
+    raise ValueError(f"rot_form must be one of {ROT_FORMS}, got {e['rot_form']!r}")
+  return e
+
+
+def quat_forms(q):
+  """(N, 4) wxyz -> (N, 4 forms, 4): q times 1, i, j, k -- the same Gaussian with two of its axes flipped (a 180 degree turn about
+  one of its own axes). The 4 forms are exactly the rotations that leave an ellipsoid (with fixed axis order) unchanged."""
+  w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+  return np.stack([q, np.stack([-x, w, z, -y], 1), np.stack([-y, -z, w, x], 1), np.stack([-z, y, -x, w], 1)], 1)
+
+
+def set_rot_form(q, rot_form, rng=None):
+  """(N, 4) wxyz -> the same Gaussians' quaternions in the requested form, w >= 0. canonical: the form with the largest |w| (the
+  one closest to no rotation in this frame); random: a uniformly random form per Gaussian; keep: q unchanged."""
+  if rot_form == "keep":
+    return q
+  forms = quat_forms(q)
+  pick = (np.abs(forms[:, :, 0]).argmax(1) if rot_form == "canonical"
+          else (rng if rng is not None else np.random.default_rng()).integers(4, size=len(q)))
+  out = forms[np.arange(len(q)), pick]
+  return np.where(out[:, :1] < 0, -out, out).astype(q.dtype)
+
+
+def encode_grid(grid, source, scale_order=None, scale_floor_px=None, rot_form="keep", rng=None, scale_sort=None):
   """The grid's Gaussians as raw (un-normalized) x0 channels, (CHANNELS, L, H, W) float32, zero at the slots without a Gaussian.
   `source`: the dataset item's "source" dict (xyz_cam (L, H, W, 3) with NaN where there is no hit, hit (L, H, W), pose_gl (4, 4),
   K_depth (3, 3)).
   scale_floor_px: every scale axis is raised to at least this fraction of the pixel footprint at the Gaussian's depth in the source
   camera (z / fx): an axis thinner than ~1/10 px is invisible, but its log value (where the fit happened to leave it) is a wide,
-  unpredictable target. scale_sort: the axes of every Gaussian ordered largest -> smallest (sort_scale_axes), so a scale channel
-  means the same axis in every slot. Both render the same as the grid (bla/_test_scale_reencode.py: floor 0.1 px >= 56 dB PSNR
-  against the original render over 5000 renders)."""
+  unpredictable target. scale_order: the order of every Gaussian's axes (the rotation permuted to match) -- keep (as fitted),
+  sorted (largest -> smallest, sort_scale_axes: a scale channel means the same axis in every slot), random (a fresh random order per
+  call). scale_sort: the legacy boolean (True = sorted). Both render the same as the grid (bla/_test_scale_reencode.py: floor 0.1 px >= 56 dB PSNR
+  against the original render over 5000 renders). rot_form (set_rot_form, after the sort): which of a Gaussian's 4 equivalent
+  quaternions is stored -- keep (as fitted, in the camera frame: after the sort an effectively random one), canonical (largest
+  |w|), random (a fresh random one per call; rng: its generator, default a fresh one)."""
+  # scale_order None: keep, or the legacy flag's choice; both given must agree
+  e = normalize_encoding({**({"scale_order": scale_order} if scale_order is not None else {}), "scale_floor_px": scale_floor_px,
+                          "rot_form": rot_form, **({"scale_sort": scale_sort} if scale_sort is not None else {})})
+  scale_order, rot_form = e["scale_order"], e["rot_form"]
+  if "random" in (scale_order, rot_form) and rng is None:
+    rng = np.random.default_rng()
   valid = grid["layer_valid"].transpose(2, 0, 1)                      # (L, H, W)
   hit = source["hit"].numpy()
   mismatch = int((valid != hit).sum())
@@ -111,9 +163,12 @@ def encode_grid(grid, source, scale_sort=False, scale_floor_px=None):
     scales = np.maximum(scales, float(scale_floor_px) * np.nan_to_num(footprint)[..., None])
   if valid.any():
     q = rotate_quats_wxyz(grid["gaussian_quats"].transpose(2, 0, 1, 3)[valid], c2w[:3, :3].T)   # world -> source camera
-    if scale_sort:
+    if scale_order == "sorted":
       scales[valid], q = sort_scale_axes(scales[valid], q)
-    quat[valid] = np.where(q[:, :1] < 0, -q, q)                      # q and -q are one rotation: w >= 0
+    elif scale_order == "random":
+      scales[valid], q = permute_scale_axes(scales[valid], q, np.argsort(rng.random((len(q), 3)), axis=1))
+    q = np.where(q[:, :1] < 0, -q, q)                                # q and -q are one rotation: w >= 0
+    quat[valid] = set_rot_form(q, rot_form, rng)
 
   opacity = np.clip(grid["gaussian_opacities"].transpose(2, 0, 1), 1e-6, 1 - 1e-6)
   opacity = np.clip(np.log(opacity / (1 - opacity)), -OPACITY_LOGIT_CLAMP, OPACITY_LOGIT_CLAMP)
@@ -135,8 +190,8 @@ def augment_x0(x0, source, rng, slot_shuffle=False, slot_shuffle_block=2, slot_s
   slot_shuffle: every layer is tiled into n x n blocks (n = slot_shuffle_block; the tiling shifted by a random 0..n-1 slots in
   each direction per item, the partial blocks at the borders left alone); every block has its Gaussians randomly permuted among its
   slots (all or nothing: the fitted arrangement is just one of the permutations): every channel moves along, the offsets are
-  re-anchored to the new slot (mean = anchor + offset kept). Only the block's valid slots whose anchors are within slot_shuffle_max_px pixel footprints of the block's mean anchor take
-  part (not across depth edges); the others stay.
+  re-anchored to the new slot (mean = anchor + offset kept). Only the block's valid slots whose anchors are within slot_shuffle_max_px
+  pixel footprints of the block's mean anchor take part (not across depth edges); the others stay.
   (With the x0 loss on, the x0 target is shuffled too: at high t its best prediction blends a block's Gaussians.)"""
   x0 = x0.copy()
   if slot_shuffle:
@@ -181,6 +236,78 @@ def shuffle_slots(x0, source, rng, n, max_px):
   off = Xn[OFFSET] + np.moveaxis(An, -1, 0) - np.moveaxis(A, -1, 0)  # mean = old anchor + offset, re-anchored to the new slot
   Xn[OFFSET] = np.where(take, off, X[OFFSET])
   x0[:, :, rows, cols] = Xn.reshape(c, l, hb, wb, n, n).transpose(0, 1, 2, 4, 3, 5).reshape(c, l, hb * n, wb * n)
+
+
+def quat_to_matrix(q):
+  """(N, 4) unit wxyz quaternions -> (N, 3, 3) rotation matrices (torch; scipy's convention)."""
+  w, x, y, z = q.unbind(-1)
+  return torch.stack([
+    1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y),
+    2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
+    2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], -1).reshape(-1, 3, 3)
+
+
+def matrix_to_quat(R):
+  """(N, 3, 3) rotation matrices -> (N, 4) unit wxyz quaternions with w >= 0 (torch; the largest-component branch per row)."""
+  m = R
+  t = torch.stack([1 + m[:, 0, 0] + m[:, 1, 1] + m[:, 2, 2], 1 + m[:, 0, 0] - m[:, 1, 1] - m[:, 2, 2],
+                   1 - m[:, 0, 0] + m[:, 1, 1] - m[:, 2, 2], 1 - m[:, 0, 0] - m[:, 1, 1] + m[:, 2, 2]], 1).clamp_min(1e-12)
+  r = t.sqrt()                                                       # 2|w|, 2|x|, 2|y|, 2|z|
+  a, b, c = m[:, 2, 1] - m[:, 1, 2], m[:, 0, 2] - m[:, 2, 0], m[:, 1, 0] - m[:, 0, 1]
+  d, e, f = m[:, 0, 1] + m[:, 1, 0], m[:, 0, 2] + m[:, 2, 0], m[:, 1, 2] + m[:, 2, 1]
+  cand = torch.stack([
+    torch.stack([r[:, 0] / 2, a / (2 * r[:, 0]), b / (2 * r[:, 0]), c / (2 * r[:, 0])], 1),
+    torch.stack([a / (2 * r[:, 1]), r[:, 1] / 2, d / (2 * r[:, 1]), e / (2 * r[:, 1])], 1),
+    torch.stack([b / (2 * r[:, 2]), d / (2 * r[:, 2]), r[:, 2] / 2, f / (2 * r[:, 2])], 1),
+    torch.stack([c / (2 * r[:, 3]), e / (2 * r[:, 3]), f / (2 * r[:, 3]), r[:, 3] / 2], 1)], 1)   # (N, 4 branches, 4)
+  q = cand[torch.arange(len(m), device=m.device), t.argmax(1)]
+  q = F.normalize(q, dim=1)
+  return torch.where(q[:, :1] < 0, -q, q)
+
+
+def format_projection(mean, std, hit, anchor_z, fx, scale_sort=False, scale_floor_px=None, scale_order=None, rot_form="keep"):
+  """A function on normalized x0 predictions (B, L, CHANNELS, H, W) that puts the valid slots' Gaussians into the training grids'
+  format (encode_grid with this encoding): the scale axes ordered largest -> smallest (the rotation permuted to match, as
+  sort_scale_axes), every axis at least scale_floor_px pixel footprints, the rotation a unit quaternion with w >= 0. For the sampler's
+  intermediate predictions (GSDiffusionModel.sample's `project`): render-invariant apart from the floor. hit (B or 1, L, H, W);
+  anchor_z (L, H, W) the anchors' depth (the floor is at the Gaussian's mean depth: anchor + offset z); fx the depth camera's
+  focal length. Takes the run's encoding as keywords: scale_order (keep | sorted | random; only sorted is projected) or the legacy
+  scale_sort, rot_form (canonical: the quaternion form with the largest |w|; keep / random: left as predicted)."""
+  if scale_order is not None:
+    scale_sort = scale_order == "sorted"
+  o = np.cumsum((0,) + DIMS)
+  sc, ro = slice(int(o[1]), int(o[2])), slice(int(o[2]), int(o[3]))   # the scale and rotation channels
+
+  def project(x0):
+    x = x0.clone()
+    v = hit.expand(x.shape[0], *hit.shape[1:]).bool()                # (B, L, H, W)
+    raw = x * std[None, None, :, None, None] + mean[None, None, :, None, None]
+    s = raw[:, :, sc].permute(0, 1, 3, 4, 2)[v].float()               # (N, 3) log-scales
+    q = F.normalize(raw[:, :, ro].permute(0, 1, 3, 4, 2)[v].float(), dim=1)
+    if scale_sort:
+      order = torch.argsort(-s, dim=1, stable=True)   # stable: tied axes (the floor ties many) keep their order -- as encode_grid's
+                                                      # sort, so an encoded grid is a fixed point (CUDA's unstable sort reverses ties)
+      R = torch.gather(quat_to_matrix(q), 2, order[:, None, :].expand(-1, 3, -1))
+      R[torch.linalg.det(R) < 0, :, 2] *= -1
+      q, s = matrix_to_quat(R), torch.gather(s, 1, order)
+    else:
+      q = torch.where(q[:, :1] < 0, -q, q)
+    if rot_form == "canonical":   # q times 1, i, j, k: the same Gaussian; keep the one with the largest |w|
+      w, x_, y, z = q.unbind(-1)
+      forms = torch.stack([q, torch.stack([-x_, w, z, -y], 1), torch.stack([-y, -z, w, x_], 1), torch.stack([-z, y, -x_, w], 1)], 1)
+      q = forms[torch.arange(len(q), device=q.device), forms[:, :, 0].abs().argmax(1)]
+      q = torch.where(q[:, :1] < 0, -q, q)
+    if scale_floor_px is not None:
+      z = anchor_z.expand(*v.shape)[v].float() + raw[:, :, int(o[4]) + 2].permute(0, 1, 2, 3)[v].float()   # the mean's depth, as encode_grid
+      floor = torch.log(float(scale_floor_px) * z.clamp_min(1e-3) / float(fx))   # (a wild predicted offset must not make it NaN)
+      s = torch.maximum(s, floor[:, None])
+    out = raw.permute(0, 1, 3, 4, 2).clone()                          # (B, L, H, W, C)
+    out[..., sc][v] = s.to(out.dtype)
+    out[..., ro][v] = q.to(out.dtype)
+    sub = out.permute(0, 1, 4, 2, 3)
+    return (sub - mean[None, None, :, None, None]) / std[None, None, :, None, None]
+
+  return project
 
 
 def decode_x0(x0, mean, std, lo=None, hi=None):
@@ -247,15 +374,18 @@ def make_listing(grid_index, source_h5, out_path):
 
 class GridTargetDataset(Dataset):
   """Wraps a dataset of render items (gs_dataset.WTFeatureDataset) and adds each item's ground-truth Gaussians, "x0_raw"
-  (CHANNELS, L, H, W) (see encode_grid, with `encoding`: its scale_sort / scale_floor_px), read from the grid file of its source view."""
+  (CHANNELS, L, H, W) (see encode_grid, with `encoding`: its scale_order / scale_floor_px / rot_form), read from the grid file of its source view."""
 
-  def __init__(self, inner, grid_index, encoding=None, augment=None):
-    """augment: augment_x0's keyword arguments (diffusion.augment), for the training set only; None: none."""
+  def __init__(self, inner, grid_index, encoding=None, seeded=False, augment=None):
+    """seeded: the random parts of the encoding (scale_order / rot_form random) are a function of the item's source view, the same
+    in every epoch (validation sets); otherwise fresh per call (training). augment: augment_x0's keyword arguments
+    (diffusion.augment), for the training set only; None: none."""
     self.inner = inner
+    self.seeded = seeded
     augment = dict(augment or {})
     self.augment = augment if augment.get("slot_shuffle") else None   # the default: off
     self.grid_index = grid_index
-    self.encoding = {**dict(scale_sort=False, scale_floor_px=None), **(encoding or {})}
+    self.encoding = normalize_encoding(encoding)
     self.volumes = inner.volumes   # the preview code reads the volumes' mesh/view columns
     missing = sorted(set(int(v) for v in inner.volumes.df["view_idx"].to_list()) - set(grid_index))
     if missing:
@@ -269,7 +399,8 @@ class GridTargetDataset(Dataset):
     grid, _ = load_grid(self.grid_index[item["source_view"]])
     # half precision in transit (dense (14, 6, 504, 504) is 85 MB in float32): the log-scales (|x| < 17), logits, colours and offsets
     # lose < 2% of the channel's std; the model upcasts it
-    x0 = encode_grid(grid, item["source"], **self.encoding)
+    rng = np.random.default_rng(int(item["source_view"])) if self.seeded else None
+    x0 = encode_grid(grid, item["source"], rng=rng, **self.encoding)
     if self.augment:   # a fresh stream per call: torch's RNG is seeded per dataloader worker
       x0 = augment_x0(x0, item["source"], np.random.default_rng(int(torch.randint(2 ** 62, ()))), **self.augment)
     item["x0_raw"] = torch.from_numpy(x0).half()
@@ -278,8 +409,10 @@ class GridTargetDataset(Dataset):
 
 def encoding_tag(encoding):
   """The cache subdirectory of an encoding's moments: "" for the default encoding (the caches written before encodings existed)."""
-  e = {**dict(scale_sort=False, scale_floor_px=None), **(encoding or {})}
-  parts = (["sort"] if e["scale_sort"] else []) + ([f"floor{float(e['scale_floor_px']):g}px"] if e["scale_floor_px"] is not None else [])
+  e = normalize_encoding(encoding)
+  parts = {"keep": [], "sorted": ["sort"], "random": ["randorder"]}[e["scale_order"]]
+  parts = parts + ([f"floor{float(e['scale_floor_px']):g}px"] if e["scale_floor_px"] is not None else [])
+  parts += [f"rot{e['rot_form']}"] if e["rot_form"] != "keep" else []
   return "_".join(parts)
 
 
@@ -297,7 +430,7 @@ def _grid_moments(dataset, i, path, cache_dir):
       return z["s"], z["s2"], int(z["n"]), z["lo"], z["hi"]
   item = dataset.inner[i]
   grid, _ = load_grid(path)
-  x = torch.from_numpy(encode_grid(grid, item["source"], **dataset.encoding))[:, item["source"]["hit"]].double()   # (CHANNELS, valid slots), full precision
+  x = torch.from_numpy(encode_grid(grid, item["source"], rng=np.random.default_rng(int(item["source_view"])), **dataset.encoding))[:, item["source"]["hit"]].double()   # (CHANNELS, valid slots), full precision
   if x.shape[1]:
     moments = (x.sum(1).numpy(), x.square().sum(1).numpy(), x.shape[1], x.amin(1).numpy(), x.amax(1).numpy())
   else:   # a grid without a Gaussian: no moments (compute_stats raises when no grid has any)
@@ -595,9 +728,10 @@ class GSDiffusionModel(nn.Module):
     return loss, parts, counts
 
   @torch.no_grad()
-  def sample(self, image, hit, seeds=None, steps=None):
+  def sample(self, image, hit, seeds=None, steps=None, project=None):
     """20 Euler steps of the flow from pure noise -> the Gaussian dict. The noise of volume i is a function of seeds[i] (default:
-    eval_seed + i): reproducible. Invalid slots stay at the noise."""
+    eval_seed + i): reproducible. Invalid slots stay at the noise. project: applied to every step's x0 prediction before it is used
+    (e.g. format_projection; the last step's x0 prediction is the output)."""
     steps = steps or self.steps
     feats = self._feats(image)
     b, l = hit.shape[:2]
@@ -609,6 +743,8 @@ class GSDiffusionModel(nn.Module):
     for i in range(steps):
       t = ts[i]
       x0_hat = self.head(feats, self._net_input(a * x + (1 - a) * eps, a), t.expand(b, l)).float()
+      if project is not None:
+        x0_hat = project(x0_hat)
       x = x - (t - ts[i + 1]) * (x - x0_hat) / t.clamp(min=T_MIN_CLAMP)
     return self.decode(x)
 

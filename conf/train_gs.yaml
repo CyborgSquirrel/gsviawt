@@ -353,8 +353,12 @@ diffusion:
   # encoding (<grids_dir>/.x0_moments/<tag>/). A config without this block (runs before it existed) means sort off, no floor;
   # a checkpoint only resumes with the encoding it was trained with.
   scale_encoding:
-    scale_sort: true           # every Gaussian's axes ordered largest -> smallest (rotation permuted to match)
+    scale_order: sorted        # every Gaussian's axes (rotation permuted to match): keep (as fitted) | sorted (largest -> smallest) |
+                               # random (a fresh random order per encode; for rendering-only training)
     scale_floor_px: 0.1        # every axis raised to at least this fraction of a pixel at its source-camera depth (null: off)
+    rot_form: keep             # which of each Gaussian's 4 equivalent quaternions (two axes flipped) is stored, after the sort:
+                               # keep (as fitted; after the sort effectively random) | canonical (largest |w|) | random (fresh per encode;
+                               # for rendering-only training: with the x0 loss the rotation target is then unpredictable)
   # Render-invariant augmentation of the TRAINING grids (gs_diffusion.augment_x0; the statistics, validations and eval are not
   # augmented): the same Gaussians written down differently. Meant for rendering-only training (x0_weight=0): with the x0 loss on, a
   # shuffled target is unpredictable.
