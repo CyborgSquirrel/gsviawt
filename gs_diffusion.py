@@ -26,6 +26,7 @@ import json
 import logging
 import math
 import os
+import warnings
 
 import h5py
 import hydra
@@ -179,6 +180,64 @@ def encode_grid(grid, source, scale_order=None, scale_floor_px=None, rot_form="k
   return np.ascontiguousarray(x0.transpose(3, 0, 1, 2))              # (CHANNELS, L, H, W)
 
 
+SCALE, ROTATION, OFFSET = (slice(o, o + d) for o, d in zip(np.cumsum((0,) + DIMS)[[1, 2, 4]], DIMS[1:2] + DIMS[2:3] + DIMS[4:5]))
+
+
+def augment_x0(x0, source, rng, slot_shuffle=False, slot_shuffle_block=2, slot_shuffle_max_px=3.0):
+  """Render-invariant augmentation of an item's raw x0 (CHANNELS, L, H, W) (encode_grid's), returned as a new array: the same
+  Gaussians, written down differently. Training items only (diffusion.augment); the statistics and the validations see encode_grid.
+  (A random scale-axis order is an encoding option instead: diffusion.scale_encoding.scale_order=random.)
+  slot_shuffle: every layer is tiled into n x n blocks (n = slot_shuffle_block; the tiling shifted by a random 0..n-1 slots in
+  each direction per item, the partial blocks at the borders left alone); every block has its Gaussians randomly permuted among its
+  slots (all or nothing: the fitted arrangement is just one of the permutations): every channel moves along, the offsets are
+  re-anchored to the new slot (mean = anchor + offset kept). Only the block's valid slots whose anchors are within slot_shuffle_max_px
+  pixel footprints of the block's mean anchor take part (not across depth edges); the others stay.
+  (With the x0 loss on, the x0 target is shuffled too: at high t its best prediction blends a block's Gaussians.)"""
+  x0 = x0.copy()
+  if slot_shuffle:
+    shuffle_slots(x0, source, rng, int(slot_shuffle_block), slot_shuffle_max_px)
+  return x0
+
+
+def shuffle_slots(x0, source, rng, n, max_px):
+  """augment_x0's block shuffle, in place on x0 (CHANNELS, L, H, W)."""
+  c, l, h, w = x0.shape
+  sy, sx = (int(v) for v in rng.integers(n, size=2))                 # the tiling's shift, 0..n-1 slots
+  hb, wb = (h - sy) // n, (w - sx) // n
+  if hb == 0 or wb == 0:
+    return
+  rows, cols = slice(sy, sy + hb * n), slice(sx, sx + wb * n)
+
+  anchor = source["xyz_cam"].numpy()[:, rows, cols]                  # (L, H', W', 3)
+  hit = source["hit"].numpy()[:, rows, cols]                         # (L, H', W')
+  A = anchor.reshape(l, hb, n, wb, n, 3).transpose(0, 1, 3, 2, 4, 5).reshape(l, hb, wb, n * n, 3)
+  V = hit.reshape(l, hb, n, wb, n).transpose(0, 1, 3, 2, 4).reshape(l, hb, wb, n * n)
+  X = x0[:, :, rows, cols].reshape(c, l, hb, n, wb, n).transpose(0, 1, 2, 4, 3, 5).reshape(c, l, hb, wb, n * n)
+
+  with warnings.catch_warnings():                                    # blocks without a valid slot: "mean of empty slice"
+    warnings.simplefilter("ignore", RuntimeWarning)
+    centre = np.nanmean(np.where(V[..., None], A, np.nan), axis=3, keepdims=True)                   # (L, hb, wb, 1, 3)
+  dist = np.linalg.norm(A - centre, axis=-1)                                                          # NaN at invalid slots
+  footprint = np.nan_to_num(A[..., 2]) / float(source["K_depth"][0, 0])
+  take = V & (np.nan_to_num(dist, nan=np.inf) <= max_px * footprint)                         # (L, hb, wb, n*n)
+
+  # a uniform random permutation of each block's taking slots among themselves; the others map to themselves
+  pos = np.broadcast_to(np.arange(n * n), take.shape)
+  dest = np.sort(np.where(take, pos, n * n), axis=-1)                # the taking slots, in order (then n*n padding)
+  src = np.take_along_axis(pos, np.argsort(np.where(take, rng.random(take.shape), 2.0), axis=-1), axis=-1)
+  k = take.sum(-1, keepdims=True)
+  first = np.arange(n * n) < k                                       # (L, hb, wb, n*n): the first k entries are real
+  perm = np.concatenate([np.broadcast_to(np.arange(n * n), take.shape), np.zeros(take.shape[:-1] + (1,), int)], -1)
+  np.put_along_axis(perm, np.where(first, dest, n * n), src, axis=-1)   # slot -> the slot its Gaussian comes from (padding -> the
+  perm = perm[..., :n * n]                                           #   extra column, dropped)
+
+  Xn = np.take_along_axis(X, np.broadcast_to(perm, X.shape), axis=-1)
+  An = np.take_along_axis(A, perm[..., None].repeat(3, -1), axis=-2)                                 # the Gaussians' old anchors
+  off = Xn[OFFSET] + np.moveaxis(An, -1, 0) - np.moveaxis(A, -1, 0)  # mean = old anchor + offset, re-anchored to the new slot
+  Xn[OFFSET] = np.where(take, off, X[OFFSET])
+  x0[:, :, rows, cols] = Xn.reshape(c, l, hb, wb, n, n).transpose(0, 1, 2, 4, 3, 5).reshape(c, l, hb * n, wb * n)
+
+
 def quat_to_matrix(q):
   """(N, 4) unit wxyz quaternions -> (N, 3, 3) rotation matrices (torch; scipy's convention)."""
   w, x, y, z = q.unbind(-1)
@@ -317,11 +376,14 @@ class GridTargetDataset(Dataset):
   """Wraps a dataset of render items (gs_dataset.WTFeatureDataset) and adds each item's ground-truth Gaussians, "x0_raw"
   (CHANNELS, L, H, W) (see encode_grid, with `encoding`: its scale_order / scale_floor_px / rot_form), read from the grid file of its source view."""
 
-  def __init__(self, inner, grid_index, encoding=None, seeded=False):
+  def __init__(self, inner, grid_index, encoding=None, seeded=False, augment=None):
     """seeded: the random parts of the encoding (scale_order / rot_form random) are a function of the item's source view, the same
-    in every epoch (validation sets); otherwise fresh per call (training)."""
+    in every epoch (validation sets); otherwise fresh per call (training). augment: augment_x0's keyword arguments
+    (diffusion.augment), for the training set only; None: none."""
     self.inner = inner
     self.seeded = seeded
+    augment = dict(augment or {})
+    self.augment = augment if augment.get("slot_shuffle") else None   # the default: off
     self.grid_index = grid_index
     self.encoding = normalize_encoding(encoding)
     self.volumes = inner.volumes   # the preview code reads the volumes' mesh/view columns
@@ -338,7 +400,10 @@ class GridTargetDataset(Dataset):
     # half precision in transit (dense (14, 6, 504, 504) is 85 MB in float32): the log-scales (|x| < 17), logits, colours and offsets
     # lose < 2% of the channel's std; the model upcasts it
     rng = np.random.default_rng(int(item["source_view"])) if self.seeded else None
-    item["x0_raw"] = torch.from_numpy(encode_grid(grid, item["source"], rng=rng, **self.encoding)).half()
+    x0 = encode_grid(grid, item["source"], rng=rng, **self.encoding)
+    if self.augment:   # a fresh stream per call: torch's RNG is seeded per dataloader worker
+      x0 = augment_x0(x0, item["source"], np.random.default_rng(int(torch.randint(2 ** 62, ()))), **self.augment)
+    item["x0_raw"] = torch.from_numpy(x0).half()
     return item
 
 
