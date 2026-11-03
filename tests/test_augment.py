@@ -1,5 +1,5 @@
 """diffusion.augment (gs_diffusion.augment_x0): render-invariant -- every Gaussian (world mean = anchor + offset, covariance, opacity,
-colour) is preserved, only how it is written down changes. scale_perm permutes axes; the block shuffle moves Gaussians within shifted
+colour) is preserved, only how it is written down changes. The block shuffle moves Gaussians within shifted
 n x n blocks of a layer, re-anchoring offsets, not across depth edges."""
 import numpy as np
 import torch
@@ -46,15 +46,6 @@ def test_off_is_identity():
   np.testing.assert_array_equal(gd.augment_x0(x0, src, np.random.default_rng(0)), x0)
 
 
-def test_scale_perm_preserves_gaussians_and_randomizes_order():
-  x0, src = scene()
-  out = gd.augment_x0(x0, src, np.random.default_rng(1), scale_perm=True)
-  np.testing.assert_allclose(gaussians(out, src), gaussians(x0, src), atol=1e-4)
-  hit = src["hit"].numpy()
-  same = np.isclose(out[gd.SCALE][:, hit], x0[gd.SCALE][:, hit]).all(0).mean()
-  assert 0.05 < same < 0.35            # about 1/6 keep their order
-
-
 def test_block_shuffle_preserves_gaussians_and_moves_within_blocks():
   x0, src = scene()
   for seed in range(5):
@@ -97,8 +88,7 @@ def test_depth_guard_and_probability():
 def test_dataset_augments_only_when_on():
   class Inner:
     volumes = type("V", (), {"df": {"view_idx": type("C", (), {"to_list": staticmethod(lambda: [3])})}})()
-  defaults = {"scale_perm": False, "slot_shuffle": False, "slot_shuffle_block": 2, "slot_shuffle_max_px": 3.0}
+  defaults = {"slot_shuffle": False, "slot_shuffle_block": 2, "slot_shuffle_max_px": 3.0}
   assert gd.GridTargetDataset(Inner(), {3: "x.h5"}, augment=defaults).augment is None
   assert gd.GridTargetDataset(Inner(), {3: "x.h5"}).augment is None
   assert gd.GridTargetDataset(Inner(), {3: "x.h5"}, augment={**defaults, "slot_shuffle": True}).augment["slot_shuffle_block"] == 2
-  assert gd.GridTargetDataset(Inner(), {3: "x.h5"}, augment={**defaults, "scale_perm": True}).augment["scale_perm"]

@@ -359,7 +359,6 @@ diffusion:
   # augmented): the same Gaussians written down differently. Meant for rendering-only training (x0_weight=0): with the x0 loss on, a
   # shuffled target is unpredictable.
   augment:
-    scale_perm: false          # every Gaussian's scale axes in a random order (rotation permuted to match); all or nothing
     slot_shuffle: false        # per layer, n x n blocks of slots (tiling shifted by a random 0..n-1 per item), each block's Gaussians
                                # randomly permuted among its slots (offsets re-anchored); all or nothing
     slot_shuffle_block: 2      # n: the strength
