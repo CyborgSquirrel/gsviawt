@@ -118,6 +118,9 @@ def test_scale_order_random_and_legacy_mapping():
   assert gd.normalize_encoding({"scale_sort": False}) == gd.ENCODING_DEFAULTS
   assert gd.encoding_tag({"scale_order": "sorted", "scale_floor_px": 0.1}) == "sort_floor0.1px"          # the existing caches
   assert gd.encoding_tag({"scale_order": "random", "scale_floor_px": 0.1}) == "randorder_floor0.1px"
+  with pytest.raises(ValueError):
+    gd.encode_grid(grid, source, scale_sort=True, scale_order="keep")                 # contradictory: not silently sorted
+  assert np.array_equal(gd.encode_grid(grid, source), gd.encode_grid(grid, source, scale_order="keep"))
   for bad in ({"scale_sort": True, "scale_order": "keep"}, {"scale_order": "shuffled"}, {"scale_perm": True}):
     with pytest.raises(ValueError):
       gd.normalize_encoding(bad)

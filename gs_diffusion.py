@@ -124,7 +124,7 @@ def set_rot_form(q, rot_form, rng=None):
   return np.where(out[:, :1] < 0, -out, out).astype(q.dtype)
 
 
-def encode_grid(grid, source, scale_order="keep", scale_floor_px=None, rot_form="keep", rng=None, scale_sort=None):
+def encode_grid(grid, source, scale_order=None, scale_floor_px=None, rot_form="keep", rng=None, scale_sort=None):
   """The grid's Gaussians as raw (un-normalized) x0 channels, (CHANNELS, L, H, W) float32, zero at the slots without a Gaussian.
   `source`: the dataset item's "source" dict (xyz_cam (L, H, W, 3) with NaN where there is no hit, hit (L, H, W), pose_gl (4, 4),
   K_depth (3, 3)).
@@ -136,9 +136,9 @@ def encode_grid(grid, source, scale_order="keep", scale_floor_px=None, rot_form=
   against the original render over 5000 renders). rot_form (set_rot_form, after the sort): which of a Gaussian's 4 equivalent
   quaternions is stored -- keep (as fitted, in the camera frame: after the sort an effectively random one), canonical (largest
   |w|), random (a fresh random one per call; rng: its generator, default a fresh one)."""
-  legacy = {} if scale_sort is None else {"scale_sort": scale_sort}   # the legacy flag decides unless scale_order is also given
-  e = normalize_encoding({**({"scale_order": scale_order} if not legacy or scale_order != "keep" else {}),
-                          "scale_floor_px": scale_floor_px, "rot_form": rot_form, **legacy})
+  # scale_order None: keep, or the legacy flag's choice; both given must agree
+  e = normalize_encoding({**({"scale_order": scale_order} if scale_order is not None else {}), "scale_floor_px": scale_floor_px,
+                          "rot_form": rot_form, **({"scale_sort": scale_sort} if scale_sort is not None else {})})
   scale_order, rot_form = e["scale_order"], e["rot_form"]
   if "random" in (scale_order, rot_form) and rng is None:
     rng = np.random.default_rng()
