@@ -128,13 +128,13 @@ def encode_grid(grid, source, scale_sort=False, scale_floor_px=None):
 SCALE, ROTATION, OFFSET = (slice(o, o + d) for o, d in zip(np.cumsum((0,) + DIMS)[[1, 2, 4]], DIMS[1:2] + DIMS[2:3] + DIMS[4:5]))
 
 
-def augment_x0(x0, source, rng, scale_perm=False, slot_shuffle_p=0.0, slot_shuffle_block=2, slot_shuffle_max_px=3.0):
+def augment_x0(x0, source, rng, scale_perm=False, slot_shuffle=False, slot_shuffle_block=2, slot_shuffle_max_px=3.0):
   """Render-invariant augmentation of an item's raw x0 (CHANNELS, L, H, W) (encode_grid's), returned as a new array: the same
   Gaussians, written down differently. Training items only (diffusion.augment); the statistics and the validations see encode_grid.
   scale_perm: every valid Gaussian's scale axes in a random order (uniform over the 6), its rotation permuted to match.
-  slot_shuffle_p: every layer is tiled into n x n blocks (n = slot_shuffle_block; the tiling shifted by a random 0..n-1 slots in
-  each direction per item, the partial blocks at the borders left alone); each block, with this probability, has its Gaussians
-  randomly permuted among its slots: every channel moves along, the offsets are re-anchored to the new slot (mean = anchor + offset
+  slot_shuffle: every layer is tiled into n x n blocks (n = slot_shuffle_block; the tiling shifted by a random 0..n-1 slots in
+  each direction per item, the partial blocks at the borders left alone); every block has its Gaussians randomly permuted among its
+  slots (all or nothing, like scale_perm: the fitted arrangement is just one of the permutations): every channel moves along, the offsets are re-anchored to the new slot (mean = anchor + offset
   kept). Only the block's valid slots whose anchors are within slot_shuffle_max_px pixel footprints of the block's mean anchor take
   part (not across depth edges); the others stay.
   (With the x0 loss on, the x0 target is shuffled too: at high t its best prediction blends a block's Gaussians.)"""
@@ -147,12 +147,12 @@ def augment_x0(x0, source, rng, scale_perm=False, slot_shuffle_p=0.0, slot_shuff
     s, q = permute_scale_axes(s, q, order)
     x0[SCALE][:, hit] = np.log(np.maximum(s, 1e-8)).T
     x0[ROTATION][:, hit] = np.where(q[:, :1] < 0, -q, q).T
-  if slot_shuffle_p > 0:
-    shuffle_slots(x0, source, rng, slot_shuffle_p, int(slot_shuffle_block), slot_shuffle_max_px)
+  if slot_shuffle:
+    shuffle_slots(x0, source, rng, int(slot_shuffle_block), slot_shuffle_max_px)
   return x0
 
 
-def shuffle_slots(x0, source, rng, p, n, max_px):
+def shuffle_slots(x0, source, rng, n, max_px):
   """augment_x0's block shuffle, in place on x0 (CHANNELS, L, H, W)."""
   c, l, h, w = x0.shape
   sy, sx = (int(v) for v in rng.integers(n, size=2))                 # the tiling's shift, 0..n-1 slots
@@ -172,8 +172,7 @@ def shuffle_slots(x0, source, rng, p, n, max_px):
     centre = np.nanmean(np.where(V[..., None], A, np.nan), axis=3, keepdims=True)                   # (L, hb, wb, 1, 3)
   dist = np.linalg.norm(A - centre, axis=-1)                                                          # NaN at invalid slots
   footprint = np.nan_to_num(A[..., 2]) / float(source["K_depth"][0, 0])
-  chosen = rng.random((l, hb, wb, 1)) < p
-  take = V & chosen & (np.nan_to_num(dist, nan=np.inf) <= max_px * footprint)                         # (L, hb, wb, n*n)
+  take = V & (np.nan_to_num(dist, nan=np.inf) <= max_px * footprint)                         # (L, hb, wb, n*n)
 
   # a uniform random permutation of each block's taking slots among themselves; the others map to themselves
   pos = np.broadcast_to(np.arange(n * n), take.shape)
@@ -262,7 +261,7 @@ class GridTargetDataset(Dataset):
     """augment: augment_x0's keyword arguments (diffusion.augment), for the training set only; None: none."""
     self.inner = inner
     augment = dict(augment or {})
-    self.augment = augment if augment.get("scale_perm") or augment.get("slot_shuffle_p", 0) > 0 else None   # the defaults: off
+    self.augment = augment if augment.get("scale_perm") or augment.get("slot_shuffle") else None   # the defaults: off
     self.grid_index = grid_index
     self.encoding = {**dict(scale_sort=False, scale_floor_px=None), **(encoding or {})}
     self.volumes = inner.volumes   # the preview code reads the volumes' mesh/view columns

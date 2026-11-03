@@ -360,9 +360,9 @@ diffusion:
   # shuffled target is unpredictable.
   augment:
     scale_perm: false          # every Gaussian's scale axes in a random order (rotation permuted to match); all or nothing
-    slot_shuffle_p: 0.0        # per layer, n x n blocks of slots (tiling shifted by a random 0..n-1 per item) whose Gaussians are randomly
-                               # permuted (offsets re-anchored), this fraction of the blocks
-    slot_shuffle_block: 2      # n
+    slot_shuffle: false        # per layer, n x n blocks of slots (tiling shifted by a random 0..n-1 per item), each block's Gaussians
+                               # randomly permuted among its slots (offsets re-anchored); all or nothing
+    slot_shuffle_block: 2      # n: the strength
     slot_shuffle_max_px: 3.0   # ... only slots whose anchors are within this many pixel footprints of the block's mean anchor
   train_targets: grid           # the training volumes' supervision (target) views: grid = the training grid views of the mesh;
                                # all = every render of the mesh except the held-out grid views (validation pools unchanged)

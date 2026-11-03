@@ -59,7 +59,7 @@ def test_block_shuffle_preserves_gaussians_and_moves_within_blocks():
   x0, src = scene()
   for seed in range(5):
     for n in (2, 3):
-      out = gd.augment_x0(x0, src, np.random.default_rng(seed), slot_shuffle_p=1.0, slot_shuffle_block=n)
+      out = gd.augment_x0(x0, src, np.random.default_rng(seed), slot_shuffle=True, slot_shuffle_block=n)
       np.testing.assert_allclose(gaussians(out, src), gaussians(x0, src), atol=1e-5)
       hit = src["hit"].numpy()
       assert (out[:, ~hit] == 0).all()                               # nothing moved into an empty slot
@@ -75,7 +75,7 @@ def test_block_shift_covers_all_offsets():
   x0, src = scene(hole=False)
   traded = 0
   for seed in range(40):
-    out = gd.augment_x0(x0, src, np.random.default_rng(seed), slot_shuffle_p=1.0, slot_shuffle_block=2)
+    out = gd.augment_x0(x0, src, np.random.default_rng(seed), slot_shuffle=True, slot_shuffle_block=2)
     traded += np.isclose(out[0, 0, 0, 2], x0[0, 0, 0, 1])
   assert 0 < traded < 40
 
@@ -87,22 +87,18 @@ def test_depth_guard_and_probability():
   xyz[0, :, :6, :2] *= 10.0
   src = {**src, "xyz_cam": torch.from_numpy(xyz)}
   for seed in range(10):
-    out = gd.augment_x0(x0, src, np.random.default_rng(seed), slot_shuffle_p=1.0, slot_shuffle_block=2)
+    out = gd.augment_x0(x0, src, np.random.default_rng(seed), slot_shuffle=True, slot_shuffle_block=2)
     np.testing.assert_allclose(gaussians(out, src), gaussians(x0, src), atol=1e-5)
     for y in range(H):                                               # nothing crosses the edge between columns 5 and 6
       left = set(np.round(out[0, 0, y, :6], 5)) - set(np.round(x0[0, 0, :, :6].ravel(), 5))
       assert not left
-  x1, s1 = scene()
-  out = gd.augment_x0(x1, s1, np.random.default_rng(0), slot_shuffle_p=0.25, slot_shuffle_block=2)
-  moved = (~np.isclose(out[0], x1[0]) & s1["hit"].numpy()).mean()
-  assert 0.05 < moved < 0.35                                         # ~ p * (1 - 1/(the block's permutations fixing a slot))
 
 
 def test_dataset_augments_only_when_on():
   class Inner:
     volumes = type("V", (), {"df": {"view_idx": type("C", (), {"to_list": staticmethod(lambda: [3])})}})()
-  defaults = {"scale_perm": False, "slot_shuffle_p": 0.0, "slot_shuffle_block": 2, "slot_shuffle_max_px": 3.0}
+  defaults = {"scale_perm": False, "slot_shuffle": False, "slot_shuffle_block": 2, "slot_shuffle_max_px": 3.0}
   assert gd.GridTargetDataset(Inner(), {3: "x.h5"}, augment=defaults).augment is None
   assert gd.GridTargetDataset(Inner(), {3: "x.h5"}).augment is None
-  assert gd.GridTargetDataset(Inner(), {3: "x.h5"}, augment={**defaults, "slot_shuffle_p": 0.5}).augment["slot_shuffle_block"] == 2
+  assert gd.GridTargetDataset(Inner(), {3: "x.h5"}, augment={**defaults, "slot_shuffle": True}).augment["slot_shuffle_block"] == 2
   assert gd.GridTargetDataset(Inner(), {3: "x.h5"}, augment={**defaults, "scale_perm": True}).augment["scale_perm"]
