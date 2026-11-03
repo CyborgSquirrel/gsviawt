@@ -60,3 +60,24 @@ def test_seeded_items_draw_the_same_targets_and_keep_the_global_random_state(mon
   assert val[0]["targets"] == t1 and val[1]["targets"] != t1
   train = gd.GridTargetDataset(Inner(), {5: "a.h5", 6: "b.h5"})
   assert len({tuple(train[0]["targets"]) for _ in range(5)}) > 1    # training items: fresh draws
+
+
+def test_eval_can_turn_off_the_target_seeding(monkeypatch):
+  """eval_diffusion seeds target views itself (random.seed per volume); with seed_targets off the dataset leaves that alone."""
+  class Column(list):
+    def to_list(self):
+      return list(self)
+
+  class Inner:
+    volumes = types.SimpleNamespace(df={"view_idx": Column([5])})
+    def __len__(self):
+      return 1
+    def __getitem__(self, i):
+      return {"source_view": 5, "targets": random.sample(range(1000), 3), "source": {}}
+  monkeypatch.setattr(gd, "load_grid", lambda path: ({}, {}))
+  monkeypatch.setattr(gd, "encode_grid", lambda grid, source, **k: np.zeros((1,), np.float32))
+  ds = gd.GridTargetDataset(Inner(), {5: "a.h5"}, seeded=True)
+  ds.seed_targets = False
+  random.seed("0/val_meshes/0"); a = ds[0]["targets"]
+  random.seed("0/val_meshes/0"); b = random.sample(range(1000), 3)
+  assert a == b                                     # exactly what the eval's own seed gives

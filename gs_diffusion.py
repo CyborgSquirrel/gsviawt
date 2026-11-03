@@ -383,6 +383,7 @@ class GridTargetDataset(Dataset):
     (diffusion.augment), for the training set only; None: none."""
     self.inner = inner
     self.seeded = seeded
+    self.seed_targets = seeded   # eval_diffusion turns this off: it seeds the target views itself (its own, older convention)
     augment = dict(augment or {})
     self.augment = augment if augment.get("slot_shuffle") else None   # the default: off
     self.grid_index = grid_index
@@ -396,7 +397,7 @@ class GridTargetDataset(Dataset):
     return len(self.inner)
 
   def __getitem__(self, idx):
-    if self.seeded:   # the volume's target views (drawn from Python's global random) a function of the volume; global state kept
+    if self.seed_targets:   # the volume's target views (drawn from Python's global random) a function of the volume; global state kept
       state = random.getstate()
       random.seed(f"val_targets/{int(self.volumes.df['view_idx'][idx])}")
       try:
