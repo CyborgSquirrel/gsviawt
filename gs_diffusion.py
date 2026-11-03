@@ -167,7 +167,8 @@ def format_projection(mean, std, hit, anchor_z, fx, scale_sort=False, scale_floo
     s = raw[:, :, sc].permute(0, 1, 3, 4, 2)[v].float()               # (N, 3) log-scales
     q = F.normalize(raw[:, :, ro].permute(0, 1, 3, 4, 2)[v].float(), dim=1)
     if scale_sort:
-      order = torch.argsort(-s, dim=1)
+      order = torch.argsort(-s, dim=1, stable=True)   # stable: tied axes (the floor ties many) keep their order -- as encode_grid's
+                                                      # sort, so an encoded grid is a fixed point (CUDA's unstable sort reverses ties)
       R = torch.gather(quat_to_matrix(q), 2, order[:, None, :].expand(-1, 3, -1))
       R[torch.linalg.det(R) < 0, :, 2] *= -1
       q, s = matrix_to_quat(R), torch.gather(s, 1, order)

@@ -1,6 +1,7 @@
 """gs_diffusion.format_projection: puts x0 predictions into the training grids' format (sorted axes + rotation, floor, unit w >= 0
 quaternion) -- the same Gaussians as sort_scale_axes gives (covariance unchanged), a fixed point on encoded grids."""
 import numpy as np
+import pytest
 import torch
 from scipy.spatial.transform import Rotation
 
@@ -79,3 +80,20 @@ def test_projection_takes_the_new_encoding_keys():
   s = can[0].permute(0, 2, 3, 1)[hit[0]][:, SC].numpy()
   np.testing.assert_allclose(cov(s, q), cov(old[0].permute(0, 2, 3, 1)[hit[0]][:, SC].numpy(),
                                             old[0].permute(0, 2, 3, 1)[hit[0]][:, RO].numpy()), rtol=1e-4, atol=1e-8)
+
+
+@pytest.mark.cuda
+def test_projection_is_a_fixed_point_with_tied_axes_on_cuda():
+  """The floor ties axes; an unstable sort would swap them (another quaternion form) on every projection."""
+  rng = np.random.default_rng(2)
+  B, L, H, W, C = 1, 2, 8, 8, gd.CHANNELS
+  dev = torch.device("cuda")
+  mean, std = torch.zeros(C, dtype=torch.float64, device=dev), torch.ones(C, dtype=torch.float64, device=dev)
+  hit = torch.ones(1, L, H, W, dtype=torch.bool, device=dev)
+  x = torch.tensor(rng.normal(size=(B, L, C, H, W)), device=dev)
+  x[:, :, 2] = x[:, :, 3] = -5.0                                     # two tied (small) axes everywhere
+  x[:, :, 1] = -1.0
+  az = torch.full((L, H, W), 2.0, dtype=torch.float64, device=dev)
+  proj = gd.format_projection(mean, std, hit, az, 100.0, scale_sort=True)
+  once = proj(x)
+  torch.testing.assert_close(proj(once), once, atol=1e-5, rtol=1e-5)   # float32 round trip; a tie swap would move rotations by ~1
