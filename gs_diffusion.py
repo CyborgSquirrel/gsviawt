@@ -64,12 +64,11 @@ def load_grid(path):
   return grid, attrs
 
 
-def sort_scale_axes(scale, quat):
-  """(N, 3) scales, (N, 4) wxyz quaternions -> the same Gaussians with their axes ordered largest -> smallest: the scales sorted and
-  the rotation's columns permuted to match (a column negated where the permutation is a reflection -- a Gaussian is symmetric under
-  axis negation). Covariance R diag(s^2) R^T unchanged."""
+def permute_scale_axes(scale, quat, order):
+  """(N, 3) scales, (N, 4) wxyz quaternions, (N, 3) axis orders -> the same Gaussians with their axes in that order: the scales
+  permuted and the rotation's columns permuted to match (a column negated where the permutation is a reflection -- a Gaussian is
+  symmetric under axis negation). Covariance R diag(s^2) R^T unchanged."""
   from scipy.spatial.transform import Rotation
-  order = np.argsort(-scale, axis=1)
   R = Rotation.from_quat(quat[:, [1, 2, 3, 0]]).as_matrix()                        # (N, 3, 3)
   R = np.take_along_axis(R, order[:, None, :], axis=2)
   R[np.linalg.det(R) < 0, :, 2] *= -1
@@ -77,15 +76,72 @@ def sort_scale_axes(scale, quat):
   return np.take_along_axis(scale, order, axis=1), q.astype(np.float32)
 
 
-def encode_grid(grid, source, scale_sort=False, scale_floor_px=None):
+def sort_scale_axes(scale, quat):
+  """The Gaussians with their axes ordered largest -> smallest (permute_scale_axes)."""
+  return permute_scale_axes(scale, quat, np.argsort(-scale, axis=1))
+
+
+ENCODING_DEFAULTS = dict(scale_order="keep", scale_floor_px=None, rot_form="keep")   # what a config without the key means
+SCALE_ORDERS = ("keep", "sorted", "random")
+ROT_FORMS = ("keep", "canonical", "random")
+
+
+def normalize_encoding(encoding):
+  """diffusion.scale_encoding (or a checkpoint's x0_encoding) -> the complete, validated encoding dict. The defaults fill missing keys;
+  the legacy boolean scale_sort (configs and checkpoints before scale_order) maps to scale_order sorted / keep."""
+  e = dict(encoding or {})
+  if "scale_sort" in e:
+    legacy = "sorted" if e.pop("scale_sort") else "keep"
+    if e.setdefault("scale_order", legacy) != legacy:
+      raise ValueError(f"scale_encoding: scale_sort and scale_order disagree ({legacy} vs {e['scale_order']})")
+  e = {**ENCODING_DEFAULTS, **e}
+  unknown = sorted(set(e) - set(ENCODING_DEFAULTS))
+  if unknown:
+    raise ValueError(f"scale_encoding: unknown keys {unknown}")
+  if e["scale_order"] not in SCALE_ORDERS:
+    raise ValueError(f"scale_order must be one of {SCALE_ORDERS}, got {e['scale_order']!r}")
+  if e["rot_form"] not in ROT_FORMS:
+    raise ValueError(f"rot_form must be one of {ROT_FORMS}, got {e['rot_form']!r}")
+  return e
+
+
+def quat_forms(q):
+  """(N, 4) wxyz -> (N, 4 forms, 4): q times 1, i, j, k -- the same Gaussian with two of its axes flipped (a 180 degree turn about
+  one of its own axes). The 4 forms are exactly the rotations that leave an ellipsoid (with fixed axis order) unchanged."""
+  w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+  return np.stack([q, np.stack([-x, w, z, -y], 1), np.stack([-y, -z, w, x], 1), np.stack([-z, y, -x, w], 1)], 1)
+
+
+def set_rot_form(q, rot_form, rng=None):
+  """(N, 4) wxyz -> the same Gaussians' quaternions in the requested form, w >= 0. canonical: the form with the largest |w| (the
+  one closest to no rotation in this frame); random: a uniformly random form per Gaussian; keep: q unchanged."""
+  if rot_form == "keep":
+    return q
+  forms = quat_forms(q)
+  pick = (np.abs(forms[:, :, 0]).argmax(1) if rot_form == "canonical"
+          else (rng if rng is not None else np.random.default_rng()).integers(4, size=len(q)))
+  out = forms[np.arange(len(q)), pick]
+  return np.where(out[:, :1] < 0, -out, out).astype(q.dtype)
+
+
+def encode_grid(grid, source, scale_order=None, scale_floor_px=None, rot_form="keep", rng=None, scale_sort=None):
   """The grid's Gaussians as raw (un-normalized) x0 channels, (CHANNELS, L, H, W) float32, zero at the slots without a Gaussian.
   `source`: the dataset item's "source" dict (xyz_cam (L, H, W, 3) with NaN where there is no hit, hit (L, H, W), pose_gl (4, 4),
   K_depth (3, 3)).
   scale_floor_px: every scale axis is raised to at least this fraction of the pixel footprint at the Gaussian's depth in the source
   camera (z / fx): an axis thinner than ~1/10 px is invisible, but its log value (where the fit happened to leave it) is a wide,
-  unpredictable target. scale_sort: the axes of every Gaussian ordered largest -> smallest (sort_scale_axes), so a scale channel
-  means the same axis in every slot. Both render the same as the grid (bla/_test_scale_reencode.py: floor 0.1 px >= 56 dB PSNR
-  against the original render over 5000 renders)."""
+  unpredictable target. scale_order: the order of every Gaussian's axes (the rotation permuted to match) -- keep (as fitted),
+  sorted (largest -> smallest, sort_scale_axes: a scale channel means the same axis in every slot), random (a fresh random order per
+  call). scale_sort: the legacy boolean (True = sorted). Both render the same as the grid (bla/_test_scale_reencode.py: floor 0.1 px >= 56 dB PSNR
+  against the original render over 5000 renders). rot_form (set_rot_form, after the sort): which of a Gaussian's 4 equivalent
+  quaternions is stored -- keep (as fitted, in the camera frame: after the sort an effectively random one), canonical (largest
+  |w|), random (a fresh random one per call; rng: its generator, default a fresh one)."""
+  # scale_order None: keep, or the legacy flag's choice; both given must agree
+  e = normalize_encoding({**({"scale_order": scale_order} if scale_order is not None else {}), "scale_floor_px": scale_floor_px,
+                          "rot_form": rot_form, **({"scale_sort": scale_sort} if scale_sort is not None else {})})
+  scale_order, rot_form = e["scale_order"], e["rot_form"]
+  if "random" in (scale_order, rot_form) and rng is None:
+    rng = np.random.default_rng()
   valid = grid["layer_valid"].transpose(2, 0, 1)                      # (L, H, W)
   hit = source["hit"].numpy()
   mismatch = int((valid != hit).sum())
@@ -106,9 +162,12 @@ def encode_grid(grid, source, scale_sort=False, scale_floor_px=None):
     scales = np.maximum(scales, float(scale_floor_px) * np.nan_to_num(footprint)[..., None])
   if valid.any():
     q = rotate_quats_wxyz(grid["gaussian_quats"].transpose(2, 0, 1, 3)[valid], c2w[:3, :3].T)   # world -> source camera
-    if scale_sort:
+    if scale_order == "sorted":
       scales[valid], q = sort_scale_axes(scales[valid], q)
-    quat[valid] = np.where(q[:, :1] < 0, -q, q)                      # q and -q are one rotation: w >= 0
+    elif scale_order == "random":
+      scales[valid], q = permute_scale_axes(scales[valid], q, np.argsort(rng.random((len(q), 3)), axis=1))
+    q = np.where(q[:, :1] < 0, -q, q)                                # q and -q are one rotation: w >= 0
+    quat[valid] = set_rot_form(q, rot_form, rng)
 
   opacity = np.clip(grid["gaussian_opacities"].transpose(2, 0, 1), 1e-6, 1 - 1e-6)
   opacity = np.clip(np.log(opacity / (1 - opacity)), -OPACITY_LOGIT_CLAMP, OPACITY_LOGIT_CLAMP)
@@ -184,12 +243,15 @@ def make_listing(grid_index, source_h5, out_path):
 
 class GridTargetDataset(Dataset):
   """Wraps a dataset of render items (gs_dataset.WTFeatureDataset) and adds each item's ground-truth Gaussians, "x0_raw"
-  (CHANNELS, L, H, W) (see encode_grid, with `encoding`: its scale_sort / scale_floor_px), read from the grid file of its source view."""
+  (CHANNELS, L, H, W) (see encode_grid, with `encoding`: its scale_order / scale_floor_px / rot_form), read from the grid file of its source view."""
 
-  def __init__(self, inner, grid_index, encoding=None):
+  def __init__(self, inner, grid_index, encoding=None, seeded=False):
+    """seeded: the random parts of the encoding (scale_order / rot_form random) are a function of the item's source view, the same
+    in every epoch (validation sets); otherwise fresh per call (training)."""
     self.inner = inner
+    self.seeded = seeded
     self.grid_index = grid_index
-    self.encoding = {**dict(scale_sort=False, scale_floor_px=None), **(encoding or {})}
+    self.encoding = normalize_encoding(encoding)
     self.volumes = inner.volumes   # the preview code reads the volumes' mesh/view columns
     missing = sorted(set(int(v) for v in inner.volumes.df["view_idx"].to_list()) - set(grid_index))
     if missing:
@@ -203,14 +265,17 @@ class GridTargetDataset(Dataset):
     grid, _ = load_grid(self.grid_index[item["source_view"]])
     # half precision in transit (dense (14, 6, 504, 504) is 85 MB in float32): the log-scales (|x| < 17), logits, colours and offsets
     # lose < 2% of the channel's std; the model upcasts it
-    item["x0_raw"] = torch.from_numpy(encode_grid(grid, item["source"], **self.encoding)).half()
+    rng = np.random.default_rng(int(item["source_view"])) if self.seeded else None
+    item["x0_raw"] = torch.from_numpy(encode_grid(grid, item["source"], rng=rng, **self.encoding)).half()
     return item
 
 
 def encoding_tag(encoding):
   """The cache subdirectory of an encoding's moments: "" for the default encoding (the caches written before encodings existed)."""
-  e = {**dict(scale_sort=False, scale_floor_px=None), **(encoding or {})}
-  parts = (["sort"] if e["scale_sort"] else []) + ([f"floor{float(e['scale_floor_px']):g}px"] if e["scale_floor_px"] is not None else [])
+  e = normalize_encoding(encoding)
+  parts = {"keep": [], "sorted": ["sort"], "random": ["randorder"]}[e["scale_order"]]
+  parts = parts + ([f"floor{float(e['scale_floor_px']):g}px"] if e["scale_floor_px"] is not None else [])
+  parts += [f"rot{e['rot_form']}"] if e["rot_form"] != "keep" else []
   return "_".join(parts)
 
 
@@ -228,7 +293,7 @@ def _grid_moments(dataset, i, path, cache_dir):
       return z["s"], z["s2"], int(z["n"]), z["lo"], z["hi"]
   item = dataset.inner[i]
   grid, _ = load_grid(path)
-  x = torch.from_numpy(encode_grid(grid, item["source"], **dataset.encoding))[:, item["source"]["hit"]].double()   # (CHANNELS, valid slots), full precision
+  x = torch.from_numpy(encode_grid(grid, item["source"], rng=np.random.default_rng(int(item["source_view"])), **dataset.encoding))[:, item["source"]["hit"]].double()   # (CHANNELS, valid slots), full precision
   if x.shape[1]:
     moments = (x.sum(1).numpy(), x.square().sum(1).numpy(), x.shape[1], x.amin(1).numpy(), x.amax(1).numpy())
   else:   # a grid without a Gaussian: no moments (compute_stats raises when no grid has any)
