@@ -500,17 +500,31 @@ class GSDataModule(pl.LightningDataModule):
       **OmegaConf.to_container(self.cfg.loader, resolve=True),
     )
 
+  def validation_seed(self, index, name):
+    """The shuffle seed of validation set `name` at the index-th validation (module.EventValidation counts them): a function of
+    cfg.seed, the index and the set only -- so at the same validation every run scores the same volumes (paired comparisons), and
+    each validation a different random sample."""
+    words = [ord(c) for c in name]
+    return int(np.random.SeedSequence([int(self.cfg.seed), int(index), *words]).generate_state(1)[0])
+
+  def reseed_validation(self, index):
+    """Seeds every val dataloader's shuffle for the index-th validation (called by module.EventValidation before it runs)."""
+    for name, g in getattr(self, "_val_generators", {}).items():
+      g.manual_seed(self.validation_seed(index, name))
+
   def val_dataloader(self):
+    self._val_generators = {name: torch.Generator() for name in self.val_datasets}
     return [
       DataLoader(
         ds,
         shuffle=True,   # every validation iterates it afresh: a new random order, so a partial one is a random sample
+        generator=self._val_generators[name],   # seeded per validation by reseed_validation (paired across runs)
         collate_fn=collate_with_batch_size,
         num_workers=0,
         batch_size=self.cfg.loader.batch_size,
         drop_last=False,
       )
-      for ds in self.val_datasets.values()
+      for name, ds in self.val_datasets.items()
     ]
 
 

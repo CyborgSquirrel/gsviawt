@@ -435,7 +435,9 @@ class EventValidation(pl.Callback):
   `volumes`, how many volumes of EACH validation set it scores: a whole number (200, or the string "200") is
   that many volumes, a percentage string ("50%") that proportion of the set, None the whole set (decimals
   are rejected as a count: floats and ints get mixed up in configs). It takes batches from the start of each set's dataloader
-  until it has that many (the val dataloaders shuffle, so every validation scores a fresh random sample); a
+  until it has that many (the val dataloaders shuffle, so every validation scores a fresh random sample; before its k-th run it
+  calls the datamodule's reseed_validation(k), if it has one, so that sample is the same for every run at its k-th validation:
+  paired comparisons across runs); a
   set with fewer volumes is scored whole (trainer.limit_val_batches doesn't apply to these). Lightning's own
   validations (at the end of training, ...) are sized by trainer.limit_val_batches instead.
 
@@ -448,6 +450,7 @@ class EventValidation(pl.Callback):
     self.trigger = Trigger(trigger_event)
     self.count, self.fraction = self._parse_volumes(volumes)
     self.at_end = at_end
+    self.runs = 0   # validations run so far (the k of reseed_validation)
 
   @staticmethod
   def _parse_volumes(volumes):
@@ -495,6 +498,9 @@ class EventValidation(pl.Callback):
     val_loop._max_batches = [self._batches(dl) for dl in val_loop._combined_loader.flattened]
     datamodule = trainer.datamodule
     datamodule.validation = self.name
+    self.runs += 1
+    if hasattr(datamodule, "reseed_validation"):
+      datamodule.reseed_validation(self.runs)
     trainer.validating = True   # picks the right trainer._active_loop
     first_loop_iter = trainer._logger_connector._first_loop_iter
     try:
