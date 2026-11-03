@@ -8,5 +8,6 @@ sets: [val_meshes, val_views_sval, val_views_strain]
 val_t: [0.25, 0.5, 0.75, 1]  # diffusion.val_t of the runs
 x_axis: train_seconds        # the runs' x-axis (logged on every row by train_gs.py's ProgressWandbLogger)
 max_runs: 20
-train_smoothing: 0.9         # exponential smoothing of the per-step train panels (0: off); validation panels are never smoothed
+train_smoothing: 0.95        # exponential smoothing of the per-step train panels (0: off); validation panels are never smoothed
 save: false                  # false: print the layout only; true: save the view to W&B (writes to the project)
+url: null                    # with save=true: an existing view's URL to update in place (its runset kept); null: create a new view

@@ -2,6 +2,7 @@
 
   python wandb_workspace.py                  # print the layout, write nothing
   python wandb_workspace.py save=true        # save it as a NEW view in the project and print its URL
+  python wandb_workspace.py save=true url=<view URL>   # update that view in place (panels + settings; its runset is kept)
 
 Sections, in order: the full sample's image quality (the comparable generation metric, as eval_diffusion's), the one-step
 render at each shared timestep of diffusion.val_t, the validation losses, the train losses, the x0 loss per field / per
@@ -91,6 +92,10 @@ def main(cfg: DictConfig):
     for p in s.panels:
       print("  ", getattr(p, "title", None), getattr(p, "y", getattr(p, "media_keys", "")))
   if cfg.save:
+    if cfg.url:   # update that view: its panels and settings from here, its runset (which runs it shows) as it is
+      existing = ws.Workspace.from_url(cfg.url)
+      existing.sections, existing.settings = view.sections, view.settings
+      view = existing
     view.save()
     print("saved:", view.url)
 
