@@ -60,3 +60,33 @@ def test_tags_defaults_and_checkpoint_compat():
   train_gs.GSLightningModule.on_load_checkpoint(module(new), {"x0_encoding": dict(new)})   # saved before rot_form existed: keep
   with pytest.raises(SystemExit, match="rot_form=keep"):
     train_gs.GSLightningModule.on_load_checkpoint(module({**new, "rot_form": "canonical"}), {"x0_encoding": dict(new)})
+
+
+def test_random_forms_are_seeded_for_validation(monkeypatch):
+  """Validation datasets (seeded=True) give each volume the same random scale order / rotation form every time; training draws
+  fresh ones."""
+  import torch
+  rng = np.random.default_rng(0)
+  L, H, W = 2, 6, 6
+  hit = rng.random((L, H, W)) < 0.8
+  xyz = np.stack(np.meshgrid(np.arange(W), np.arange(H), indexing="xy"), -1)[None].repeat(L, 0).astype(np.float32) * 0.01
+  xyz = np.concatenate([xyz, np.full((L, H, W, 1), 2.0, np.float32)], -1)
+  grid = {"layer_valid": np.moveaxis(hit, 0, 2), "gaussian_means": np.moveaxis(xyz, 0, 2),
+          "gaussian_quats": np.moveaxis(Rotation.random(L * H * W, random_state=0).as_quat()[:, [3, 0, 1, 2]].reshape(L, H, W, 4), 0, 2).astype(np.float32),
+          "gaussian_scales": np.moveaxis(rng.uniform(0.01, 0.1, (L, H, W, 3)), 0, 2).astype(np.float32),
+          "gaussian_opacities": np.full((H, W, L), 0.5, np.float32), "gaussian_colors": np.full((H, W, L, 3), 0.5, np.float32)}
+  source = {"hit": torch.from_numpy(hit), "xyz_cam": torch.from_numpy(np.where(hit[..., None], xyz, np.nan)),
+            "pose_gl": torch.from_numpy(np.linalg.inv(gd.OPENGL_TO_OPENCV).astype(np.float32)), "K_depth": torch.eye(3) * 500}
+
+  class Inner:
+    volumes = type("V", (), {"df": {"view_idx": type("C", (), {"to_list": staticmethod(lambda: [7])})}})()
+    def __len__(self):
+      return 1
+    def __getitem__(self, i):
+      return {"source_view": 7, "source": source}
+  monkeypatch.setattr(gd, "load_grid", lambda path: (grid, {}))
+  enc = {"scale_order": "random", "rot_form": "random"}
+  val = gd.GridTargetDataset(Inner(), {7: "g.h5"}, enc, seeded=True)
+  assert torch.equal(val[0]["x0_raw"], val[0]["x0_raw"])
+  train = gd.GridTargetDataset(Inner(), {7: "g.h5"}, enc)
+  assert not torch.equal(train[0]["x0_raw"], train[0]["x0_raw"])

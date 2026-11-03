@@ -245,8 +245,11 @@ class GridTargetDataset(Dataset):
   """Wraps a dataset of render items (gs_dataset.WTFeatureDataset) and adds each item's ground-truth Gaussians, "x0_raw"
   (CHANNELS, L, H, W) (see encode_grid, with `encoding`: its scale_order / scale_floor_px / rot_form), read from the grid file of its source view."""
 
-  def __init__(self, inner, grid_index, encoding=None):
+  def __init__(self, inner, grid_index, encoding=None, seeded=False):
+    """seeded: the random parts of the encoding (scale_order / rot_form random) are a function of the item's source view, the same
+    in every epoch (validation sets); otherwise fresh per call (training)."""
     self.inner = inner
+    self.seeded = seeded
     self.grid_index = grid_index
     self.encoding = normalize_encoding(encoding)
     self.volumes = inner.volumes   # the preview code reads the volumes' mesh/view columns
@@ -262,7 +265,8 @@ class GridTargetDataset(Dataset):
     grid, _ = load_grid(self.grid_index[item["source_view"]])
     # half precision in transit (dense (14, 6, 504, 504) is 85 MB in float32): the log-scales (|x| < 17), logits, colours and offsets
     # lose < 2% of the channel's std; the model upcasts it
-    item["x0_raw"] = torch.from_numpy(encode_grid(grid, item["source"], **self.encoding)).half()
+    rng = np.random.default_rng(int(item["source_view"])) if self.seeded else None
+    item["x0_raw"] = torch.from_numpy(encode_grid(grid, item["source"], rng=rng, **self.encoding)).half()
     return item
 
 
@@ -289,7 +293,7 @@ def _grid_moments(dataset, i, path, cache_dir):
       return z["s"], z["s2"], int(z["n"]), z["lo"], z["hi"]
   item = dataset.inner[i]
   grid, _ = load_grid(path)
-  x = torch.from_numpy(encode_grid(grid, item["source"], **dataset.encoding))[:, item["source"]["hit"]].double()   # (CHANNELS, valid slots), full precision
+  x = torch.from_numpy(encode_grid(grid, item["source"], rng=np.random.default_rng(int(item["source_view"])), **dataset.encoding))[:, item["source"]["hit"]].double()   # (CHANNELS, valid slots), full precision
   if x.shape[1]:
     moments = (x.sum(1).numpy(), x.square().sum(1).numpy(), x.shape[1], x.amin(1).numpy(), x.amax(1).numpy())
   else:   # a grid without a Gaussian: no moments (compute_stats raises when no grid has any)

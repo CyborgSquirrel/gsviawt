@@ -478,7 +478,7 @@ class GSDataModule(pl.LightningDataModule):
     if grid_index is not None:
       enc = x0_encoding(cfg)
       self.train_ds = gs_diffusion.GridTargetDataset(self.train_ds, grid_index, enc)
-      self.val_datasets = {n: gs_diffusion.GridTargetDataset(ds, grid_index, enc) for n, ds in self.val_datasets.items()}
+      self.val_datasets = {n: gs_diffusion.GridTargetDataset(ds, grid_index, enc, seeded=True) for n, ds in self.val_datasets.items()}
       for name, ds in self.val_datasets.items():
         check_val_targets(ds, name, cfg)
       # normalization of the x0 channels: the valid slots of the TRAIN grids (moments cached per grid, next to the grids)
