@@ -355,6 +355,15 @@ diffusion:
   scale_encoding:
     scale_sort: true           # every Gaussian's axes ordered largest -> smallest (rotation permuted to match)
     scale_floor_px: 0.1        # every axis raised to at least this fraction of a pixel at its source-camera depth (null: off)
+  # Render-invariant augmentation of the TRAINING grids (gs_diffusion.augment_x0; the statistics, validations and eval are not
+  # augmented): the same Gaussians written down differently. Meant for rendering-only training (x0_weight=0): with the x0 loss on, a
+  # shuffled target is unpredictable.
+  augment:
+    scale_perm: false          # every Gaussian's scale axes in a random order (rotation permuted to match); all or nothing
+    slot_shuffle_p: 0.0        # per layer, n x n blocks of slots (tiling shifted by a random 0..n-1 per item) whose Gaussians are randomly
+                               # permuted (offsets re-anchored), this fraction of the blocks
+    slot_shuffle_block: 2      # n
+    slot_shuffle_max_px: 3.0   # ... only slots whose anchors are within this many pixel footprints of the block's mean anchor
   train_targets: grid           # the training volumes' supervision (target) views: grid = the training grid views of the mesh;
                                # all = every render of the mesh except the held-out grid views (validation pools unchanged)
   ema:

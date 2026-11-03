@@ -477,7 +477,9 @@ class GSDataModule(pl.LightningDataModule):
       name: WTFeatureDataset(features_h5, v, rows=r, **kwargs) for name, (v, r) in sets.items() if len(r)}
     if grid_index is not None:
       enc = x0_encoding(cfg)
-      self.train_ds = gs_diffusion.GridTargetDataset(self.train_ds, grid_index, enc)
+      augment = cfg.diffusion.get("augment")
+      self.train_ds = gs_diffusion.GridTargetDataset(
+        self.train_ds, grid_index, enc, augment=OmegaConf.to_container(augment) if augment is not None else None)
       self.val_datasets = {n: gs_diffusion.GridTargetDataset(ds, grid_index, enc) for n, ds in self.val_datasets.items()}
       for name, ds in self.val_datasets.items():
         check_val_targets(ds, name, cfg)
