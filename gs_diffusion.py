@@ -181,6 +181,7 @@ def encode_grid(grid, source, scale_order=None, scale_floor_px=None, rot_form="k
 
 
 SCALE, ROTATION, OFFSET = (slice(o, o + d) for o, d in zip(np.cumsum((0,) + DIMS)[[1, 2, 4]], DIMS[1:2] + DIMS[2:3] + DIMS[4:5]))
+_SCALE_IDX = torch.arange(SCALE.start, SCALE.stop)
 
 
 def augment_x0(x0, source, rng, slot_shuffle=False, slot_shuffle_block=2, slot_shuffle_max_px=3.0):
@@ -310,12 +311,24 @@ def format_projection(mean, std, hit, anchor_z, fx, scale_sort=False, scale_floo
   return project
 
 
-def decode_x0(x0, mean, std, lo=None, hi=None):
+DECODE_CLAMPS = ("channel", "scale")
+
+
+def decode_x0(x0, mean, std, lo=None, hi=None, clamp="channel"):
   """Normalized x0 (B, L, CHANNELS, H, W) -> the Gaussian dict flatten_gaussians reads (gs_decoder.activate_gaussians' layout).
-  lo / hi (CHANNELS,): the range of every channel in the training grids; a sample is clamped into it (an unbounded exp(scale) of a
-  half-trained sampler would otherwise become a scene-sized Gaussian)."""
+  lo / hi (CHANNELS,): the range of every channel in the training grids (an unbounded exp(scale) of a half-trained sampler would
+  otherwise become a scene-sized Gaussian). clamp (diffusion.decode_clamp): channel = every channel clamped into its own range;
+  scale = only the 3 scale channels, all into ONE range (the smallest lo and the largest hi over the 3 axes: with sorted axes a
+  per-axis range would cut an axis written into the "wrong" channel), every other channel unclamped (as gs_decoder's head).
+  A clamped value has no gradient."""
   raw = x0 * std[None, None, :, None, None] + mean[None, None, :, None, None]
   if lo is not None:
+    if clamp == "scale":
+      idx = _SCALE_IDX.to(lo.device)
+      lo = torch.full_like(lo, -float("inf")).index_fill(0, idx, float(lo[SCALE].min()))
+      hi = torch.full_like(hi, float("inf")).index_fill(0, idx, float(hi[SCALE].max()))
+    elif clamp != "channel":
+      raise ValueError(f"decode clamp must be one of {DECODE_CLAMPS}, got {clamp!r}")
     raw = torch.maximum(torch.minimum(raw, hi[None, None, :, None, None]), lo[None, None, :, None, None])
   opacity, scale, rotation, sh_dc, offset = raw.split(DIMS, dim=2)
   return {
@@ -620,6 +633,7 @@ class GSDiffusionModel(nn.Module):
 
   max_sh_degree = 0
   phase = 1   # diffusion.schedule.phase (set in __init__)
+  decode_clamp = "channel"   # diffusion.decode_clamp (set in __init__)
 
   def __init__(self, cfg, stats):
     super().__init__()
@@ -639,6 +653,9 @@ class GSDiffusionModel(nn.Module):
     self.register_buffer("x0_std", std.clone().float())
     self.register_buffer("x0_lo", lo.clone().float())     # the training grids' range of each channel: samples are clamped into it
     self.register_buffer("x0_hi", hi.clone().float())
+    self.decode_clamp = str(d.get("decode_clamp", "channel"))   # (configs without the key: every channel, as before)
+    if self.decode_clamp not in DECODE_CLAMPS:
+      raise SystemExit(f"diffusion.decode_clamp must be one of {DECODE_CLAMPS}, got {self.decode_clamp!r}")
     fixed_t = d.schedule.get("fixed_t")
     if fixed_t is not None and cfg.diffusion.get("photom") is not None and cfg.diffusion.photom.enabled:
       raise SystemExit("diffusion.schedule.fixed_t with diffusion.photom: the rendering loss's t gate never opens at t = 1, the "
@@ -750,7 +767,7 @@ class GSDiffusionModel(nn.Module):
 
   def decode(self, x0):
     """Normalized x0 (B, L, C, H, W) -> the Gaussian dict (differentiable inside the clamp range)."""
-    return decode_x0(x0.float(), self.x0_mean, self.x0_std, self.x0_lo, self.x0_hi)
+    return decode_x0(x0.float(), self.x0_mean, self.x0_std, self.x0_lo, self.x0_hi, clamp=self.decode_clamp)
 
   def forward(self, inputs):
     image, hit, seeds = inputs
