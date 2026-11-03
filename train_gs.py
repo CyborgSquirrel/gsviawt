@@ -93,7 +93,7 @@ def image_quality(pred_rgb, gt_rgb, gt_alpha):
 def x0_encoding(cfg):
   """cfg.diffusion.scale_encoding, completed with the defaults of a config without it (sort off, no floor: runs before it existed)."""
   enc = OmegaConf.select(cfg, "diffusion.scale_encoding", default=None)
-  return {**gs_diffusion.ENCODING_DEFAULTS, **(OmegaConf.to_container(enc) if enc is not None else {})}
+  return gs_diffusion.normalize_encoding(OmegaConf.to_container(enc) if enc is not None else None)
 
 
 def diffusion_enabled(cfg):
@@ -587,13 +587,13 @@ class GSLightningModule(pl.LightningModule):
     if diffusion_enabled(self.cfg):
       # checkpoints from before x0_encoding was saved were all trained without the scale encoding
       # (keys a checkpoint predates mean their defaults, as in a config without them)
-      saved = {**gs_diffusion.ENCODING_DEFAULTS, **checkpoint.get("x0_encoding", {})}
+      saved = gs_diffusion.normalize_encoding(checkpoint.get("x0_encoding"))
       now = x0_encoding(self.cfg)
       if saved != now:
         raise SystemExit(
           f"the checkpoint was trained with diffusion.scale_encoding={saved}, this config has {now}: its x0 statistics and targets "
-          f"would not match. Resume with the checkpoint's own encoding, e.g. diffusion.scale_encoding.scale_sort="
-          f"{str(saved['scale_sort']).lower()} diffusion.scale_encoding.scale_floor_px={saved['scale_floor_px'] if saved['scale_floor_px'] is not None else 'null'}"
+          f"would not match. Resume with the checkpoint's own encoding, e.g. diffusion.scale_encoding.scale_order="
+          f"{saved['scale_order']} diffusion.scale_encoding.scale_floor_px={saved['scale_floor_px'] if saved['scale_floor_px'] is not None else 'null'}"
           f" diffusion.scale_encoding.rot_form={saved['rot_form']}")
     if self.ema is not None and "ema" in checkpoint:
       self.ema.load_state_dict(checkpoint["ema"])
