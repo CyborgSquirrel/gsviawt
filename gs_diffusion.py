@@ -147,13 +147,16 @@ def matrix_to_quat(R):
   return torch.where(q[:, :1] < 0, -q, q)
 
 
-def format_projection(mean, std, hit, anchor_z, fx, scale_sort=False, scale_floor_px=None):
+def format_projection(mean, std, hit, anchor_z, fx, scale_sort=False, scale_floor_px=None, scale_order=None, rot_form="keep"):
   """A function on normalized x0 predictions (B, L, CHANNELS, H, W) that puts the valid slots' Gaussians into the training grids'
   format (encode_grid with this encoding): the scale axes ordered largest -> smallest (the rotation permuted to match, as
   sort_scale_axes), every axis at least scale_floor_px pixel footprints, the rotation a unit quaternion with w >= 0. For the sampler's
   intermediate predictions (GSDiffusionModel.sample's `project`): render-invariant apart from the floor. hit (B or 1, L, H, W);
   anchor_z (L, H, W) the anchors' depth (the floor is at the Gaussian's mean depth: anchor + offset z); fx the depth camera's
-  focal length."""
+  focal length. Takes the run's encoding as keywords: scale_order (keep | sorted | random; only sorted is projected) or the legacy
+  scale_sort, rot_form (canonical: the quaternion form with the largest |w|; keep / random: left as predicted)."""
+  if scale_order is not None:
+    scale_sort = scale_order == "sorted"
   o = np.cumsum((0,) + DIMS)
   sc, ro = slice(int(o[1]), int(o[2])), slice(int(o[2]), int(o[3]))   # the scale and rotation channels
 
@@ -169,6 +172,11 @@ def format_projection(mean, std, hit, anchor_z, fx, scale_sort=False, scale_floo
       R[torch.linalg.det(R) < 0, :, 2] *= -1
       q, s = matrix_to_quat(R), torch.gather(s, 1, order)
     else:
+      q = torch.where(q[:, :1] < 0, -q, q)
+    if rot_form == "canonical":   # q times 1, i, j, k: the same Gaussian; keep the one with the largest |w|
+      w, x_, y, z = q.unbind(-1)
+      forms = torch.stack([q, torch.stack([-x_, w, z, -y], 1), torch.stack([-y, -z, w, x_], 1), torch.stack([-z, y, -x_, w], 1)], 1)
+      q = forms[torch.arange(len(q), device=q.device), forms[:, :, 0].abs().argmax(1)]
       q = torch.where(q[:, :1] < 0, -q, q)
     if scale_floor_px is not None:
       z = anchor_z.expand(*v.shape)[v].float() + raw[:, :, int(o[4]) + 2].permute(0, 1, 2, 3)[v].float()   # the mean's depth, as encode_grid

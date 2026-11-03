@@ -61,3 +61,21 @@ def test_sampler_hook_is_called_every_step():
   hit = torch.ones(1, 2, 2, 2, dtype=torch.bool)
   out = m.sample(torch.zeros(1, 3, 4, 4), hit, seeds=[1], project=lambda z: calls.append(1) or z * 0)
   assert len(calls) == 4 and torch.all(out == 0)                     # the last step's x0 prediction is the output
+
+
+def test_projection_takes_the_new_encoding_keys():
+  rng = np.random.default_rng(1)
+  B, L, H, W, C = 1, 2, 3, 3, gd.CHANNELS
+  mean, std = torch.zeros(C, dtype=torch.float64), torch.ones(C, dtype=torch.float64)
+  hit = torch.ones(1, L, H, W, dtype=torch.bool)
+  x = torch.tensor(rng.normal(size=(B, L, C, H, W)))
+  az = torch.full((L, H, W), 2.0, dtype=torch.float64)
+  old = gd.format_projection(mean, std, hit, az, 100.0, scale_sort=True, scale_floor_px=0.1)(x)
+  new = gd.format_projection(mean, std, hit, az, 100.0, scale_order="sorted", scale_floor_px=0.1, rot_form="keep")(x)
+  np.testing.assert_allclose(new.numpy(), old.numpy())
+  can = gd.format_projection(mean, std, hit, az, 100.0, scale_order="sorted", scale_floor_px=0.1, rot_form="canonical")(x)
+  q = can[0].permute(0, 2, 3, 1)[hit[0]][:, RO].numpy()
+  assert (np.abs(q).argmax(1) == 0).all()                            # w the largest component
+  s = can[0].permute(0, 2, 3, 1)[hit[0]][:, SC].numpy()
+  np.testing.assert_allclose(cov(s, q), cov(old[0].permute(0, 2, 3, 1)[hit[0]][:, SC].numpy(),
+                                            old[0].permute(0, 2, 3, 1)[hit[0]][:, RO].numpy()), rtol=1e-4, atol=1e-8)
