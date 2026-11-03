@@ -77,7 +77,30 @@ def sort_scale_axes(scale, quat):
   return np.take_along_axis(scale, order, axis=1), q.astype(np.float32)
 
 
-def encode_grid(grid, source, scale_sort=False, scale_floor_px=None):
+ENCODING_DEFAULTS = dict(scale_sort=False, scale_floor_px=None, rot_form="keep")   # what a config without the key means
+ROT_FORMS = ("keep", "canonical", "random")
+
+
+def quat_forms(q):
+  """(N, 4) wxyz -> (N, 4 forms, 4): q times 1, i, j, k -- the same Gaussian with two of its axes flipped (a 180 degree turn about
+  one of its own axes). The 4 forms are exactly the rotations that leave an ellipsoid (with fixed axis order) unchanged."""
+  w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+  return np.stack([q, np.stack([-x, w, z, -y], 1), np.stack([-y, -z, w, x], 1), np.stack([-z, y, -x, w], 1)], 1)
+
+
+def set_rot_form(q, rot_form, rng=None):
+  """(N, 4) wxyz -> the same Gaussians' quaternions in the requested form, w >= 0. canonical: the form with the largest |w| (the
+  one closest to no rotation in this frame); random: a uniformly random form per Gaussian; keep: q unchanged."""
+  if rot_form == "keep":
+    return q
+  forms = quat_forms(q)
+  pick = (np.abs(forms[:, :, 0]).argmax(1) if rot_form == "canonical"
+          else (rng if rng is not None else np.random.default_rng()).integers(4, size=len(q)))
+  out = forms[np.arange(len(q)), pick]
+  return np.where(out[:, :1] < 0, -out, out).astype(q.dtype)
+
+
+def encode_grid(grid, source, scale_sort=False, scale_floor_px=None, rot_form="keep", rng=None):
   """The grid's Gaussians as raw (un-normalized) x0 channels, (CHANNELS, L, H, W) float32, zero at the slots without a Gaussian.
   `source`: the dataset item's "source" dict (xyz_cam (L, H, W, 3) with NaN where there is no hit, hit (L, H, W), pose_gl (4, 4),
   K_depth (3, 3)).
@@ -85,7 +108,11 @@ def encode_grid(grid, source, scale_sort=False, scale_floor_px=None):
   camera (z / fx): an axis thinner than ~1/10 px is invisible, but its log value (where the fit happened to leave it) is a wide,
   unpredictable target. scale_sort: the axes of every Gaussian ordered largest -> smallest (sort_scale_axes), so a scale channel
   means the same axis in every slot. Both render the same as the grid (bla/_test_scale_reencode.py: floor 0.1 px >= 56 dB PSNR
-  against the original render over 5000 renders)."""
+  against the original render over 5000 renders). rot_form (set_rot_form, after the sort): which of a Gaussian's 4 equivalent
+  quaternions is stored -- keep (as fitted, in the camera frame: after the sort an effectively random one), canonical (largest
+  |w|), random (a fresh random one per call; rng: its generator, default a fresh one)."""
+  if rot_form not in ROT_FORMS:
+    raise ValueError(f"rot_form must be one of {ROT_FORMS}, got {rot_form!r}")
   valid = grid["layer_valid"].transpose(2, 0, 1)                      # (L, H, W)
   hit = source["hit"].numpy()
   mismatch = int((valid != hit).sum())
@@ -108,7 +135,8 @@ def encode_grid(grid, source, scale_sort=False, scale_floor_px=None):
     q = rotate_quats_wxyz(grid["gaussian_quats"].transpose(2, 0, 1, 3)[valid], c2w[:3, :3].T)   # world -> source camera
     if scale_sort:
       scales[valid], q = sort_scale_axes(scales[valid], q)
-    quat[valid] = np.where(q[:, :1] < 0, -q, q)                      # q and -q are one rotation: w >= 0
+    q = np.where(q[:, :1] < 0, -q, q)                                # q and -q are one rotation: w >= 0
+    quat[valid] = set_rot_form(q, rot_form, rng)
 
   opacity = np.clip(grid["gaussian_opacities"].transpose(2, 0, 1), 1e-6, 1 - 1e-6)
   opacity = np.clip(np.log(opacity / (1 - opacity)), -OPACITY_LOGIT_CLAMP, OPACITY_LOGIT_CLAMP)
@@ -189,7 +217,7 @@ class GridTargetDataset(Dataset):
   def __init__(self, inner, grid_index, encoding=None):
     self.inner = inner
     self.grid_index = grid_index
-    self.encoding = {**dict(scale_sort=False, scale_floor_px=None), **(encoding or {})}
+    self.encoding = {**ENCODING_DEFAULTS, **(encoding or {})}
     self.volumes = inner.volumes   # the preview code reads the volumes' mesh/view columns
     missing = sorted(set(int(v) for v in inner.volumes.df["view_idx"].to_list()) - set(grid_index))
     if missing:
@@ -209,8 +237,9 @@ class GridTargetDataset(Dataset):
 
 def encoding_tag(encoding):
   """The cache subdirectory of an encoding's moments: "" for the default encoding (the caches written before encodings existed)."""
-  e = {**dict(scale_sort=False, scale_floor_px=None), **(encoding or {})}
+  e = {**ENCODING_DEFAULTS, **(encoding or {})}
   parts = (["sort"] if e["scale_sort"] else []) + ([f"floor{float(e['scale_floor_px']):g}px"] if e["scale_floor_px"] is not None else [])
+  parts += [f"rot{e['rot_form']}"] if e["rot_form"] != "keep" else []
   return "_".join(parts)
 
 

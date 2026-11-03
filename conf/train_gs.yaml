@@ -355,6 +355,9 @@ diffusion:
   scale_encoding:
     scale_sort: true           # every Gaussian's axes ordered largest -> smallest (rotation permuted to match)
     scale_floor_px: 0.1        # every axis raised to at least this fraction of a pixel at its source-camera depth (null: off)
+    rot_form: keep             # which of each Gaussian's 4 equivalent quaternions (two axes flipped) is stored, after the sort:
+                               # keep (as fitted; after the sort effectively random) | canonical (largest |w|) | random (fresh per encode;
+                               # for rendering-only training: with the x0 loss the rotation target is then unpredictable)
   train_targets: grid           # the training volumes' supervision (target) views: grid = the training grid views of the mesh;
                                # all = every render of the mesh except the held-out grid views (validation pools unchanged)
   ema:

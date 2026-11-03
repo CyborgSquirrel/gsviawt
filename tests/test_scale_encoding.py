@@ -71,7 +71,7 @@ def test_encoding_tag_and_dataset_encoding():
       import polars as pl
       df = pl.DataFrame({"view_idx": [3]})
   ds = gd.GridTargetDataset(Inner(), {3: "unused.h5"}, {"scale_sort": True})   # overriding a default must not raise
-  assert ds.encoding == {"scale_sort": True, "scale_floor_px": None}
+  assert ds.encoding == {"scale_sort": True, "scale_floor_px": None, "rot_form": "keep"}
 
 
 def test_default_is_sort_floor_and_checkpoints_keep_their_encoding():
@@ -82,8 +82,8 @@ def test_default_is_sort_floor_and_checkpoints_keep_their_encoding():
   import train_gs
   root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
   conf = OmegaConf.load(os.path.join(root, "conf", "train_gs.yaml"))
-  assert train_gs.x0_encoding(conf) == {"scale_sort": True, "scale_floor_px": 0.1}
-  off = {"scale_sort": False, "scale_floor_px": None}
+  assert train_gs.x0_encoding(conf) == {"scale_sort": True, "scale_floor_px": 0.1, "rot_form": "keep"}
+  off = {"scale_sort": False, "scale_floor_px": None, "rot_form": "keep"}
   assert train_gs.x0_encoding(OmegaConf.create({"diffusion": {"enabled": True}})) == off
 
   def module(enc):
@@ -92,7 +92,7 @@ def test_default_is_sort_floor_and_checkpoints_keep_their_encoding():
   M = train_gs.GSLightningModule
   ckpt = {}
   M.on_save_checkpoint(module({"scale_sort": True, "scale_floor_px": 0.1}), ckpt)
-  assert ckpt["x0_encoding"] == {"scale_sort": True, "scale_floor_px": 0.1}
+  assert ckpt["x0_encoding"] == {"scale_sort": True, "scale_floor_px": 0.1, "rot_form": "keep"}
   M.on_load_checkpoint(module({"scale_sort": True, "scale_floor_px": 0.1}), dict(ckpt))
   with pytest.raises(SystemExit, match="scale_sort=true diffusion.scale_encoding.scale_floor_px=0.1"):
     M.on_load_checkpoint(module(off), dict(ckpt))
