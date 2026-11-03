@@ -83,8 +83,8 @@ def test_val_t_bag_balances_each_validation_set():
 
   fake = types.SimpleNamespace(
     cfg=OmegaConf.create({"diffusion": {"eval_seed": 0, "val_t": [0.25, 0.5, 0.75, 1.0]}}), device=torch.device("cpu"),
-    model=types.SimpleNamespace(inputs=lambda batch, dev: ("img", torch.ones(batch["batch_size"], 6, 4, 4), [0] * batch["batch_size"]),
-                                training_loss=training_loss, decode=lambda x: x),
+    model=types.SimpleNamespace(inputs=lambda batch, dev: ("img", torch.ones(batch["batch_size"], 6, 4, 4), [0] * batch["batch_size"], None),
+                                training_loss=training_loss, decode=lambda x, floor=None: x),
     _photom_per_volume=lambda batch, gauss: {"l1": gauss + 1, "total": gauss + 1},
     _log_metric=lambda stage, k, v, n: logged.append((stage, k, n)))
   fake._pop_val_t = lambda stage: M._pop_val_t(fake, stage)
@@ -164,7 +164,7 @@ def test_shared_t1_is_the_one_step_sample():
   m.head = lambda feats, x, t: x * w[None, None, :, None, None] + t[:, :, None, None, None]   # a stand-in network
   m._feats = lambda image: None
   m.normalize = lambda x: x
-  m.decode = lambda x: x
+  m.decode = lambda x, floor=None: x
   m.eval_seed = 0
   m.schedule = types.SimpleNamespace(sample=lambda b, phase, generator=None: torch.rand(b, 6, generator=generator))
   if hasattr(gd.GSDiffusionModel, "_net_input"):

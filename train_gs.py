@@ -596,7 +596,7 @@ class GSLightningModule(pl.LightningModule):
           f"the checkpoint was trained with diffusion.scale_encoding={saved}, this config has {now}: its x0 statistics and targets "
           f"would not match. Resume with the checkpoint's own encoding, e.g. diffusion.scale_encoding.scale_order="
           f"{saved['scale_order']} diffusion.scale_encoding.scale_floor_px={saved['scale_floor_px'] if saved['scale_floor_px'] is not None else 'null'}"
-          f" diffusion.scale_encoding.rot_form={saved['rot_form']}")
+          f" diffusion.scale_encoding.scale_floor_mode={saved['scale_floor_mode']} diffusion.scale_encoding.rot_form={saved['rot_form']}")
     if self.ema is not None and "ema" in checkpoint:
       self.ema.load_state_dict(checkpoint["ema"])
       self._ema_fresh = False
@@ -644,7 +644,7 @@ class GSLightningModule(pl.LightningModule):
 
   def _diffusion_losses(self, batch, seeded=False):
     """(loss, parts, counts, x0_hat, t); seeded: the timesteps and noise of each volume are a function of the volume (validation)."""
-    image, hit, seeds = self.model.inputs(batch, self.device)
+    image, hit, seeds, _ = self.model.inputs(batch, self.device)
     return self.model.training_loss(image, hit, batch["x0_raw"].to(self.device), seeds=seeds if seeded else None, return_pred=True)
 
   def _photom_active(self):
@@ -668,7 +668,8 @@ class GSLightningModule(pl.LightningModule):
     tv = {"max": lambda: t.amax(dim=1), "mean": lambda: t.mean(dim=1), "layer0": lambda: t[:, 0]}[reduce]()   # (B,)
     keep = ((tv >= float(lo)) & (tv <= float(hi))).float()
     log(stage, "loss/photom_frac", keep.mean(), batch["batch_size"])
-    return self._render_photom(stage, batch, self.model.decode(x0_hat), keep, "loss/photom", log)
+    return self._render_photom(stage, batch, self.model.decode(x0_hat, self.model.floor_context(batch, self.device)), keep,
+                               "loss/photom", log)
 
   def _render_photom(self, stage, batch, gauss, keep, key, log=None):
     """loss.photom (L1 + D-SSIM on the views of loss.photom.for, against the dataset's rendered images) of the Gaussian dict gauss,
@@ -777,11 +778,11 @@ class GSLightningModule(pl.LightningModule):
     t (t = 1: the 1-step sample, the x0 prediction from pure noise). One forward and one render for the whole batch."""
     B = batch["batch_size"]
     tv = torch.tensor([self._pop_val_t(stage) for _ in range(B)], device=self.device)   # (B,)
-    image, hit, seeds = self.model.inputs(batch, self.device)
+    image, hit, seeds, floor = self.model.inputs(batch, self.device)
     L = hit.shape[1]
     x0_hat = self.model.training_loss(image, hit, batch["x0_raw"].to(self.device), seeds=seeds, return_pred=True,
                                       t=tv[:, None].expand(B, L))[3]
-    per = self._photom_per_volume(batch, self.model.decode(x0_hat))
+    per = self._photom_per_volume(batch, self.model.decode(x0_hat, floor))
     for v in sorted(set(tv.tolist())):
       self._log_photom(stage, per, (tv == v).float(), f"loss/photom_t{v:g}")
 

@@ -170,7 +170,7 @@ def main(cfg):
             if gt_depth.shape[-2:] != gt.shape[-2:]:
               gt_depth = None                                # the depth peel is at another resolution than the images
             angle = view_angles(batch, views)
-            image, hit, _ = model.inputs(batch, device)
+            image, hit, _, floor = model.inputs(batch, device)
             project = None
             if cfg.get("project_format"):   # the sampler's intermediate x0 predictions put into the training grids' format
               enc = train_gs.x0_encoding(run)
@@ -178,9 +178,10 @@ def main(cfg):
                                              float(item["source"]["K_depth"][0, 0]), **enc)
             base = 1_000_003 * (int(cfg.seed) + 1) + int(item["source_view"]) * 101
             seeds = [base + k for k in range(K)]
-            out = {"fit": [render(model, batch, model.decode(model.normalize(batch["x0_raw"].to(device).float())), views, device)],
-                   "onestep": [render(model, batch, model.sample(image, hit, seeds=seeds[:1], steps=1, project=project), views, device)]}
-            g = model.sample(image.expand(K, *image.shape[1:]), hit.expand(K, *hit.shape[1:]), seeds=seeds, steps=steps, project=project)
+            out = {"fit": [render(model, batch, model.decode(model.normalize(batch["x0_raw"].to(device).float()), floor), views, device)],
+                   "onestep": [render(model, batch, model.sample(image, hit, seeds=seeds[:1], steps=1, project=project, floor=floor), views, device)]}
+            g = model.sample(image.expand(K, *image.shape[1:]), hit.expand(K, *hit.shape[1:]), seeds=seeds, steps=steps, project=project,
+                             floor=floor)
             out["samples"] = [render(model, batch, {k: v[j:j + 1] for k, v in g.items()}, views, device) for j in range(K)]
             M = lambda r: metrics(r[0], gt, dssim, lpips, r[1], gt_alpha, r[2], gt_depth)
             per = {m: M(r[0]) for m, r in out.items() if m != "samples"}

@@ -82,9 +82,11 @@ def sort_scale_axes(scale, quat):
   return permute_scale_axes(scale, quat, np.argsort(-scale, axis=1))
 
 
-ENCODING_DEFAULTS = dict(scale_order="keep", scale_floor_px=None, rot_form="keep")   # what a config without the key means
+ENCODING_DEFAULTS = dict(scale_order="keep", scale_floor_px=None, scale_floor_mode="max", rot_form="keep")   # what a config without the key means
 SCALE_ORDERS = ("keep", "sorted", "random")
 ROT_FORMS = ("keep", "canonical", "random")
+SCALE_FLOOR_MODES = ("max", "add")
+FLOOR_ADD_EPS = 0.1   # scale_floor_mode add: an axis at (or under) the floor is stored as this fraction of the floor above it
 
 
 def normalize_encoding(encoding):
@@ -103,6 +105,8 @@ def normalize_encoding(encoding):
     raise ValueError(f"scale_order must be one of {SCALE_ORDERS}, got {e['scale_order']!r}")
   if e["rot_form"] not in ROT_FORMS:
     raise ValueError(f"rot_form must be one of {ROT_FORMS}, got {e['rot_form']!r}")
+  if e["scale_floor_mode"] not in SCALE_FLOOR_MODES:
+    raise ValueError(f"scale_floor_mode must be one of {SCALE_FLOOR_MODES}, got {e['scale_floor_mode']!r}")
   return e
 
 
@@ -125,13 +129,17 @@ def set_rot_form(q, rot_form, rng=None):
   return np.where(out[:, :1] < 0, -out, out).astype(q.dtype)
 
 
-def encode_grid(grid, source, scale_order=None, scale_floor_px=None, rot_form="keep", rng=None, scale_sort=None):
+def encode_grid(grid, source, scale_order=None, scale_floor_px=None, rot_form="keep", rng=None, scale_sort=None,
+                scale_floor_mode="max"):
   """The grid's Gaussians as raw (un-normalized) x0 channels, (CHANNELS, L, H, W) float32, zero at the slots without a Gaussian.
   `source`: the dataset item's "source" dict (xyz_cam (L, H, W, 3) with NaN where there is no hit, hit (L, H, W), pose_gl (4, 4),
   K_depth (3, 3)).
   scale_floor_px: every scale axis is raised to at least this fraction of the pixel footprint at the Gaussian's depth in the source
   camera (z / fx): an axis thinner than ~1/10 px is invisible, but its log value (where the fit happened to leave it) is a wide,
-  unpredictable target. scale_order: the order of every Gaussian's axes (the rotation permuted to match) -- keep (as fitted),
+  unpredictable target. scale_floor_mode: how the floor is applied -- max (every axis raised to it, the channel the log of the
+  axis) | add (the channel the log of the axis's excess over the floor, at least FLOOR_ADD_EPS floors: the decode adds the floor
+  back, scale = floor + exp(channel), so no prediction is ever under it; an axis at the floor renders FLOOR_ADD_EPS floors larger).
+  scale_order: the order of every Gaussian's axes (the rotation permuted to match) -- keep (as fitted),
   sorted (largest -> smallest, sort_scale_axes: a scale channel means the same axis in every slot), random (a fresh random order per
   call). scale_sort: the legacy boolean (True = sorted). Both render the same as the grid (bla/_test_scale_reencode.py: floor 0.1 px >= 56 dB PSNR
   against the original render over 5000 renders). rot_form (set_rot_form, after the sort): which of a Gaussian's 4 equivalent
@@ -139,7 +147,7 @@ def encode_grid(grid, source, scale_order=None, scale_floor_px=None, rot_form="k
   |w|), random (a fresh random one per call; rng: its generator, default a fresh one)."""
   # scale_order None: keep, or the legacy flag's choice; both given must agree
   e = normalize_encoding({**({"scale_order": scale_order} if scale_order is not None else {}), "scale_floor_px": scale_floor_px,
-                          "rot_form": rot_form, **({"scale_sort": scale_sort} if scale_sort is not None else {})})
+                          "scale_floor_mode": scale_floor_mode, "rot_form": rot_form, **({"scale_sort": scale_sort} if scale_sort is not None else {})})
   scale_order, rot_form = e["scale_order"], e["rot_form"]
   if "random" in (scale_order, rot_form) and rng is None:
     rng = np.random.default_rng()
@@ -158,9 +166,12 @@ def encode_grid(grid, source, scale_order=None, scale_floor_px=None, rot_form="k
 
   quat = np.zeros(valid.shape + (4,), np.float32)
   scales = grid["gaussian_scales"].transpose(2, 0, 1, 3).astype(np.float32)
+  floor = None
   if scale_floor_px is not None:
     footprint = means_cam[..., 2] / float(source["K_depth"][0, 0])                 # (L, H, W): one pixel's size at that depth
-    scales = np.maximum(scales, float(scale_floor_px) * np.nan_to_num(footprint)[..., None])
+    floor = float(scale_floor_px) * np.nan_to_num(footprint)[..., None]
+    if scale_floor_mode == "max":
+      scales = np.maximum(scales, floor)
   if valid.any():
     q = rotate_quats_wxyz(grid["gaussian_quats"].transpose(2, 0, 1, 3)[valid], c2w[:3, :3].T)   # world -> source camera
     if scale_order == "sorted":
@@ -172,6 +183,8 @@ def encode_grid(grid, source, scale_order=None, scale_floor_px=None, rot_form="k
 
   opacity = np.clip(grid["gaussian_opacities"].transpose(2, 0, 1), 1e-6, 1 - 1e-6)
   opacity = np.clip(np.log(opacity / (1 - opacity)), -OPACITY_LOGIT_CLAMP, OPACITY_LOGIT_CLAMP)
+  if floor is not None and scale_floor_mode == "add":   # (after the sort: the excess has the axes' order, the floor is per Gaussian)
+    scales = np.maximum(scales - floor, FLOOR_ADD_EPS * floor)
   scale = np.log(np.maximum(scales, 1e-8))
   color = (grid["gaussian_colors"].transpose(2, 0, 1, 3) - 0.5) / SH_C0
 
@@ -266,7 +279,8 @@ def matrix_to_quat(R):
   return torch.where(q[:, :1] < 0, -q, q)
 
 
-def format_projection(mean, std, hit, anchor_z, fx, scale_sort=False, scale_floor_px=None, scale_order=None, rot_form="keep"):
+def format_projection(mean, std, hit, anchor_z, fx, scale_sort=False, scale_floor_px=None, scale_order=None, rot_form="keep",
+                      scale_floor_mode="max"):
   """A function on normalized x0 predictions (B, L, CHANNELS, H, W) that puts the valid slots' Gaussians into the training grids'
   format (encode_grid with this encoding): the scale axes ordered largest -> smallest (the rotation permuted to match, as
   sort_scale_axes), every axis at least scale_floor_px pixel footprints, the rotation a unit quaternion with w >= 0. For the sampler's
@@ -274,6 +288,8 @@ def format_projection(mean, std, hit, anchor_z, fx, scale_sort=False, scale_floo
   anchor_z (L, H, W) the anchors' depth (the floor is at the Gaussian's mean depth: anchor + offset z); fx the depth camera's
   focal length. Takes the run's encoding as keywords: scale_order (keep | sorted | random; only sorted is projected) or the legacy
   scale_sort, rot_form (canonical: the quaternion form with the largest |w|; keep / random: left as predicted)."""
+  if scale_floor_px is not None and scale_floor_mode != "max":
+    raise NotImplementedError("format_projection: only scale_floor_mode max (with add the decode applies the floor itself)")
   if scale_order is not None:
     scale_sort = scale_order == "sorted"
   o = np.cumsum((0,) + DIMS)
@@ -314,13 +330,15 @@ def format_projection(mean, std, hit, anchor_z, fx, scale_sort=False, scale_floo
 DECODE_CLAMPS = ("channel", "scale")
 
 
-def decode_x0(x0, mean, std, lo=None, hi=None, clamp="channel"):
+def decode_x0(x0, mean, std, lo=None, hi=None, clamp="channel", floor=None):
   """Normalized x0 (B, L, CHANNELS, H, W) -> the Gaussian dict flatten_gaussians reads (gs_decoder.activate_gaussians' layout).
   lo / hi (CHANNELS,): the range of every channel in the training grids (an unbounded exp(scale) of a half-trained sampler would
   otherwise become a scene-sized Gaussian). clamp (diffusion.decode_clamp): channel = every channel clamped into its own range;
   scale = only the 3 scale channels, all into ONE range (the smallest lo and the largest hi over the 3 axes: with sorted axes a
   per-axis range would cut an axis written into the "wrong" channel), every other channel unclamped (as gs_decoder's head).
-  A clamped value has no gradient."""
+  A clamped value has no gradient. floor (scale_floor_mode add; GSDiffusionModel.floor_context): {"px": scale_floor_px, "anchor_z"
+  (B, L, H, W), "fx" (B,)}: scale = floor + exp(channel), the floor scale_floor_px pixel footprints at the Gaussian's mean depth
+  (anchor + offset z, as encode_grid's), raw_scale its log."""
   raw = x0 * std[None, None, :, None, None] + mean[None, None, :, None, None]
   if lo is not None:
     if clamp == "scale":
@@ -331,10 +349,15 @@ def decode_x0(x0, mean, std, lo=None, hi=None, clamp="channel"):
       raise ValueError(f"decode clamp must be one of {DECODE_CLAMPS}, got {clamp!r}")
     raw = torch.maximum(torch.minimum(raw, hi[None, None, :, None, None]), lo[None, None, :, None, None])
   opacity, scale, rotation, sh_dc, offset = raw.split(DIMS, dim=2)
+  size = torch.exp(scale)
+  if floor is not None:
+    z = floor["anchor_z"][:, :, None].to(raw) + offset[:, :, 2:3]                   # (B, L, 1, H, W): the mean's depth
+    size = size + float(floor["px"]) * z.clamp_min(1e-3) / floor["fx"].to(raw)[:, None, None, None, None]
+    scale = torch.log(size)
   return {
     "opacity": torch.sigmoid(opacity),
     "raw_scale": scale,
-    "scale": torch.exp(scale),
+    "scale": size,
     "rotation": F.normalize(rotation + 1e-6, dim=2),
     "sh_dc": sh_dc,
     "offset": offset,
@@ -424,7 +447,8 @@ def encoding_tag(encoding):
   """The cache subdirectory of an encoding's moments: "" for the default encoding (the caches written before encodings existed)."""
   e = normalize_encoding(encoding)
   parts = {"keep": [], "sorted": ["sort"], "random": ["randorder"]}[e["scale_order"]]
-  parts = parts + ([f"floor{float(e['scale_floor_px']):g}px"] if e["scale_floor_px"] is not None else [])
+  parts = parts + ([f"floor{float(e['scale_floor_px']):g}px" + ("add" if e["scale_floor_mode"] == "add" else "")]
+                   if e["scale_floor_px"] is not None else [])
   parts += [f"rot{e['rot_form']}"] if e["rot_form"] != "keep" else []
   return "_".join(parts)
 
@@ -634,6 +658,7 @@ class GSDiffusionModel(nn.Module):
   max_sh_degree = 0
   phase = 1   # diffusion.schedule.phase (set in __init__)
   decode_clamp = "channel"   # diffusion.decode_clamp (set in __init__)
+  floor_add_px = None        # diffusion.scale_encoding.scale_floor_px with scale_floor_mode add (set in __init__): the decode adds it
 
   def __init__(self, cfg, stats):
     super().__init__()
@@ -654,6 +679,9 @@ class GSDiffusionModel(nn.Module):
     self.register_buffer("x0_lo", lo.clone().float())     # the training grids' range of each channel: samples are clamped into it
     self.register_buffer("x0_hi", hi.clone().float())
     self.decode_clamp = str(d.get("decode_clamp", "channel"))   # (configs without the key: every channel, as before)
+    enc = normalize_encoding(dict(d.scale_encoding) if d.get("scale_encoding") is not None else None)
+    self.floor_add_px = (float(enc["scale_floor_px"]) if enc["scale_floor_mode"] == "add" and enc["scale_floor_px"] is not None
+                         else None)
     if self.decode_clamp not in DECODE_CLAMPS:
       raise SystemExit(f"diffusion.decode_clamp must be one of {DECODE_CLAMPS}, got {self.decode_clamp!r}")
     fixed_t = d.schedule.get("fixed_t")
@@ -673,9 +701,17 @@ class GSDiffusionModel(nn.Module):
     self.eval_seed = int(d.eval_seed)
 
   def inputs(self, batch, device):
-    """(image, hit mask, per-volume seeds): the noise of a sample is a function of its volume (see eval_noise)."""
+    """(image, hit mask, per-volume seeds, floor context): the noise of a sample is a function of its volume (see eval_noise)."""
     seeds = [self.eval_seed + int(v) for v in batch["source_view"]]
-    return batch["image"].to(device), batch["source"]["hit"].to(device), seeds
+    return batch["image"].to(device), batch["source"]["hit"].to(device), seeds, self.floor_context(batch, device)
+
+  def floor_context(self, batch, device):
+    """What decode needs of the batch for scale_floor_mode add (decode_x0's floor), else None."""
+    if self.floor_add_px is None:
+      return None
+    src = batch["source"]
+    return {"px": self.floor_add_px, "anchor_z": torch.nan_to_num(src["xyz_cam"][..., 2].to(device).float()),
+            "fx": src["K_depth"][:, 0, 0].to(device).float()}
 
   def _feats(self, image):
     feats = self.backbone(image)
@@ -745,7 +781,7 @@ class GSDiffusionModel(nn.Module):
     return loss, parts, counts
 
   @torch.no_grad()
-  def sample(self, image, hit, seeds=None, steps=None, project=None):
+  def sample(self, image, hit, seeds=None, steps=None, project=None, floor=None):
     """20 Euler steps of the flow from pure noise -> the Gaussian dict. The noise of volume i is a function of seeds[i] (default:
     eval_seed + i): reproducible. Invalid slots stay at the noise. project: applied to every step's x0 prediction before it is used
     (e.g. format_projection; the last step's x0 prediction is the output)."""
@@ -763,15 +799,18 @@ class GSDiffusionModel(nn.Module):
       if project is not None:
         x0_hat = project(x0_hat)
       x = x - (t - ts[i + 1]) * (x - x0_hat) / t.clamp(min=T_MIN_CLAMP)
-    return self.decode(x)
+    return self.decode(x, floor)
 
-  def decode(self, x0):
-    """Normalized x0 (B, L, C, H, W) -> the Gaussian dict (differentiable inside the clamp range)."""
-    return decode_x0(x0.float(), self.x0_mean, self.x0_std, self.x0_lo, self.x0_hi, clamp=self.decode_clamp)
+  def decode(self, x0, floor=None):
+    """Normalized x0 (B, L, C, H, W) -> the Gaussian dict (differentiable inside the clamp range). floor: floor_context's (needed
+    with scale_floor_mode add)."""
+    if self.floor_add_px is not None and floor is None:
+      raise ValueError("scale_floor_mode add: decode needs the floor context (GSDiffusionModel.floor_context)")
+    return decode_x0(x0.float(), self.x0_mean, self.x0_std, self.x0_lo, self.x0_hi, clamp=self.decode_clamp, floor=floor)
 
   def forward(self, inputs):
-    image, hit, seeds = inputs
-    return self.sample(image, hit, seeds)
+    image, hit, seeds, floor = inputs
+    return self.sample(image, hit, seeds, floor=floor)
 
 
 # ---------------------------------------------------------------------------
