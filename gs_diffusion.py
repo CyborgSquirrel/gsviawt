@@ -576,7 +576,8 @@ class DiTTrunk(nn.Module):
 
 class DiffusionHead(nn.Module):
   """(image features (B, L, P, D), the network's noisy x (B, L, C, H, W), t (B, L)) -> x0_hat (B, L, C, H, W).
-  Token = [normalized features | the patch's raw noisy values | zero pad]: nothing is squeezed through a projection."""
+  Token = [normalized features | the patch's raw noisy values | zero pad]: nothing is squeezed through a projection -- unless dim is
+  set below that width (diffusion.dim): then a learned Linear maps the token to dim (DiT's patch embedding), a smaller trunk."""
 
   def __init__(self, feature_dim, num_layers, channels=CHANNELS, patch_size=14, dim=None, num_blocks=3, mlp_ratio=4.0,
                layer_scale_init=1e-4, t_embed_channels=256, img_token_scale=0.3, checkpoint_activations=False):
@@ -585,9 +586,10 @@ class DiffusionHead(nn.Module):
     self.noise_dim = channels * patch_size ** 2
     in_dim = feature_dim + self.noise_dim
     self.dim = dim or int(math.ceil(in_dim / 64) * 64)
-    if self.dim < in_dim or self.dim % 64:
-      raise ValueError(f"diffusion.dim={self.dim} must be a multiple of 64 and at least {in_dim} (the lossless token)")
-    self.pad = self.dim - in_dim
+    if self.dim % 64:
+      raise ValueError(f"diffusion.dim={self.dim} must be a multiple of 64")
+    self.in_proj = nn.Linear(in_dim, self.dim) if self.dim < in_dim else None   # below the lossless width: projected
+    self.pad = self.dim - in_dim if self.in_proj is None else 0
     self.time_embed = nn.Sequential(nn.Linear(t_embed_channels, self.dim), nn.SiLU(), nn.Linear(self.dim, self.dim))
     self.time_proj = nn.Sequential(nn.SiLU(), nn.Linear(self.dim, 6 * self.dim))
     self.trunk = DiTTrunk(self.dim, num_layers, num_blocks, self.dim // 64, mlp_ratio, layer_scale_init, checkpoint_activations)
@@ -607,7 +609,9 @@ class DiffusionHead(nn.Module):
     feats = (feats - feats.mean((1, 2, 3), keepdim=True)) / (feats.var((1, 2, 3), keepdim=True, unbiased=False) + 1e-6).sqrt()
     patches = rearrange(x_net, "b l c (h py) (w px) -> b l (h w) (c py px)", py=self.patch_size, px=self.patch_size)
     tokens = torch.cat([feats * self.img_token_scale, patches.to(feats.dtype)], dim=-1)
-    if self.pad:
+    if self.in_proj is not None:
+      tokens = self.in_proj(tokens)
+    elif self.pad:
       tokens = F.pad(tokens, (0, self.pad))
     out = self.out(self.trunk(tokens, self.adaln(t)))
     grid = int(round(p ** 0.5))
