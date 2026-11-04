@@ -402,13 +402,13 @@ class EventCheckpoint(pl.Callback):
   (the completed optimizer steps). trigger_event=None turns it off. (The TrainClock writes final.ckpt
   itself when the budget is spent.)
 
-  keep_last: None keeps every checkpoint; n >= 1 keeps only the newest n of this callback's own: once a new
-  one is written, the older ones it wrote are deleted (if the save raises, nothing is deleted). It only
+  keep_last: n >= 1 (default 1) keeps only the newest n of this callback's own -- once a new one is written, the older
+  ones it wrote are deleted (if the save raises, nothing is) -- and None keeps every checkpoint. It only
   deletes the paths it saved itself (kept in checkpoints too), never anything else in the directory, and
   only those in the CURRENT default_root_dir: a run resumed from a checkpoint (into a fresh output dir)
   leaves the earlier run's checkpoints alone, and stops tracking them."""
 
-  def __init__(self, *, trigger_event, filename="checkpoint-{count}-step{step}.ckpt", keep_last=None):
+  def __init__(self, *, trigger_event, filename="checkpoint-{count}-step{step}.ckpt", keep_last=1):
     if keep_last is not None and (isinstance(keep_last, bool) or not isinstance(keep_last, int) or keep_last < 1):
       raise ValueError(f"keep_last={keep_last!r}: use null (keep every checkpoint) or a whole number >= 1")
     self.trigger = Trigger(trigger_event)
