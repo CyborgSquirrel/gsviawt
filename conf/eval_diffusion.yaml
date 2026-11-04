@@ -3,7 +3,8 @@ run_config: ???          # the run's resolved config: <hydra run dir>/.hydra/con
 checkpoints: ???         # list of .ckpt paths of that run; "init" = the freshly initialized model (pipeline test only)
 weights: [raw, ema]      # raw: the trained weights; ema: diffusion.ema's average (from the checkpoint's "ema" entry)
 samples: 4               # K sampler runs per volume (seeds eval_seed + k), rendered: single (k = 0), mean of K renders, best of K
-steps: null              # sampler steps; null: the run's diffusion.steps
+steps: null              # sampler steps; null: the run's diffusion.steps; a list, e.g. [1,2,3,5,10,20,50]: one <out>/steps<N>/ each,
+                         # the volumes / fit / onestep done once
 project_format: false    # put every sampler step's x0 prediction into the training grids' format (the run's scale_sort / floor) before it is fed back
 val_sets: null           # list of validation set names; null: all of the run's
 max_volumes: null        # per set: a reproducible random subset of that many volumes (same for every run with the same split);
