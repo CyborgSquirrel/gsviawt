@@ -4,6 +4,7 @@ import random
 import types
 
 import numpy as np
+import pytest
 import torch
 from omegaconf import OmegaConf
 
@@ -117,12 +118,31 @@ def test_validation_counter_survives_a_resume(tmp_path):
   assert (resumed[0].runs, resumed[1].runs) == (3, 5)
 
 
-def test_checkpoints_are_written_after_the_validations_of_their_step():
+def test_checkpoints_come_after_the_validations(tmp_path):
+  """A checkpoint written at a step where a validation also runs must hold its counter as it is after it: the config lists
+  event_checkpoint after the validations, and EventCheckpoint refuses to start before an EventValidation."""
+  import lightning.pytorch as pl
   from module import EventCheckpoint, EventValidation
-  v1, c, v2 = EventValidation(name="big", trigger_event=None), EventCheckpoint(trigger_event=None), EventValidation(name="small", trigger_event=None)
-  other = object()
-  assert train_gs.checkpoints_last([other, v1, c, v2]) == [other, v1, v2, c]
+  names = list(OmegaConf.load("conf/train_gs.yaml").callbacks)
+  assert all(names.index("event_checkpoint") > i for i, n in enumerate(names) if n.startswith("validation_"))
 
+  class Tiny(pl.LightningModule):
+    def __init__(self):
+      super().__init__()
+      self.w = torch.nn.Linear(2, 1)
+    def training_step(self, batch, batch_idx):
+      return self.w(batch[0]).sum()
+    def configure_optimizers(self):
+      return torch.optim.SGD(self.parameters(), lr=0.1)
+
+  def fit(callbacks):
+    pl.Trainer(max_steps=1, callbacks=callbacks, accelerator="cpu", logger=False, enable_checkpointing=False,
+               enable_progress_bar=False, enable_model_summary=False, default_root_dir=str(tmp_path)).fit(
+      Tiny(), torch.utils.data.DataLoader(torch.utils.data.TensorDataset(torch.randn(4, 2)), batch_size=2))
+  v, c = EventValidation(name="big", trigger_event=None), EventCheckpoint(trigger_event=None)
+  fit([v, c])                                                   # the right order runs
+  with pytest.raises(RuntimeError, match="after every EventValidation"):
+    fit([EventCheckpoint(trigger_event=None), EventValidation(name="big", trigger_event=None)])
 
 def test_lightnings_own_validations_are_paired_and_resume(tmp_path):
   """Lightning's own validations (sized by limit_val_batches) score the same volumes in every run at its k-th one, whatever the

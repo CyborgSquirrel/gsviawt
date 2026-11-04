@@ -447,6 +447,15 @@ class EventCheckpoint(pl.Callback):
     self.count = 0
     self.saved = []   # the paths this callback wrote, oldest first (kept in checkpoints, for keep_last)
 
+  def on_fit_start(self, trainer, pl_module):
+    # both run in on_train_batch_end, in callback order: a checkpoint written at a step where a validation also runs must come
+    # after it, so it holds that validation's run counter (the k of its paired sample) as it is after the step
+    callbacks = trainer.callbacks
+    later = [c for c in callbacks[callbacks.index(self) + 1:] if isinstance(c, EventValidation)]
+    if later:
+      raise RuntimeError(f"EventCheckpoint must come after every EventValidation in the trainer's callbacks (it precedes "
+                         f"{[c.name for c in later]}): put callbacks.event_checkpoint after the validations in the config")
+
   def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
     if not self.trigger.due(trainer, pl_module, batch_idx):
       return

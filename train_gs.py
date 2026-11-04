@@ -64,8 +64,8 @@ from gs_dataset import (OPENGL_TO_OPENCV, H5Catalog, WTFeatureDataset,  # noqa: 
                         sample_matching_sources)
 from gs_decoder import PatchGaussianHead  # noqa: E402
 import gs_diffusion  # noqa: E402
-from module import (DSSIMLoss, EventCheckpoint, Events, ProgressWandbLogger, SameDirCheckpointIO, TrainClock,  # noqa: E402
-                    _completed_steps, make_scheduler, needs_clock)
+from module import (DSSIMLoss, Events, ProgressWandbLogger, SameDirCheckpointIO, TrainClock, _completed_steps,  # noqa: E402
+                    make_scheduler, needs_clock)
 from util import collate_with_batch_size, pipe, set_mode, timed  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -94,13 +94,6 @@ def x0_encoding(cfg):
   """cfg.diffusion.scale_encoding, completed with the defaults of a config without it (sort off, no floor: runs before it existed)."""
   enc = OmegaConf.select(cfg, "diffusion.scale_encoding", default=None)
   return gs_diffusion.normalize_encoding(OmegaConf.to_container(enc) if enc is not None else None)
-
-
-def checkpoints_last(callbacks):
-  """The callbacks with the EventCheckpoints moved behind the others (order kept otherwise): a checkpoint is then written after
-  the validations of the same step, so it holds their run counters (the k of the paired samples) as they are after that step
-  and a resume from it goes on with k+1."""
-  return [c for c in callbacks if not isinstance(c, EventCheckpoint)] + [c for c in callbacks if isinstance(c, EventCheckpoint)]
 
 
 def diffusion_enabled(cfg):
@@ -1208,7 +1201,6 @@ def main(cfg: DictConfig) -> None:
     )
 
   callbacks = list(hydra.utils.instantiate(cfg.callbacks).values())
-  callbacks = checkpoints_last(callbacks)
   callbacks = [events, *callbacks]   # before every consumer: see module.Events
   if clock is not None:
     callbacks = [clock, *callbacks, clock.tail()]   # first and last: see module.TrainClock
