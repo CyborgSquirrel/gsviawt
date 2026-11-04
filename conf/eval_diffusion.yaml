@@ -6,6 +6,8 @@ samples: 4               # K sampler runs per volume (seeds eval_seed + k), rend
 steps: null              # sampler steps; null: the run's diffusion.steps; a list, e.g. [1,2,3,5,10,20,50]: one <out>/steps<N>/ each,
                          # the volumes / fit / onestep done once
 project_format: false    # put every sampler step's x0 prediction into the training grids' format (the run's scale_sort / floor) before it is fed back
+project_quat: unit       # with project_format: unit (the rotation made a unit quaternion, w >= 0) | keep (left as predicted, except
+                         # where the sort reorders the axes)
 val_sets: null           # list of validation set names; null: all of the run's
 max_volumes: null        # per set: a reproducible random subset of that many volumes (same for every run with the same split);
                          # null: all (say so when reporting a subset)

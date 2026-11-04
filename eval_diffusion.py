@@ -184,7 +184,8 @@ def main(cfg):
             if cfg.get("project_format"):   # the sampler's intermediate x0 predictions put into the training grids' format
               enc = train_gs.x0_encoding(run)
               project = gd.format_projection(model.x0_mean, model.x0_std, hit, item["source"]["xyz_cam"][..., 2].to(device),
-                                             float(item["source"]["K_depth"][0, 0]), **enc)
+                                             float(item["source"]["K_depth"][0, 0]), **enc,
+                                             quat=str(cfg.get("project_quat", "unit")))
             base = 1_000_003 * (int(cfg.seed) + 1) + int(item["source_view"]) * 101
             seeds = [base + k for k in range(K)]
             M = lambda r: metrics(r[0], gt, dssim, lpips, r[1], gt_alpha, r[2], gt_depth)
