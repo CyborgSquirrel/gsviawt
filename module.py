@@ -44,6 +44,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import pack, rearrange, repeat
 from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.plugins.io import TorchCheckpointIO
 from lightning.pytorch.trainer import call
 from omegaconf import OmegaConf
 from torch.optim import Optimizer
@@ -198,6 +199,35 @@ def time_wsd_progress(seconds, max_seconds, warmup_fraction, decay_fraction):
   if seconds >= max_seconds:
     return 0.0
   return 0.5 * (1.0 + math.cos(math.pi * (seconds - decay_start) / (max_seconds - decay_start)))
+
+
+class SameDirCheckpointIO(TorchCheckpointIO):
+  """Lightning's checkpoint IO, saving next to the destination instead of through the system temp dir.
+
+  Lightning's own atomic save (fsspec transaction) writes the whole checkpoint to tempfile.mkstemp() -- /tmp, or $TMPDIR --
+  and then moves it into place: the temp file must fit in /tmp (a 30 GB RAM-backed tmpfs on a cluster node, where ~12 GB
+  checkpoints failed with ENOSPC) and the move across filesystems copies it a second time. This writes <path>.tmp-<pid> in
+  the destination's own directory, fsyncs it and renames it onto <path> (os.replace: atomic on one filesystem), so a crash
+  mid-save never leaves a partial <path>; on any error the temp file is removed and the error raised."""
+
+  def save_checkpoint(self, checkpoint, path, storage_options=None):
+    if storage_options is not None:
+      raise TypeError(f"SameDirCheckpointIO.save_checkpoint takes no storage_options, got {storage_options!r}")
+    path = os.fspath(path)
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = f"{path}.tmp-{os.getpid()}"
+    try:
+      with open(tmp, "wb") as f:
+        torch.save(checkpoint, f)
+        f.flush()
+        os.fsync(f.fileno())
+      os.replace(tmp, path)
+    except BaseException:
+      try:
+        os.remove(tmp)
+      except FileNotFoundError:
+        pass
+      raise
 
 
 class TrainClock(pl.Callback):
@@ -400,25 +430,66 @@ class EventCheckpoint(pl.Callback):
   name, or a cadence of its own). filename is a str.format() template over {count} (how many this
   callback has saved, this one included; kept in checkpoints, so a resumed run goes on counting) and {step}
   (the completed optimizer steps). trigger_event=None turns it off. (The TrainClock writes final.ckpt
-  itself when the budget is spent.)"""
+  itself when the budget is spent.)
 
-  def __init__(self, *, trigger_event, filename="checkpoint-{count}-step{step}.ckpt"):
+  keep_last: n >= 1 (default 1) keeps only the newest n of this callback's own -- once a new one is written, the older
+  ones it wrote are deleted (if the save raises, nothing is) -- and None keeps every checkpoint. It only
+  deletes the paths it saved itself (kept in checkpoints too), never anything else in the directory, and
+  only those in the CURRENT default_root_dir: a run resumed from a checkpoint (into a fresh output dir)
+  leaves the earlier run's checkpoints alone, and stops tracking them."""
+
+  def __init__(self, *, trigger_event, filename="checkpoint-{count}-step{step}.ckpt", keep_last=1):
+    if keep_last is not None and (isinstance(keep_last, bool) or not isinstance(keep_last, int) or keep_last < 1):
+      raise ValueError(f"keep_last={keep_last!r}: use null (keep every checkpoint) or a whole number >= 1")
     self.trigger = Trigger(trigger_event)
     self.filename = filename
+    self.keep_last = keep_last
     self.count = 0
+    self.saved = []   # the paths this callback wrote, oldest first (kept in checkpoints, for keep_last)
+
+  def on_fit_start(self, trainer, pl_module):
+    # both run in on_train_batch_end, in callback order: a checkpoint written at a step where a validation also runs must come
+    # after it, so it holds that validation's run counter (the k of its paired sample) as it is after the step
+    callbacks = trainer.callbacks
+    later = [c for c in callbacks[callbacks.index(self) + 1:] if isinstance(c, EventValidation)]
+    if later:
+      raise RuntimeError(f"EventCheckpoint must come after every EventValidation in the trainer's callbacks (it precedes "
+                         f"{[c.name for c in later]}): put callbacks.event_checkpoint after the validations in the config")
 
   def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
     if not self.trigger.due(trainer, pl_module, batch_idx):
       return
     self.count += 1
-    name = self.filename.format(count=self.count, step=_completed_steps(trainer, pl_module))
-    trainer.save_checkpoint(os.path.join(trainer.default_root_dir, name))
+    path = os.path.join(trainer.default_root_dir, self.filename.format(count=self.count, step=_completed_steps(trainer, pl_module)))
+    previous = self.saved
+    # listed before the save, so the checkpoint's own state names it too (a resume into the same dir prunes it later)
+    self.saved = [p for p in previous if p != path] + [path]
+    try:
+      trainer.save_checkpoint(path)
+    except BaseException:
+      self.saved = previous   # keep the old ones (and the error)
+      raise
+    if self.keep_last is not None:
+      self._prune(trainer)
+
+  def _prune(self, trainer):
+    # only files directly in this run's dir: an earlier run's (another dir, before a resume) are left alone and forgotten
+    root = os.path.abspath(trainer.default_root_dir)
+    ours = [p for p in self.saved if os.path.dirname(os.path.abspath(p)) == root]
+    old, self.saved = ours[:-self.keep_last], ours[-self.keep_last:]
+    if trainer.is_global_zero:
+      for p in old:
+        try:
+          os.remove(p)
+        except FileNotFoundError:
+          pass
 
   def state_dict(self):
-    return {"count": self.count}
+    return {"count": self.count, "saved": list(self.saved)}
 
   def load_state_dict(self, state):
     self.count = state["count"]
+    self.saved = list(state.get("saved", []))   # older checkpoints have no list: nothing to prune from before the resume
 
 
 class EventValidation(pl.Callback):
@@ -522,6 +593,8 @@ class EventValidation(pl.Callback):
     finally:
       val_loop._max_batches = limits   # Lightning's own validations use trainer.limit_val_batches
       datamodule.validation = "lightning"
+      if hasattr(datamodule, "reseed_lightning"):
+        datamodule.reseed_lightning()   # ready for Lightning's own next validation (see GSDataModule.reseed_lightning)
     trainer.training = True
     trainer._logger_connector._first_loop_iter = first_loop_iter
     # A one-shot flag of Lightning's epoch loop (loops/training_epoch_loop.py): its on_advance_end, which runs
