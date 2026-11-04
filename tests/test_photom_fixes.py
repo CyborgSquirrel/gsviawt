@@ -1,10 +1,9 @@
 """The PR #97 fixes: D-SSIM in fp32 (its gradient under bf16 autocast was noise), the validation's rendering keys
 (loss/photom: the training's term, gated the same way; loss/photom_t<t>: at a shared timestep from a shuffled bag of
 diffusion.val_t; loss/photom_full: the full sample -- none colliding), and train/loss/x0 logged only for accepted steps."""
-import os
-import tempfile
 import types
 
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
@@ -71,84 +70,122 @@ def test_validation_photom_keys():
   assert logged == ["photom", "val_t"]
 
 
+VAL_T = [0.25, 0.5, 0.75, 1.0]
+SETS = {"val_a": (3, 4), "val_b": (5, 1)}   # batch sizes: 7 and 6 volumes, neither a multiple of len(val_t) (bags carry over)
+
+
+def val_t_run(seed=42, eval_seed=0):
+  """A fake GSLightningModule (the real val_t methods; a stand-in model recording the t of every forward) on a GSDataModule shell
+  (the real reseeding); validate(k) runs the k-th EventValidation's val_t pass (k=None: Lightning's own next) -> {set: [t per volume]}."""
+  M, D = train_gs.GSLightningModule, train_gs.GSDataModule
+  dm = types.SimpleNamespace(cfg=OmegaConf.create({"seed": seed, "loader": {"batch_size": 4}}), validation="lightning",
+                             val_datasets={n: list(range(sum(b))) for n, b in SETS.items()}, lightning_runs=0)
+  for m in ("validation_seed", "reseed_validation", "reseed_lightning", "val_dataloader", "load_state_dict"):
+    setattr(dm, m, (lambda f: lambda *a, **k: f(dm, *a, **k))(getattr(D, m)))
+  dm.val_dataloader()
+  forwards = []
+
+  def training_loss(image, hit, x0_raw, seeds, return_pred, t):
+    forwards.append(t[:, 0].tolist())
+    return None, None, None, torch.zeros(t.shape[0]), t
+
+  fake = types.SimpleNamespace(
+    cfg=OmegaConf.create({"diffusion": {"eval_seed": eval_seed, "val_t": VAL_T}}), device=torch.device("cpu"),
+    trainer=types.SimpleNamespace(datamodule=dm, sanity_checking=False),
+    model=types.SimpleNamespace(inputs=lambda batch, dev: ("img", torch.ones(batch["batch_size"], 6, 4, 4), [0] * batch["batch_size"], None),
+                                training_loss=training_loss, decode=lambda x, floor=None: x),
+    _photom_per_volume=lambda batch, gauss: {"l1": gauss + 1, "total": gauss + 1}, _log_metric=lambda *a: None)
+  fake._pop_val_t = lambda stage: M._pop_val_t(fake, stage)
+  fake._log_photom = lambda *a: M._log_photom(fake, *a)
+
+  def validate(k=None):
+    if k is not None:
+      dm.validation = "small"
+      dm.reseed_validation(k)
+    M.on_validation_epoch_start(fake)
+    out = {}
+    for stage, sizes in SETS.items():
+      forwards.clear()
+      for B in sizes:
+        M._diffusion_val_t(fake, stage, {"batch_size": B, "x0_raw": torch.zeros(B)})
+      out[stage] = sum(forwards, [])
+    if k is not None:
+      dm.validation = "lightning"
+      dm.reseed_lightning()
+    else:
+      M.on_validation_end(fake)
+    return out
+  return dm, validate
+
+
 def test_val_t_bag_balances_each_validation_set():
-  """Every validation set's volumes split evenly over diffusion.val_t (a fresh shuffled bag per set and validation), one shared t
-  per volume over all its layers, one forward + one render per batch, logged as loss/photom_t<t> with its own count."""
+  """Every validation set's volumes split evenly over diffusion.val_t: a fresh shuffled bag per set and validation, refilled when
+  empty, so each run of len(val_t) volumes in a set takes every value once (sets not a multiple of it: no bag shared between sets
+  or carried into the next validation)."""
+  _, validate = val_t_run()
+  for k in (1, 2, 3):
+    for stage, ts in validate(k).items():
+      assert len(ts) == sum(SETS[stage])
+      for i in range(0, len(ts), len(VAL_T)):
+        chunk = ts[i:i + len(VAL_T)]
+        assert len(set(chunk)) == len(chunk) and set(chunk) <= set(VAL_T), (k, stage, ts)
+
+
+def test_val_t_logs_one_shared_t_per_volume():
+  """One shared t per volume over all its layers, one forward per batch, logged as loss/photom_t<t>[_l1] with its own count."""
   M = train_gs.GSLightningModule
   logged, forwards = [], []
 
   def training_loss(image, hit, x0_raw, seeds, return_pred, t):
     forwards.append(t.clone())
     return None, None, None, torch.zeros(t.shape[0]), t
-
+  dm = types.SimpleNamespace(validation_seeds={"val_a": 5})
   fake = types.SimpleNamespace(
-    cfg=OmegaConf.create({"diffusion": {"eval_seed": 0, "val_t": [0.25, 0.5, 0.75, 1.0]}}), device=torch.device("cpu"),
+    cfg=OmegaConf.create({"diffusion": {"eval_seed": 0, "val_t": VAL_T}}), device=torch.device("cpu"),
+    trainer=types.SimpleNamespace(datamodule=dm),
     model=types.SimpleNamespace(inputs=lambda batch, dev: ("img", torch.ones(batch["batch_size"], 6, 4, 4), [0] * batch["batch_size"], None),
                                 training_loss=training_loss, decode=lambda x, floor=None: x),
     _photom_per_volume=lambda batch, gauss: {"l1": gauss + 1, "total": gauss + 1},
     _log_metric=lambda stage, k, v, n: logged.append((stage, k, n)))
   fake._pop_val_t = lambda stage: M._pop_val_t(fake, stage)
   fake._log_photom = lambda *a: M._log_photom(fake, *a)
-  for _ in range(2):   # two validations
-    M.on_validation_epoch_start(fake)
-    for stage in ("val_a", "val_b"):
-      for B in (3, 5):   # 8 volumes per set
-        M._diffusion_val_t(fake, stage, {"batch_size": B, "x0_raw": torch.zeros(B)})
-  assert len(forwards) == 8 and all(f.shape[1] == 6 and (f == f[:, :1]).all() for f in forwards)   # shared over the layers
-  for k in range(2):
-    for s_i, stage in enumerate(("val_a", "val_b")):
-      ts = torch.cat(forwards[4 * k + 2 * s_i: 4 * k + 2 * s_i + 2])[:, 0].tolist()
-      assert sorted(ts) == [0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0], (stage, ts)
-  keys = {k for _, k, _ in logged}
-  assert keys == {f"loss/photom_t{t}" for t in ("0.25", "0.5", "0.75", "1")} | {f"loss/photom_t{t}_l1" for t in ("0.25", "0.5", "0.75", "1")}
+  M.on_validation_epoch_start(fake)
+  M._diffusion_val_t(fake, "val_a", {"batch_size": 8, "x0_raw": torch.zeros(8)})
+  assert len(forwards) == 1 and forwards[0].shape == (8, 6) and (forwards[0] == forwards[0][:, :1]).all()
+  ts = sorted(forwards[0][:, 0].tolist())
+  assert ts == sorted(VAL_T * 2)
+  ts_names = ("0.25", "0.5", "0.75", "1")
+  assert {k for _, k, _ in logged} == {f"loss/photom_t{t}" for t in ts_names} | {f"loss/photom_t{t}_l1" for t in ts_names}
+  assert all(n == 2 for _, k, n in logged if k == "loss/photom_t0.5")
+
+
+def test_val_t_is_paired_across_runs_and_resumes():
+  """At its k-th validation every run gives each volume of a set the same t (a function of cfg.seed, eval_seed, k and the set, not
+  of the run's history), the next validation a different draw, and a resumed run (counters restored) goes on with the sequence."""
+  _, a = val_t_run()
+  ref = {k: a(k) for k in (1, 2, 3)}
+  lightning = [a() for _ in range(3)]                  # Lightning's own validations 1..3
+  _, b = val_t_run()
+  np.random.seed(7); torch.rand(9)
+  b(); b(); b(5)                                         # another history
+  assert b(2) == ref[2] and b(3) == ref[3]
+  assert ref[2] != ref[3] and ref[2]["val_a"][:6] != ref[2]["val_b"]   # per validation, per set
+  assert lightning[0] != ref[1]                          # Lightning's own validations: their own seeds
+  dm, c = val_t_run()                                    # resumed after 2 of Lightning's own validations
+  dm.load_state_dict({"lightning_runs": 2})
+  assert c() == lightning[2]
+  assert val_t_run(seed=7)[1](2) != ref[2] and val_t_run(eval_seed=1)[1](2) != ref[2]
 
 
 @pytest.mark.cuda
 @pytest.mark.data
-def test_validation_photom_is_gated_like_training():
-  root = os.environ.get("GSVIAWT_TEST_DATA", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bla"))
-  grids = os.path.join(root, "grids_test", "fit", "grids")
-  if not os.path.isdir(grids):
-    pytest.skip(f"local test data missing: {grids}")
-  import gs_diffusion as gd
-  from gs_dataset import WTFeatureDataset, render_catalog
-  from util import collate_with_batch_size
-  idx, src = gd.build_grid_index(grids)
-  if not os.path.exists(src):
-    pytest.skip(f"render file of the test grids missing: {src}")
-  listing = gd.make_listing(idx, src, os.path.join(tempfile.mkdtemp(), "listing.h5"))
-  cat = render_catalog(src)
-  cat = cat.take([p for p, v in enumerate(cat.df["view_idx"].to_list()) if v in set(idx)])
-  w = gd.GridTargetDataset(WTFeatureDataset(listing, cat, num_layers=6, num_views=2, depth_size=None, image_size=504,
-                                            read_features=False), idx)
-  mean, std, lo, hi = gd.compute_stats(w, idx)[:4]
-  dev = torch.device("cuda")
-
-  class Stub(torch.nn.Module):
-    max_sh_degree = 0
-    backbone = None
-    decode = gd.GSDiffusionModel.decode
-
-    def __init__(self):
-      super().__init__()
-      for n, v in (("x0_mean", mean), ("x0_std", std), ("x0_lo", lo), ("x0_hi", hi)):
-        self.register_buffer(n, v.float())
-  logged = {}
-  fake = types.SimpleNamespace(
-    cfg=OmegaConf.create({"loss": {"photom": {"for": ["target"], "l1_weight": 1.0, "dssim_weight": 0.85}},
-                          "diffusion": {"photom": {"enabled": True, "t_range": [0.0, 0.7], "t_reduce": "max"}}}),
-    device=dev, model=Stub().to(dev), dssim=DSSIMLoss(reduction="none").to(dev),
-    _log_metric=lambda stage, k, v, n: logged.__setitem__(f"{stage}/{k}", float(v)))
-  batch = collate_with_batch_size([w[i] for i in range(len(w))])
-  x0 = ((batch["x0_raw"].to(dev).float().permute(0, 2, 1, 3, 4) - mean.to(dev)[None, None, :, None, None])
-        / std.to(dev)[None, None, :, None, None])
-  fake._render_photom = lambda *a: train_gs.GSLightningModule._render_photom(fake, *a)
-  fake._photom_per_volume = lambda *a: train_gs.GSLightningModule._photom_per_volume(fake, *a)
-  fake._log_photom = lambda *a: train_gs.GSLightningModule._log_photom(fake, *a)
-  B = batch["batch_size"]
-  train_gs.GSLightningModule._diffusion_photom(fake, "val", batch, x0, torch.full((B, 6), 0.9, device=dev))   # max t 0.9: out
+def test_validation_photom_is_gated_like_training(photom_setup):
+  s = photom_setup
+  logged, B = s.logged, s.B
+  logged.clear()
+  s.photom("val", s.batch, s.x0, torch.full((B, 6), 0.9, device=s.dev))   # max t 0.9: out
   assert logged == {"val/loss/photom_frac": 0.0}
-  train_gs.GSLightningModule._diffusion_photom(fake, "val", batch, x0, torch.full((B, 6), 0.5, device=dev))   # in t_range
+  s.photom("val", s.batch, s.x0, torch.full((B, 6), 0.5, device=s.dev))   # in t_range
   assert logged["val/loss/photom_frac"] == 1.0 and {"val/loss/photom", "val/loss/photom_l1", "val/loss/photom_dssim", "val/loss/photom_psnr", "val/loss/photom_fg_psnr", "val/loss/photom_bg_l1"} <= set(logged)
   assert 20 < logged["val/loss/photom_psnr"] < 60 and logged["val/loss/photom_bg_l1"] < 0.05   # the fits themselves: sane values
   assert logged["val/loss/photom"] < 0.15   # the fitted grids themselves (about 0.08): a sane render, not noise
@@ -167,8 +204,7 @@ def test_shared_t1_is_the_one_step_sample():
   m.decode = lambda x, floor=None: x
   m.eval_seed = 0
   m.schedule = types.SimpleNamespace(sample=lambda b, phase, generator=None: torch.rand(b, 6, generator=generator))
-  if hasattr(gd.GSDiffusionModel, "_net_input"):
-    m.schedule.fixed_t = None
+  m.schedule.fixed_t = None
   B, L = 2, 6
   hit = torch.rand(B, L, 4, 4, generator=torch.Generator().manual_seed(1)) > 0.3
   image, seeds = torch.zeros(B, 3, 8, 8), [3, 9]

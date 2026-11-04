@@ -510,9 +510,12 @@ class GSDataModule(pl.LightningDataModule):
 
   def reseed_validation(self, index, kind=None):
     """Seeds every val dataloader's shuffle for the index-th validation (called by module.EventValidation before it runs);
-    kind="lightning": for the index-th of Lightning's own validations (their own seeds)."""
-    for name, g in getattr(self, "_val_generators", {}).items():
-      g.manual_seed(self.validation_seed(index, name if kind is None else f"{kind}/{name}"))
+    kind="lightning": for the index-th of Lightning's own validations (their own seeds). The seeds stay in self.validation_seeds
+    (per set) for the validation's other draws (GSLightningModule's val_t bags)."""
+    gens = getattr(self, "_val_generators", {})
+    self.validation_seeds = {name: self.validation_seed(index, name if kind is None else f"{kind}/{name}") for name in gens}
+    for name, g in gens.items():
+      g.manual_seed(self.validation_seeds[name])
 
   def reseed_lightning(self):
     """Seeds the val dataloaders for Lightning's NEXT own validation. Lightning builds a validation's iterator (and fetches its
@@ -797,15 +800,21 @@ class GSLightningModule(pl.LightningModule):
       dm.reseed_lightning()
 
   def on_validation_epoch_start(self):
-    self._val_t_bags = {}   # a fresh bag per validation set at every validation: each splits its volumes evenly over diffusion.val_t
+    # a fresh bag per validation set at every validation (each splits its volumes evenly over diffusion.val_t), shuffled by an RNG
+    # of this validation and set
+    self._val_t_bags, self._val_t_rngs = {}, {}
 
   def _pop_val_t(self, stage):
-    """The next timestep of the validation set's bag of diffusion.val_t (refilled, shuffled, when empty)."""
+    """The next timestep of the validation set's bag of diffusion.val_t (refilled, shuffled, when empty). The shuffles of a
+    validation are seeded by diffusion.eval_seed and the set's validation seed (GSDataModule.reseed_validation: cfg.seed, the
+    validation's index, the set), so at its k-th validation every run -- and a resumed one -- gives each volume the same t."""
     bags = self.__dict__.setdefault("_val_t_bags", {})
     if not bags.get(stage):
-      if not hasattr(self, "_val_t_rng"):
-        self._val_t_rng = np.random.default_rng(int(self.cfg.diffusion.eval_seed))
-      bags[stage] = [float(v) for v in self._val_t_rng.permutation(list(self.cfg.diffusion.val_t))]
+      rngs = self.__dict__.setdefault("_val_t_rngs", {})
+      if stage not in rngs:
+        seed = self.trainer.datamodule.validation_seeds[stage]
+        rngs[stage] = np.random.default_rng([int(self.cfg.diffusion.eval_seed), int(seed)])
+      bags[stage] = [float(v) for v in rngs[stage].permutation(list(self.cfg.diffusion.val_t))]
     return bags[stage].pop()
 
   @torch.no_grad()
