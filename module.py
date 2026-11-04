@@ -522,6 +522,8 @@ class EventValidation(pl.Callback):
     finally:
       val_loop._max_batches = limits   # Lightning's own validations use trainer.limit_val_batches
       datamodule.validation = "lightning"
+      if hasattr(datamodule, "reseed_lightning"):
+        datamodule.reseed_lightning()   # ready for Lightning's own next validation (see GSDataModule.reseed_lightning)
     trainer.training = True
     trainer._logger_connector._first_loop_iter = first_loop_iter
     # A one-shot flag of Lightning's epoch loop (loops/training_epoch_loop.py): its on_advance_end, which runs

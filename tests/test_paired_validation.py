@@ -14,8 +14,9 @@ import train_gs
 def datamodule(seed=42):
   dm = types.SimpleNamespace(cfg=OmegaConf.create({"seed": seed, "loader": {"batch_size": 4}}),
                              val_datasets={"val_meshes": list(range(50)), "val_views_sval": list(range(80))})
-  for m in ("validation_seed", "reseed_validation", "val_dataloader"):
-    setattr(dm, m, (lambda f: lambda *a: f(dm, *a))(getattr(train_gs.GSDataModule, m)))
+  dm.lightning_runs = 0
+  for m in ("validation_seed", "reseed_validation", "reseed_lightning", "val_dataloader"):
+    setattr(dm, m, (lambda f: lambda *a, **k: f(dm, *a, **k))(getattr(train_gs.GSDataModule, m)))
   return dm
 
 
@@ -114,3 +115,61 @@ def test_validation_counter_survives_a_resume(tmp_path):
   resumed = make()
   pl.Trainer(max_steps=3, callbacks=resumed, **kw).fit(Tiny(), data(), ckpt_path=path)
   assert (resumed[0].runs, resumed[1].runs) == (3, 5)
+
+
+def test_checkpoints_are_written_after_the_validations_of_their_step():
+  from module import EventCheckpoint, EventValidation
+  v1, c, v2 = EventValidation(name="big", trigger_event=None), EventCheckpoint(trigger_event=None), EventValidation(name="small", trigger_event=None)
+  other = object()
+  assert train_gs.checkpoints_last([other, v1, c, v2]) == [other, v1, v2, c]
+
+
+def test_lightnings_own_validations_are_paired_and_resume(tmp_path):
+  """Lightning's own validations (sized by limit_val_batches) score the same volumes in every run at its k-th one, whatever the
+  global RNG did before; a different sample at k+1; the sanity check doesn't count; the count is kept in checkpoints."""
+  import lightning.pytorch as pl
+
+  class DM(pl.LightningDataModule):
+    def __init__(self):
+      super().__init__()
+      self.cfg = OmegaConf.create({"seed": 42, "loader": {"batch_size": 4}})
+      self.val_datasets = {k: [{"i": i} for i in range(n)] for k, n in (("val_meshes", 50), ("val_views_sval", 80))}
+      self.validation, self.lightning_runs = "lightning", 0
+    train_dataloader = lambda self: torch.utils.data.DataLoader(torch.randn(40, 2), batch_size=2)
+  for m in ("validation_seed", "reseed_validation", "reseed_lightning", "state_dict", "load_state_dict", "val_dataloader"):
+    setattr(DM, m, getattr(train_gs.GSDataModule, m))
+
+  class Tiny(pl.LightningModule):
+    def __init__(self):
+      super().__init__()
+      self.w, self.seen = torch.nn.Linear(2, 1), []
+    def training_step(self, batch, i):
+      torch.rand(7)   # global RNG consumption that differs between "runs"
+      return self.w(batch).sum()
+    def validation_step(self, batch, i, dataloader_idx=0):
+      self.seen.append(("sanity" if self.trainer.sanity_checking else self.global_step, dataloader_idx, batch["i"].tolist()))
+    def configure_optimizers(self):
+      return torch.optim.SGD(self.parameters(), lr=0.1)
+    on_validation_end = train_gs.GSLightningModule.on_validation_end
+
+  def run(junk, steps=10, ckpt=None, save=None):
+    torch.manual_seed(junk)
+    random.seed(junk)
+    m, dm = Tiny(), DM()
+    t = pl.Trainer(max_steps=steps, val_check_interval=5, limit_val_batches=1, num_sanity_val_steps=1, accelerator="cpu",
+                   logger=False, enable_checkpointing=False, enable_progress_bar=False, enable_model_summary=False,
+                   default_root_dir=str(tmp_path))
+    t.fit(m, dm, ckpt_path=ckpt)
+    if save:
+      t.save_checkpoint(save)
+    return m.seen, dm
+
+  a, dm_a = run(1)
+  b, _ = run(2)
+  assert a == b and dm_a.lightning_runs == 2
+  by = lambda seen, when: [x[2] for x in seen if x[0] == when]
+  assert by(a, "sanity") == by(a, 5) != by(a, 10)       # sanity = the first real one; the next one a new sample
+  path = str(tmp_path / "half.ckpt")
+  run(3, steps=5, save=path)                             # stop after the first validation, resume to the second
+  resumed, dm_r = run(4, steps=10, ckpt=path)
+  assert by(resumed, 10) == by(a, 10) and dm_r.lightning_runs == 2

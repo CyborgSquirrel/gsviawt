@@ -64,7 +64,7 @@ from gs_dataset import (OPENGL_TO_OPENCV, H5Catalog, WTFeatureDataset,  # noqa: 
                         sample_matching_sources)
 from gs_decoder import PatchGaussianHead  # noqa: E402
 import gs_diffusion  # noqa: E402
-from module import (DSSIMLoss, Events, ProgressWandbLogger, TrainClock, _completed_steps,  # noqa: E402
+from module import (DSSIMLoss, EventCheckpoint, Events, ProgressWandbLogger, TrainClock, _completed_steps,  # noqa: E402
                     make_scheduler, needs_clock)
 from util import collate_with_batch_size, pipe, set_mode, timed  # noqa: E402
 
@@ -94,6 +94,13 @@ def x0_encoding(cfg):
   """cfg.diffusion.scale_encoding, completed with the defaults of a config without it (sort off, no floor: runs before it existed)."""
   enc = OmegaConf.select(cfg, "diffusion.scale_encoding", default=None)
   return gs_diffusion.normalize_encoding(OmegaConf.to_container(enc) if enc is not None else None)
+
+
+def checkpoints_last(callbacks):
+  """The callbacks with the EventCheckpoints moved behind the others (order kept otherwise): a checkpoint is then written after
+  the validations of the same step, so it holds their run counters (the k of the paired samples) as they are after that step
+  and a resume from it goes on with k+1."""
+  return [c for c in callbacks if not isinstance(c, EventCheckpoint)] + [c for c in callbacks if isinstance(c, EventCheckpoint)]
 
 
 def diffusion_enabled(cfg):
@@ -390,6 +397,7 @@ class GSDataModule(pl.LightningDataModule):
     self.train_ds = None
     self.val_datasets = None
     self.validation = "lightning"
+    self.lightning_runs = 0   # Lightning's own validations so far (kept in checkpoints: state_dict)
 
   def setup(self, stage=None):
     if self.train_ds is not None:
@@ -504,16 +512,31 @@ class GSDataModule(pl.LightningDataModule):
     """The shuffle seed of validation set `name` at the index-th validation (module.EventValidation counts them): a function of
     cfg.seed, the index and the set only -- so at the same validation every run scores the same volumes (paired comparisons), and
     each validation a different random sample."""
-    words = [ord(c) for c in name]
+    words = [ord(c) for c in name]   # (name: the set's; "lightning/<set>" for Lightning's own validations)
     return int(np.random.SeedSequence([int(self.cfg.seed), int(index), *words]).generate_state(1)[0])
 
-  def reseed_validation(self, index):
-    """Seeds every val dataloader's shuffle for the index-th validation (called by module.EventValidation before it runs)."""
+  def reseed_validation(self, index, kind=None):
+    """Seeds every val dataloader's shuffle for the index-th validation (called by module.EventValidation before it runs);
+    kind="lightning": for the index-th of Lightning's own validations (their own seeds)."""
     for name, g in getattr(self, "_val_generators", {}).items():
-      g.manual_seed(self.validation_seed(index, name))
+      g.manual_seed(self.validation_seed(index, name if kind is None else f"{kind}/{name}"))
+
+  def reseed_lightning(self):
+    """Seeds the val dataloaders for Lightning's NEXT own validation. Lightning builds a validation's iterator (and fetches its
+    first batch) before any hook runs, so the generators are kept in this state whenever no EventValidation is running: after
+    val_dataloader, after every EventValidation and after every Lightning validation (GSLightningModule.on_validation_end)."""
+    self.reseed_validation(self.lightning_runs + 1, kind="lightning")
+
+  def state_dict(self):
+    return {"lightning_runs": self.lightning_runs}
+
+  def load_state_dict(self, state):
+    self.lightning_runs = int(state.get("lightning_runs", 0))
+    self.reseed_lightning()
 
   def val_dataloader(self):
     self._val_generators = {name: torch.Generator() for name in self.val_datasets}
+    self.reseed_lightning()
     return [
       DataLoader(
         ds,
@@ -772,6 +795,13 @@ class GSLightningModule(pl.LightningModule):
       self._diffusion_photom(stage, batch, x0_hat, t)   # the training's own rendering term, gated the same way
     if self.cfg.diffusion.get("val_t"):
       self._diffusion_val_t(stage, batch)
+
+  def on_validation_end(self):
+    dm = getattr(self.trainer, "datamodule", None)
+    if dm is not None and getattr(dm, "validation", None) == "lightning" and hasattr(dm, "reseed_lightning"):
+      if not self.trainer.sanity_checking:   # the sanity check doesn't count: the first real one gets the same sample
+        dm.lightning_runs += 1
+      dm.reseed_lightning()
 
   def on_validation_epoch_start(self):
     self._val_t_bags = {}   # a fresh bag per validation set at every validation: each splits its volumes evenly over diffusion.val_t
@@ -1178,6 +1208,7 @@ def main(cfg: DictConfig) -> None:
     )
 
   callbacks = list(hydra.utils.instantiate(cfg.callbacks).values())
+  callbacks = checkpoints_last(callbacks)
   callbacks = [events, *callbacks]   # before every consumer: see module.Events
   if clock is not None:
     callbacks = [clock, *callbacks, clock.tail()]   # first and last: see module.TrainClock
