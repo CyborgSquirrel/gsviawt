@@ -56,7 +56,7 @@ def test_sampler_hook_is_called_every_step():
   torch.nn.Module.__init__(m)
   m.head = lambda feats, x, t: x * 0.5
   m._feats = lambda image: None
-  m.decode = lambda x: x
+  m.decode = lambda x, floor=None: x
   m.eval_seed, m.steps = 0, 4
   m.schedule = type("S", (), {"sample": staticmethod(lambda b, phase, generator=None: torch.rand(b, 2, generator=generator)), "fixed_t": None})()
   hit = torch.ones(1, 2, 2, 2, dtype=torch.bool)

@@ -71,7 +71,7 @@ def test_encoding_tag_and_dataset_encoding():
       import polars as pl
       df = pl.DataFrame({"view_idx": [3]})
   ds = gd.GridTargetDataset(Inner(), {3: "unused.h5"}, {"scale_sort": True})   # overriding a default must not raise
-  assert ds.encoding == {"scale_order": "sorted", "scale_floor_px": None, "rot_form": "keep"}   # legacy scale_sort mapped
+  assert ds.encoding == {"scale_order": "sorted", "scale_floor_px": None, "scale_floor_mode": "max", "rot_form": "keep"}   # legacy scale_sort mapped
 
 
 def test_default_is_sort_floor_and_checkpoints_keep_their_encoding():
@@ -82,8 +82,8 @@ def test_default_is_sort_floor_and_checkpoints_keep_their_encoding():
   import train_gs
   root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
   conf = OmegaConf.load(os.path.join(root, "conf", "train_gs.yaml"))
-  assert train_gs.x0_encoding(conf) == {"scale_order": "sorted", "scale_floor_px": 0.1, "rot_form": "keep"}
-  off = {"scale_order": "keep", "scale_floor_px": None, "rot_form": "keep"}
+  assert train_gs.x0_encoding(conf) == {"scale_order": "sorted", "scale_floor_px": 0.1, "scale_floor_mode": "max", "rot_form": "keep"}
+  off = {"scale_order": "keep", "scale_floor_px": None, "scale_floor_mode": "max", "rot_form": "keep"}
   assert train_gs.x0_encoding(OmegaConf.create({"diffusion": {"enabled": True}})) == off
 
   def module(enc):
@@ -92,7 +92,7 @@ def test_default_is_sort_floor_and_checkpoints_keep_their_encoding():
   M = train_gs.GSLightningModule
   ckpt = {}
   M.on_save_checkpoint(module({"scale_sort": True, "scale_floor_px": 0.1}), ckpt)
-  assert ckpt["x0_encoding"] == {"scale_order": "sorted", "scale_floor_px": 0.1, "rot_form": "keep"}
+  assert ckpt["x0_encoding"] == {"scale_order": "sorted", "scale_floor_px": 0.1, "scale_floor_mode": "max", "rot_form": "keep"}
   M.on_load_checkpoint(module({"scale_sort": True, "scale_floor_px": 0.1}), dict(ckpt))
   with pytest.raises(SystemExit, match="scale_order=sorted diffusion.scale_encoding.scale_floor_px=0.1"):
     M.on_load_checkpoint(module(off), dict(ckpt))
@@ -114,7 +114,7 @@ def test_scale_order_random_and_legacy_mapping():
   distinct = (np.diff(sa, axis=1) < -1e-7).all(1)                                    # (floored axes tie: any order is sorted)
   assert distinct.sum() > 200 and 0.08 < (np.diff(sr[distinct], axis=1) <= 0).all(1).mean() < 0.28   # about 1/6 come out sorted
   np.testing.assert_allclose(cov(r[4:8][:, hit].T, sr), cov(a[4:8][:, hit].T, sa), rtol=1e-4, atol=1e-10)
-  assert gd.normalize_encoding({"scale_sort": True, "scale_floor_px": 0.1}) == {"scale_order": "sorted", "scale_floor_px": 0.1, "rot_form": "keep"}
+  assert gd.normalize_encoding({"scale_sort": True, "scale_floor_px": 0.1}) == {"scale_order": "sorted", "scale_floor_px": 0.1, "scale_floor_mode": "max", "rot_form": "keep"}
   assert gd.normalize_encoding({"scale_sort": False}) == gd.ENCODING_DEFAULTS
   assert gd.encoding_tag({"scale_order": "sorted", "scale_floor_px": 0.1}) == "sort_floor0.1px"          # the existing caches
   assert gd.encoding_tag({"scale_order": "random", "scale_floor_px": 0.1}) == "randorder_floor0.1px"
