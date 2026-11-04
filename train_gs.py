@@ -64,8 +64,8 @@ from gs_dataset import (OPENGL_TO_OPENCV, H5Catalog, WTFeatureDataset,  # noqa: 
                         sample_matching_sources)
 from gs_decoder import PatchGaussianHead  # noqa: E402
 import gs_diffusion  # noqa: E402
-from module import (DSSIMLoss, EventCheckpoint, Events, ProgressWandbLogger, TrainClock, _completed_steps,  # noqa: E402
-                    make_scheduler, needs_clock)
+from module import (DSSIMLoss, EventCheckpoint, Events, ProgressWandbLogger, SameDirCheckpointIO, TrainClock,  # noqa: E402
+                    _completed_steps, make_scheduler, needs_clock)
 from util import collate_with_batch_size, pipe, set_mode, timed  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -1217,6 +1217,7 @@ def main(cfg: DictConfig) -> None:
     **OmegaConf.to_container(cfg.trainer, resolve=True),
     logger=logger,
     callbacks=callbacks,
+    plugins=[SameDirCheckpointIO()],   # checkpoints written next to their destination, not through /tmp
   )
   with timed("train"):
     trainer.fit(model, datamodule=datamodule, ckpt_path=cfg.ckpt_path)
