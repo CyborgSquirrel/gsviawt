@@ -267,11 +267,16 @@ def _expand_h5_paths(h5_paths):
   return out
 
 
-def _read_view(f, path, view_idx, k_depth_name, k_image_name):
+def _read_view(f, path, view_idx, k_depth_name, k_image_name, depth=True, images=None):
   """One view straight out of an open h5py.File `f` (for the datasets that
-  have no H5Catalog -- see _read_catalog_view for the catalog path)."""
+  have no H5Catalog -- see _read_catalog_view for the catalog path).
+  depth=False: the depth peel is not read ("depth_peel" None) unless the
+  file is RGB-only (the alpha is its hit mask). images: the view's `images`
+  row if the caller has read it already."""
+  images = f["images"][view_idx] if images is None else images
+  depth_peel = f["depth_peel"][view_idx] if depth or images.shape[-1] != 4 else None
   return _decode_view(
-    path, view_idx, f["images"][view_idx], f["depth_peel"][view_idx], f[k_depth_name][view_idx],
+    path, view_idx, images, depth_peel, f[k_depth_name][view_idx],
     f[k_image_name][view_idx] if k_image_name is not None else None, f["camera_pose"][view_idx])
 
 
@@ -286,9 +291,10 @@ def _read_catalog_view(catalog, pos):
 
 def _decode_view(path, view_idx, images, depth_peel, K_depth, K_image, pose):
   """The raw h5 arrays of one view -> the float32 view dict _assemble_item
-  takes. K_image None: same as K_depth."""
+  takes. K_image None: same as K_depth. depth_peel None (an RGBA view
+  read without it): "depth_peel" None."""
   images = np.asarray(images)
-  depth_peel = np.asarray(depth_peel).astype(np.float32)
+  depth_peel = np.asarray(depth_peel).astype(np.float32) if depth_peel is not None else None
   K_depth = np.asarray(K_depth).astype(np.float32)
   K_image = np.asarray(K_image).astype(np.float32) if K_image is not None else K_depth
   pose = np.asarray(pose).astype(np.float32)
@@ -396,19 +402,23 @@ def _build_catalog_item(source_catalog, source_pos, target_catalog, target_pos, 
   return _assemble_item(src, targets, num_layers, mesh_id, source_view, target_views)
 
 
-def _build_item(f, path, source_view, target_views, num_layers, mesh_id, depth_size=None):
+def _build_item(f, path, source_view, target_views, num_layers, mesh_id, depth_size=None, target_depth=True,
+                source_images=None):
   """_assemble_item, reading src/targets from an open render_objaverse.py-
   schema h5py.File (f) at path -- see _assemble_item for the shared part.
   depth_size: resample the SOURCE view's depth-peel (and its K_depth) to
   depth_size x depth_size by nearest neighbour before unprojecting it, for a
   head whose grid is not the render's (e.g. 504 for a 512 render). The RGB
-  and K_image, which the targets are rendered against, keep the render's size."""
+  and K_image, which the targets are rendered against, keep the render's size.
+  target_depth=False: the target views' depth peels are not read (the item
+  doesn't carry them; RGB-only files still read them for the alpha).
+  source_images: the source view's `images` row if the caller has read it."""
   k_depth_name = intrinsics_name(f, "depth")
   k_image_name = intrinsics_name(f, "image", None)
-  src = _read_view(f, path, source_view, k_depth_name, k_image_name)
+  src = _read_view(f, path, source_view, k_depth_name, k_image_name, images=source_images)
   if depth_size is not None and src["depth_peel"].shape[:2] != (depth_size, depth_size):
     src["depth_peel"], src["K_depth"] = resize_depth_nearest(src["depth_peel"], src["K_depth"], depth_size)
-  targets = [_read_view(f, path, v, k_depth_name, k_image_name) for v in target_views]
+  targets = [_read_view(f, path, v, k_depth_name, k_image_name, depth=target_depth) for v in target_views]
   return _assemble_item(src, targets, num_layers, mesh_id, source_view, target_views)
 
 
@@ -1022,9 +1032,11 @@ class WTFeatureDataset(Dataset):
       else:
         sampled = random.sample(pool, min(k + 1, len(pool)))
         targets = [v for v in sampled if v != source_view][:k]
+    h5 = _get_h5(self.source_h5)
+    images = h5["images"][source_view] if self.image_size is not None else None   # read once: the view and the image
     out = _build_item(
-      _get_h5(self.source_h5), self.source_h5, source_view, targets, self.num_layers, vol["mesh_id"],
-      depth_size=self.depth_size)
+      h5, self.source_h5, source_view, targets, self.num_layers, vol["mesh_id"],
+      depth_size=self.depth_size, target_depth=False, source_images=images)
 
     if self.image_size is not None:
       # the source image instead of its cached features, for a trainable encoder (gs_backbone.py);
@@ -1032,9 +1044,9 @@ class WTFeatureDataset(Dataset):
       from wt.data import preprocess_rgba_for_model
       from wt_infer_layers import rgba_from_render
 
+      rgba = images if images.shape[-1] == 4 else rgba_from_render(h5, source_view)   # (rgba_from_render's own shortcut)
       rgb, _, _ = preprocess_rgba_for_model(
-        rgba_from_render(_get_h5(self.source_h5), source_view), image_size=self.image_size,
-        num_layers=1, center_crop=False, bg_color=(0, 0, 0))
+        rgba, image_size=self.image_size, num_layers=1, center_crop=False, bg_color=(0, 0, 0))
       out["image"] = rgb[0]   # (3, S, S) in [0, 1]
       if not self.read_features:
         return out
