@@ -6,7 +6,8 @@
 
 Sections, in order: the full sample's image quality (the comparable generation metric, as eval_diffusion's), the one-step
 render at each shared timestep of diffusion.val_t, the validation losses, the train losses, the x0 loss per field / per
-timestep bucket (train), media, and bookkeeping (validation sizes, standard errors). The runset is a regex on the run name
+timestep bucket (train), the orbits (one panel per set: train and each validation set, one tile per run), the other media, and
+bookkeeping (validation sizes, standard errors). The runset is a regex on the run name
 (`query`), so runs that match later show up without re-saving. Keys are the ones train_gs.py logs; which ones are comparable
 between runs is noted in the section headers (validation loss/x0 and the gated loss/photom follow diffusion.schedule.phase).
 Needs `pip install wandb-workspaces` and a W&B login for save=true.
@@ -67,11 +68,14 @@ def build(cfg):
       line("x0 loss per field", [f"train/loss/x0/{f}" for f in FIELDS], x, sm),
       line("x0 loss per t bucket", [f"train/loss/x0/{b}" for b in T_BUCKETS], x, sm),
     ], columns=2, is_open=False),
+    section("Orbits per set (one tile per run: its latest orbit; scroll a tile for earlier ones)",
+            [wr.MediaBrowser(title=f"orbits: {SET_TITLES.get(s, s)}", media_keys=[f"{s}/orbit"], mode="gallery",
+                             gallery_axis="run", num_columns=int(cfg.orbit_columns))
+             for s in ("train", *cfg.sets)], columns=1, is_open=False),
     section("Media", [
-      wr.MediaBrowser(title="orbits", media_keys=[f"{s}/orbit" for s in ("train", *cfg.sets)]),
       wr.MediaBrowser(title="panels [GT | render | diff]", media_keys=[f"{s}/panel" for s in ("train", *cfg.sets)]),
       wr.MediaBrowser(title="scale layers", media_keys=[f"{s}/scale_layers" for s in ("train", *cfg.sets)]),
-    ], columns=3, is_open=False),
+    ], columns=2, is_open=False),
     section("Bookkeeping (validation sizes, standard error of the full-sample loss)",
             per_set(cfg, "n_volumes", "volumes scored") + per_set(cfg, "loss_se", "SE of loss"), is_open=False),
   ]
