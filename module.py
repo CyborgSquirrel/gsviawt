@@ -400,25 +400,57 @@ class EventCheckpoint(pl.Callback):
   name, or a cadence of its own). filename is a str.format() template over {count} (how many this
   callback has saved, this one included; kept in checkpoints, so a resumed run goes on counting) and {step}
   (the completed optimizer steps). trigger_event=None turns it off. (The TrainClock writes final.ckpt
-  itself when the budget is spent.)"""
+  itself when the budget is spent.)
 
-  def __init__(self, *, trigger_event, filename="checkpoint-{count}-step{step}.ckpt"):
+  keep_last: n >= 1 (default 1) keeps only the newest n of this callback's own -- once a new one is written, the older
+  ones it wrote are deleted (if the save raises, nothing is) -- and None keeps every checkpoint. It only
+  deletes the paths it saved itself (kept in checkpoints too), never anything else in the directory, and
+  only those in the CURRENT default_root_dir: a run resumed from a checkpoint (into a fresh output dir)
+  leaves the earlier run's checkpoints alone, and stops tracking them."""
+
+  def __init__(self, *, trigger_event, filename="checkpoint-{count}-step{step}.ckpt", keep_last=1):
+    if keep_last is not None and (isinstance(keep_last, bool) or not isinstance(keep_last, int) or keep_last < 1):
+      raise ValueError(f"keep_last={keep_last!r}: use null (keep every checkpoint) or a whole number >= 1")
     self.trigger = Trigger(trigger_event)
     self.filename = filename
+    self.keep_last = keep_last
     self.count = 0
+    self.saved = []   # the paths this callback wrote, oldest first (kept in checkpoints, for keep_last)
 
   def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
     if not self.trigger.due(trainer, pl_module, batch_idx):
       return
     self.count += 1
-    name = self.filename.format(count=self.count, step=_completed_steps(trainer, pl_module))
-    trainer.save_checkpoint(os.path.join(trainer.default_root_dir, name))
+    path = os.path.join(trainer.default_root_dir, self.filename.format(count=self.count, step=_completed_steps(trainer, pl_module)))
+    previous = self.saved
+    # listed before the save, so the checkpoint's own state names it too (a resume into the same dir prunes it later)
+    self.saved = [p for p in previous if p != path] + [path]
+    try:
+      trainer.save_checkpoint(path)
+    except BaseException:
+      self.saved = previous   # keep the old ones (and the error)
+      raise
+    if self.keep_last is not None:
+      self._prune(trainer)
+
+  def _prune(self, trainer):
+    # only files directly in this run's dir: an earlier run's (another dir, before a resume) are left alone and forgotten
+    root = os.path.abspath(trainer.default_root_dir)
+    ours = [p for p in self.saved if os.path.dirname(os.path.abspath(p)) == root]
+    old, self.saved = ours[:-self.keep_last], ours[-self.keep_last:]
+    if trainer.is_global_zero:
+      for p in old:
+        try:
+          os.remove(p)
+        except FileNotFoundError:
+          pass
 
   def state_dict(self):
-    return {"count": self.count}
+    return {"count": self.count, "saved": list(self.saved)}
 
   def load_state_dict(self, state):
     self.count = state["count"]
+    self.saved = list(state.get("saved", []))   # older checkpoints have no list: nothing to prune from before the resume
 
 
 class EventValidation(pl.Callback):
