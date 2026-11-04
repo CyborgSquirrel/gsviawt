@@ -78,8 +78,12 @@ def test_random_forms_are_seeded_for_validation(monkeypatch):
   source = {"hit": torch.from_numpy(hit), "xyz_cam": torch.from_numpy(np.where(hit[..., None], xyz, np.nan)),
             "pose_gl": torch.from_numpy(np.linalg.inv(gd.OPENGL_TO_OPENCV).astype(np.float32)), "K_depth": torch.eye(3) * 500}
 
+  class Column(list):
+    def to_list(self):
+      return list(self)
+
   class Inner:
-    volumes = type("V", (), {"df": {"view_idx": type("C", (), {"to_list": staticmethod(lambda: [7])})}})()
+    volumes = types.SimpleNamespace(df={"view_idx": Column([7])})
     def __len__(self):
       return 1
     def __getitem__(self, i):

@@ -26,6 +26,7 @@ import json
 import logging
 import math
 import os
+import random
 import warnings
 
 import h5py
@@ -413,11 +414,12 @@ class GridTargetDataset(Dataset):
   (CHANNELS, L, H, W) (see encode_grid, with `encoding`: its scale_order / scale_floor_px / rot_form), read from the grid file of its source view."""
 
   def __init__(self, inner, grid_index, encoding=None, seeded=False, augment=None):
-    """seeded: the random parts of the encoding (scale_order / rot_form random) are a function of the item's source view, the same
-    in every epoch (validation sets); otherwise fresh per call (training). augment: augment_x0's keyword arguments
+    """seeded: the random parts of the encoding (scale_order / rot_form random) and the target views are a function of the item's
+    source view, the same in every epoch and every run (validation sets); otherwise fresh per call (training). augment: augment_x0's keyword arguments
     (diffusion.augment), for the training set only; None: none."""
     self.inner = inner
     self.seeded = seeded
+    self.seed_targets = seeded   # eval_diffusion turns this off: it seeds the target views itself (its own, older convention)
     augment = dict(augment or {})
     self.augment = augment if augment.get("slot_shuffle") else None   # the default: off
     self.grid_index = grid_index
@@ -431,7 +433,15 @@ class GridTargetDataset(Dataset):
     return len(self.inner)
 
   def __getitem__(self, idx):
-    item = self.inner[idx]
+    if self.seed_targets:   # the volume's target views (drawn from Python's global random) a function of the volume; global state kept
+      state = random.getstate()
+      random.seed(f"val_targets/{int(self.volumes.df['view_idx'][idx])}")
+      try:
+        item = self.inner[idx]
+      finally:
+        random.setstate(state)
+    else:
+      item = self.inner[idx]
     grid, _ = load_grid(self.grid_index[item["source_view"]])
     # half precision in transit (dense (14, 6, 504, 504) is 85 MB in float32): the log-scales (|x| < 17), logits, colours and offsets
     # lose < 2% of the channel's std; the model upcasts it
@@ -613,7 +623,8 @@ class DiTTrunk(nn.Module):
 
 class DiffusionHead(nn.Module):
   """(image features (B, L, P, D), the network's noisy x (B, L, C, H, W), t (B, L)) -> x0_hat (B, L, C, H, W).
-  Token = [normalized features | the patch's raw noisy values | zero pad]: nothing is squeezed through a projection."""
+  Token = [normalized features | the patch's raw noisy values | zero pad]: nothing is squeezed through a projection -- unless dim is
+  set below that width (diffusion.dim): then a learned Linear maps the token to dim (DiT's patch embedding), a smaller trunk."""
 
   def __init__(self, feature_dim, num_layers, channels=CHANNELS, patch_size=14, dim=None, num_blocks=3, mlp_ratio=4.0,
                layer_scale_init=1e-4, t_embed_channels=256, img_token_scale=0.3, checkpoint_activations=False):
@@ -622,9 +633,10 @@ class DiffusionHead(nn.Module):
     self.noise_dim = channels * patch_size ** 2
     in_dim = feature_dim + self.noise_dim
     self.dim = dim or int(math.ceil(in_dim / 64) * 64)
-    if self.dim < in_dim or self.dim % 64:
-      raise ValueError(f"diffusion.dim={self.dim} must be a multiple of 64 and at least {in_dim} (the lossless token)")
-    self.pad = self.dim - in_dim
+    if self.dim % 64:
+      raise ValueError(f"diffusion.dim={self.dim} must be a multiple of 64")
+    self.in_proj = nn.Linear(in_dim, self.dim) if self.dim < in_dim else None   # below the lossless width: projected
+    self.pad = self.dim - in_dim if self.in_proj is None else 0
     self.time_embed = nn.Sequential(nn.Linear(t_embed_channels, self.dim), nn.SiLU(), nn.Linear(self.dim, self.dim))
     self.time_proj = nn.Sequential(nn.SiLU(), nn.Linear(self.dim, 6 * self.dim))
     self.trunk = DiTTrunk(self.dim, num_layers, num_blocks, self.dim // 64, mlp_ratio, layer_scale_init, checkpoint_activations)
@@ -644,7 +656,9 @@ class DiffusionHead(nn.Module):
     feats = (feats - feats.mean((1, 2, 3), keepdim=True)) / (feats.var((1, 2, 3), keepdim=True, unbiased=False) + 1e-6).sqrt()
     patches = rearrange(x_net, "b l c (h py) (w px) -> b l (h w) (c py px)", py=self.patch_size, px=self.patch_size)
     tokens = torch.cat([feats * self.img_token_scale, patches.to(feats.dtype)], dim=-1)
-    if self.pad:
+    if self.in_proj is not None:
+      tokens = self.in_proj(tokens)
+    elif self.pad:
       tokens = F.pad(tokens, (0, self.pad))
     out = self.out(self.trunk(tokens, self.adaln(t)))
     grid = int(round(p ** 0.5))
