@@ -161,37 +161,43 @@ def encode_grid(grid, source, scale_order=None, scale_floor_px=None, rot_form="k
       "is this grid from this render / this view?")
   c2w = source["pose_gl"].numpy() @ OPENGL_TO_OPENCV
   w2c = np.linalg.inv(c2w)
-  means = grid["gaussian_means"].transpose(2, 0, 1, 3)               # (L, H, W, 3), world frame
-  means_cam = means @ w2c[:3, :3].T + w2c[:3, 3]
-  offset = means_cam - source["xyz_cam"].numpy()
+  # the math on the valid slots only (~6% of them), as (N, .) rows in [valid]'s order, scattered into the zeros once; every op is
+  # elementwise per slot (or per row), so the values are the dense version's bit for bit, and the rng draws the same (N, .) shapes
+  li, yi, xi = np.nonzero(valid)
+  take = lambda k: grid[k][yi, xi, li]                                # the grid's (H, W, L, .) arrays -> (N, .)
+  means = take("gaussian_means")                                     # world frame
+  # world -> source camera; a single row doubled: numpy's matmul takes BLAS gemv for one row, gemm (the dense version's, (W, 3)
+  # per (layer, row)) for more, and the two can differ in the last bit
+  means_cam = ((np.repeat(means, 2, 0) if len(means) == 1 else means) @ w2c[:3, :3].T)[:len(means)] + w2c[:3, 3]
+  offset = means_cam - source["xyz_cam"].numpy()[li, yi, xi]
 
-  quat = np.zeros(valid.shape + (4,), np.float32)
-  scales = grid["gaussian_scales"].transpose(2, 0, 1, 3).astype(np.float32)
+  quat = np.zeros((len(li), 4), np.float32)
+  scales = take("gaussian_scales").astype(np.float32)
   floor = None
   if scale_floor_px is not None:
-    footprint = means_cam[..., 2] / float(source["K_depth"][0, 0])                 # (L, H, W): one pixel's size at that depth
-    floor = float(scale_floor_px) * np.nan_to_num(footprint)[..., None]
+    footprint = means_cam[:, 2] / float(source["K_depth"][0, 0])                   # (N,): one pixel's size at that depth
+    floor = float(scale_floor_px) * np.nan_to_num(footprint)[:, None]
     if scale_floor_mode == "max":
       scales = np.maximum(scales, floor)
-  if valid.any():
-    q = rotate_quats_wxyz(grid["gaussian_quats"].transpose(2, 0, 1, 3)[valid], c2w[:3, :3].T)   # world -> source camera
+  if len(li):
+    q = rotate_quats_wxyz(take("gaussian_quats"), c2w[:3, :3].T)    # world -> source camera
     if scale_order == "sorted":
-      scales[valid], q = sort_scale_axes(scales[valid], q)
+      scales, q = sort_scale_axes(scales, q)
     elif scale_order == "random":
-      scales[valid], q = permute_scale_axes(scales[valid], q, np.argsort(rng.random((len(q), 3)), axis=1))
+      scales, q = permute_scale_axes(scales, q, np.argsort(rng.random((len(q), 3)), axis=1))
     q = np.where(q[:, :1] < 0, -q, q)                                # q and -q are one rotation: w >= 0
-    quat[valid] = set_rot_form(q, rot_form, rng)
+    quat[:] = set_rot_form(q, rot_form, rng)
 
-  opacity = np.clip(grid["gaussian_opacities"].transpose(2, 0, 1), 1e-6, 1 - 1e-6)
+  opacity = np.clip(take("gaussian_opacities"), 1e-6, 1 - 1e-6)
   opacity = np.clip(np.log(opacity / (1 - opacity)), -OPACITY_LOGIT_CLAMP, OPACITY_LOGIT_CLAMP)
   if floor is not None and scale_floor_mode == "add":   # (after the sort: the excess has the axes' order, the floor is per Gaussian)
     scales = np.maximum(scales - floor, FLOOR_ADD_EPS * floor)
   scale = np.log(np.maximum(scales, 1e-8))
-  color = (grid["gaussian_colors"].transpose(2, 0, 1, 3) - 0.5) / SH_C0
+  color = (take("gaussian_colors") - 0.5) / SH_C0
 
-  x0 = np.concatenate([opacity[..., None], scale, quat, color, offset], axis=-1)   # (L, H, W, CHANNELS)
-  x0 = np.where(valid[..., None], x0, 0.0).astype(np.float32)
-  return np.ascontiguousarray(x0.transpose(3, 0, 1, 2))              # (CHANNELS, L, H, W)
+  x0 = np.zeros((CHANNELS,) + valid.shape, np.float32)
+  x0[:, li, yi, xi] = np.concatenate([opacity[:, None], scale, quat, color, offset], axis=-1).astype(np.float32).T
+  return x0                                                          # (CHANNELS, L, H, W)
 
 
 SCALE, ROTATION, OFFSET = (slice(o, o + d) for o, d in zip(np.cumsum((0,) + DIMS)[[1, 2, 4]], DIMS[1:2] + DIMS[2:3] + DIMS[4:5]))
