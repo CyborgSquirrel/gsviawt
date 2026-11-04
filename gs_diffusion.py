@@ -281,16 +281,22 @@ def matrix_to_quat(R):
 
 
 def format_projection(mean, std, hit, anchor_z, fx, scale_sort=False, scale_floor_px=None, scale_order=None, rot_form="keep",
-                      scale_floor_mode="max"):
+                      scale_floor_mode="max", quat="unit"):
   """A function on normalized x0 predictions (B, L, CHANNELS, H, W) that puts the valid slots' Gaussians into the training grids'
   format (encode_grid with this encoding): the scale axes ordered largest -> smallest (the rotation permuted to match, as
   sort_scale_axes), every axis at least scale_floor_px pixel footprints, the rotation a unit quaternion with w >= 0. For the sampler's
   intermediate predictions (GSDiffusionModel.sample's `project`): render-invariant apart from the floor. hit (B or 1, L, H, W);
   anchor_z (L, H, W) the anchors' depth (the floor is at the Gaussian's mean depth: anchor + offset z); fx the depth camera's
   focal length. Takes the run's encoding as keywords: scale_order (keep | sorted | random; only sorted is projected) or the legacy
-  scale_sort, rot_form (canonical: the quaternion form with the largest |w|; keep / random: left as predicted)."""
+  scale_sort, rot_form (canonical: the quaternion form with the largest |w|; keep / random: left as predicted). quat: unit (the
+  rotation becomes a unit quaternion with w >= 0) | keep (the predicted quaternion is left as it is -- its length and sign --
+  except where the sort reorders the axes: there the permuted rotation, scaled to the predicted length)."""
   if scale_floor_px is not None and scale_floor_mode != "max":
     raise NotImplementedError("format_projection: only scale_floor_mode max (with add the decode applies the floor itself)")
+  if quat not in ("unit", "keep"):
+    raise ValueError(f"format_projection: quat must be unit or keep, got {quat!r}")
+  if quat == "keep" and rot_form == "canonical":
+    raise NotImplementedError("format_projection: quat=keep with rot_form canonical")
   if scale_order is not None:
     scale_sort = scale_order == "sorted"
   o = np.cumsum((0,) + DIMS)
@@ -301,13 +307,16 @@ def format_projection(mean, std, hit, anchor_z, fx, scale_sort=False, scale_floo
     v = hit.expand(x.shape[0], *hit.shape[1:]).bool()                # (B, L, H, W)
     raw = x * std[None, None, :, None, None] + mean[None, None, :, None, None]
     s = raw[:, :, sc].permute(0, 1, 3, 4, 2)[v].float()               # (N, 3) log-scales
-    q = F.normalize(raw[:, :, ro].permute(0, 1, 3, 4, 2)[v].float(), dim=1)
+    q_raw = raw[:, :, ro].permute(0, 1, 3, 4, 2)[v].float()
+    q = F.normalize(q_raw, dim=1)
+    moved = torch.zeros(len(q), dtype=torch.bool, device=q.device)
     if scale_sort:
       order = torch.argsort(-s, dim=1, stable=True)   # stable: tied axes (the floor ties many) keep their order -- as encode_grid's
                                                       # sort, so an encoded grid is a fixed point (CUDA's unstable sort reverses ties)
       R = torch.gather(quat_to_matrix(q), 2, order[:, None, :].expand(-1, 3, -1))
       R[torch.linalg.det(R) < 0, :, 2] *= -1
       q, s = matrix_to_quat(R), torch.gather(s, 1, order)
+      moved = (order != torch.arange(3, device=order.device)).any(1)
     else:
       q = torch.where(q[:, :1] < 0, -q, q)
     if rot_form == "canonical":   # q times 1, i, j, k: the same Gaussian; keep the one with the largest |w|
@@ -315,6 +324,8 @@ def format_projection(mean, std, hit, anchor_z, fx, scale_sort=False, scale_floo
       forms = torch.stack([q, torch.stack([-x_, w, z, -y], 1), torch.stack([-y, -z, w, x_], 1), torch.stack([-z, y, -x_, w], 1)], 1)
       q = forms[torch.arange(len(q), device=q.device), forms[:, :, 0].abs().argmax(1)]
       q = torch.where(q[:, :1] < 0, -q, q)
+    if quat == "keep":   # as predicted, but where the axes were reordered: the permuted rotation at the predicted length
+      q = torch.where(moved[:, None], q * q_raw.norm(dim=1, keepdim=True), q_raw)
     if scale_floor_px is not None:
       z = anchor_z.expand(*v.shape)[v].float() + raw[:, :, int(o[4]) + 2].permute(0, 1, 2, 3)[v].float()   # the mean's depth, as encode_grid
       floor = torch.log(float(scale_floor_px) * z.clamp_min(1e-3) / float(fx))   # (a wild predicted offset must not make it NaN)

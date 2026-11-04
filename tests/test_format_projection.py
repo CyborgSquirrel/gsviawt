@@ -97,3 +97,28 @@ def test_projection_is_a_fixed_point_with_tied_axes_on_cuda():
   proj = gd.format_projection(mean, std, hit, az, 100.0, scale_sort=True)
   once = proj(x)
   torch.testing.assert_close(proj(once), once, atol=1e-5, rtol=1e-5)   # float32 round trip; a tie swap would move rotations by ~1
+
+
+def test_projection_can_keep_the_predicted_quaternion():
+  """quat=keep: an already-sorted Gaussian keeps its predicted (non-unit, any-sign) quaternion exactly; a reordered one gets the
+  permuted rotation (the same Gaussian) at the predicted length; scales are sorted / floored as with quat=unit."""
+  rng = np.random.default_rng(1)
+  B, L, H, W, C = 1, 2, 3, 4, gd.CHANNELS
+  mean, std = torch.zeros(C, dtype=torch.float64), torch.ones(C, dtype=torch.float64)
+  hit = torch.ones((1, L, H, W), dtype=torch.bool)
+  x = torch.tensor(rng.normal(size=(B, L, C, H, W)))
+  x[:, :, 4:8] *= 0.4                                                   # short quaternions, as an x0 model's averaged prediction
+  anchor_z = torch.full((L, H, W), 2.0, dtype=torch.float64)
+  out = gd.format_projection(mean, std, hit, anchor_z, 100.0, scale_sort=True, quat="keep")(x)
+  unit = gd.format_projection(mean, std, hit, anchor_z, 100.0, scale_sort=True)(x)
+  r = lambda z: z.permute(0, 1, 3, 4, 2).reshape(-1, C).numpy()
+  r0, r1, ru = r(x), r(out), r(unit)
+  np.testing.assert_allclose(r1[:, SC], ru[:, SC], atol=1e-6)        # the scales as with quat=unit
+  already = (np.diff(r0[:, SC], axis=1) <= 0).all(1)
+  assert already.any() and (~already).any()
+  np.testing.assert_allclose(r1[already][:, RO], r0[already][:, RO], atol=1e-6)   # untouched
+  n0 = np.linalg.norm(r0[:, RO], axis=1)
+  np.testing.assert_allclose(np.linalg.norm(r1[~already][:, RO], axis=1), n0[~already], rtol=1e-5)
+  q1 = r1[~already][:, RO] / n0[~already, None]
+  np.testing.assert_allclose(cov(r1[~already][:, SC], q1), cov(r0[~already][:, SC], r0[~already][:, RO] / n0[~already, None]),
+                             rtol=1e-4, atol=1e-9)                   # still the same Gaussians
