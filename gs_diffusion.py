@@ -289,8 +289,8 @@ def format_projection(mean, std, hit, anchor_z, fx, scale_sort=False, scale_floo
   anchor_z (L, H, W) the anchors' depth (the floor is at the Gaussian's mean depth: anchor + offset z); fx the depth camera's
   focal length. Takes the run's encoding as keywords: scale_order (keep | sorted | random; only sorted is projected) or the legacy
   scale_sort, rot_form (canonical: the quaternion form with the largest |w|; keep / random: left as predicted). quat: unit (the
-  rotation becomes a unit quaternion with w >= 0) | keep (the predicted quaternion is left as it is -- its length and sign --
-  except where the sort reorders the axes: there the permuted rotation, scaled to the predicted length)."""
+  rotation becomes a unit quaternion with w >= 0) | keep (the predicted quaternion is left exactly as it is,
+  except where the sort reorders the axes: there the permuted rotation at the predicted length, its sign as matrix_to_quat gives it)."""
   if scale_floor_px is not None and scale_floor_mode != "max":
     raise NotImplementedError("format_projection: only scale_floor_mode max (with add the decode applies the floor itself)")
   if quat not in ("unit", "keep"):
