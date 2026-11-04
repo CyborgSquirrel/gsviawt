@@ -44,6 +44,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import pack, rearrange, repeat
 from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.plugins.io import TorchCheckpointIO
 from lightning.pytorch.trainer import call
 from omegaconf import OmegaConf
 from torch.optim import Optimizer
@@ -198,6 +199,35 @@ def time_wsd_progress(seconds, max_seconds, warmup_fraction, decay_fraction):
   if seconds >= max_seconds:
     return 0.0
   return 0.5 * (1.0 + math.cos(math.pi * (seconds - decay_start) / (max_seconds - decay_start)))
+
+
+class SameDirCheckpointIO(TorchCheckpointIO):
+  """Lightning's checkpoint IO, saving next to the destination instead of through the system temp dir.
+
+  Lightning's own atomic save (fsspec transaction) writes the whole checkpoint to tempfile.mkstemp() -- /tmp, or $TMPDIR --
+  and then moves it into place: the temp file must fit in /tmp (a 30 GB RAM-backed tmpfs on a cluster node, where ~12 GB
+  checkpoints failed with ENOSPC) and the move across filesystems copies it a second time. This writes <path>.tmp-<pid> in
+  the destination's own directory, fsyncs it and renames it onto <path> (os.replace: atomic on one filesystem), so a crash
+  mid-save never leaves a partial <path>; on any error the temp file is removed and the error raised."""
+
+  def save_checkpoint(self, checkpoint, path, storage_options=None):
+    if storage_options is not None:
+      raise TypeError(f"SameDirCheckpointIO.save_checkpoint takes no storage_options, got {storage_options!r}")
+    path = os.fspath(path)
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = f"{path}.tmp-{os.getpid()}"
+    try:
+      with open(tmp, "wb") as f:
+        torch.save(checkpoint, f)
+        f.flush()
+        os.fsync(f.fileno())
+      os.replace(tmp, path)
+    except BaseException:
+      try:
+        os.remove(tmp)
+      except FileNotFoundError:
+        pass
+      raise
 
 
 class TrainClock(pl.Callback):
