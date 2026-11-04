@@ -450,7 +450,18 @@ class EventValidation(pl.Callback):
     self.trigger = Trigger(trigger_event)
     self.count, self.fraction = self._parse_volumes(volumes)
     self.at_end = at_end
-    self.runs = 0   # validations run so far (the k of reseed_validation)
+    self.runs = 0   # validations run so far (the k of reseed_validation; kept in checkpoints, so a resumed run goes on counting)
+
+  @property
+  def state_key(self):
+    # one entry per validation (raw / EMA, small / big) in a checkpoint's callback states, not one for the class
+    return self._generate_state_key(name=self.name)
+
+  def state_dict(self):
+    return {"runs": self.runs}
+
+  def load_state_dict(self, state):
+    self.runs = int(state.get("runs", 0))
 
   @staticmethod
   def _parse_volumes(volumes):

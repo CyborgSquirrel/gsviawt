@@ -81,3 +81,36 @@ def test_eval_can_turn_off_the_target_seeding(monkeypatch):
   random.seed("0/val_meshes/0"); a = ds[0]["targets"]
   random.seed("0/val_meshes/0"); b = random.sample(range(1000), 3)
   assert a == b                                     # exactly what the eval's own seed gives
+
+
+def test_validation_counter_survives_a_resume(tmp_path):
+  """EventValidation's run counter (the k of reseed_validation) is kept in checkpoints, one entry per validation, so a resumed
+  run goes on with validation k+1 instead of repeating the samples of validations 1, 2, ..."""
+  import lightning.pytorch as pl
+  from module import EventValidation
+
+  class Tiny(pl.LightningModule):
+    def __init__(self):
+      super().__init__()
+      self.w = torch.nn.Linear(2, 1)
+
+    def training_step(self, batch, batch_idx):
+      return self.w(batch[0]).sum()
+
+    def configure_optimizers(self):
+      return torch.optim.SGD(self.parameters(), lr=0.1)
+
+  data = lambda: torch.utils.data.DataLoader(torch.utils.data.TensorDataset(torch.randn(8, 2)), batch_size=2)
+  kw = dict(accelerator="cpu", logger=False, enable_checkpointing=False, enable_progress_bar=False, enable_model_summary=False,
+            default_root_dir=str(tmp_path))
+  make = lambda: [EventValidation(name="big", trigger_event=None), EventValidation(name="big_ema", trigger_event=None, ema=True)]
+  cbs = make()
+  assert cbs[0].state_key != cbs[1].state_key
+  trainer = pl.Trainer(max_steps=2, callbacks=cbs, **kw)
+  trainer.fit(Tiny(), data())
+  cbs[0].runs, cbs[1].runs = 3, 5
+  path = str(tmp_path / "c.ckpt")
+  trainer.save_checkpoint(path)
+  resumed = make()
+  pl.Trainer(max_steps=3, callbacks=resumed, **kw).fit(Tiny(), data(), ckpt_path=path)
+  assert (resumed[0].runs, resumed[1].runs) == (3, 5)
