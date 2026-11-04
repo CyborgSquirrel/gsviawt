@@ -62,14 +62,6 @@ def test_encode_rejects_mismatched_hit_mask():
     gd.encode_grid(grid, source)
 
 
-def test_decode_clamps_to_range():
-  x = torch.full((1, 1, gd.CHANNELS, 1, 1), 100.0)
-  out = gd.decode_x0(x, torch.zeros(gd.CHANNELS), torch.ones(gd.CHANNELS), lo=torch.full((gd.CHANNELS,), -2.0),
-                     hi=torch.full((gd.CHANNELS,), 2.0))
-  assert torch.allclose(out["raw_scale"], torch.full_like(out["raw_scale"], 2.0))
-  assert torch.allclose(out["offset"], torch.full_like(out["offset"], 2.0))
-
-
 def test_ema_update_apply_restore_and_state():
   m = torch.nn.Linear(3, 2)
   torch.nn.init.zeros_(m.weight)

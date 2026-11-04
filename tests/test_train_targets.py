@@ -12,14 +12,9 @@ pytestmark = pytest.mark.data
 
 
 @pytest.fixture(scope="module")
-def modules():
-  import os
-  root = os.environ.get("GSVIAWT_TEST_DATA", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bla"))
-  paths = {k: os.path.join(root, p) for k, p in (("cfg", "eval_test/run409_config.yaml"), ("grids", "fit_dataset/grids"),
-                                                    ("h5", "trellis_new10_50views_eevee_504.h5"))}
-  for p in paths.values():
-    if not os.path.exists(p):
-      pytest.skip(f"local test data missing: {p}")
+def modules(data_dir):
+  paths = {k: data_dir(p) for k, p in (("cfg", "eval_test/run409_config.yaml"), ("grids", "fit_dataset/grids"),
+                                        ("h5", "trellis_new10_50views_eevee_504.h5"))}
   base = OmegaConf.load(paths["cfg"])
 
   def dm(tt):
