@@ -196,23 +196,29 @@ class AttentionBlock(nn.Module):
 
 
 class TransformerTrunk(nn.Module):
-  """num_blocks AttentionBlocks cycling frame -> ray -> global (World Tracing's
-  "frame_ray_global" head pattern), with its per-layer FiLM: a learned layer
-  embedding -> MLP -> (gamma, beta) applied as x*(1+gamma)+beta before every
-  frame block (zero-initialized, so it starts as a no-op).  (B, L, P, D) in and
-  out."""
+  """num_blocks AttentionBlocks, with a per-layer FiLM: a learned layer embedding -> MLP -> (gamma, beta)
+  applied as x*(1+gamma)+beta (zero-initialized, so it starts as a no-op).  (B, L, P, D) in and out.
+  attention_pattern picks the blocks' attention modes and where the FiLM sits:
+    frame_ray_global: the blocks cycle frame -> ray -> global (World Tracing's head pattern); FiLM before
+                      every frame block (so, with 3 blocks, before the first one only)
+    global:           every block is global attention over all L*P tokens; FiLM before the first block only"""
 
   MODES = ("frame", "ray", "global")
+  PATTERNS = ("frame_ray_global", "global")
 
   def __init__(self, dim, num_layers, num_blocks, num_heads=24, mlp_ratio=4.0, layer_scale_init=1e-4,
-               checkpoint_activations=False):
+               checkpoint_activations=False, attention_pattern="frame_ray_global"):
     super().__init__()
+    if attention_pattern not in self.PATTERNS:
+      raise ValueError(f"attention_pattern must be one of {self.PATTERNS}, got {attention_pattern!r}")
+    self.attention_pattern = attention_pattern
     self.checkpoint_activations = checkpoint_activations
     self.num_heads = num_heads
+    modes = [self.MODES[i % 3] for i in range(num_blocks)] if attention_pattern == "frame_ray_global" else ["global"] * num_blocks
     self.blocks = nn.ModuleList(
-      AttentionBlock(dim, num_heads, self.MODES[i % 3], mlp_ratio, layer_scale_init)
-      for i in range(num_blocks)
+      AttentionBlock(dim, num_heads, mode, mlp_ratio, layer_scale_init) for mode in modes
     )
+    self.film_before = [i for i, mode in enumerate(modes) if mode == "frame"] if attention_pattern == "frame_ray_global" else [0]
     self.layer_embed = nn.Embedding(num_layers, dim)
     self.film = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, 2 * dim))
     nn.init.zeros_(self.film[-1].weight)
@@ -234,8 +240,8 @@ class TransformerTrunk(nn.Module):
     cos, sin = self._rope_tables(grid, x.device)
     gamma, beta = self.film(self.layer_embed(torch.arange(num_layers, device=x.device))).chunk(2, dim=-1)  # (L, D)
     gamma, beta = gamma[None, :, None], beta[None, :, None]
-    for block in self.blocks:
-      if block.mode == "frame":
+    for i, block in enumerate(self.blocks):
+      if i in self.film_before:
         x = x * (1 + gamma) + beta
       if self.checkpoint_activations and torch.is_grad_enabled():
         x = torch.utils.checkpoint.checkpoint(block, x, cos, sin, use_reentrant=False)
@@ -266,7 +272,7 @@ class PatchGaussianHead(nn.Module):
                sh_scale=1.0, scale_lambda=0.01, zero_init_last_conv=False,
                predict_mean_offset=False, num_blocks=0, num_heads=24, mlp_ratio=4.0,
                layer_scale_init=1e-4, layer_embed_dim=None, input_proj_dim=None, input_proj_identity_init=False,
-               checkpoint_activations=False):
+               checkpoint_activations=False, attention_pattern="frame_ray_global"):
     super().__init__()
     self.num_layers = num_layers
     # With layer_embed_dim set, the features may be a single [1, P, D] map (e.g. one
@@ -301,7 +307,7 @@ class PatchGaussianHead(nn.Module):
     p2 = patch_size ** 2
     self.trunk = (
       TransformerTrunk(in_dim, num_layers, num_blocks, num_heads, mlp_ratio, layer_scale_init,
-                       checkpoint_activations)
+                       checkpoint_activations, attention_pattern)
       if num_blocks > 0 else None
     )
     self.proj = nn.Linear(in_dim, self.channels * p2)
