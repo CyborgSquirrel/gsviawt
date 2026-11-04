@@ -26,6 +26,7 @@ import json
 import logging
 import math
 import os
+import random
 import warnings
 
 import h5py
@@ -377,11 +378,12 @@ class GridTargetDataset(Dataset):
   (CHANNELS, L, H, W) (see encode_grid, with `encoding`: its scale_order / scale_floor_px / rot_form), read from the grid file of its source view."""
 
   def __init__(self, inner, grid_index, encoding=None, seeded=False, augment=None):
-    """seeded: the random parts of the encoding (scale_order / rot_form random) are a function of the item's source view, the same
-    in every epoch (validation sets); otherwise fresh per call (training). augment: augment_x0's keyword arguments
+    """seeded: the random parts of the encoding (scale_order / rot_form random) and the target views are a function of the item's
+    source view, the same in every epoch and every run (validation sets); otherwise fresh per call (training). augment: augment_x0's keyword arguments
     (diffusion.augment), for the training set only; None: none."""
     self.inner = inner
     self.seeded = seeded
+    self.seed_targets = seeded   # eval_diffusion turns this off: it seeds the target views itself (its own, older convention)
     augment = dict(augment or {})
     self.augment = augment if augment.get("slot_shuffle") else None   # the default: off
     self.grid_index = grid_index
@@ -395,7 +397,15 @@ class GridTargetDataset(Dataset):
     return len(self.inner)
 
   def __getitem__(self, idx):
-    item = self.inner[idx]
+    if self.seed_targets:   # the volume's target views (drawn from Python's global random) a function of the volume; global state kept
+      state = random.getstate()
+      random.seed(f"val_targets/{int(self.volumes.df['view_idx'][idx])}")
+      try:
+        item = self.inner[idx]
+      finally:
+        random.setstate(state)
+    else:
+      item = self.inner[idx]
     grid, _ = load_grid(self.grid_index[item["source_view"]])
     # half precision in transit (dense (14, 6, 504, 504) is 85 MB in float32): the log-scales (|x| < 17), logits, colours and offsets
     # lose < 2% of the channel's std; the model upcasts it

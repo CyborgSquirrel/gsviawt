@@ -136,6 +136,8 @@ def main(cfg):
     raise SystemExit("not a diffusion-mode run")
   dm = train_gs.GSDataModule(run)
   dm.setup()
+  for ds in dm.val_datasets.values():   # the target views come from this script's own per-volume seed (random.seed below), as in
+    ds.seed_targets = False              # every eval so far -- not the validations' seeding, so evals stay paired across code versions
   module = train_gs.GSLightningModule(run, dm.diffusion_stats).to(device).eval()
   model = module.model
   dssim = DSSIMLoss(reduction="none").to(device)
