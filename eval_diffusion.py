@@ -19,6 +19,9 @@ Methods:
   sample     one full sampler run (k = 0)
   meanK      the mean of the K samples' RENDERS
   bestK      the best of the K samples by loss (an oracle: it looks at the target)
+steps: one sampler step count, or a list of them (the run's diffusion.steps when null): with a list, every step count gets its own
+<out>/steps<N>/ with the same files as a single run (the same numbers: the noise and target views do not depend on the step
+count), but the volumes, the fit and the onestep are loaded / rendered / scored once for all of them.
 Writes <out>/views.csv (one row per checkpoint, weights, set, volume, method, target view), <out>/volumes.csv (the same averaged
 over the volume's target views) and <out>/summary.json (mean and standard error over volumes per checkpoint, weights, set, method;
 volumes, not views, are the unit). mean<K> has no depth (an average of renders has no single depth)."""
@@ -143,10 +146,14 @@ def main(cfg):
   dssim = DSSIMLoss(reduction="none").to(device)
   from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
   lpips = LearnedPerceptualImagePatchSimilarity(net_type="vgg", normalize=True).to(device).eval()
-  K, steps = int(cfg.samples), (int(cfg.steps) if cfg.steps is not None else model.steps)
+  K = int(cfg.samples)
+  if cfg.steps is None or isinstance(cfg.steps, (int, str)):
+    outs = {int(cfg.steps) if cfg.steps is not None else model.steps: cfg.out}
+  else:
+    outs = {int(s): os.path.join(cfg.out, f"steps{int(s)}") for s in cfg.steps}
   sets = list(cfg.val_sets) if cfg.val_sets is not None else list(dm.val_datasets)
 
-  rows, view_rows = [], []
+  rows, view_rows = {s: [] for s in outs}, {s: [] for s in outs}
   for ckpt_path in cfg.checkpoints:
     has_ema = False if ckpt_path == "init" else load_checkpoint(module, ckpt_path)
     for weights in cfg.weights:
@@ -180,31 +187,41 @@ def main(cfg):
                                              float(item["source"]["K_depth"][0, 0]), **enc)
             base = 1_000_003 * (int(cfg.seed) + 1) + int(item["source_view"]) * 101
             seeds = [base + k for k in range(K)]
-            out = {"fit": [render(model, batch, model.decode(model.normalize(batch["x0_raw"].to(device).float())), views, device)],
-                   "onestep": [render(model, batch, model.sample(image, hit, seeds=seeds[:1], steps=1, project=project), views, device)]}
-            g = model.sample(image.expand(K, *image.shape[1:]), hit.expand(K, *hit.shape[1:]), seeds=seeds, steps=steps, project=project)
-            out["samples"] = [render(model, batch, {k: v[j:j + 1] for k, v in g.items()}, views, device) for j in range(K)]
             M = lambda r: metrics(r[0], gt, dssim, lpips, r[1], gt_alpha, r[2], gt_depth)
-            per = {m: M(r[0]) for m, r in out.items() if m != "samples"}
-            ks = [M(r) for r in out["samples"]]
-            per["sample"] = ks[0]
-            per[f"mean{K}"] = metrics(torch.stack([r[0] for r in out["samples"]]).mean(0), gt, dssim, lpips,
-                                      torch.stack([r[1] for r in out["samples"]]).mean(0), gt_alpha)
-            best = int(np.argmin([float(m["loss"].mean()) for m in ks]))
-            per[f"best{K}"] = ks[best]
-            for method, m in per.items():
-              key = {"checkpoint": ckpt_path, "weights": weights, "set": set_name, "volume": i,
-                     "mesh": int(item["mesh_index"]), "source_view": int(item["source_view"])}
-              rows.append({**key, "target_views": " ".join(map(str, item["target_views"])), "method": method,
-                           **{k: float(m[k].nanmean()) if torch.isfinite(m[k]).any() else float("nan") for k in METRICS}})
-              for v, tv in enumerate(item["target_views"]):
-                view_rows.append({**key, "target_view": int(tv), "angle": float(angle[v]), "method": method,
-                                  **{k: float(m[k][v]) for k in METRICS}})
-            print(f"{os.path.basename(str(ckpt_path))} {weights} {set_name} {k + 1}/{n} (volume {i}):",
+            once = {"fit": M(render(model, batch, model.decode(model.normalize(batch["x0_raw"].to(device).float())), views, device)),
+                    "onestep": M(render(model, batch, model.sample(image, hit, seeds=seeds[:1], steps=1, project=project), views,
+                                        device))}
+            key = {"checkpoint": ckpt_path, "weights": weights, "set": set_name, "volume": i,
+                   "mesh": int(item["mesh_index"]), "source_view": int(item["source_view"])}
+            for steps in outs:
+              g = model.sample(image.expand(K, *image.shape[1:]), hit.expand(K, *hit.shape[1:]), seeds=seeds, steps=steps,
+                               project=project)
+              samples = [render(model, batch, {k: v[j:j + 1] for k, v in g.items()}, views, device) for j in range(K)]
+              per = dict(once)
+              ks = [M(r) for r in samples]
+              per["sample"] = ks[0]
+              per[f"mean{K}"] = metrics(torch.stack([r[0] for r in samples]).mean(0), gt, dssim, lpips,
+                                        torch.stack([r[1] for r in samples]).mean(0), gt_alpha)
+              best = int(np.argmin([float(m["loss"].mean()) for m in ks]))
+              per[f"best{K}"] = ks[best]
+              for method, m in per.items():
+                rows[steps].append({**key, "target_views": " ".join(map(str, item["target_views"])), "method": method,
+                                    **{k: float(m[k].nanmean()) if torch.isfinite(m[k]).any() else float("nan") for k in METRICS}})
+                for v, tv in enumerate(item["target_views"]):
+                  view_rows[steps].append({**key, "target_view": int(tv), "angle": float(angle[v]), "method": method,
+                                           **{k: float(m[k][v]) for k in METRICS}})
+            print(f"{os.path.basename(str(ckpt_path))} {weights} {set_name} {k + 1}/{n} (volume {i}), steps {steps}:",
                   {m: round(float(v["loss"].mean()), 4) for m, v in per.items()}, flush=True)
 
+  for steps, out_dir in outs.items():
+    write_outputs(cfg, out_dir, rows[steps], view_rows[steps])
+
+
+def write_outputs(cfg, out_dir, rows, view_rows):
+  """<out_dir>/volumes.csv, views.csv and summary.json (mean and SE over volumes per checkpoint, weights, set, method)."""
+  os.makedirs(out_dir, exist_ok=True)
   for name, rs in (("volumes.csv", rows), ("views.csv", view_rows)):
-    with open(os.path.join(cfg.out, name), "w", newline="") as f:
+    with open(os.path.join(out_dir, name), "w", newline="") as f:
       w = csv.DictWriter(f, fieldnames=list(rs[0]))
       w.writeheader()
       w.writerows(rs)
@@ -220,9 +237,9 @@ def main(cfg):
       entry[k] = float(v.mean()) if len(v) else None
       entry[f"{k}_se"] = float(v.std(ddof=1) / math.sqrt(len(v))) if len(v) > 1 else None
     out.append(entry)
-  with open(os.path.join(cfg.out, "summary.json"), "w") as f:
+  with open(os.path.join(out_dir, "summary.json"), "w") as f:
     json.dump({"config": OmegaConf.to_container(cfg), "results": out}, f, indent=1)
-  print(f"wrote {cfg.out}", flush=True)
+  print(f"wrote {out_dir}", flush=True)
 
 
 if __name__ == "__main__":
