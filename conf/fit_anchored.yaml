@@ -34,7 +34,9 @@ finetune:
 
 lr:
   offset: 0.00016       # x scene_extent (fit_3dgs.load_scene_h5's, over the training cameras)
-  offset_weight_decay: 3.0   # AdamW decoupled weight decay on the offsets (combined fit and fine-tune): pull toward the anchor
+  offset_weight_decay: 0.3   # AdamW decoupled weight decay on the offsets (combined fit and fine-tune): pull toward the anchor.
+                             # Held-out PSNR vs median offset from the slot (40 meshes): 0 -> +0.02 dB / 5.1 px, 0.3 -> ref / 4.0 px,
+                             # 1 -> -0.08 dB / 2.7 px, 3 -> -0.30 dB / 1.4 px, 10 -> -0.73 dB / 0.7 px
   sh0: 0.0025
   opacities: 0.025
   scales: 0.005
