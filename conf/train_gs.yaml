@@ -345,6 +345,9 @@ diffusion:
   # empty_except_layer0 (as empty, but all of layer 0 kept: the background patches' image features). The predictions at dropped
   # tokens are never read (the loss, the render and the sampler use valid slots only). No parameters: checkpoints load either way
   token_drop: none
+  # DiT's FinalLayer before the output projection: LayerNorm + a zero-initialized shift / scale from the timestep, a t-dependent
+  # gain on the whole residual stream (x_t's slice included) right before the readout. false: the plain Linear readout, as before
+  final_adaln: false
   steps: 20                   # Euler steps when sampling
   eval_seed: 0                 # the noise of the samples, and of the validation loss
   # the decode of a prediction (the training rendering loss, the samples) clamps into the training grids' range: channel = every

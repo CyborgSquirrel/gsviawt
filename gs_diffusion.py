@@ -770,7 +770,7 @@ class DiffusionHead(nn.Module):
   set below that width (diffusion.dim): then a learned Linear maps the token to dim (DiT's patch embedding), a smaller trunk."""
 
   def __init__(self, feature_dim, num_layers, channels=CHANNELS, patch_size=14, dim=None, num_blocks=3, mlp_ratio=4.0,
-               layer_scale_init=1e-4, t_embed_channels=256, img_token_scale=0.3, checkpoint_activations=False):
+               layer_scale_init=1e-4, t_embed_channels=256, img_token_scale=0.3, checkpoint_activations=False, final_adaln=False):
     super().__init__()
     self.patch_size, self.channels, self.img_token_scale, self.t_embed_channels = patch_size, channels, img_token_scale, t_embed_channels
     self.noise_dim = channels * patch_size ** 2
@@ -783,16 +783,42 @@ class DiffusionHead(nn.Module):
     self.time_embed = nn.Sequential(nn.Linear(t_embed_channels, self.dim), nn.SiLU(), nn.Linear(self.dim, self.dim))
     self.time_proj = nn.Sequential(nn.SiLU(), nn.Linear(self.dim, 6 * self.dim))
     self.trunk = DiTTrunk(self.dim, num_layers, num_blocks, self.dim // 64, mlp_ratio, layer_scale_init, checkpoint_activations)
+    # diffusion.final_adaln: DiT's FinalLayer before the output projection -- LayerNorm (no affine), then a per-(sample, layer)
+    # shift / scale from the time embedding, zero-initialized (so it starts as LayerNorm + out). Unlike the blocks' AdaLN, which
+    # only modulates what the branches add, it scales the whole residual stream, x_t's slice included: a t-dependent gain on the
+    # path from x_t to the output (research 23/25: without one the shared readout settles on a flat gain on x_t)
+    self.final_norm = nn.LayerNorm(self.dim, elementwise_affine=False, eps=1e-6) if final_adaln else None
+    self.final_ada = nn.Sequential(nn.SiLU(), nn.Linear(self.dim, 2 * self.dim)) if final_adaln else None
+    if final_adaln:
+      nn.init.zeros_(self.final_ada[-1].weight)
+      nn.init.zeros_(self.final_ada[-1].bias)
     self.out = nn.Linear(self.dim, self.noise_dim)
     nn.init.zeros_(self.out.weight)
     nn.init.zeros_(self.out.bias)
 
-  def adaln(self, t):
-    """t: (B, L) in [0, 1] -> (B, L, 6, D), in fp32 (WT computes the time embedding outside autocast)."""
+  def time_embedding(self, t):
+    """t: (B, L) in [0, 1] -> (B, L, D), in fp32 (WT computes the time embedding outside autocast)."""
     b, l = t.shape
     with torch.autocast(device_type=t.device.type, enabled=False):
-      emb = self.time_embed(sinusoidal_embedding(t.reshape(-1) * 1000.0, self.t_embed_channels))
+      return self.time_embed(sinusoidal_embedding(t.reshape(-1) * 1000.0, self.t_embed_channels)).reshape(b, l, self.dim)
+
+  def adaln(self, t, emb=None):
+    """t: (B, L) in [0, 1] -> (B, L, 6, D), in fp32. emb: the time embedding of t, if already computed."""
+    b, l = t.shape
+    emb = self.time_embedding(t) if emb is None else emb
+    with torch.autocast(device_type=t.device.type, enabled=False):
       return self.time_proj(emb).reshape(b, l, 6, self.dim)
+
+  def readout(self, h, emb, rows=None):
+    """The trunk's output h (B, L, P, D), or packed rows (T, D) with rows = their (sample, layer) index (PackIndex.frame) ->
+    the output projection, through the final AdaLN when diffusion.final_adaln."""
+    if self.final_ada is not None:
+      with torch.autocast(device_type=h.device.type, enabled=False):
+        mod = self.final_ada(emb)                                        # (B, L, 2D) fp32
+      mod = mod[:, :, None, :] if rows is None else mod.reshape(-1, mod.shape[-1])[rows]
+      shift, scale = mod.chunk(2, dim=-1)
+      h = (self.final_norm(h.float()) * (1 + scale) + shift).to(h.dtype)
+    return self.out(h)
 
   def forward(self, feats, x_net, t, pack=None):
     """pack: a PackIndex (diffusion.token_drop): the trunk and the output projection run on its kept tokens only, and the
@@ -809,10 +835,11 @@ class DiffusionHead(nn.Module):
       tokens = self.in_proj(tokens)
     elif self.pad:
       tokens = F.pad(tokens, (0, self.pad))
+    emb = self.time_embedding(t)
     if pack is None:
-      out = self.out(self.trunk(tokens, self.adaln(t)))
+      out = self.readout(self.trunk(tokens, self.adaln(t, emb)), emb)
     else:
-      out = pack.scatter(self.out(self.trunk.forward_packed(tokens, self.adaln(t), pack)))
+      out = pack.scatter(self.readout(self.trunk.forward_packed(tokens, self.adaln(t, emb), pack), emb, pack.frame))
     grid = int(round(p ** 0.5))
     return rearrange(out, "b l (h w) (c py px) -> b l c (h py) (w px)", h=grid, w=grid, py=self.patch_size, px=self.patch_size)
 
@@ -839,7 +866,7 @@ class GSDiffusionModel(nn.Module):
     self.head = DiffusionHead(
       int(cfg.model.feature_dim), self.num_layers, patch_size=self.patch_size, dim=d.get("dim"), num_blocks=int(d.num_blocks),
       img_token_scale=float(d.img_token_scale), checkpoint_activations=bool(d.get("checkpoint_activations", False)),
-      layer_scale_init=float(cfg.model.transformer.layer_scale_init))
+      layer_scale_init=float(cfg.model.transformer.layer_scale_init), final_adaln=bool(d.get("final_adaln", False)))
     mean, std, lo, hi = stats
     self.register_buffer("x0_mean", mean.clone().float())
     self.register_buffer("x0_std", std.clone().float())
