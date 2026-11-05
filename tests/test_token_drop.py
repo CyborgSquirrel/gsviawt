@@ -95,7 +95,7 @@ def _ref_block(block, x, cos, sin, adaln, keep):
   elif block.mode == "ray":
     q, k, v = qkv(h.transpose(1, 2).reshape(b * p, l, d), b * p, l)
     att = torch.einsum("nshd,nthd->nhst", q, k) * hd ** -0.5
-    ok = keep.transpose(1, 2).reshape(b * p, l)[:, None, None, :] | torch.eye(l, dtype=torch.bool)[None, None]
+    ok = keep.transpose(1, 2).reshape(b * p, l)[:, None, None, :] | torch.eye(l, dtype=torch.bool, device=x.device)[None, None]
     att = att.masked_fill(~ok, float("-inf"))
     y = torch.einsum("nhst,nthd->nshd", att.softmax(-1).to(v.dtype), v).reshape(b, p, l, d).transpose(1, 2)
   else:
