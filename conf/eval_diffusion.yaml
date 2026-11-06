@@ -8,7 +8,8 @@ steps: null              # sampler steps; null: the run's diffusion.steps; a lis
 project_format: false    # put every sampler step's x0 prediction into the training grids' format (the run's scale_sort / floor) before it is fed back
 project_quat: unit       # with project_format: unit (the rotation made a unit quaternion, w >= 0) | keep (left as predicted, except
                          # where the sort reorders the axes)
-val_sets: null           # list of validation set names; null: all of the run's
+val_sets: null           # list of validation set names; null: all of the run's. val_train (the training volumes, train_gs.yaml's
+                         # data.val_train) can be named for a run trained without it too
 max_volumes: null        # per set: a reproducible random subset of that many volumes (same for every run with the same split);
                          # null: all (say so when reporting a subset)
 seed: 0                  # the target views of a volume and the noise are functions of (seed, set, volume)

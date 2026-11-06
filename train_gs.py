@@ -54,7 +54,7 @@ import torch.nn as nn
 import torch.utils.checkpoint
 from einops import pack, rearrange
 from omegaconf import DictConfig, OmegaConf, open_dict
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader
 
 import wandb
 
@@ -99,6 +99,32 @@ def x0_encoding(cfg):
 def diffusion_enabled(cfg):
   """cfg.diffusion.enabled; configs without the block (older ones) are not diffusion runs."""
   return bool(OmegaConf.select(cfg, "diffusion.enabled", default=False))
+
+
+CATALOG_ROW = "__catalog_row"   # the row-index column catalog_transform's expression must keep
+
+
+def catalog_transform_keys(df, expr):
+  """The (mesh_id, view_idx) keys of the catalogue rows data.catalog_transform keeps: `expr` is a Python expression evaluated with
+  `df` (the catalogue dataframe, plus a row-index column CATALOG_ROW) and `pl` (polars) in scope, which must return a DataFrame of
+  some of df's rows (still carrying CATALOG_ROW), e.g. 'df.filter(pl.col("mesh_id") == 13).filter(pl.col("view_idx") == 12)'."""
+  indexed = df.with_row_index(CATALOG_ROW)
+  try:
+    out = eval(expr, {"df": indexed, "pl": polars})
+  except Exception as e:
+    raise SystemExit(f"data.catalog_transform {expr!r} failed: {type(e).__name__}: {e}") from e
+  if isinstance(out, polars.LazyFrame):
+    out = out.collect()
+  if not isinstance(out, polars.DataFrame):
+    raise SystemExit(f"data.catalog_transform {expr!r} must return a polars DataFrame, got {type(out).__name__}")
+  if CATALOG_ROW not in out.columns:
+    raise SystemExit(f"data.catalog_transform {expr!r}: the result lost the {CATALOG_ROW!r} column (filter df's rows, don't "
+                     "select columns away)")
+  kept = sorted(set(out[CATALOG_ROW].to_list()))
+  if kept and not 0 <= kept[0] <= kept[-1] < len(df):
+    raise SystemExit(f"data.catalog_transform {expr!r}: {CATALOG_ROW} values out of range")
+  sub = df[kept]
+  return set(zip(sub["mesh_id"].to_list(), sub["view_idx"].to_list()))
 
 
 def check_val_targets(ds, name, cfg):
@@ -378,6 +404,9 @@ class GSDataModule(pl.LightningDataModule):
     val_views_strain: volumes with a train-view source, as many per mesh as it has val views (see
                       gs_dataset.sample_matching_sources); targets from the val views
     val_views_sval:   volumes with a val-view source, targets from the val views
+    val_train:        (data.val_train) the training volumes themselves, targets from the train views
+  data.catalog_transform (a polars expression, see catalog_transform_keys) then cuts the training set and every validation
+  set down to the volumes of the catalogue rows it keeps; the splits, pools and x0 stats stay the full catalogue's.
   Every validation set is complete (the empty ones are dropped); how much of it a validation scores is
   that validation's own choice (module.EventValidation volumes; trainer.limit_val_batches for Lightning's own
   ones, which a run with an at_end validation doesn't have): the val dataloaders shuffle, so each validation scores a fresh random sample. The datasets are in
@@ -462,6 +491,27 @@ class GSDataModule(pl.LightningDataModule):
     if len(val_views):
       sets["val_views_strain"] = (val_views, rows_in(sample_matching_sources(train_views, val_views, seed=cfg.seed)))
       sets["val_views_sval"] = (val_views, rows_in(val_views))
+    # data.catalog_transform: the splits, the supervision-view pools and the x0 stats (below) are the full catalogue's; the
+    # transform only picks which of their volumes (source views) are trained / validated on
+    stats_rows = train_rows
+    transform = d.get("catalog_transform")
+    if transform is not None:
+      keys = catalog_transform_keys(catalog.df, str(transform))
+      key_of = dict(zip(rows.tolist(), volume_keys))
+      kept = lambda rs: [r for r in rs if key_of[r] in keys]
+      before = {"train": len(train_rows), **{n: len(r) for n, (_, r) in sets.items()}}
+      train_rows = kept(train_rows)
+      sets = {n: (v, kept(r)) for n, (v, r) in sets.items()}
+      after = {"train": len(train_rows), **{n: len(r) for n, (_, r) in sets.items()}}
+      log.info("data.catalog_transform %r keeps %d of %d catalogue rows; volumes kept (of): %s", transform, len(keys),
+               len(catalog), {n: f"{after[n]} ({before[n]})" for n in before})
+      if not train_rows:
+        raise SystemExit(
+          f"data.catalog_transform {transform!r} leaves no training volume (kept per set: {after}): its rows are not training "
+          "source views -- e.g. a held-out mesh of data.mesh_split or a held-out view of data.view_split, or no volume of the data")
+    repeat = d.get("repeat", 1)
+    if isinstance(repeat, bool) or not isinstance(repeat, int) or repeat < 1:
+      raise SystemExit(f"data.repeat must be a whole number >= 1, got {repeat!r}")
     train_pool = train_views
     if grid_index is not None and cfg.diffusion.get("train_targets", "grid") == "all":
       # diffusion.train_targets=all: the training volumes' supervision views are ALL renders of their mesh except the held-out
@@ -473,6 +523,9 @@ class GSDataModule(pl.LightningDataModule):
         if m in train_mesh_ids and (m, v) not in held_out])
     elif cfg.diffusion.get("train_targets", "grid") not in ("grid", "all"):
       raise SystemExit(f"diffusion.train_targets must be grid or all, got {cfg.diffusion.train_targets!r}")
+    if d.get("val_train", False):
+      # val_train: the training volumes themselves (after data.catalog_transform), targets from the training views' pool
+      sets["val_train"] = (train_pool, train_rows)
     self.train_ds = WTFeatureDataset(features_h5, train_pool, rows=train_rows, **kwargs)
     self.val_datasets = {
       name: WTFeatureDataset(features_h5, v, rows=r, **kwargs) for name, (v, r) in sets.items() if len(r)}
@@ -484,9 +537,12 @@ class GSDataModule(pl.LightningDataModule):
       self.val_datasets = {n: gs_diffusion.GridTargetDataset(ds, grid_index, enc, seeded=True) for n, ds in self.val_datasets.items()}
       for name, ds in self.val_datasets.items():
         check_val_targets(ds, name, cfg)
-      # normalization of the x0 channels: the valid slots of the TRAIN grids (moments cached per grid, next to the grids)
+      # normalization of the x0 channels: the valid slots of the TRAIN grids (moments cached per grid, next to the grids) -- all of
+      # them, also under data.catalog_transform, so a run on a few volumes sees them normalized like a run on all
+      stats_ds = self.train_ds if stats_rows == train_rows else gs_diffusion.GridTargetDataset(
+        WTFeatureDataset(features_h5, train_pool, rows=stats_rows, **kwargs), grid_index, enc)
       self.diffusion_stats = gs_diffusion.compute_stats(
-        self.train_ds, grid_index, os.path.join(cfg.diffusion.grids_dir, ".x0_moments"))
+        stats_ds, grid_index, os.path.join(cfg.diffusion.grids_dir, ".x0_moments"))
     log.info(
       "volumes: %d train, validation sets %s", len(self.train_ds),
       {n: len(ds) for n, ds in self.val_datasets.items()})
@@ -494,8 +550,11 @@ class GSDataModule(pl.LightningDataModule):
       self.val_datasets = {"val": _EmptyDataset()}
 
   def train_dataloader(self):
+    # data.repeat: an epoch is that many passes over the training volumes (each access draws its own targets, t and noise);
+    # self.train_ds itself (the previews' "train" stage) is not repeated
+    repeat = int(self.cfg.data.get("repeat", 1))
     return DataLoader(
-      self.train_ds,
+      self.train_ds if repeat == 1 else ConcatDataset([self.train_ds] * repeat),
       shuffle=True,
       collate_fn=collate_with_batch_size,
       **OmegaConf.to_container(self.cfg.loader, resolve=True),
