@@ -56,6 +56,8 @@ import wandb
 
 # camera helpers: cameras.py; re-exported here, the old import path (`from module import make_viewmats`, ...)
 from cameras import OPENGL_TO_OPENCV, WORLD_UP, look_at_c2w, make_viewmats, unproject_depth_peel  # noqa: F401
+# SH_C0 lives in gaussians.py; re-exported here (`from module import SH_C0`)
+from gaussians import SH_C0, logit  # noqa: F401
 
 log = logging.getLogger(__name__)
 
@@ -73,12 +75,8 @@ if not OmegaConf.has_resolver("eval"):
 # fit_gsplat.py's own, moved here when that script was deleted)
 # ---------------------------------------------------------------------------
 
-SH_C0 = 0.28209479177387814  # SH band-0 constant, for RGB <-> sh0 in the .ply
-
-
 def _logit(x, eps=1e-4):
-  x = np.clip(x, eps, 1.0 - eps)
-  return np.log(x / (1.0 - x))
+  return logit(x, eps)
 
 
 def init_gaussians(depth_primary, K_primary, pose_primary, image_primary,

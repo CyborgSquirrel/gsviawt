@@ -124,6 +124,7 @@ import wandb
 
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _REPO_ROOT)
+from gaussians import logit  # noqa: E402
 from module import DSSIMLoss, OPENGL_TO_OPENCV, ProgressWandbLogger, _completed_steps  # noqa: E402
 from gs_dataset import _EmptyDataset, render_catalog  # noqa: E402
 from util import timed  # noqa: E402
@@ -386,8 +387,7 @@ def load_scene_h5(hdf5_path, train_idx, val_idx, seed):
 # ---------------------------------------------------------------------------
 
 def _logit(x, eps=1e-4):
-  x = np.clip(x, eps, 1.0 - eps)
-  return np.log(x / (1.0 - x))
+  return logit(x, eps)
 
 
 def init_gaussians(pcd, max_sh_degree, init_opacity, knn_k):
