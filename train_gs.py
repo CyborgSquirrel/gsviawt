@@ -59,9 +59,8 @@ from torch.utils.data import ConcatDataset, DataLoader
 import wandb
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
-from gs_dataset import (OPENGL_TO_OPENCV, H5Catalog, WTFeatureDataset,  # noqa: E402
-                        _EmptyDataset, render_catalog, rotate_quats_wxyz,
-                        sample_matching_sources)
+from gs_dataset import (OPENGL_TO_OPENCV, WTFeatureDataset, _EmptyDataset,  # noqa: E402
+                        render_catalog, rotate_quats_wxyz, sample_matching_sources)
 from gs_decoder import PatchGaussianHead  # noqa: E402
 import gs_diffusion  # noqa: E402
 from module import (DSSIMLoss, Events, ProgressWandbLogger, SameDirCheckpointIO, TrainClock, _completed_steps,  # noqa: E402
@@ -238,7 +237,6 @@ def model_forward(
   model,
   batch,
   *,
-  need_flat_gauss: bool=False,
   need_render: bool=False,
   render_view_idx = None,
   bg_colors = None,
@@ -259,14 +257,6 @@ def model_forward(
   # render 3DGS if necessary
   if need_render:
     rvi = render_view_idx
-
-    # TODO: overrides
-    # gauss_render = gauss_pred
-    # gt = item.get("ground_truth")
-    # if gt is not None:
-    #   gauss_render = apply_ground_truth_overrides(gauss, gt, hit, predict_params, device)
-    # src = item["source"]
-    # hit = src["hit"].to(device)
 
     pred_rgb = []
     pred_alpha = []
@@ -950,7 +940,6 @@ class GSLightningModule(pl.LightningModule):
       device=device,
     )
     pred_rgb = model_pred["rgb"]
-    pred_alpha = model_pred["alpha"]
 
     # loss
     loss = torch.zeros((), device=device)
@@ -1044,23 +1033,8 @@ class GSLightningModule(pl.LightningModule):
       loss = loss + cfg.loss.mean_offset_reg_weight * mean_offset_reg
       _log("loss/mean_offset_reg", mean_offset_reg.detach())
 
-    # TODO: skim through this code, fix it up
-    # if need_direct:
-    #   raise NotImplementedError()
-    # if need_direct:
-    #   direct_total, direct_parts = compute_direct_loss(gauss, gt, hit, cfg.loss, device)
-    #   loss = loss + direct_total
-    #   for k, v in direct_parts.items():
-    #     metrics[f"direct_{k}"] = v.detach()
-
     _log("loss", loss.detach())
     out["loss"] = loss
-
-    # TODO: Are any of these metrics actually needed?
-    # metrics["mean_opacity"] = flat["opacities"].mean().detach() if flat["opacities"].numel() else torch.zeros((), device=device)
-    # metrics["mean_scale"] = flat["scales"].mean().detach() if flat["scales"].numel() else torch.zeros((), device=device)
-    # metrics["frac_kept"] = torch.tensor(
-    #   flat["means"].shape[0] / max(1, item["source"]["hit"].numel()), device=device)
 
     return out
 

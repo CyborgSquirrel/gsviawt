@@ -974,7 +974,6 @@ class PanelCallback(pl.Callback):
     if not self.trigger.due(trainer, pl_module, batch_idx):
       return
     mode = "step"
-    n = _completed_steps(trainer, pl_module)  # count of COMPLETED optimizer steps
     stages = None  # every stage the module has
 
     if pl_module.logger is None:
@@ -1066,7 +1065,6 @@ class ScaleLayersCallback(pl.Callback):
     if not self.trigger.due(trainer, pl_module, batch_idx):
       return
     mode = "step"
-    n = _completed_steps(trainer, pl_module)  # count of COMPLETED optimizer steps
     stages = None  # every stage the module has
 
     if pl_module.logger is None:

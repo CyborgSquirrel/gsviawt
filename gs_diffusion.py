@@ -22,7 +22,6 @@ of 64 for the heads).
 
 import contextlib
 import glob
-import json
 import logging
 import math
 import os
