@@ -279,6 +279,9 @@ def test_converter_skip_and_resume(files, tmp_path):
   assert mtimes == {n: os.stat(os.path.join(sparse, f"{n}.h5")).st_mtime_ns for n in files}   # not rewritten
   shutil.copy(os.path.join(dense, "one.h5"), os.path.join(sparse, "one.h5"))   # a dense file where a sparse one should be
   assert cgs.convert_one((dense, sparse, "one.h5"))[1].startswith("error")
+  st = os.stat(os.path.join(sparse, "mixed.h5"))   # the dense file re-finalized after its copy: refused, nothing carried over
+  os.utime(os.path.join(dense, "mixed.h5"), ns=(st.st_atime_ns, st.st_mtime_ns + 10 ** 9))
+  assert "changed after its sparse copy" in cgs.convert_one((dense, sparse, "mixed.h5"))[1]
   for n in files:   # the originals are untouched
     assert same(grid_io.load_grid(os.path.join(dense, f"{n}.h5"))[0]["gaussian_means"], files[n][2]["gaussian_means"])
 

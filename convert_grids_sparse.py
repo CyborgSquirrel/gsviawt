@@ -73,6 +73,8 @@ def convert_one(args):
       with h5py.File(dst, "r") as f:
         if not grid_io.is_sparse(f):
           raise ValueError(f"{dst} exists and is not sparse: left alone")
+      if os.stat(src).st_mtime_ns > os.stat(dst).st_mtime_ns:   # (a fresh copy is always newer than its source)
+        raise ValueError(f"{src} changed after its sparse copy was made: delete {dst} to convert it again")
       status = "skipped"
     else:
       grid_io.convert_file(src, dst)
