@@ -1073,6 +1073,59 @@ class GSDiffusionModel(nn.Module):
     return loss, parts, counts
 
   @torch.no_grad()
+  def xt_probe(self, image, hit, x0_raw, seeds, ts, gain_delta=0.01):
+    """The x_t reliance probe (diffusion.probe): does the x0 prediction use the noisy input, or only the image? Per volume and per
+    shared timestep t in ts (every layer at t, as in the sampler), from x_t = (1 - t) x0 + t eps with the volume's own seeded noise
+    (eval_noise: the validation loss's; invalid slots at the noise, through _net_input, as the model always sees them):
+      err_model  the masked x0 error of the model's prediction (the head call of training_loss / sample, packing included), per
+                 valid slot and channel, in normalized units
+      err_copy   the same error of c(t) x_t, c = (1 - t) / ((1 - t)^2 + t^2): the best linear estimate of unit-variance data from
+                 x_t alone (its error is t^2 / ((1 - t)^2 + t^2) on such data)
+      gain       <x0_hat(x_t + delta) - x0_hat(x_t), delta> / |delta|^2 over the valid slots, delta = gain_delta z (z a seeded
+                 standard normal on the valid slots, its own stream: not eps's): the prediction's response to its input (1 / (1 - t)
+                 for "unshrink x_t", 0 for a prediction that ignores it); its two forwards in fp32 (autocast off), so a small delta
+                 is not lost to bf16
+    Returns {t: {"err_model", "err_copy", "gain", "valid"}}, each (B,) float32 on the device (valid: the volume's valid slots; a
+    volume without any has NaN values). The volumes run one at a time (bounded memory, and each volume's values do not depend on
+    the batch it came in); nothing draws from a global random stream."""
+    device = image.device
+    b, l = hit.shape[:2]
+    x0_all = self.normalize(x0_raw.to(device).float())                               # (B, L, C, H, W)
+    out = {float(t): {k: torch.full((b,), float("nan"), device=device) for k in ("err_model", "err_copy", "gain", "valid")}
+           for t in ts}
+    fp32 = torch.autocast(device_type=device.type, enabled=False)
+    for i in range(b):
+      x0, h = x0_all[i:i + 1], hit[i:i + 1]
+      feats = self._feats(image[i:i + 1])
+      pack = self.pack(h)
+      _, eps = self.eval_noise([seeds[i]], x0.shape, device)
+      a = h[:, :, None].to(x0.dtype)                                                 # (1, L, 1, H, W)
+      n = a.sum() * CHANNELS
+      for t in ts:
+        out[float(t)]["valid"][i] = a.sum()
+      if n == 0:
+        continue
+      for t in ts:
+        t = float(t)
+        res = out[t]
+        # the deterministic control (schedule.fixed_t) has no other timestep (as training_loss); its input has no x_t anyway
+        t_in = torch.full((1, l), float(self.schedule.fixed_t) if self.schedule.fixed_t is not None else t, device=device)
+        x_t = (1 - t) * x0 + t * eps
+        head = lambda x, f=feats: self._head(f, self._net_input(a * x + (1 - a) * eps, a), t_in, pack).float()
+        masked_mse = lambda pred: ((pred - x0).square() * a).sum() / n
+        res["err_model"][i] = masked_mse(head(x_t))
+        res["err_copy"][i] = masked_mse((1 - t) / ((1 - t) ** 2 + t ** 2) * x_t)
+        gen = torch.Generator(device=device).manual_seed(
+          int(np.random.SeedSequence([int(seeds[i]), round(t * 1e6), 0x7874]).generate_state(1)[0]))   # 0x7874: "xt"
+        delta = gain_delta * torch.randn(x0.shape, device=device, generator=gen) * a
+        with fp32:
+          f32 = feats.float()
+          base = head(x_t.float(), f32)
+          moved = head(x_t.float() + delta, f32)
+        res["gain"][i] = ((moved - base) * delta).sum() / delta.square().sum()
+    return out
+
+  @torch.no_grad()
   def sample(self, image, hit, seeds=None, steps=None, project=None, floor=None, guidance=None):
     """20 Euler steps of the flow from pure noise -> the Gaussian dict. The noise of volume i is a function of seeds[i] (default:
     eval_seed + i): reproducible. Invalid slots stay at the noise. project: applied to every step's x0 prediction before it is used
