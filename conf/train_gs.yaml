@@ -361,6 +361,23 @@ diffusion:
   # Default empty (Nov 6): at equal steps it matches dense (runs 1032/1040 vs 1030) at ~4.8x faster steps; run configs without the
   # key (older runs) keep every token, as they were trained
   token_drop: empty
+  # Condition (image) dropout in training: per SAMPLE, with probability p, the image tokens of every layer and patch become the null
+  # condition instead of the z-scored features (after the z-score and img_token_scale). Applies to the x0 loss and the rendering
+  # loss alike (one forward); the validations stay conditional. Logs train/cond_dropped (the realized fraction) and the x0 /
+  # rendering losses over the kept / dropped samples (train/loss/x0/cond_kept|cond_dropped, train/loss/photom_cond|photom_uncond).
+  # Configs without the key: off. A run trained with p = 0 has no meaningful unconditional branch (diffusion.cfg below).
+  cond_dropout:
+    p: 0.0                     # 0 = off: nothing is drawn, the random streams and the loss exactly as without dropout
+    "null": zeros              # zeros (the features' mean after the z-score; no parameter) | learned (a learned feature_dim
+                               # vector, zero-initialized: the parameter head.null_cond exists only then)
+  # Classifier-free guidance when sampling (the validations' samples, previews / orbits, eval_diffusion.py's `guidance` override):
+  # x0 = x0_uncond + scale * (x0_cond - x0_uncond) on the raw (normalized) x0 prediction, before the format projection and the
+  # decode clamp. Configs without the key: off.
+  cfg:
+    scale: 1.0                 # 1: the conditional prediction only (one forward per step, as without guidance); 0: the unconditional
+                               # prediction only (a probe); otherwise two forwards per guided step
+    interval: [0.0, 1.0]       # guide only the sampler steps with lo <= t <= hi (t = 1: pure noise; the others conditional)
+    fields: null               # null: every channel; or a subset of [opacity, scale, rotation, sh_dc, offset] (the rest conditional)
   steps: 20                    # Euler steps when sampling
   eval_seed: 0                 # the noise of the samples, and of the validation loss
   # the decode of a prediction (the training rendering loss, the samples) clamps into the training grids' range: channel = every

@@ -137,6 +137,8 @@ def main(cfg):
       run.diffusion.source_h5 = cfg.source_h5
     if cfg.val_sets is not None and "val_train" in cfg.val_sets:
       run.data.val_train = True                   # scoreable for a run trained without data.val_train too
+    if cfg.get("guidance") is not None:           # the samplers' classifier-free guidance (the model reads diffusion.cfg)
+      run.diffusion.cfg = OmegaConf.merge(run.diffusion.get("cfg") or {}, cfg.guidance)
   if not train_gs.diffusion_enabled(run):
     raise SystemExit("not a diffusion-mode run")
   dm = train_gs.GSDataModule(run)

@@ -741,21 +741,31 @@ class GSLightningModule(pl.LightningModule):
     seconds = self.clock.seconds() if self.clock is not None else 0.0
     return seconds >= float(p.start_seconds)
 
-  def _diffusion_photom(self, stage, batch, x0_hat, t, log=None):
+  def _diffusion_photom(self, stage, batch, x0_hat, t, log=None, cond_drop=None):
     """The photometric loss of the diffusion model's x0 prediction (at the timesteps t), rendered: per volume, only the volumes
     whose timestep, reduced over the layers by diffusion.photom.t_reduce (max: the noisiest layer, mean, layer0), is in
     diffusion.photom.t_range count (a mean over them; zero when there is none). Logs <prefix>/photom[_l1|_dssim] (over the
     volumes that count) and photom_frac (the fraction of volumes that count); the validations log it the same way, so
     train/loss/photom and <set>/<name>/loss/photom are one quantity. log: called instead of _log_metric (the train step holds
-    its logs until the step is accepted). Returns the loss (with its graph)."""
+    its logs until the step is accepted). Returns the loss (with its graph). cond_drop: the (B,) mask of the samples trained with
+    the null image condition (diffusion.cond_dropout): the same renders' loss is also logged over the conditioned / dropped
+    volumes that count, as <prefix>/photom_cond[_<term>] / photom_uncond[_<term>] (the loss itself is unchanged)."""
     log = log or self._log_metric
     lo, hi = self.cfg.diffusion.photom.t_range
     reduce = self.cfg.diffusion.photom.t_reduce
     tv = {"max": lambda: t.amax(dim=1), "mean": lambda: t.mean(dim=1), "layer0": lambda: t[:, 0]}[reduce]()   # (B,)
     keep = ((tv >= float(lo)) & (tv <= float(hi))).float()
     log(stage, "loss/photom_frac", keep.mean(), batch["batch_size"])
-    return self._render_photom(stage, batch, self.model.decode(x0_hat, self.model.floor_context(batch, self.device)), keep,
-                               "loss/photom", log)
+    gauss = self.model.decode(x0_hat, self.model.floor_context(batch, self.device))
+    if cond_drop is None:
+      return self._render_photom(stage, batch, gauss, keep, "loss/photom", log)
+    if keep.sum() == 0:
+      return torch.zeros((), device=self.device)
+    per = self._photom_per_volume(batch, gauss)
+    dropped = cond_drop.to(keep.device, keep.dtype)
+    self._log_photom(stage, per, keep * (1 - dropped), "loss/photom_cond", log)
+    self._log_photom(stage, per, keep * dropped, "loss/photom_uncond", log)
+    return self._log_photom(stage, per, keep, "loss/photom", log)
 
   def _render_photom(self, stage, batch, gauss, keep, key, log=None):
     """loss.photom (L1 + D-SSIM on the views of loss.photom.for, against the dataset's rendered images) of the Gaussian dict gauss,
@@ -809,12 +819,14 @@ class GSLightningModule(pl.LightningModule):
     average is skipped (no optimizer step), as in WT's recipe, and so is a non-finite one (gs_diffusion.SpikeSkip)."""
     B = batch["batch_size"]
     loss, parts, counts, x0_hat, t = self._diffusion_losses(batch)
+    # diffusion.cond_dropout (p > 0 only): the (B,) mask of the samples whose image condition was the null this step
+    cond_drop = parts.pop("cond_drop", None)
     x0_loss = loss.detach()
     loss = float(self.cfg.diffusion.get("x0_weight", 1.0)) * loss   # 0: the x0 loss is only logged (diffusion.photom alone trains)
     held = []   # the rendering loss's logs: like train/loss and the x0 loss's, accepted steps only
     if self._photom_active():
       loss = loss + float(self.cfg.diffusion.photom.weight) * self._diffusion_photom(
-        "train", batch, x0_hat, t, log=lambda *a: held.append(a))
+        "train", batch, x0_hat, t, log=lambda *a: held.append(a), **({"cond_drop": cond_drop} if cond_drop is not None else {}))
     value = float(loss.detach())
     skipped = self.spike_skip.check(value)
     self._log_metric("train", "skipped", float(skipped), B)
@@ -829,6 +841,8 @@ class GSLightningModule(pl.LightningModule):
     self._log_metric("train", "loss", loss.detach(), B)
     self._log_metric("train", "loss/x0", x0_loss, B)   # like train/loss and its parts: accepted steps only
     self._log_parts("train", "loss/x0", parts, counts)   # the validations' keys: <set>/<name>/loss/x0/<part>
+    if cond_drop is not None:
+      self._log_metric("train", "cond_dropped", cond_drop.float().mean(), B)   # the realized fraction of null-condition samples
     for a in held:
       self._log_metric(*a)
     return loss

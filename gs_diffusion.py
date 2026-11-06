@@ -530,6 +530,50 @@ def compute_stats(dataset, grid_index, cache_dir=None):
 # ---------------------------------------------------------------------------
 
 TOKEN_DROPS = ("none", "empty", "empty_except_layer0")
+COND_NULLS = ("zeros", "learned")
+GUIDANCE_DEFAULTS = dict(scale=1.0, interval=(0.0, 1.0), fields=None)   # diffusion.cfg: what a config without the key means
+
+
+def normalize_cond_dropout(cd):
+  """diffusion.cond_dropout (None or missing keys: off) -> {"p": float in [0, 1], "null": zeros | learned}."""
+  cd = {"p": 0.0, "null": "zeros", **dict(cd or {})}
+  unknown = sorted(set(cd) - {"p", "null"})
+  if unknown:
+    raise ValueError(f"diffusion.cond_dropout: unknown keys {unknown}")
+  p = float(cd["p"])
+  if not 0.0 <= p <= 1.0:
+    raise ValueError(f"diffusion.cond_dropout.p must be in [0, 1], got {p}")
+  if cd["null"] not in COND_NULLS:
+    raise ValueError(f"diffusion.cond_dropout.null must be one of {COND_NULLS}, got {cd['null']!r}")
+  return {"p": p, "null": str(cd["null"])}
+
+
+def normalize_guidance(g):
+  """diffusion.cfg (classifier-free guidance at sampling; None or missing keys: the defaults, off) -> {"scale": float,
+  "interval": (lo, hi), "fields": tuple of FIELDS names or None (all)}."""
+  g = {**GUIDANCE_DEFAULTS, **{k: v for k, v in dict(g or {}).items()}}
+  unknown = sorted(set(g) - set(GUIDANCE_DEFAULTS))
+  if unknown:
+    raise ValueError(f"diffusion.cfg: unknown keys {unknown}")
+  lo, hi = (float(v) for v in g["interval"])
+  if lo > hi:
+    raise ValueError(f"diffusion.cfg.interval must be [lo, hi] with lo <= hi, got {[lo, hi]}")
+  fields = None
+  if g["fields"] is not None:
+    fields = tuple(str(f) for f in g["fields"])
+    bad = sorted(set(fields) - set(FIELDS))
+    if bad or not fields:
+      raise ValueError(f"diffusion.cfg.fields must be a non-empty subset of {FIELDS} (or null: all), got {list(fields)}")
+  return {"scale": float(g["scale"]), "interval": (lo, hi), "fields": fields}
+
+
+def warn_guidance_without_dropout(guidance, cond_dropout_p):
+  """Guidance (scale != 1) on a run trained without condition dropout: its unconditional branch was never trained."""
+  if guidance["scale"] != 1.0 and float(cond_dropout_p) == 0.0:
+    msg = (f"diffusion.cfg.scale={guidance['scale']:g} on a run trained with diffusion.cond_dropout.p=0: the unconditional "
+           "branch (null image condition) was never trained, so it (and the guided mix) is not meaningful")
+    log.warning(msg)
+    warnings.warn(msg)
 
 
 def token_keep(hit, patch_size, token_drop):
@@ -758,8 +802,14 @@ class DiffusionHead(nn.Module):
   set below that width (diffusion.dim): then a learned Linear maps the token to dim (DiT's patch embedding), a smaller trunk."""
 
   def __init__(self, feature_dim, num_layers, channels=CHANNELS, patch_size=14, dim=None, num_blocks=3, mlp_ratio=4.0,
-               layer_scale_init=1e-4, t_embed_channels=256, img_token_scale=0.3, checkpoint_activations=False):
+               layer_scale_init=1e-4, t_embed_channels=256, img_token_scale=0.3, checkpoint_activations=False, cond_null="zeros"):
+    """cond_null (diffusion.cond_dropout.null): what a dropped sample's image tokens become -- zeros (the z-scored features' mean;
+    no parameter) | learned (a learned (feature_dim,) vector, zero-initialized: the parameter `null_cond` exists only then)."""
     super().__init__()
+    if cond_null not in COND_NULLS:
+      raise ValueError(f"cond_null must be one of {COND_NULLS}, got {cond_null!r}")
+    if cond_null == "learned":
+      self.null_cond = nn.Parameter(torch.zeros(feature_dim))
     self.patch_size, self.channels, self.img_token_scale, self.t_embed_channels = patch_size, channels, img_token_scale, t_embed_channels
     self.noise_dim = channels * patch_size ** 2
     in_dim = feature_dim + self.noise_dim
@@ -782,17 +832,23 @@ class DiffusionHead(nn.Module):
       emb = self.time_embed(sinusoidal_embedding(t.reshape(-1) * 1000.0, self.t_embed_channels))
       return self.time_proj(emb).reshape(b, l, 6, self.dim)
 
-  def forward(self, feats, x_net, t, pack=None):
+  def forward(self, feats, x_net, t, pack=None, uncond=None):
     """pack: a PackIndex (diffusion.token_drop): the trunk and the output projection run on its kept tokens only, and the
-    prediction is 0 at the dropped ones (fully empty patches: nothing reads them). None: every token (the dense path)."""
+    prediction is 0 at the dropped ones (fully empty patches: nothing reads them). None: every token (the dense path).
+    uncond: (B,) bool, the samples whose image condition is replaced by the null (diffusion.cond_dropout): every token of the sample
+    (all layers, all patches) gets the null instead of its z-scored, img_token_scale-scaled features; None: no sample (the call
+    exactly as before)."""
     b, l, p, _ = feats.shape
     feats = (feats - feats.mean((1, 2, 3), keepdim=True)) / (feats.var((1, 2, 3), keepdim=True, unbiased=False) + 1e-6).sqrt()
+    if uncond is not None:   # after the per-sample z-score and the scale (a null before them would be renormalized), before packing
+      null = self.null_cond.to(feats.dtype) if hasattr(self, "null_cond") else feats.new_zeros(())
+      feats = torch.where(uncond.to(feats.device).bool()[:, None, None, None], null, feats * self.img_token_scale)
     patches = rearrange(x_net, "b l c (h py) (w px) -> b l (h w) (c py px)", py=self.patch_size, px=self.patch_size)
     if pack is not None and pack.T == 0:   # nothing kept (no valid slot in the batch): no output is read, the dense path keeps the
       pack = None                          # graph (a loss of 0 with zero gradients) without an empty attention
     if pack is not None:   # the feature z-scoring above stays over all tokens; everything after it is per token
       feats, patches = pack.gather(feats), pack.gather(patches)
-    tokens = torch.cat([feats * self.img_token_scale, patches.to(feats.dtype)], dim=-1)
+    tokens = torch.cat([feats if uncond is not None else feats * self.img_token_scale, patches.to(feats.dtype)], dim=-1)
     if self.in_proj is not None:
       tokens = self.in_proj(tokens)
     elif self.pad:
@@ -814,6 +870,8 @@ class GSDiffusionModel(nn.Module):
   decode_clamp = "channel"   # diffusion.decode_clamp (set in __init__)
   floor_add_px = None        # diffusion.scale_encoding.scale_floor_px with scale_floor_mode add (set in __init__): the decode adds it
   token_drop = "none"        # diffusion.token_drop (set in __init__)
+  cond_dropout_p = 0.0       # diffusion.cond_dropout.p (set in __init__): 0 = never dropped, nothing drawn
+  guidance = GUIDANCE_DEFAULTS   # diffusion.cfg, normalized (set in __init__): scale 1 = conditional only, one forward per step
 
   def __init__(self, cfg, stats):
     super().__init__()
@@ -823,11 +881,16 @@ class GSDiffusionModel(nn.Module):
       raise SystemExit("diffusion mode needs an image backbone: model/backbone=moge_mix")
     self.num_layers = int(cfg.data.num_layers)
     self.patch_size = int(cfg.model.patch_size)
+    # (configs without the keys, older runs: no dropout, no guidance)
+    cond_dropout = normalize_cond_dropout(d.get("cond_dropout"))
+    self.cond_dropout_p = cond_dropout["p"]
+    self.guidance = normalize_guidance(d.get("cfg"))
+    warn_guidance_without_dropout(self.guidance, self.cond_dropout_p)
     self.backbone = hydra.utils.instantiate(cfg.model.backbone)
     self.head = DiffusionHead(
       int(cfg.model.feature_dim), self.num_layers, patch_size=self.patch_size, dim=d.get("dim"), num_blocks=int(d.num_blocks),
       img_token_scale=float(d.img_token_scale), checkpoint_activations=bool(d.get("checkpoint_activations", False)),
-      layer_scale_init=float(cfg.model.transformer.layer_scale_init))
+      layer_scale_init=float(cfg.model.transformer.layer_scale_init), cond_null=cond_dropout["null"])
     mean, std, lo, hi = stats
     self.register_buffer("x0_mean", mean.clone().float())
     self.register_buffer("x0_std", std.clone().float())
@@ -864,9 +927,51 @@ class GSDiffusionModel(nn.Module):
       return None
     return PackIndex(token_keep(hit, self.patch_size, self.token_drop))
 
-  def _head(self, feats, x_net, t, pack):
-    """self.head, with the pack only when there is one (token_drop none: the head's call exactly as before)."""
+  def _head(self, feats, x_net, t, pack, uncond=None):
+    """self.head, with the pack only when there is one (token_drop none: the head's call exactly as before), and the null-condition
+    mask uncond (B,) only when there is one."""
+    if uncond is not None:
+      return self.head(feats, x_net, t, pack, uncond=uncond)
     return self.head(feats, x_net, t) if pack is None else self.head(feats, x_net, t, pack)
+
+  @staticmethod
+  def _uncond(condition, b, device):
+    """condition (True: every sample conditioned | False: none | a (B,) bool tensor, True = that sample keeps its image) -> the
+    head's uncond mask (B,) bool, or None (every sample conditioned: the head's call as before)."""
+    if condition is True:
+      return None
+    if condition is False:
+      return torch.ones(b, dtype=torch.bool, device=device)
+    condition = torch.as_tensor(condition, device=device)
+    if condition.shape != (b,) or condition.dtype != torch.bool:
+      raise ValueError(f"condition must be True, False or a ({b},) bool tensor, got {condition.dtype} {tuple(condition.shape)}")
+    return ~condition
+
+  def predict_x0(self, image, hit, x_net, t, condition=True, feats=None):
+    """The head's x0 prediction (B, L, C, H, W, normalized) for the network input x_net (B, L, C, H, W: the noisy grid, invalid
+    slots already noise, as training_loss / sample build it) at timesteps t (B, L), with diffusion.token_drop's packing from hit.
+    condition: True (conditional) | False (unconditional: every sample's image tokens the null) | a (B,) bool tensor (True = that
+    sample conditioned). feats: the backbone's features of image, if already computed (then image is not read)."""
+    feats = self._feats(image) if feats is None else feats
+    a = hit[:, :, None].to(x_net.dtype)
+    return self._head(feats, self._net_input(x_net, a), t, self.pack(hit), self._uncond(condition, x_net.shape[0], x_net.device))
+
+  def _guided_x0(self, feats, x_net, t, pack, guidance):
+    """The guided x0 prediction (float) of one sampler step inside the guidance interval: x0_u + scale * (x0_c - x0_u), on
+    guidance["fields"] only (the other channels: the conditional prediction). Scale 0 on all fields: the unconditional forward
+    alone."""
+    s, fields = guidance["scale"], guidance["fields"]
+    x_u = self._head(feats, x_net, t, pack, torch.ones(x_net.shape[0], dtype=torch.bool, device=x_net.device)).float()
+    if s == 0.0 and fields is None:
+      return x_u
+    x_c = self._head(feats, x_net, t, pack).float()
+    out = x_u + s * (x_c - x_u)
+    if fields is not None:
+      on = torch.zeros(CHANNELS, dtype=torch.bool, device=out.device)
+      for f in fields:
+        on[X0_SLICES[f]] = True
+      out = torch.where(on[None, None, :, None, None], out, x_c)
+    return out
 
   def inputs(self, batch, device):
     """(image, hit mask, per-volume seeds, floor context): the noise of a sample is a function of its volume (see eval_noise)."""
@@ -908,12 +1013,18 @@ class GSDiffusionModel(nn.Module):
       return x_net
     return (1 - a).expand_as(x_net).to(x_net.dtype)
 
-  def training_loss(self, image, hit, x0_raw, seeds=None, return_pred=False, t=None):
+  def training_loss(self, image, hit, x0_raw, seeds=None, return_pred=False, t=None, condition=None):
     """The masked x0 loss. Returns (loss, parts, counts): parts = per-field and per-t-bucket detached means, counts the number of valid
     slots each is a mean over (a bucket can be empty: it is not a mean then, and must not be logged). seeds: per-volume seeds
     for the timesteps and the noise (validation); None: the global random stream. return_pred: also the prediction x0_hat
     (B, L, C, H, W, normalized, with its graph) and the timesteps t (B, L), for the rendering loss (diffusion.photom). t: these
-    timesteps (B, L) instead of the schedule's (the noise is still the seeds')."""
+    timesteps (B, L) instead of the schedule's (the noise is still the seeds').
+    condition: None = the training's condition dropout (diffusion.cond_dropout): on the global random stream only (seeds None) with
+    p > 0, each sample's image condition is replaced by the null with probability p (one draw of (B,) uniforms on x0's device, after
+    the timesteps and the noise; with p = 0 nothing is drawn); seeded calls (validations) are conditional. True | False | a (B,)
+    bool tensor (True = that sample conditioned): that, explicitly (e.g. the unconditional branch's validation loss). When a
+    dropout was drawn, parts also holds "cond_drop" (the (B,) bool mask; not a mean: the caller pops it) and the x0 loss over
+    the conditioned / dropped samples' valid slots as "cond_kept" / "cond_dropped" (counts: their slots)."""
     feats = self._feats(image)
     x0 = self.normalize(x0_raw)
     b, l = x0.shape[:2]
@@ -929,12 +1040,25 @@ class GSDiffusionModel(nn.Module):
     t5 = t[:, :, None, None, None]
     a = hit[:, :, None].to(x0.dtype)                                                 # (B, L, 1, H, W): the validity mask
     x_net = self._net_input(a * ((1 - t5) * x0 + t5 * eps) + (1 - a) * eps, a)     # WT Eq. 7: invalid slots see the max noise
-    x0_hat = self._head(feats, x_net, t, self.pack(hit))
+    drop = None
+    if condition is None:
+      if seeds is None and self.cond_dropout_p > 0:   # (p = 0: no draw, the random streams as without dropout)
+        drop = torch.rand(b, device=x0.device) < self.cond_dropout_p                 # (B,) True = the null condition
+      uncond = drop
+    else:
+      uncond = self._uncond(condition, b, x0.device)
+    x0_hat = self._head(feats, x_net, t, self.pack(hit), uncond)
     err = (x0_hat.float() - x0).square()                                            # (B, L, C, H, W)
     valid = a.sum().clamp_min(1)
     loss = (err * a).sum() / (valid * CHANNELS)
     with torch.no_grad():
       parts, counts = {}, {}
+      if drop is not None:
+        parts["cond_drop"] = drop
+        for name, sel in (("cond_kept", ~drop), ("cond_dropped", drop)):
+          m = a * sel[:, None, None, None, None].to(a.dtype)
+          counts[name] = m.sum()
+          parts[name] = ((err * m).sum() / (counts[name].clamp_min(1) * CHANNELS)).detach()
       for name, sl in X0_SLICES.items():
         dim = sl.stop - sl.start
         parts[name] = ((err[:, :, sl] * a).sum() / (valid * dim)).detach()
@@ -949,10 +1073,19 @@ class GSDiffusionModel(nn.Module):
     return loss, parts, counts
 
   @torch.no_grad()
-  def sample(self, image, hit, seeds=None, steps=None, project=None, floor=None):
+  def sample(self, image, hit, seeds=None, steps=None, project=None, floor=None, guidance=None):
     """20 Euler steps of the flow from pure noise -> the Gaussian dict. The noise of volume i is a function of seeds[i] (default:
     eval_seed + i): reproducible. Invalid slots stay at the noise. project: applied to every step's x0 prediction before it is used
-    (e.g. format_projection; the last step's x0 prediction is the output)."""
+    (e.g. format_projection; the last step's x0 prediction is the output).
+    guidance: classifier-free guidance (diffusion.cfg's keys; None: the model's, self.guidance). scale 1: the conditional
+    prediction only (one forward per step, as without guidance); otherwise, at the steps whose t is in interval (inclusive):
+    x0_u + scale * (x0_c - x0_u) on the raw (normalized) predictions of fields (null: all), before project and the decode's clamp
+    (scale 0 on all fields: the unconditional prediction, one forward); outside the interval: the conditional prediction."""
+    if guidance is None:
+      guidance = self.guidance
+    else:
+      guidance = normalize_guidance(guidance)
+      warn_guidance_without_dropout(guidance, self.cond_dropout_p)
     steps = steps or self.steps
     feats = self._feats(image)
     b, l = hit.shape[:2]
@@ -964,7 +1097,12 @@ class GSDiffusionModel(nn.Module):
     pack = self.pack(hit)   # the same tokens at every step
     for i in range(steps):
       t = ts[i]
-      x0_hat = self._head(feats, self._net_input(a * x + (1 - a) * eps, a), t.expand(b, l), pack).float()
+      x_net = self._net_input(a * x + (1 - a) * eps, a)
+      lo, hi = guidance["interval"]
+      if guidance["scale"] != 1.0 and lo <= float(t) <= hi:
+        x0_hat = self._guided_x0(feats, x_net, t.expand(b, l), pack, guidance)
+      else:
+        x0_hat = self._head(feats, x_net, t.expand(b, l), pack).float()
       if project is not None:
         x0_hat = project(x0_hat)
       x = x - (t - ts[i + 1]) * (x - x0_hat) / t.clamp(min=T_MIN_CLAMP)
