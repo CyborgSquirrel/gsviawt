@@ -371,6 +371,24 @@ diffusion:
   # the validation's index and the set: paired across runs and resumes), logged as
   # <set>/<name>/loss/photom_t<t> (t = 1: the 1-step sample, from pure noise). Empty / null: off
   val_t: [0.25, 0.5, 0.75, 1.0]
+  # The x_t reliance probe (GSDiffusionModel.xt_probe): does the x0 prediction use its noisy input x_t, or has it collapsed into an
+  # image -> 3DGS lookup? Every validation (small / big, raw / ema, Lightning's own; every set) takes the first `volumes` volumes of
+  # each set in its own seeded order and, at each shared t of `ts` (every layer at t), noises them with their seeded noise
+  # (eval_seed: the validation loss's) and logs <set>/<name>/probe/t<t>/:
+  #   err_model  the masked x0 error of the prediction (normalized units, per valid slot and channel)
+  #   err_copy   the error of c(t) x_t, c = (1-t) / ((1-t)^2 + t^2): what x_t alone gives (t^2 / ((1-t)^2 + t^2) for unit-variance data)
+  #   ratio      err_model / err_copy (of the means over the volumes): <~ 1 at low t when the model uses x_t; >> 1 when it ignores it
+  #   gain       the prediction's response to a small seeded perturbation of x_t (of size gain_delta, two fp32 forwards):
+  #              -> 1 / (1-t) ~ 1 at low t when it uses x_t, -> 0 at t = 1; ~ 0 at every t for an image-only lookup
+  # and probe/n_volumes. Logging only: no rendering, no change to any other logged number, the training or its random streams.
+  # Cost per probed volume: 1 backbone pass + 3 head forwards per t (2 of them in fp32). A run config without the key (a saved
+  # config of a run from before it, e.g. loaded by eval_diffusion.py): off. A resume composed from this file (ckpt_path=...) gets it
+  # on: it only adds probe/ keys (diffusion.probe.enabled=false to keep an old run's logs exactly as they were)
+  probe:
+    enabled: true
+    ts: [1.0, 0.5, 0.2, 0.1, 0.02]
+    volumes: 8                 # per set and validation (fewer when the validation scores fewer)
+    gain_delta: 0.01
   schedule:
     standard: {mu: 0.0, sigma: 1.0}                         # layers 1.. (logit-normal)
     plateau: {mu: 0.0, sigma: 1.0, mirror: false}           # layer 0: logit-normal up to its mode t* = 0.5, then flat towards t = 1
