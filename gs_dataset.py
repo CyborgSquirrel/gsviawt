@@ -47,13 +47,11 @@ import torch
 from einops import rearrange
 from torch.utils.data import Dataset, random_split
 
+# camera helpers: cameras.py; re-exported here, the old import path (`from gs_dataset import OPENGL_TO_OPENCV`, ...)
+from cameras import OPENGL_TO_OPENCV, dense_unproject_camera, relative_viewmats  # noqa: F401
 from util import intrinsics_name, resize_depth_nearest
 
 log = logging.getLogger(__name__)
-
-# Camera-local axis flip: Blender/OpenGL (X right, Y up, Z back) <-> OpenCV
-# (X right, Y down, Z forward). Same flip module.py / debug_pointcloud.py use.
-OPENGL_TO_OPENCV = np.diag([1.0, -1.0, -1.0, 1.0]).astype(np.float32)
 
 # z-score constants for camera-space xyz (WT's own training distribution,
 # from the finetune-wt-lora worktree's wt_dataset.xyz_to_x0), derived from
@@ -63,31 +61,6 @@ OPENGL_TO_OPENCV = np.diag([1.0, -1.0, -1.0, 1.0]).astype(np.float32)
 # analogue of Flash3D's "divide depth by 20" trick.
 XYZ_MEAN = np.array([-0.0024, -0.0040, 1.9043], dtype=np.float32)
 XYZ_STD = np.array([0.281, 0.316, 0.706], dtype=np.float32)
-
-
-def dense_unproject_camera(depth_peel, intrinsics):
-  """depth_peel: (H,W,L) f32, <=0/NaN = no hit. intrinsics: (3,3), this
-  view's own camera. Returns (xyz_cam, hit): xyz_cam is (H,W,L,3) f32 in
-  this camera's own OpenCV frame (X right, Y down, Z forward), NaN where not
-  hit; hit is (H,W,L) bool. Same ray formula as
-  debug_pointcloud.unproject_depth_peel(space="camera"), densified."""
-  h, w, l = depth_peel.shape
-  uu, vv = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
-  pixels_h = np.stack([uu + 0.5, vv + 0.5, np.ones_like(uu)], axis=-1)   # (H,W,3), pixel centres
-  rays_cv = pixels_h @ np.linalg.inv(intrinsics).T                  # (H,W,3), unit-depth rays
-  hit = depth_peel > 0                                              # NaN and legacy -1.0 both fail
-  xyz_cam = rays_cv[:, :, None, :] * depth_peel[:, :, :, None]      # (H,W,L,3)
-  return np.where(hit[..., None], xyz_cam, np.nan).astype(np.float32), hit
-
-
-def relative_viewmats(poses):
-  """poses: (V,4,4) camera-to-world, OpenGL axes, poses[0] = the source
-  view. Returns viewmats: (V,4,4) world-to-camera in OpenCV convention, but
-  with "world" redefined as the source camera's own frame -- viewmats[0] is
-  always the identity matrix."""
-  c2w_cv = poses @ OPENGL_TO_OPENCV                # (V,4,4), still world-referenced
-  rel_c2w = np.linalg.inv(c2w_cv[0]) @ c2w_cv       # (V,4,4), source-frame-referenced
-  return np.linalg.inv(rel_c2w).astype(np.float32)  # (V,4,4), viewmats[0] == eye(4)
 
 
 def xyz_to_x0(xyz):

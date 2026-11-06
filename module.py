@@ -22,9 +22,11 @@ a distance (each entry includes its own "scene_scale") and
 the already-world-space Gaussians.
 
 Also holds the depth-peel Gaussian-seeding helpers (SH_C0/init_gaussians/
-make_viewmats/_scatter_grid) that used to live in the deleted fit_gsplat.py,
-now used by fit_3dgs.py's layered mode, anchored_3dgs.py, orbit_video.py and
-gs_diffusion.py.
+_scatter_grid) that used to live in the deleted fit_gsplat.py, now used by
+fit_3dgs.py's layered mode, anchored_3dgs.py, orbit_video.py and
+gs_diffusion.py. The camera helpers (OPENGL_TO_OPENCV, WORLD_UP, look_at_c2w,
+make_viewmats, unproject_depth_peel) live in cameras.py and are re-exported
+here.
 """
 
 import collections
@@ -52,7 +54,8 @@ from torch.optim import Optimizer
 
 import wandb
 
-from debug_pointcloud import unproject_depth_peel
+# camera helpers: cameras.py; re-exported here, the old import path (`from module import make_viewmats`, ...)
+from cameras import OPENGL_TO_OPENCV, WORLD_UP, look_at_c2w, make_viewmats, unproject_depth_peel  # noqa: F401
 
 log = logging.getLogger(__name__)
 
@@ -63,28 +66,6 @@ log = logging.getLogger(__name__)
 # double-register it and raise.
 if not OmegaConf.has_resolver("eval"):
   OmegaConf.register_new_resolver("eval", eval)
-
-# Camera-local axis flip: Blender/OpenGL (X right, Y up, Z back) <-> OpenCV
-# (X right, Y down, Z forward). Canonical copy -- the deleted fit_gsplat.py and
-# gs_dataset.py each used to define their own identical constant.
-OPENGL_TO_OPENCV = np.diag([1.0, -1.0, -1.0, 1.0]).astype(np.float32)
-WORLD_UP = np.array([0.0, 0.0, 1.0], np.float32)  # Blender / render_objaverse is Z-up
-
-
-def look_at_c2w(eye, target, up=WORLD_UP):
-  """OpenGL camera-to-world (X right, Y up, -Z forward) looking from `eye`
-  at `target`. Canonical copy -- the deleted fit_gsplat.py had its own; orbit_video.py
-  still has a near-copy (bare-norm divide, a different fallback up)."""
-  z = eye - target
-  z = z / (np.linalg.norm(z) + 1e-8)
-  if abs(np.dot(z, up)) > 0.999:
-    up = np.array([0.0, 1.0, 0.0], np.float32) if abs(up[1]) < 0.9 else np.array([1.0, 0.0, 0.0], np.float32)
-  x = np.cross(up, z); x = x / (np.linalg.norm(x) + 1e-8)
-  y = np.cross(z, x)
-  c2w = np.eye(4, dtype=np.float32)
-  c2w[:3, 0], c2w[:3, 1], c2w[:3, 2], c2w[:3, 3] = x, y, z, eye
-  return c2w
-
 
 # ---------------------------------------------------------------------------
 # depth-peel Gaussian seeding -- shared by fit_3dgs.py's layered mode,
@@ -140,13 +121,6 @@ def init_gaussians(depth_primary, K_primary, pose_primary, image_primary,
                                            # here to justify a logit representation at all
     "u": u.astype(np.int64), "v": v.astype(np.int64), "layer": layer.astype(np.int64),
   }
-
-
-def make_viewmats(poses):
-  """poses: (V,4,4) camera-to-world, OpenGL cam axes. Returns (V,4,4)
-  world-to-camera in OpenCV convention -- what gsplat wants."""
-  c2w_cv = poses @ OPENGL_TO_OPENCV
-  return np.linalg.inv(c2w_cv).astype(np.float32)
 
 
 def _scatter_grid(flat, v, u, layer, H, W, L):
