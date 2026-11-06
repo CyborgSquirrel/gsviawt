@@ -35,7 +35,7 @@ def per_set(cfg, key, title):
   return [line(f"{title}: {SET_TITLES.get(s, s)}", f"{s}/{cfg.validation}/{key}", cfg.x_axis) for s in cfg.sets]
 
 
-def section(name, panels, columns=3, is_open=True):
+def section(name, panels, columns, is_open=True):
   return ws.Section(name=name, panels=panels, is_open=is_open,
                     layout_settings=ws.SectionLayoutSettings(columns=columns, rows=max(1, -(-len(panels) // columns))))
 
@@ -44,23 +44,24 @@ def build(cfg):
   x, sm = cfg.x_axis, cfg.train_smoothing
   ts = [f"{float(t):g}" for t in cfg.val_t]
   probe_ts = [f"{float(t):g}" for t in cfg.probe_ts]
+  n = len(cfg.sets)   # the per-set sections: one column per set, so each row is one metric across the sets
   sections = [
     section("Samples: full rollout (comparable across runs)",
             per_set(cfg, "loss/photom_full_fg_psnr", "fg PSNR")
             + per_set(cfg, "loss/photom_full_psnr", "PSNR")
-            + per_set(cfg, "loss/photom_full_bg_l1", "bg L1 (haze)")),
+            + per_set(cfg, "loss/photom_full_bg_l1", "bg L1 (haze)"), n),
     section("One step at a shared t (comparable across runs; fg PSNR, t = 1: 1-step sample)",
             [line(f"t = {t}: {SET_TITLES.get(s, s)}", f"{s}/{cfg.validation}/loss/photom_t{t}_fg_psnr", x)
-             for t in ts for s in cfg.sets]),
+             for t in ts for s in cfg.sets], n),
     section("x_t reliance (diffusion.probe; one line per t. Uses x_t: ratio <~ 1 and gain -> ~1 at low t, gain -> 0 at t = 1. "
             "Image lookup: ratio >> 1, gain ~ 0 everywhere)",
             [line(f"{name}: {SET_TITLES.get(s, s)}", [f"{s}/{cfg.validation}/probe/t{t}/{key}" for t in probe_ts], x, **kw)
              for key, name, kw in (("ratio", "err_model / err_copy (log)", {"log_y": True}), ("gain", "gain", {}))
-             for s in cfg.sets]),
+             for s in cfg.sets], n),
     section("Validation losses (loss/photom: the training's rendering term; loss/x0 and loss/photom follow schedule.phase)",
             per_set(cfg, "loss/photom_full", "full sample L1+D-SSIM")
             + per_set(cfg, "loss/photom", "rendering term")
-            + per_set(cfg, "loss/x0", "x0 loss")),
+            + per_set(cfg, "loss/x0", "x0 loss"), n),
     section("Training", [
       line("train/loss (weighted total)", "train/loss", x, sm),
       line("train/loss/x0 (unweighted)", "train/loss/x0", x, sm),
@@ -84,7 +85,7 @@ def build(cfg):
       wr.MediaBrowser(title="scale layers", media_keys=[f"{s}/scale_layers" for s in ("train", *cfg.sets)]),
     ], columns=2, is_open=False),
     section("Bookkeeping (validation sizes, standard error of the full-sample loss)",
-            per_set(cfg, "n_volumes", "volumes scored") + per_set(cfg, "loss_se", "SE of loss"), is_open=False),
+            per_set(cfg, "n_volumes", "volumes scored") + per_set(cfg, "loss_se", "SE of loss"), n, is_open=False),
   ]
   return ws.Workspace(
     entity=cfg.entity, project=cfg.project, name=cfg.name, sections=sections,
