@@ -135,6 +135,8 @@ def main(cfg):
       run.diffusion.grids_dir = cfg.grids_dir
     if cfg.source_h5 is not None:
       run.diffusion.source_h5 = cfg.source_h5
+    if cfg.val_sets is not None and "val_train" in cfg.val_sets:
+      run.data.val_train = True                   # scoreable for a run trained without data.val_train too
   if not train_gs.diffusion_enabled(run):
     raise SystemExit("not a diffusion-mode run")
   dm = train_gs.GSDataModule(run)

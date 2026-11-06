@@ -19,7 +19,8 @@ from omegaconf import DictConfig
 
 FIELDS = ("opacity", "scale", "rotation", "sh_dc", "offset")      # gs_diffusion.FIELDS (not imported: keeps this torch-free)
 T_BUCKETS = ("t0-0.25", "t0.25-0.5", "t0.5-0.75", "t0.75-1")
-SET_TITLES = {"val_meshes": "unseen meshes", "val_views_sval": "unseen views (sval)", "val_views_strain": "unseen views (strain)"}
+SET_TITLES = {"val_meshes": "unseen meshes", "val_views_sval": "unseen views (sval)", "val_views_strain": "unseen views (strain)",
+              "val_train": "training volumes"}
 
 
 def line(title, ys, x, smoothing=0.0, **kw):

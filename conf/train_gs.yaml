@@ -77,6 +77,20 @@ data:
   # (model.rgb_patch).
   input: features           # features | image | features_image (both: model.rgb_patch)
   image_size: 504           # side of the image fed to the backbone (input: image), a multiple of 14
+  # Restrict the volumes (source views) trained and validated on with a Python/polars expression over the render catalogue: it
+  # is evaluated with `df` (the catalogue dataframe: mesh_id, view_idx, path, ...; plus a row-index column it must keep) and `pl`
+  # (polars) in scope and returns some of df's rows, e.g. one volume for an overfitting run:
+  #   data.catalog_transform='df.filter(pl.col("mesh_id") == 13).filter(pl.col("view_idx") == 12)'
+  # The splits (mesh_split / view_split), the supervision-view pools and the x0 normalization stats are the full catalogue's, as
+  # without it: only the training set's and each validation set's volumes are cut down to the kept rows (an emptied validation
+  # set is dropped; no training volume left is an error). null = all.
+  catalog_transform: null
+  # Add a validation set "val_train" of the training volumes themselves (after catalog_transform; targets from the training views'
+  # pool, seeded like the other sets): how well the run fits what it trains on.
+  val_train: false
+  # An epoch is this many passes over the training volumes (each access draws its own target views, t and noise), e.g. so a
+  # one-volume run fills a batch and has epochs of many steps. 1 = one pass.
+  repeat: 1
 
 model:
   patch_size: 14            # WT's patch size; head output grid = sqrt(P) * patch_size per side
