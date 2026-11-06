@@ -7,22 +7,24 @@ around it, aimed at the object, writing an H.264 .mp4 (or, with
 
 Two input formats, picked from the file extension:
 
-  *.h5   -- a `fit_gsplat.py` output: `gaussian_means` / `gaussian_scales` /
-            `gaussian_quats` / `gaussian_opacities` / `gaussian_colors` as
+  *.h5   -- a layered-grid .h5 (fit_3dgs.py's `save_output_layered`, the
+            schema the deleted `fit_gsplat.py` wrote): `gaussian_means` /
+            `gaussian_scales` / `gaussian_quats` / `gaussian_opacities` /
+            `gaussian_colors` as
             (H, W, 6, .) grids plus a `layer_valid` mask. Values are already
             activated (world-space means, exp'd scales, sigmoid'd opacity /
             colour, unit quats).
-  *.ply  -- a standard INRIA-format 3DGS point cloud (what `fit_gsplat.py`
+  *.ply  -- a standard INRIA-format 3DGS point cloud (what `fit_3dgs.py`
             also writes, and what most 3DGS viewers eat). Fields are stored
             un-activated: colour = SH_C0 * f_dc + 0.5, opacity = sigmoid,
             scale = exp, rot = normalised quat.
 
-The object from `fit_gsplat` lives near the origin at roughly unit-cube size
+The object of a fit lives near the origin at roughly unit-cube size
 (the renderer normalises it there), so the default orbit circles the origin.
 `look_at: centroid` / an explicit `camera_distance` cover models that don't.
 
 Rendering uses `gsplat.rasterization` with the same OpenGL->OpenCV camera
-convention as `fit_gsplat.make_viewmats`. Config is Hydra (`conf/orbit.yaml`);
+convention as `cameras.make_viewmats`. Config is Hydra (`conf/orbit.yaml`);
 run in the container venv, e.g.
 
     docker exec -w /app/.claude/worktrees/orbit-video gsviawt-app-gpu-1 \\
@@ -53,7 +55,8 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from module import DSSIMLoss, SH_C0, make_viewmats, write_mp4  # noqa: E402
+from cameras import WORLD_UP, make_viewmats  # noqa: E402
+from module import DSSIMLoss, SH_C0, write_mp4  # noqa: E402
 
 import h5py  # noqa: E402
 import hydra  # noqa: E402
@@ -67,7 +70,6 @@ from util import timed  # noqa: E402
 log = logging.getLogger("orbit_video")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-WORLD_UP = np.array([0.0, 0.0, 1.0], np.float32)  # Blender / render_objaverse is Z-up
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +81,7 @@ def _sigmoid(x):
 
 
 def load_h5(path, ds):
-  """fit_gsplat .h5 -> dict of flat, already-activated Gaussian arrays."""
+  """Layered-grid .h5 -> dict of flat, already-activated Gaussian arrays."""
   with h5py.File(path, "r") as f:
     valid = np.asarray(f[ds.valid][:]).astype(bool)          # (H, W, L)
     def flat(name, c):
@@ -138,7 +140,7 @@ def load_model(cfg):
 
 def resolve_mesh_path(cfg):
   """The mesh to compare against, or None for the plain showcase. `auto` reads
-  a .h5 model's `mesh_path` attribute (fit_gsplat records it); an explicit
+  a .h5 model's `mesh_path` attribute (fit_3dgs.save_output_layered records it); an explicit
   path is taken as-is."""
   mp = cfg.get("mesh_path")
   if mp in (None, "null", ""):
@@ -171,7 +173,11 @@ def look_at_c2w(eye, target, up=WORLD_UP):
   `target`, world up = +Z by default. Matches render_objaverse's
   `to_track_quat('-Z','Y')`. `up` can be overridden for callers whose "world"
   isn't Blender's Z-up frame (e.g. train_gs.py's orbit preview, which works
-  entirely within an arbitrary camera's own frame)."""
+  entirely within an arbitrary camera's own frame).
+
+  Not cameras.look_at_c2w (module.py's): this one divides by the bare norm
+  (no +1e-8) and always falls back to up = +Y, so its frames can differ in
+  the last bits -- kept as is, the orbit videos stay reproducible."""
   z = eye - target                                        # camera +Z points back
   z /= np.linalg.norm(z)
   up = up if abs(np.dot(z, up)) < 0.999 else np.array([0.0, 1.0, 0.0], np.float32)

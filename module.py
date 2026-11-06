@@ -22,8 +22,11 @@ a distance (each entry includes its own "scene_scale") and
 the already-world-space Gaussians.
 
 Also holds the depth-peel Gaussian-seeding helpers (SH_C0/init_gaussians/
-make_viewmats/_scatter_grid) that used to live in fit_gsplat.py, now used
-by fit_3dgs.py's layered mode, orbit_video.py and gs_decoder.py.
+_scatter_grid) that used to live in the deleted fit_gsplat.py, now used by
+fit_3dgs.py's layered mode, anchored_3dgs.py, orbit_video.py and
+gs_diffusion.py. The camera helpers (OPENGL_TO_OPENCV, WORLD_UP, look_at_c2w,
+make_viewmats, unproject_depth_peel) live in cameras.py and are re-exported
+here.
 """
 
 import collections
@@ -51,52 +54,27 @@ from torch.optim import Optimizer
 
 import wandb
 
-from debug_pointcloud import unproject_depth_peel
+# camera helpers: cameras.py; re-exported here, the old import path (`from module import make_viewmats`, ...)
+from cameras import OPENGL_TO_OPENCV, WORLD_UP, look_at_c2w, make_viewmats, unproject_depth_peel  # noqa: F401
+# SH_C0 lives in gaussians.py; re-exported here (`from module import SH_C0`)
+from gaussians import SH_C0, logit  # noqa: F401
+from util import register_eval_resolver
 
 log = logging.getLogger(__name__)
 
-# Both scripts' conf/*.yaml lean on this for callback/trainer fields that are
-# a small expression over another field rather than a literal (e.g.
-# "${eval:'${iters} // 50'}") -- registered here, once, so importing either
-# script (both import this module, directly or via gs_decoder.py) can't
-# double-register it and raise.
-if not OmegaConf.has_resolver("eval"):
-  OmegaConf.register_new_resolver("eval", eval)
-
-# Camera-local axis flip: Blender/OpenGL (X right, Y up, Z back) <-> OpenCV
-# (X right, Y down, Z forward). Canonical copy -- fit_gsplat.py and
-# gs_dataset.py each used to define their own identical constant.
-OPENGL_TO_OPENCV = np.diag([1.0, -1.0, -1.0, 1.0]).astype(np.float32)
-WORLD_UP = np.array([0.0, 0.0, 1.0], np.float32)  # Blender / render_objaverse is Z-up
-
-
-def look_at_c2w(eye, target, up=WORLD_UP):
-  """OpenGL camera-to-world (X right, Y up, -Z forward) looking from `eye`
-  at `target`. Canonical copy -- fit_gsplat.py and orbit_video.py each used
-  to define their own identical function."""
-  z = eye - target
-  z = z / (np.linalg.norm(z) + 1e-8)
-  if abs(np.dot(z, up)) > 0.999:
-    up = np.array([0.0, 1.0, 0.0], np.float32) if abs(up[1]) < 0.9 else np.array([1.0, 0.0, 0.0], np.float32)
-  x = np.cross(up, z); x = x / (np.linalg.norm(x) + 1e-8)
-  y = np.cross(z, x)
-  c2w = np.eye(4, dtype=np.float32)
-  c2w[:3, 0], c2w[:3, 1], c2w[:3, 2], c2w[:3, 3] = x, y, z, eye
-  return c2w
-
+# Both scripts' conf/*.yaml lean on the `eval` resolver for callback/trainer
+# fields that are a small expression over another field rather than a literal
+# (e.g. "${eval:'${iters} // 50'}") -- registered on import (see util.py).
+register_eval_resolver()
 
 # ---------------------------------------------------------------------------
 # depth-peel Gaussian seeding -- shared by fit_3dgs.py's layered mode,
-# orbit_video.py and gs_decoder.py (formerly fit_gsplat.py's own, moved here
-# when that script was deleted)
+# anchored_3dgs.py, orbit_video.py and gs_diffusion.py (formerly
+# fit_gsplat.py's own, moved here when that script was deleted)
 # ---------------------------------------------------------------------------
 
-SH_C0 = 0.28209479177387814  # SH band-0 constant, for RGB <-> sh0 in the .ply
-
-
 def _logit(x, eps=1e-4):
-  x = np.clip(x, eps, 1.0 - eps)
-  return np.log(x / (1.0 - x))
+  return logit(x, eps)
 
 
 def init_gaussians(depth_primary, K_primary, pose_primary, image_primary,
@@ -139,13 +117,6 @@ def init_gaussians(depth_primary, K_primary, pose_primary, image_primary,
                                            # here to justify a logit representation at all
     "u": u.astype(np.int64), "v": v.astype(np.int64), "layer": layer.astype(np.int64),
   }
-
-
-def make_viewmats(poses):
-  """poses: (V,4,4) camera-to-world, OpenGL cam axes. Returns (V,4,4)
-  world-to-camera in OpenCV convention -- what gsplat wants."""
-  c2w_cv = poses @ OPENGL_TO_OPENCV
-  return np.linalg.inv(c2w_cv).astype(np.float32)
 
 
 def _scatter_grid(flat, v, u, layer, H, W, L):
@@ -768,7 +739,7 @@ class DSSIMLoss(nn.Module):
 
   reduction:
     "mean" (default) -- scalar, averaged over every element. What
-      fit_gsplat.py's single fixed-batch loss wants directly.
+      the deleted fit_gsplat.py's single fixed-batch loss wanted directly.
     "sum"  -- scalar, summed over every element.
     "none" -- per-pixel (N,C,H,W) map, unreduced -- e.g. train_gs.py's
       `_step` needs this to log/split per-source/target-view means itself
@@ -882,8 +853,8 @@ def _completed_steps(trainer, pl_module):
   sit at 0 for 10/10 steps). A module built that way must expose its own
   accurate step_count instead (fit_3dgs.py already tracks one, for its own
   should_stop/LR-schedule/SH-degree-ramp bookkeeping) -- this reads that
-  when present, trainer.global_step otherwise. fit_gsplat.py/train_gs.py
-  both use plain automatic optimization and are unaffected either way."""
+  when present, trainer.global_step otherwise. train_gs.py
+  uses plain automatic optimization and are unaffected either way."""
   if not pl_module.automatic_optimization:
     return int(pl_module.step_count)
   return trainer.global_step
@@ -896,7 +867,7 @@ def _completed_steps(trainer, pl_module):
 # handful of views and log a [GT | render | |diff|] comparison to wandb.
 # What differs per script is how you get from "current state" to actual
 # gsplat.rasterization()-ready Gaussian arrays: train_gs.py runs its model
-# forward + flatten_gaussians on a batch item; fit_gsplat.py just activates
+# forward + flatten_gaussians on a batch item; fit_3dgs.py just activates
 # its own live optimizer params (no model, no batch). What's identical once
 # you have those arrays -- the render call, building the panel image, and
 # logging it -- lives here.
@@ -906,7 +877,7 @@ def _completed_steps(trainer, pl_module):
 # instead of some other callback
 # unconditionally stashing a value onto pl_module every epoch whether or
 # not it's ever read. Each LightningModule (train_gs.py's GSLightningModule,
-# fit_gsplat.py's GSFitLightningModule) implements two methods itself:
+# fit_3dgs.py's Fit3DGSLightningModule) implements two methods itself:
 #   preview_stages() -> the names of the stages that have preview objects:
 #       "train", then each val set
 #   preview_entries(stage, count=1, with_layers=False) -> a GENERATOR of up
@@ -916,7 +887,7 @@ def _completed_steps(trainer, pl_module):
 #    "views": {"viewmat","K","width","height","gt_rgb"},
 #    "mesh_index": int (optional), "gauss_layers": {...} (optional)}
 # (gauss arrays already flattened/activated -- exactly what render() already
-# needs in fit_gsplat.py, or one flatten_gaussians() yield in train_gs.py;
+# needs in fit_3dgs.py, or one flatten_gaussians() yield in train_gs.py;
 # gt_rgb: (V,C,H,W) in [0,1]; sh_degree: None or an int).
 #
 # Stateless: nothing is cached between calls. A consumer that keeps no entry
@@ -974,7 +945,6 @@ class PanelCallback(pl.Callback):
     if not self.trigger.due(trainer, pl_module, batch_idx):
       return
     mode = "step"
-    n = _completed_steps(trainer, pl_module)  # count of COMPLETED optimizer steps
     stages = None  # every stage the module has
 
     if pl_module.logger is None:
@@ -1066,7 +1036,6 @@ class ScaleLayersCallback(pl.Callback):
     if not self.trigger.due(trainer, pl_module, batch_idx):
       return
     mode = "step"
-    n = _completed_steps(trainer, pl_module)  # count of COMPLETED optimizer steps
     stages = None  # every stage the module has
 
     if pl_module.logger is None:
@@ -1093,7 +1062,7 @@ class ScaleLayersCallback(pl.Callback):
 def write_mp4(frames, path, fps, crf):
   """H.264 .mp4 via imageio's ffmpeg backend (imageio-ffmpeg ships a static
   binary -- nothing needed on the system PATH). Canonical copy -- orbit_video.py
-  and fit_gsplat.py both used to define their own identical version of this;
+  and the deleted fit_gsplat.py both used to define their own identical version of this;
   they now import it from here."""
   import imageio.v2 as imageio
   writer = imageio.get_writer(

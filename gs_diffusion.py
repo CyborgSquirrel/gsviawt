@@ -1,7 +1,7 @@
 """Diffusion mode of train_gs.py: a diffusion model over the fitted layered 3DGS grids (World Tracing's recipe).
 
 The data are fit_3dgs.py `gaussian_layout=layered` fits, one finalized grid .h5 per source view (see
-bla/finalize_fit_dataset.py: `mesh<M>_view<V>.h5`, (H, W, 6, .) arrays, NaN where a slot has no Gaussian). Gaussian POSITIONS come
+finalize_fit_dataset.py: `mesh<M>_view<V>.h5`, (H, W, 6, .) arrays, NaN where a slot has no Gaussian). Gaussian POSITIONS come
 from the source view's point cloud (the depth peel, as everywhere in train_gs.py); the model generates, per slot, 14 channels
 (CHANNELS), normalized per channel (x0):
     opacity (1)   logit, clamped to +-7
@@ -22,7 +22,6 @@ of 64 for the heads).
 
 import contextlib
 import glob
-import json
 import logging
 import math
 import os
@@ -40,15 +39,18 @@ from einops import rearrange
 from torch.utils.data import Dataset
 
 from diffusion_schedule import LayerAwareSchedule
+# the x0 layout, SH_C0 and quat_forms live in gaussians.py (re-exported here: gs_diffusion.CHANNELS, gs_diffusion.SCALE, ...)
+from gaussians import SH_C0, X0_CHANNELS, X0_DIMS, X0_FIELDS, X0_SLICES, quat_forms  # noqa: F401
 from gs_dataset import OPENGL_TO_OPENCV, rotate_quats_wxyz
 from gs_decoder import AttentionBlock, apply_rope, rope_cos_sin
-from module import SH_C0
+from util import register_eval_resolver
 
 log = logging.getLogger(__name__)
 
-FIELDS = ("opacity", "scale", "rotation", "sh_dc", "offset")
-DIMS = (1, 3, 4, 3, 3)
-CHANNELS = sum(DIMS)   # 14
+# the run configs' ${eval:...} fields (module.py registered it when this module still imported it, for SH_C0)
+register_eval_resolver()
+
+FIELDS, DIMS, CHANNELS = X0_FIELDS, X0_DIMS, X0_CHANNELS   # 14 channels
 OPACITY_LOGIT_CLAMP = 7.0
 T_MIN_CLAMP = 0.05     # WT's: the x0 -> velocity conversion divides by max(t, T_MIN_CLAMP)
 
@@ -109,13 +111,6 @@ def normalize_encoding(encoding):
   if e["scale_floor_mode"] not in SCALE_FLOOR_MODES:
     raise ValueError(f"scale_floor_mode must be one of {SCALE_FLOOR_MODES}, got {e['scale_floor_mode']!r}")
   return e
-
-
-def quat_forms(q):
-  """(N, 4) wxyz -> (N, 4 forms, 4): q times 1, i, j, k -- the same Gaussian with two of its axes flipped (a 180 degree turn about
-  one of its own axes). The 4 forms are exactly the rotations that leave an ellipsoid (with fixed axis order) unchanged."""
-  w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-  return np.stack([q, np.stack([-x, w, z, -y], 1), np.stack([-y, -z, w, x], 1), np.stack([-z, y, -x, w], 1)], 1)
 
 
 def set_rot_form(q, rot_form, rng=None):
@@ -200,7 +195,7 @@ def encode_grid(grid, source, scale_order=None, scale_floor_px=None, rot_form="k
   return x0                                                          # (CHANNELS, L, H, W)
 
 
-SCALE, ROTATION, OFFSET = (slice(o, o + d) for o, d in zip(np.cumsum((0,) + DIMS)[[1, 2, 4]], DIMS[1:2] + DIMS[2:3] + DIMS[4:5]))
+SCALE, ROTATION, OFFSET = X0_SLICES["scale"], X0_SLICES["rotation"], X0_SLICES["offset"]
 _SCALE_IDX = torch.arange(SCALE.start, SCALE.stop)
 
 
@@ -305,8 +300,7 @@ def format_projection(mean, std, hit, anchor_z, fx, scale_sort=False, scale_floo
     raise NotImplementedError("format_projection: quat=keep with rot_form canonical")
   if scale_order is not None:
     scale_sort = scale_order == "sorted"
-  o = np.cumsum((0,) + DIMS)
-  sc, ro = slice(int(o[1]), int(o[2])), slice(int(o[2]), int(o[3]))   # the scale and rotation channels
+  sc, ro = SCALE, ROTATION   # the scale and rotation channels
 
   def project(x0):
     x = x0.clone()
@@ -326,14 +320,13 @@ def format_projection(mean, std, hit, anchor_z, fx, scale_sort=False, scale_floo
     else:
       q = torch.where(q[:, :1] < 0, -q, q)
     if rot_form == "canonical":   # q times 1, i, j, k: the same Gaussian; keep the one with the largest |w|
-      w, x_, y, z = q.unbind(-1)
-      forms = torch.stack([q, torch.stack([-x_, w, z, -y], 1), torch.stack([-y, -z, w, x_], 1), torch.stack([-z, y, -x_, w], 1)], 1)
+      forms = quat_forms(q)
       q = forms[torch.arange(len(q), device=q.device), forms[:, :, 0].abs().argmax(1)]
       q = torch.where(q[:, :1] < 0, -q, q)
     if quat == "keep":   # as predicted, but where the axes were reordered: the permuted rotation at the predicted length
       q = torch.where(moved[:, None], q * q_raw.norm(dim=1, keepdim=True), q_raw)
     if scale_floor_px is not None:
-      z = anchor_z.expand(*v.shape)[v].float() + raw[:, :, int(o[4]) + 2].permute(0, 1, 2, 3)[v].float()   # the mean's depth, as encode_grid
+      z = anchor_z.expand(*v.shape)[v].float() + raw[:, :, OFFSET.start + 2].permute(0, 1, 2, 3)[v].float()   # the mean's depth, as encode_grid
       floor = torch.log(float(scale_floor_px) * z.clamp_min(1e-3) / float(fx))   # (a wild predicted offset must not make it NaN)
       s = torch.maximum(s, floor[:, None])
     out = raw.permute(0, 1, 3, 4, 2).clone()                          # (B, L, H, W, C)
@@ -947,9 +940,9 @@ class GSDiffusionModel(nn.Module):
     loss = (err * a).sum() / (valid * CHANNELS)
     with torch.no_grad():
       parts, counts = {}, {}
-      for name, sl in zip(FIELDS, np.cumsum((0,) + DIMS)[:-1].tolist()):
-        dim = DIMS[FIELDS.index(name)]
-        parts[name] = ((err[:, :, sl:sl + dim] * a).sum() / (valid * dim)).detach()
+      for name, sl in X0_SLICES.items():
+        dim = sl.stop - sl.start
+        parts[name] = ((err[:, :, sl] * a).sum() / (valid * dim)).detach()
         counts[name] = valid
       for lo, hi in ((0.0, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 1.01)):
         in_bucket = a * ((t5 >= lo) & (t5 < hi)).to(a.dtype)

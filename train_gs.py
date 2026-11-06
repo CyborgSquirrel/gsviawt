@@ -12,8 +12,12 @@ anchored to the source view's own depth-peel point cloud (see gs_dataset.py's
 dense_unproject_camera); with model.predict_mean_offset the head also
 predicts a residual offset on top of that anchor (see flatten_gaussians).
 
-For now this is overfitting only: data.item picks ONE row of the features h5
-(gs_dataset.WTFeatureDataset) and the model trains on it alone.
+data.item picks the rows of the features h5 the datasets hold (one row, a
+list of rows, or null for all of them; gs_dataset.WTFeatureDataset), split
+into train/val by data.mesh_split / data.view_split. With model/backbone set
+(data.input=image) the head's input is the source image instead of cached
+features, and with diffusion.enabled the model is gs_diffusion.py's
+diffusion model over fitted layered 3DGS grids.
 
 Training objective (Flash3D's cross-view photometric setup): decode the
 source view's Gaussians, render them into the source view itself
@@ -32,8 +36,8 @@ Usage:
     docker exec -w /app gsviawt-app-gpu-1 /home/user/venv/bin/python train_gs.py \\
         ckpt_path=/app/outputs/3dgs-model-2026-09-01_12-00-00/final.ckpt
 
-gsplat JIT-compiles CUDA kernels on first import; see _setup_cuda_toolchain
-(copied from fit_gsplat.py, which needs the same env setup).
+gsplat JIT-compiles CUDA kernels on first import; the CUDA toolchain
+it needs is set up at the image level (see Dockerfile).
 """
 
 import contextlib as ctl
@@ -59,9 +63,8 @@ from torch.utils.data import ConcatDataset, DataLoader
 import wandb
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
-from gs_dataset import (OPENGL_TO_OPENCV, H5Catalog, WTFeatureDataset,  # noqa: E402
-                        _EmptyDataset, render_catalog, rotate_quats_wxyz,
-                        sample_matching_sources)
+from gs_dataset import (OPENGL_TO_OPENCV, WTFeatureDataset, _EmptyDataset,  # noqa: E402
+                        render_catalog, rotate_quats_wxyz, sample_matching_sources)
 from gs_decoder import PatchGaussianHead  # noqa: E402
 import gs_diffusion  # noqa: E402
 from module import (DSSIMLoss, Events, ProgressWandbLogger, SameDirCheckpointIO, TrainClock, _completed_steps,  # noqa: E402
@@ -238,7 +241,6 @@ def model_forward(
   model,
   batch,
   *,
-  need_flat_gauss: bool=False,
   need_render: bool=False,
   render_view_idx = None,
   bg_colors = None,
@@ -259,14 +261,6 @@ def model_forward(
   # render 3DGS if necessary
   if need_render:
     rvi = render_view_idx
-
-    # TODO: overrides
-    # gauss_render = gauss_pred
-    # gt = item.get("ground_truth")
-    # if gt is not None:
-    #   gauss_render = apply_ground_truth_overrides(gauss, gt, hit, predict_params, device)
-    # src = item["source"]
-    # hit = src["hit"].to(device)
 
     pred_rgb = []
     pred_alpha = []
@@ -369,11 +363,11 @@ def flatten_gaussians(b, gauss, xyz_cam, hit):
     scale_flat    = rearrange(gauss["scale"]   [idx], "l c h w -> (l h w) c")
     rotation_flat = rearrange(gauss["rotation"][idx], "l c h w -> (l h w) c")
     colors_flat   = rearrange(gauss["sh_dc"]   [idx], "l c h w -> (l h w) 1 c")
-    if "sh_rest" in gauss:
-      colors_flat = pack(
+    if "sh_rest" in gauss:   # max_sh_degree > 0: (N, 1 + K, 3), the DC band first
+      colors_flat, _ = pack(
         [
-          colors_flat[idx],
-          rearrange(gauss["sh_rest"], "l (k c) h w -> (l h w) k c", c=3)
+          colors_flat,
+          rearrange(gauss["sh_rest"][idx], "l (k c) h w -> (l h w) k c", c=3)
         ],
         "n * c",
       )
@@ -950,7 +944,6 @@ class GSLightningModule(pl.LightningModule):
       device=device,
     )
     pred_rgb = model_pred["rgb"]
-    pred_alpha = model_pred["alpha"]
 
     # loss
     loss = torch.zeros((), device=device)
@@ -1044,23 +1037,8 @@ class GSLightningModule(pl.LightningModule):
       loss = loss + cfg.loss.mean_offset_reg_weight * mean_offset_reg
       _log("loss/mean_offset_reg", mean_offset_reg.detach())
 
-    # TODO: skim through this code, fix it up
-    # if need_direct:
-    #   raise NotImplementedError()
-    # if need_direct:
-    #   direct_total, direct_parts = compute_direct_loss(gauss, gt, hit, cfg.loss, device)
-    #   loss = loss + direct_total
-    #   for k, v in direct_parts.items():
-    #     metrics[f"direct_{k}"] = v.detach()
-
     _log("loss", loss.detach())
     out["loss"] = loss
-
-    # TODO: Are any of these metrics actually needed?
-    # metrics["mean_opacity"] = flat["opacities"].mean().detach() if flat["opacities"].numel() else torch.zeros((), device=device)
-    # metrics["mean_scale"] = flat["scales"].mean().detach() if flat["scales"].numel() else torch.zeros((), device=device)
-    # metrics["frac_kept"] = torch.tensor(
-    #   flat["means"].shape[0] / max(1, item["source"]["hit"].numel()), device=device)
 
     return out
 
@@ -1141,8 +1119,8 @@ class GSLightningModule(pl.LightningModule):
       **({"gauss_layers": gauss_layers} if gauss_layers is not None else {}),
       # scene_scale: the source camera's own real distance from the world
       # origin -- module.OrbitCallback's orbit radius (matches
-      # fit_gsplat.py's own scene_scale: norm of a capture camera's own
-      # world position).
+      # the deleted fit_gsplat.py's scene_scale: norm of a capture camera's
+      # own world position).
       "scene_scale": float(np.linalg.norm(pose_gl_np[:3, 3])) or 1.0,
       "views": {
         "viewmat": torch.from_numpy(world_viewmat.astype(np.float32)).to(device),

@@ -30,10 +30,9 @@ import shutil
 import h5py
 import numpy as np
 import torch
-from omegaconf import OmegaConf
 from scipy.spatial import cKDTree
 
-from debug_pointcloud import unproject_depth_peel
+from cameras import unproject_depth_peel
 from fit_3dgs import render, save_output_layered
 from module import DSSIMLoss, OPENGL_TO_OPENCV, SH_C0
 
