@@ -1,7 +1,7 @@
 """Diffusion mode of train_gs.py: a diffusion model over the fitted layered 3DGS grids (World Tracing's recipe).
 
 The data are fit_3dgs.py `gaussian_layout=layered` fits, one finalized grid .h5 per source view (see
-bla/finalize_fit_dataset.py: `mesh<M>_view<V>.h5`, (H, W, 6, .) arrays, NaN where a slot has no Gaussian). Gaussian POSITIONS come
+finalize_fit_dataset.py: `mesh<M>_view<V>.h5`, (H, W, 6, .) arrays, NaN where a slot has no Gaussian). Gaussian POSITIONS come
 from the source view's point cloud (the depth peel, as everywhere in train_gs.py); the model generates, per slot, 14 channels
 (CHANNELS), normalized per channel (x0):
     opacity (1)   logit, clamped to +-7

@@ -2,11 +2,11 @@
 """Faithful 3D Gaussian Splatting optimization on a COLMAP scene (same format
 as gaussian-splatting/ -- images/ + sparse/0/, e.g. data/tandt/truck), ported
 onto this repo's Hydra + Lightning + wandb-logging + shared-callback shape
-(module.py's, originally fit_gsplat.py's) instead of the reference's
+(module.py's) instead of the reference's
 argparse + raw training loop.
 
-Unlike fit_gsplat.py (which seeds one Gaussian per depth-peel pixel, from a
-synthetic render, and never adds to that set), `gaussian_layout: set`
+Unlike `gaussian_layout: layered` below (one Gaussian per depth-peel pixel of
+a synthetic render, never added to), `gaussian_layout: set`
 (the default) ports the REAL algorithm: free `xyz`, the COLMAP sparse point
 cloud as the seed, and full growing/shrinking densification via
 gsplat.strategy.DefaultStrategy -- gsplat's own reimplementation of
@@ -19,13 +19,13 @@ train.py on this exact scene at every checkpoint.
 
 `gaussian_layout: layered` is the other option, for an h5 scene only (see
 load_scene_h5/init_gaussians_layered): seeds one Gaussian per depth-peel
-hit in the primary train view instead, same as fit_gsplat.py's own
+hit in the primary train view instead, with module.init_gaussians'
 seeding (reused verbatim), and disables growing/splitting/pruning
 specifically (refine_start_iter pushed past cfg.iters, so DefaultStrategy's
 own grow/prune gate never trips) -- the Gaussian count stays fixed all
 run, its (u, v, layer) origin in that view's depth grid tracked
 throughout, so the final params can be scattered back into a
-fit_gsplat.py-schema grid .h5 (save_output_layered) alongside the usual
+layered-grid .h5 (save_output_layered) alongside the usual
 flat output. Periodic OPACITY RESET is a separate mechanism (gated by
 reset_every, not refine_start_iter) and is deliberately left running --
 it mutates existing Gaussians' opacity in place, never adds/removes/
@@ -73,7 +73,7 @@ fused-ssim) are vendored or built; this file renders with gsplat only.
 Rendering is gsplat (packed=True, full SH -- sh0/shN, active degree ramped
 by oneupSHdegree() every 1000 iters same as the reference), NOT
 diff-gaussian-rasterization. COLMAP's R/T are already world-to-camera in
-OpenCV convention (unlike fit_gsplat.py's Blender/OpenGL renders), so
+OpenCV convention (unlike render_objaverse.py's Blender/OpenGL renders), so
 getWorld2View2()'s output is used directly as gsplat's viewmat -- no
 OPENGL_TO_OPENCV flip needed here.
 
@@ -83,7 +83,7 @@ between `backward()` and `optimizer.step()` (to grow/shrink the per-Gaussian
 Adam state before the step that would otherwise mismatch shapes), which
 Lightning's automatic-optimization hook ordering doesn't expose. Shares its
 loss/OOM-handling/PanelCallback/OrbitCallback building blocks with
-fit_gsplat.py/train_gs.py via module.py -- see that module's docstring.
+train_gs.py via module.py -- see that module's docstring.
 
 Held-out test views (llffhold=8, same as the reference's --eval) are used
 both as periodic val/loss* metrics during training AND for a final
@@ -98,8 +98,8 @@ Config is Hydra (`conf/fit_3dgs.yaml`); run in the container venv, e.g.
         source_path=/app/data/tandt/truck
 
 gsplat's CUDA kernels are prebuilt into the image (see Dockerfile);
-CUDA_HOME/PATH/TORCH_CUDA_ARCH_LIST are already set at the image level,
-unlike fit_gsplat.py's docstring (stale) suggests.
+CUDA_HOME/PATH/TORCH_CUDA_ARCH_LIST are already set at the image level
+(no runtime toolchain setup is needed).
 """
 
 import json
@@ -177,7 +177,7 @@ def _load_camera(cam_info, resolution):
   (H,W,3) float32 in [0,1] at the resolution actually used, 'alpha' (H,W,1)
   float32, always 1 (real photos have no matte -- see cfg.background), 'viewmat'
   (4,4) world-to-camera (OpenCV convention, straight from getWorld2View2 --
-  COLMAP's R/T already ARE this, unlike fit_gsplat.py's OpenGL renders), 'K'
+  COLMAP's R/T already ARE this, unlike render_objaverse.py's OpenGL renders), 'K'
   (3,3) (assumes centered principal point, same as the reference's FoV-only
   camera model), 'name' (for results.json / logging)."""
   w, h = _resolution_for(cam_info.width, cam_info.height, resolution)
@@ -309,7 +309,7 @@ def load_scene_h5(hdf5_path, train_idx, val_idx, seed):
   filenames to hold out every 8th of here, just a flat view axis.
 
   Camera convention: `camera_pose` is camera-to-world in Blender/OpenGL
-  axes (X right, Y up, Z back), same as gs_dataset.py's/fit_gsplat.py's
+  axes (X right, Y up, Z back), same as gs_dataset.py's/render_objaverse.py's
   renders -- flip via OPENGL_TO_OPENCV then invert (NOT getWorld2View2,
   which assumes COLMAP's own already-OpenCV R/T). Matches
   gaussian-splatting's own readCamerasFromTransforms (`c2w[:3,1:3] *= -1`)
@@ -381,7 +381,7 @@ def load_scene_h5(hdf5_path, train_idx, val_idx, seed):
 # returns the MEAN SQUARED distance to the knn_k nearest neighbours, and the
 # reference takes scale = sqrt(that) -- i.e. the RMS distance, not the
 # arithmetic mean of the (unsquared) distances cKDTree.query returns
-# directly. Already this repo's convention, see fit_gsplat.py's own
+# directly. Already this repo's convention, see module.py's
 # init_gaussians, just squared/rooted correctly here to match distCUDA2).
 # ---------------------------------------------------------------------------
 
@@ -424,7 +424,7 @@ def init_gaussians(pcd, max_sh_degree, init_opacity, knn_k):
 # resolve_views -- explicit if set, else the smallest train index).
 # Every Gaussian keeps a fixed (u, v, layer) origin in that view's depth
 # grid, so the final flat param set can be scattered back into a
-# fit_gsplat.py-schema (H, W, L, .) grid (see save_output_layered) --
+# layered-grid (H, W, L, .) .h5 (see save_output_layered) --
 # that 1:1 correspondence is also exactly why densification (which adds/
 # removes Gaussians) is incompatible with this mode and must stay off.
 #
@@ -432,8 +432,8 @@ def init_gaussians(pcd, max_sh_degree, init_opacity, knn_k):
 # KNN-scale/front-pixel-colour work (same quantity, same seeding scene) --
 # only the colour representation differs downstream: this file trains full
 # SH (sh0/shN, degree ramped), so the seed colour (already plain [0,1]
-# RGB -- no logit representation to round-trip through, unlike the old
-# fit_gsplat.py's own flat-sigmoid colour model) is converted straight to
+# RGB -- no logit representation to round-trip through, unlike the former
+# fit_gsplat.py's flat-sigmoid colour model) is converted straight to
 # sh0 (RGB2SH) with shN left at zero, exactly like init_gaussians()'s own
 # pcd-colour conversion above.
 # ---------------------------------------------------------------------------
@@ -533,15 +533,15 @@ def save_output(path, cfg, params_np, scene_extent, final_loss, n_seeded):
 
 
 def save_output_layered(path, params_np, meta):
-  """gaussian_layout="layered" only: an ADDITIONAL fit_gsplat.py-schema
-  (H, W, L, .) grid .h5 (gaussian_means/scales/quats/opacities/colors +
+  """gaussian_layout="layered" only: an ADDITIONAL layered-grid
+  (H, W, L, .) .h5 (gaussian_means/scales/quats/opacities/colors +
   layer_valid), scattered from the same flat params save_output() also
   wrote flat -- written alongside, never instead of, that flat .h5/.ply
   (which stay format-agnostic and are what the Chamfer/disparity tooling
   already consumes). Lets orbit_video.py and anything else built for
-  fit_gsplat.py's own output consume a layered fit_3dgs.py run unmodified.
+  that grid schema consume a layered fit_3dgs.py run unmodified.
 
-  colors here is DC-only (SH_C0*sh0 + 0.5) -- fit_gsplat.py's grid schema
+  colors here is DC-only (SH_C0*sh0 + 0.5) -- the grid schema
   has no SH slot at all (flat colour), so any learned view-dependent shN
   this file trained is dropped for this specific output; the full-SH
   colour survives in the flat .h5/.ply from save_output()/write_ply()."""
@@ -777,15 +777,13 @@ class Fit3DGSLightningModule(pl.LightningModule):
 
   def _step(self, stage, batch, batch_idx):
     """Shared by training_step/validation_step/run_final_eval (stage ==
-    "train"/"val"/"final_eval") -- fit_gsplat.py/train_gs.py's own
+    "train"/"val"/"final_eval") -- train_gs.py's own
     convention -- one _step, not near-identical copies: that's how
     views_seen ended up logged for train but silently never for val, a
     literal duplicated-code bug, not a deliberate omission. Everything
     that mutates optimizer/strategy state (backward, the 6 optimizers'
     .step(), gsplat's grow/prune/reset, the means-LR/SH-degree schedule,
-    should_stop) stays train-only -- gated by `stage == "train"` inline,
-    same as fit_gsplat.py gates its own train-only bits (random_bg,
-    final_loss) inside its shared _step.
+    should_stop) stays train-only -- gated by `stage == "train"` inline.
 
     final_eval returns a {"PSNR"/"SSIM"/"LPIPS": float} dict instead of
     the usual loss tensor -- it has no Trainer loop driving it (run_final_

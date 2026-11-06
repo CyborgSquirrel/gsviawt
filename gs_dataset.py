@@ -52,7 +52,7 @@ from util import intrinsics_name, resize_depth_nearest
 log = logging.getLogger(__name__)
 
 # Camera-local axis flip: Blender/OpenGL (X right, Y up, Z back) <-> OpenCV
-# (X right, Y down, Z forward). Same flip fit_gsplat.py / debug_pointcloud.py use.
+# (X right, Y down, Z forward). Same flip module.py / debug_pointcloud.py use.
 OPENGL_TO_OPENCV = np.diag([1.0, -1.0, -1.0, 1.0]).astype(np.float32)
 
 # z-score constants for camera-space xyz (WT's own training distribution,
@@ -98,7 +98,7 @@ def rotate_quats_wxyz(q_wxyz, R_transform):
   """q_wxyz: (...,4) numpy wxyz unit quaternions. R_transform: (3,3) rotation
   matrix applied on the left (R_out = R_transform @ R_in). Returns (...,4)
   wxyz, same shape. Uses scipy.spatial.transform.Rotation (already a project
-  dependency -- fit_gsplat.py uses it too) rather than hand-rolled quaternion
+  dependency) rather than hand-rolled quaternion
   composition, which is an easy place to get sign/order conventions wrong.
   Public (not _-prefixed): train_gs.py's _preview_entry() also uses this,
   the opposite direction (camera-to-world instead of world-to-camera), to
@@ -114,18 +114,19 @@ def rotate_quats_wxyz(q_wxyz, R_transform):
 
 
 def _load_ground_truth(gt_h5_path, source_pose_gl):
-  """Reads a fit_gsplat.py-schema .h5 (per-pixel ground-truth Gaussian
-  params from ONE direct 3DGS fit, primary view first). Returns
+  """Reads a fit_gsplat.py-schema .h5 (the deleted fit_gsplat.py's output:
+  per-pixel ground-truth Gaussian params from ONE direct 3DGS fit, primary
+  view first). Returns
   (tensors, attrs).
 
   tensors, in this file's (L,H,W,...) convention (matching xyz_cam/hit):
     opacity (L,H,W) f32 in (0,1); scale (L,H,W,3) f32, absolute world-unit
     size (same units GSModel.forward's own "scale" output already ends up
     in -- no rescaling needed); rotation (L,H,W,4) f32 wxyz, ROTATED INTO
-    THE SOURCE CAMERA'S OWN FRAME (fit_gsplat.py optimizes in true Blender
+    THE SOURCE CAMERA'S OWN FRAME (fit_gsplat.py optimized in true Blender
     world space; this codebase's Gaussians live in the source camera's own
     frame -- see this module's docstring / relative_viewmats); color
-    (L,H,W,3) f32, flat sigmoid RGB (NOT SH -- fit_gsplat.py has no SH>0 at
+    (L,H,W,3) f32, flat sigmoid RGB (NOT SH -- fit_gsplat.py had no SH>0 at
     all); valid (L,H,W) bool; means_world (L,H,W,3) f32, sanity-check-only
     (see _check_ground_truth_consistency), callers should drop it after.
   attrs: {"config": parsed config_json dict, "mesh_index": int, "mesh_path": str}.
@@ -324,10 +325,11 @@ def _decode_view(path, view_idx, images, depth_peel, K_depth, K_image, pose):
 
 
 def _read_primary_from_gauss_h5(f):
-  """f: open h5py.File for a fit_gsplat.py-schema ground-truth .h5. Reads
-  the PRIMARY view's own image/depth/pose/intrinsics directly out of that
-  file's embedded '_used'/'_primary' arrays (index 0 -- fit_gsplat.py always
-  lists the primary view first, config_json["primary"] is its index in the
+  """f: open h5py.File for a fit_gsplat.py-schema ground-truth .h5 (the
+  deleted fit_gsplat.py's output). Reads the PRIMARY view's own
+  image/depth/pose/intrinsics directly out of that file's embedded
+  '_used'/'_primary' arrays (index 0 -- fit_gsplat.py always listed the
+  primary view first, config_json["primary"] is its index in the
   SOURCE render h5, not into these arrays). Same return shape as
   _read_view. This makes a gauss_h5 fully self-sufficient as a training
   source -- no separate photom_h5 render corpus needed -- since it already
@@ -1062,16 +1064,16 @@ class WTFeatureDataset(Dataset):
 
 class GSFixedViewsDataset(Dataset):
   """Always returns the exact same (source, targets) item, no resampling at
-  all -- fit_gsplat.py's primary/secondary terminology applied to train_gs.py,
+  all -- (deleted) fit_gsplat.py's primary/secondary terminology applied to train_gs.py,
   for single-batch overfit sanity checks (does the whole pipeline converge
   on one fixed set of views before trusting it on anything harder). `source`
   and every entry of `targets` must share the same mesh_index, checked at
-  construction (mirrors fit_gsplat.py's own primary/secondary check).
+  construction (mirrors (deleted) fit_gsplat.py's primary/secondary check).
 
   At least one of photom_h5/gauss_h5 must be set (never both -- see
   train_gs.py's config-validation block). photom_h5 (a render_objaverse.py
   h5) supplies the source+target views for photometric supervision, indexed
-  by source_view/target_views. gauss_h5 (a fit_gsplat.py h5) supplies direct
+  by source_view/target_views. gauss_h5 (a (deleted) fit_gsplat.py h5) supplies direct
   Gaussian-parameter ground truth for the source view -- AND, when photom_h5
   is None, is used to build the source view ITSELF too, straight from its
   own embedded primary-view arrays (see _read_primary_from_gauss_h5): it's
@@ -1108,7 +1110,7 @@ class GSFixedViewsDataset(Dataset):
 
     self.ground_truth = None
     if gauss_h5 is not None:
-      # Direct-parameter-supervision ground truth (fit_gsplat.py output) for
+      # Direct-parameter-supervision ground truth ((deleted) fit_gsplat.py output) for
       # the source view. Re-reads/unprojects that one view independently of
       # __getitem__'s own item-building below -- a duplicate I/O given
       # __len__()==1 (this item never changes), not worth sharing state for.
@@ -1169,8 +1171,8 @@ class GSFixedViewsDataset(Dataset):
 
 class GaussH5ValDataset(Dataset):
   """Single-item validation dataset built entirely from a fit_gsplat.py
-  ground-truth .h5's own embedded views: the primary view as source, every
-  one of its embedded secondary views (images_used[1:]/camera_pose_used[1:]/
+  ground-truth .h5's own embedded views (the deleted script's output): the
+  primary view as source, every one of its embedded secondary views (images_used[1:]/camera_pose_used[1:]/
   image_intrinsics_used[1:] -- the exact views fit_gsplat.py itself fit
   against) as photometric targets. ground_truth is attached too, so
   apply_ground_truth_overrides pins whichever fields the model isn't

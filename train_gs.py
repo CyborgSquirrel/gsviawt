@@ -12,8 +12,12 @@ anchored to the source view's own depth-peel point cloud (see gs_dataset.py's
 dense_unproject_camera); with model.predict_mean_offset the head also
 predicts a residual offset on top of that anchor (see flatten_gaussians).
 
-For now this is overfitting only: data.item picks ONE row of the features h5
-(gs_dataset.WTFeatureDataset) and the model trains on it alone.
+data.item picks the rows of the features h5 the datasets hold (one row, a
+list of rows, or null for all of them; gs_dataset.WTFeatureDataset), split
+into train/val by data.mesh_split / data.view_split. With model/backbone set
+(data.input=image) the head's input is the source image instead of cached
+features, and with diffusion.enabled the model is gs_diffusion.py's
+diffusion model over fitted layered 3DGS grids.
 
 Training objective (Flash3D's cross-view photometric setup): decode the
 source view's Gaussians, render them into the source view itself
@@ -32,8 +36,8 @@ Usage:
     docker exec -w /app gsviawt-app-gpu-1 /home/user/venv/bin/python train_gs.py \\
         ckpt_path=/app/outputs/3dgs-model-2026-09-01_12-00-00/final.ckpt
 
-gsplat JIT-compiles CUDA kernels on first import; see _setup_cuda_toolchain
-(copied from fit_gsplat.py, which needs the same env setup).
+gsplat JIT-compiles CUDA kernels on first import; the CUDA toolchain
+it needs is set up at the image level (see Dockerfile).
 """
 
 import contextlib as ctl
@@ -1115,8 +1119,8 @@ class GSLightningModule(pl.LightningModule):
       **({"gauss_layers": gauss_layers} if gauss_layers is not None else {}),
       # scene_scale: the source camera's own real distance from the world
       # origin -- module.OrbitCallback's orbit radius (matches
-      # fit_gsplat.py's own scene_scale: norm of a capture camera's own
-      # world position).
+      # the deleted fit_gsplat.py's scene_scale: norm of a capture camera's
+      # own world position).
       "scene_scale": float(np.linalg.norm(pose_gl_np[:3, 3])) or 1.0,
       "views": {
         "viewmat": torch.from_numpy(world_viewmat.astype(np.float32)).to(device),

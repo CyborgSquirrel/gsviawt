@@ -22,8 +22,9 @@ a distance (each entry includes its own "scene_scale") and
 the already-world-space Gaussians.
 
 Also holds the depth-peel Gaussian-seeding helpers (SH_C0/init_gaussians/
-make_viewmats/_scatter_grid) that used to live in fit_gsplat.py, now used
-by fit_3dgs.py's layered mode, orbit_video.py and gs_decoder.py.
+make_viewmats/_scatter_grid) that used to live in the deleted fit_gsplat.py,
+now used by fit_3dgs.py's layered mode, anchored_3dgs.py, orbit_video.py and
+gs_diffusion.py.
 """
 
 import collections
@@ -64,7 +65,7 @@ if not OmegaConf.has_resolver("eval"):
   OmegaConf.register_new_resolver("eval", eval)
 
 # Camera-local axis flip: Blender/OpenGL (X right, Y up, Z back) <-> OpenCV
-# (X right, Y down, Z forward). Canonical copy -- fit_gsplat.py and
+# (X right, Y down, Z forward). Canonical copy -- the deleted fit_gsplat.py and
 # gs_dataset.py each used to define their own identical constant.
 OPENGL_TO_OPENCV = np.diag([1.0, -1.0, -1.0, 1.0]).astype(np.float32)
 WORLD_UP = np.array([0.0, 0.0, 1.0], np.float32)  # Blender / render_objaverse is Z-up
@@ -72,8 +73,8 @@ WORLD_UP = np.array([0.0, 0.0, 1.0], np.float32)  # Blender / render_objaverse i
 
 def look_at_c2w(eye, target, up=WORLD_UP):
   """OpenGL camera-to-world (X right, Y up, -Z forward) looking from `eye`
-  at `target`. Canonical copy -- fit_gsplat.py and orbit_video.py each used
-  to define their own identical function."""
+  at `target`. Canonical copy -- the deleted fit_gsplat.py had its own; orbit_video.py
+  still has a near-copy (bare-norm divide, a different fallback up)."""
   z = eye - target
   z = z / (np.linalg.norm(z) + 1e-8)
   if abs(np.dot(z, up)) > 0.999:
@@ -87,8 +88,8 @@ def look_at_c2w(eye, target, up=WORLD_UP):
 
 # ---------------------------------------------------------------------------
 # depth-peel Gaussian seeding -- shared by fit_3dgs.py's layered mode,
-# orbit_video.py and gs_decoder.py (formerly fit_gsplat.py's own, moved here
-# when that script was deleted)
+# anchored_3dgs.py, orbit_video.py and gs_diffusion.py (formerly
+# fit_gsplat.py's own, moved here when that script was deleted)
 # ---------------------------------------------------------------------------
 
 SH_C0 = 0.28209479177387814  # SH band-0 constant, for RGB <-> sh0 in the .ply
@@ -768,7 +769,7 @@ class DSSIMLoss(nn.Module):
 
   reduction:
     "mean" (default) -- scalar, averaged over every element. What
-      fit_gsplat.py's single fixed-batch loss wants directly.
+      the deleted fit_gsplat.py's single fixed-batch loss wanted directly.
     "sum"  -- scalar, summed over every element.
     "none" -- per-pixel (N,C,H,W) map, unreduced -- e.g. train_gs.py's
       `_step` needs this to log/split per-source/target-view means itself
@@ -882,8 +883,8 @@ def _completed_steps(trainer, pl_module):
   sit at 0 for 10/10 steps). A module built that way must expose its own
   accurate step_count instead (fit_3dgs.py already tracks one, for its own
   should_stop/LR-schedule/SH-degree-ramp bookkeeping) -- this reads that
-  when present, trainer.global_step otherwise. fit_gsplat.py/train_gs.py
-  both use plain automatic optimization and are unaffected either way."""
+  when present, trainer.global_step otherwise. train_gs.py
+  uses plain automatic optimization and are unaffected either way."""
   if not pl_module.automatic_optimization:
     return int(pl_module.step_count)
   return trainer.global_step
@@ -896,7 +897,7 @@ def _completed_steps(trainer, pl_module):
 # handful of views and log a [GT | render | |diff|] comparison to wandb.
 # What differs per script is how you get from "current state" to actual
 # gsplat.rasterization()-ready Gaussian arrays: train_gs.py runs its model
-# forward + flatten_gaussians on a batch item; fit_gsplat.py just activates
+# forward + flatten_gaussians on a batch item; fit_3dgs.py just activates
 # its own live optimizer params (no model, no batch). What's identical once
 # you have those arrays -- the render call, building the panel image, and
 # logging it -- lives here.
@@ -906,7 +907,7 @@ def _completed_steps(trainer, pl_module):
 # instead of some other callback
 # unconditionally stashing a value onto pl_module every epoch whether or
 # not it's ever read. Each LightningModule (train_gs.py's GSLightningModule,
-# fit_gsplat.py's GSFitLightningModule) implements two methods itself:
+# fit_3dgs.py's Fit3DGSLightningModule) implements two methods itself:
 #   preview_stages() -> the names of the stages that have preview objects:
 #       "train", then each val set
 #   preview_entries(stage, count=1, with_layers=False) -> a GENERATOR of up
@@ -916,7 +917,7 @@ def _completed_steps(trainer, pl_module):
 #    "views": {"viewmat","K","width","height","gt_rgb"},
 #    "mesh_index": int (optional), "gauss_layers": {...} (optional)}
 # (gauss arrays already flattened/activated -- exactly what render() already
-# needs in fit_gsplat.py, or one flatten_gaussians() yield in train_gs.py;
+# needs in fit_3dgs.py, or one flatten_gaussians() yield in train_gs.py;
 # gt_rgb: (V,C,H,W) in [0,1]; sh_degree: None or an int).
 #
 # Stateless: nothing is cached between calls. A consumer that keeps no entry
@@ -1091,7 +1092,7 @@ class ScaleLayersCallback(pl.Callback):
 def write_mp4(frames, path, fps, crf):
   """H.264 .mp4 via imageio's ffmpeg backend (imageio-ffmpeg ships a static
   binary -- nothing needed on the system PATH). Canonical copy -- orbit_video.py
-  and fit_gsplat.py both used to define their own identical version of this;
+  and the deleted fit_gsplat.py both used to define their own identical version of this;
   they now import it from here."""
   import imageio.v2 as imageio
   writer = imageio.get_writer(

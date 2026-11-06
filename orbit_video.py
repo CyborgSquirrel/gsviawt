@@ -7,22 +7,24 @@ around it, aimed at the object, writing an H.264 .mp4 (or, with
 
 Two input formats, picked from the file extension:
 
-  *.h5   -- a `fit_gsplat.py` output: `gaussian_means` / `gaussian_scales` /
-            `gaussian_quats` / `gaussian_opacities` / `gaussian_colors` as
+  *.h5   -- a layered-grid .h5 (fit_3dgs.py's `save_output_layered`, the
+            schema the deleted `fit_gsplat.py` wrote): `gaussian_means` /
+            `gaussian_scales` / `gaussian_quats` / `gaussian_opacities` /
+            `gaussian_colors` as
             (H, W, 6, .) grids plus a `layer_valid` mask. Values are already
             activated (world-space means, exp'd scales, sigmoid'd opacity /
             colour, unit quats).
-  *.ply  -- a standard INRIA-format 3DGS point cloud (what `fit_gsplat.py`
+  *.ply  -- a standard INRIA-format 3DGS point cloud (what `fit_3dgs.py`
             also writes, and what most 3DGS viewers eat). Fields are stored
             un-activated: colour = SH_C0 * f_dc + 0.5, opacity = sigmoid,
             scale = exp, rot = normalised quat.
 
-The object from `fit_gsplat` lives near the origin at roughly unit-cube size
+The object of a fit lives near the origin at roughly unit-cube size
 (the renderer normalises it there), so the default orbit circles the origin.
 `look_at: centroid` / an explicit `camera_distance` cover models that don't.
 
 Rendering uses `gsplat.rasterization` with the same OpenGL->OpenCV camera
-convention as `fit_gsplat.make_viewmats`. Config is Hydra (`conf/orbit.yaml`);
+convention as `module.make_viewmats`. Config is Hydra (`conf/orbit.yaml`);
 run in the container venv, e.g.
 
     docker exec -w /app/.claude/worktrees/orbit-video gsviawt-app-gpu-1 \\
@@ -79,7 +81,7 @@ def _sigmoid(x):
 
 
 def load_h5(path, ds):
-  """fit_gsplat .h5 -> dict of flat, already-activated Gaussian arrays."""
+  """Layered-grid .h5 -> dict of flat, already-activated Gaussian arrays."""
   with h5py.File(path, "r") as f:
     valid = np.asarray(f[ds.valid][:]).astype(bool)          # (H, W, L)
     def flat(name, c):
@@ -138,7 +140,7 @@ def load_model(cfg):
 
 def resolve_mesh_path(cfg):
   """The mesh to compare against, or None for the plain showcase. `auto` reads
-  a .h5 model's `mesh_path` attribute (fit_gsplat records it); an explicit
+  a .h5 model's `mesh_path` attribute (fit_3dgs.save_output_layered records it); an explicit
   path is taken as-is."""
   mp = cfg.get("mesh_path")
   if mp in (None, "null", ""):
