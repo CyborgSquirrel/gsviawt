@@ -43,8 +43,12 @@ from diffusion_schedule import LayerAwareSchedule
 from gaussians import SH_C0, X0_CHANNELS, X0_DIMS, X0_FIELDS, X0_SLICES, quat_forms  # noqa: F401
 from gs_dataset import OPENGL_TO_OPENCV, rotate_quats_wxyz
 from gs_decoder import AttentionBlock, apply_rope, rope_cos_sin
+from util import register_eval_resolver
 
 log = logging.getLogger(__name__)
+
+# the run configs' ${eval:...} fields (module.py registered it when this module still imported it, for SH_C0)
+register_eval_resolver()
 
 FIELDS, DIMS, CHANNELS = X0_FIELDS, X0_DIMS, X0_CHANNELS   # 14 channels
 OPACITY_LOGIT_CLAMP = 7.0

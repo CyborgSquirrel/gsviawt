@@ -58,16 +58,14 @@ import wandb
 from cameras import OPENGL_TO_OPENCV, WORLD_UP, look_at_c2w, make_viewmats, unproject_depth_peel  # noqa: F401
 # SH_C0 lives in gaussians.py; re-exported here (`from module import SH_C0`)
 from gaussians import SH_C0, logit  # noqa: F401
+from util import register_eval_resolver
 
 log = logging.getLogger(__name__)
 
-# Both scripts' conf/*.yaml lean on this for callback/trainer fields that are
-# a small expression over another field rather than a literal (e.g.
-# "${eval:'${iters} // 50'}") -- registered here, once, so importing either
-# script (both import this module, directly or via gs_decoder.py) can't
-# double-register it and raise.
-if not OmegaConf.has_resolver("eval"):
-  OmegaConf.register_new_resolver("eval", eval)
+# Both scripts' conf/*.yaml lean on the `eval` resolver for callback/trainer
+# fields that are a small expression over another field rather than a literal
+# (e.g. "${eval:'${iters} // 50'}") -- registered on import (see util.py).
+register_eval_resolver()
 
 # ---------------------------------------------------------------------------
 # depth-peel Gaussian seeding -- shared by fit_3dgs.py's layered mode,
