@@ -10,6 +10,9 @@ Only complete fits are collected (grid, flat h5 and ply all there -- or, for a g
 where they are, so it can be run again later, also while fits are still running. An existing grids/<name>.h5 is never overwritten
 (overwrite=true to replace it).
 
+grid_format=sparse writes grids/<name>.h5 in grid_io.py's sparse layout instead (verified against the fit's dense grid, which is
+kept: it goes to extra/<name>/gaussians.grid.h5 with the rest of the run). Default dense, as before.
+
     python finalize_fit_dataset.py root=/scratch/vc16/t26rb00/fit_dataset
 """
 
@@ -22,12 +25,17 @@ import h5py
 import hydra
 from omegaconf import DictConfig
 
+import grid_io
+
 log = logging.getLogger(__name__)
 
 NEEDED = ("gaussians.grid.h5", "gaussians.h5", "gaussians.ply")
 
 
-def finalize_one(root, name, overwrite):
+GRID_FORMATS = ("dense", "sparse")
+
+
+def finalize_one(root, name, overwrite, grid_format="dense"):
   """Moves one fit into grids/ + extra/. Returns None when done, else the reason it was left alone."""
   run = os.path.join(root, name)
   grid_only = os.path.exists(os.path.join(run, NEEDED[0])) and not os.path.exists(os.path.join(run, "gaussians.h5"))
@@ -76,7 +84,13 @@ def finalize_one(root, name, overwrite):
   extra = os.path.join(root, "extra", name)
   if os.path.exists(extra):
     shutil.rmtree(extra)
-  shutil.move(grid, target)
+  if grid_format == "sparse":   # the dense grid stays in the run dir, so it moves to extra/ below
+    try:
+      grid_io.convert_file(grid, target)
+    except (OSError, ValueError, RuntimeError) as e:
+      return f"sparse conversion failed: {type(e).__name__}: {e}"
+  else:
+    shutil.move(grid, target)
   if os.listdir(run):
     os.makedirs(os.path.dirname(extra), exist_ok=True)
     shutil.move(run, extra)
@@ -88,10 +102,12 @@ def finalize_one(root, name, overwrite):
 @hydra.main(version_base=None, config_path="conf", config_name="finalize_fit_dataset")
 def main(cfg: DictConfig) -> None:
   logging.basicConfig(level=logging.INFO, format="%(message)s")
+  if cfg.grid_format not in GRID_FORMATS:
+    raise SystemExit(f"grid_format must be one of {GRID_FORMATS}, got {cfg.grid_format!r}")
   names = sorted(n for n in os.listdir(cfg.root) if n.startswith("mesh") and "_view" in n and os.path.isdir(os.path.join(cfg.root, n)))
   done, left = 0, {}
   for name in names:
-    reason = finalize_one(cfg.root, name, cfg.overwrite)
+    reason = finalize_one(cfg.root, name, cfg.overwrite, cfg.grid_format)
     if reason is None:
       done += 1
     else:
