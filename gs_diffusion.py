@@ -43,6 +43,7 @@ from diffusion_schedule import LayerAwareSchedule
 from gaussians import SH_C0, X0_CHANNELS, X0_DIMS, X0_FIELDS, X0_SLICES, quat_forms  # noqa: F401
 from gs_dataset import OPENGL_TO_OPENCV, rotate_quats_wxyz
 from gs_decoder import AttentionBlock, apply_rope, rope_cos_sin
+from grid_io import Grid, grid_shape, load_grid, read_grid  # noqa: F401  (load_grid: the dense dict, for the callers that want it)
 from util import register_eval_resolver
 
 log = logging.getLogger(__name__)
@@ -58,15 +59,6 @@ T_MIN_CLAMP = 0.05     # WT's: the x0 -> velocity conversion divides by max(t, T
 # ---------------------------------------------------------------------------
 # grids <-> x0 channels
 # ---------------------------------------------------------------------------
-
-def load_grid(path):
-  """A finalized grid file -> ({name: array (H, W, L, .)}, attrs)."""
-  with h5py.File(path, "r") as f:
-    grid = {k: np.asarray(f[k]) for k in (
-      "gaussian_means", "gaussian_scales", "gaussian_quats", "gaussian_opacities", "gaussian_colors", "layer_valid")}
-    attrs = {k: (v.item() if hasattr(v, "item") else v) for k, v in f.attrs.items() if k != "config_json"}
-  return grid, attrs
-
 
 def permute_scale_axes(scale, quat, order):
   """(N, 3) scales, (N, 4) wxyz quaternions, (N, 3) axis orders -> the same Gaussians with their axes in that order: the scales
@@ -128,6 +120,8 @@ def set_rot_form(q, rot_form, rng=None):
 def encode_grid(grid, source, scale_order=None, scale_floor_px=None, rot_form="keep", rng=None, scale_sort=None,
                 scale_floor_mode="max"):
   """The grid's Gaussians as raw (un-normalized) x0 channels, (CHANNELS, L, H, W) float32, zero at the slots without a Gaussian.
+  `grid`: a grid_io.Grid (read_grid: a sparse file's rows, used as they are) or load_grid's dense dict (gathered into one first: the
+  same rows, so the same x0 bit for bit).
   `source`: the dataset item's "source" dict (xyz_cam (L, H, W, 3) with NaN where there is no hit, hit (L, H, W), pose_gl (4, 4),
   K_depth (3, 3)).
   scale_floor_px: every scale axis is raised to at least this fraction of the pixel footprint at the Gaussian's depth in the source
@@ -147,7 +141,9 @@ def encode_grid(grid, source, scale_order=None, scale_floor_px=None, rot_form="k
   scale_order, rot_form = e["scale_order"], e["rot_form"]
   if "random" in (scale_order, rot_form) and rng is None:
     rng = np.random.default_rng()
-  valid = grid["layer_valid"].transpose(2, 0, 1)                      # (L, H, W)
+  if not isinstance(grid, Grid):
+    grid = Grid.from_dense(grid)
+  valid = grid.valid                                                 # (L, H, W)
   hit = source["hit"].numpy()
   mismatch = int((valid != hit).sum())
   if mismatch:   # one slot is enough: a Gaussian without a point (NaN offset) would poison the loss
@@ -158,8 +154,8 @@ def encode_grid(grid, source, scale_order=None, scale_floor_px=None, rot_form="k
   w2c = np.linalg.inv(c2w)
   # the math on the valid slots only (~6% of them), as (N, .) rows in [valid]'s order, scattered into the zeros once; every op is
   # elementwise per slot (or per row), so the values are the dense version's bit for bit, and the rng draws the same (N, .) shapes
-  li, yi, xi = np.nonzero(valid)
-  take = lambda k: grid[k][yi, xi, li]                                # the grid's (H, W, L, .) arrays -> (N, .)
+  li, yi, xi = grid.idx                                              # np.nonzero(valid)
+  take = lambda k: grid.rows[k]                                      # (N, .)
   means = take("gaussian_means")                                     # world frame
   # world -> source camera; a single row doubled: numpy's matmul takes BLAS gemv for one row, gemm (the dense version's, (W, 3)
   # per (layer, row)) for more, and the two can differ in the last bit
@@ -397,8 +393,7 @@ def build_grid_index(grids_dir, source_h5=None):
 def check_grids(grid_index, image_size, patch_size, num_layers):
   """The grids' (H, W, L) must be the model's grid: image_size square (a multiple of the patch size, so the patches tile it) and
   num_layers layers. (data.depth_size must stay null: grids are at the depth peel's own resolution.)"""
-  with h5py.File(next(iter(grid_index.values())), "r") as f:
-    h, w, l = f["layer_valid"].shape
+  h, w, l = grid_shape(next(iter(grid_index.values())))
   if (h, w) != (image_size, image_size) or h % patch_size or l != num_layers:
     raise SystemExit(
       f"the grids are {h}x{w} with {l} layers, but the model wants {image_size}x{image_size} (a multiple of the patch size "
@@ -452,7 +447,7 @@ class GridTargetDataset(Dataset):
         random.setstate(state)
     else:
       item = self.inner[idx]
-    grid, _ = load_grid(self.grid_index[item["source_view"]])
+    grid = read_grid(self.grid_index[item["source_view"]])
     # half precision in transit (dense (14, 6, 504, 504) is 85 MB in float32): the log-scales (|x| < 17), logits, colours and offsets
     # lose < 2% of the channel's std; the model upcasts it
     rng = np.random.default_rng(int(item["source_view"])) if self.seeded else None
@@ -486,7 +481,7 @@ def _grid_moments(dataset, i, path, cache_dir):
     if (z["stamp"] == stamp).all():
       return z["s"], z["s2"], int(z["n"]), z["lo"], z["hi"]
   item = dataset.inner[i]
-  grid, _ = load_grid(path)
+  grid = read_grid(path)
   x = torch.from_numpy(encode_grid(grid, item["source"], rng=np.random.default_rng(int(item["source_view"])), **dataset.encoding))[:, item["source"]["hit"]].double()   # (CHANNELS, valid slots), full precision
   if x.shape[1]:
     moments = (x.sum(1).numpy(), x.square().sum(1).numpy(), x.shape[1], x.amin(1).numpy(), x.amax(1).numpy())

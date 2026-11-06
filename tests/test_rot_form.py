@@ -88,7 +88,7 @@ def test_random_forms_are_seeded_for_validation(monkeypatch):
       return 1
     def __getitem__(self, i):
       return {"source_view": 7, "source": source}
-  monkeypatch.setattr(gd, "load_grid", lambda path: (grid, {}))
+  monkeypatch.setattr(gd, "read_grid", lambda path: grid)   # (encode_grid takes the dense dict too)
   enc = {"scale_order": "random", "rot_form": "random"}
   val = gd.GridTargetDataset(Inner(), {7: "g.h5"}, enc, seeded=True)
   assert torch.equal(val[0]["x0_raw"], val[0]["x0_raw"])
