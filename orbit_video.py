@@ -13,7 +13,8 @@ Two input formats, picked from the file extension:
             `gaussian_colors` as
             (H, W, 6, .) grids plus a `layer_valid` mask. Values are already
             activated (world-space means, exp'd scales, sigmoid'd opacity /
-            colour, unit quats).
+            colour, unit quats). A sparse finalized grid (grid_io.py: the same
+            fields as (N, .) rows) works too.
   *.ply  -- a standard INRIA-format 3DGS point cloud (what `fit_3dgs.py`
             also writes, and what most 3DGS viewers eat). Fields are stored
             un-activated: colour = SH_C0 * f_dc + 0.5, opacity = sigmoid,
@@ -55,6 +56,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import grid_io  # noqa: E402
 from cameras import WORLD_UP, make_viewmats  # noqa: E402
 from module import DSSIMLoss, SH_C0, write_mp4  # noqa: E402
 
@@ -81,12 +83,19 @@ def _sigmoid(x):
 
 
 def load_h5(path, ds):
-  """Layered-grid .h5 -> dict of flat, already-activated Gaussian arrays."""
+  """Layered-grid .h5 (dense, or a sparse finalized grid: grid_io) -> dict of flat, already-activated Gaussian arrays."""
   with h5py.File(path, "r") as f:
-    valid = np.asarray(f[ds.valid][:]).astype(bool)          # (H, W, L)
-    def flat(name, c):
-      g = np.asarray(f[ds[name]][:]).astype(np.float32)      # (H, W, L) or (H, W, L, c)
-      return g[valid].reshape(-1, c) if c > 1 else g[valid].reshape(-1)
+    if grid_io.is_sparse(f):   # rows in (layer, y, x) order: put them in the dense [valid]'s (y, x, layer) order
+      li, yi, xi = np.nonzero(f["layer_valid_lhw"][()])
+      order = np.lexsort((li, xi, yi))
+      def flat(name, c):
+        g = np.asarray(f[ds[name]][()]).astype(np.float32)[order]   # (N,) or (N, c)
+        return g.reshape(-1, c) if c > 1 else g.reshape(-1)
+    else:
+      valid = np.asarray(f[ds.valid][:]).astype(bool)          # (H, W, L)
+      def flat(name, c):
+        g = np.asarray(f[ds[name]][:]).astype(np.float32)      # (H, W, L) or (H, W, L, c)
+        return g[valid].reshape(-1, c) if c > 1 else g[valid].reshape(-1)
     out = {
       "means": flat("means", 3),
       "scales": flat("scales", 3),
