@@ -12,6 +12,10 @@ val_sets: null           # list of validation set names; null: all of the run's.
                          # data.val_train) can be named for a run trained without it too
 max_volumes: null        # per set: a reproducible random subset of that many volumes (same for every run with the same split);
                          # null: all (say so when reporting a subset)
+guidance: null           # classifier-free guidance of the samples (fit is not sampled; onestep and the samples are): null = the
+                         # run's diffusion.cfg (default off); or keys of it, on the command line e.g. +guidance.scale=0 (the
+                         # unconditional branch) or 'guidance={scale:2,interval:[0.5,1.0],fields:[sh_dc]}' (not guidance.scale=0:
+                         # the node is null). Warns on a run trained with cond_dropout.p = 0
 seed: 0                  # the target views of a volume and the noise are functions of (seed, set, volume)
 grids_dir: null          # overrides for running somewhere else than the run did (null: the run's)
 source_h5: null
