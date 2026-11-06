@@ -5,7 +5,7 @@
   python wandb_workspace.py save=true url=<view URL>   # update that view in place (panels + settings; its runset is kept)
 
 Sections, in order: the full sample's image quality (the comparable generation metric, as eval_diffusion's), the one-step
-render at each shared timestep of diffusion.val_t, the validation losses, the train losses, the x0 loss per field / per
+render at each shared timestep of diffusion.val_t, the x_t reliance probe (diffusion.probe: ratio and gain per t), the validation losses, the train losses, the x0 loss per field / per
 timestep bucket (train), the orbits (one panel per set: train and each validation set, one tile per run), the other media, and
 bookkeeping (validation sizes, standard errors). The runset is a regex on the run name
 (`query`), so runs that match later show up without re-saving. Keys are the ones train_gs.py logs; which ones are comparable
@@ -43,6 +43,7 @@ def section(name, panels, columns=3, is_open=True):
 def build(cfg):
   x, sm = cfg.x_axis, cfg.train_smoothing
   ts = [f"{float(t):g}" for t in cfg.val_t]
+  probe_ts = [f"{float(t):g}" for t in cfg.probe_ts]
   sections = [
     section("Samples: full rollout (comparable across runs)",
             per_set(cfg, "loss/photom_full_fg_psnr", "fg PSNR")
@@ -51,6 +52,11 @@ def build(cfg):
     section("One step at a shared t (comparable across runs; fg PSNR, t = 1: 1-step sample)",
             [line(f"t = {t}: {SET_TITLES.get(s, s)}", f"{s}/{cfg.validation}/loss/photom_t{t}_fg_psnr", x)
              for t in ts for s in cfg.sets]),
+    section("x_t reliance (diffusion.probe; one line per t. Uses x_t: ratio <~ 1 and gain -> ~1 at low t, gain -> 0 at t = 1. "
+            "Image lookup: ratio >> 1, gain ~ 0 everywhere)",
+            [line(f"{name}: {SET_TITLES.get(s, s)}", [f"{s}/{cfg.validation}/probe/t{t}/{key}" for t in probe_ts], x, **kw)
+             for key, name, kw in (("ratio", "err_model / err_copy (log)", {"log_y": True}), ("gain", "gain", {}))
+             for s in cfg.sets]),
     section("Validation losses (loss/photom: the training's rendering term; loss/x0 and loss/photom follow schedule.phase)",
             per_set(cfg, "loss/photom_full", "full sample L1+D-SSIM")
             + per_set(cfg, "loss/photom", "rendering term")

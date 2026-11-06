@@ -104,6 +104,13 @@ def diffusion_enabled(cfg):
   return bool(OmegaConf.select(cfg, "diffusion.enabled", default=False))
 
 
+def probe_config(cfg):
+  """cfg.diffusion.probe (the x_t reliance probe of the validations, GSDiffusionModel.xt_probe) when it is enabled, else None. A
+  config without the key (a run from before the probe) has it off: its validations, logged keys and cost stay as they were."""
+  p = OmegaConf.select(cfg, "diffusion.probe", default=None)
+  return p if p is not None and bool(p.get("enabled", False)) else None
+
+
 CATALOG_ROW = "__catalog_row"   # the row-index column catalog_transform's expression must keep
 
 
@@ -844,6 +851,45 @@ class GSLightningModule(pl.LightningModule):
       self._diffusion_photom(stage, batch, x0_hat, t)   # the training's own rendering term, gated the same way
     if self.cfg.diffusion.get("val_t"):
       self._diffusion_val_t(stage, batch)
+    if probe_config(self.cfg) is not None:
+      self._diffusion_probe(stage, batch)
+
+  @torch.no_grad()
+  def _diffusion_probe(self, stage, batch):
+    """diffusion.probe: GSDiffusionModel.xt_probe on the validation set's first diffusion.probe.volumes volumes in the validation's
+    own (seeded) order -- the first batches it scores, so no other draw and no other volume -- collected per set, logged once per
+    validation by on_validation_epoch_end. Not in Lightning's sanity check (its logs are thrown away)."""
+    p = probe_config(self.cfg)
+    if p is None or self.trainer.sanity_checking:
+      return
+    probe = self.__dict__.setdefault("_probe", {})
+    rows = probe.setdefault(stage, [])
+    k = min(int(p.volumes) - sum(int(r["n"]) for r in rows), int(batch["batch_size"]))
+    if k <= 0:
+      return
+    image, hit, seeds, _ = self.model.inputs(batch, self.device)
+    vals = self.model.xt_probe(image[:k], hit[:k], batch["x0_raw"][:k], seeds[:k], [float(t) for t in p.ts], float(p.gain_delta))
+    rows.append({"n": k, "vals": vals})
+
+  def _log_probe(self):
+    """Logs every set's collected probe values (_diffusion_probe) as <set>/<name>/probe/t<t>/{err_model, err_copy, ratio, gain}:
+    err_model, err_copy, gain the means over the probed volumes (those with a valid slot), ratio = mean err_model / mean err_copy;
+    and <set>/<name>/probe/n_volumes, how many volumes they are a mean over."""
+    probe, self._probe = self.__dict__.get("_probe") or {}, {}
+    for stage, rows in probe.items():
+      count = None
+      for t in rows[0]["vals"]:
+        v = {k: torch.cat([r["vals"][t][k] for r in rows]) for k in ("err_model", "err_copy", "gain", "valid")}
+        ok = v["valid"] > 0
+        count = int(ok.sum())
+        if not count:
+          continue
+        m = {k: float(v[k][ok].mean()) for k in ("err_model", "err_copy", "gain")}
+        m["ratio"] = m["err_model"] / m["err_copy"] if m["err_copy"] > 0 else float("nan")
+        for k, value in m.items():
+          self._log_metric(stage, f"probe/t{t:g}/{k}", value, count)
+      if count is not None:
+        self._log_metric(stage, "probe/n_volumes", float(count), 1)
 
   def on_validation_end(self):
     dm = getattr(self.trainer, "datamodule", None)
@@ -856,6 +902,11 @@ class GSLightningModule(pl.LightningModule):
     # a fresh bag per validation set at every validation (each splits its volumes evenly over diffusion.val_t), shuffled by an RNG
     # of this validation and set
     self._val_t_bags, self._val_t_rngs = {}, {}
+    self._probe = {}   # diffusion.probe: this validation's values per set (_diffusion_probe)
+
+  def on_validation_epoch_end(self):
+    if self.__dict__.get("_probe"):
+      self._log_probe()
 
   def _pop_val_t(self, stage):
     """The next timestep of the validation set's bag of diffusion.val_t (refilled, shuffled, when empty). The shuffles of a
