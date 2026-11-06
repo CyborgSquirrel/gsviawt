@@ -340,6 +340,13 @@ diffusion:
   num_blocks: 3
   img_token_scale: 0.3         # WT's: the normalized image features are scaled before they are concatenated
   checkpoint_activations: true
+  # which tokens (one layer's patch) the trunk runs on: none (all, dense) | empty (only those with >= 1 valid slot: the trunk,
+  # including its attention keys, never sees a fully empty patch; packed rows + varlen flash attention, ~8% of the tokens) |
+  # empty_except_layer0 (as empty, but all of layer 0 kept: the background patches' image features). The predictions at dropped
+  # tokens are never read (the loss, the render and the sampler use valid slots only). No parameters: checkpoints load either way.
+  # Default empty (Nov 6): at equal steps it matches dense (runs 1032/1040 vs 1030) at ~4.8x faster steps; run configs without the
+  # key (older runs) keep every token, as they were trained
+  token_drop: empty
   steps: 20                    # Euler steps when sampling
   eval_seed: 0                 # the noise of the samples, and of the validation loss
   # the decode of a prediction (the training rendering loss, the samples) clamps into the training grids' range: channel = every
