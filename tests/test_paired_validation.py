@@ -51,7 +51,7 @@ def test_seeded_items_draw_the_same_targets_and_keep_the_global_random_state(mon
       return 2
     def __getitem__(self, i):
       return {"source_view": [5, 6][i], "targets": random.sample(range(1000), 3), "source": {}}
-  monkeypatch.setattr(gd, "load_grid", lambda path: ({}, {}))
+  monkeypatch.setattr(gd, "read_grid", lambda path: {})
   monkeypatch.setattr(gd, "encode_grid", lambda grid, source, **k: np.zeros((1,), np.float32))
   val = gd.GridTargetDataset(Inner(), {5: "a.h5", 6: "b.h5"}, seeded=True)
   random.seed(0); before = random.random(); random.seed(0)
@@ -76,7 +76,7 @@ def test_eval_can_turn_off_the_target_seeding(monkeypatch):
       return 1
     def __getitem__(self, i):
       return {"source_view": 5, "targets": random.sample(range(1000), 3), "source": {}}
-  monkeypatch.setattr(gd, "load_grid", lambda path: ({}, {}))
+  monkeypatch.setattr(gd, "read_grid", lambda path: {})
   monkeypatch.setattr(gd, "encode_grid", lambda grid, source, **k: np.zeros((1,), np.float32))
   ds = gd.GridTargetDataset(Inner(), {5: "a.h5"}, seeded=True)
   ds.seed_targets = False
