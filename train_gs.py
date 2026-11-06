@@ -363,11 +363,11 @@ def flatten_gaussians(b, gauss, xyz_cam, hit):
     scale_flat    = rearrange(gauss["scale"]   [idx], "l c h w -> (l h w) c")
     rotation_flat = rearrange(gauss["rotation"][idx], "l c h w -> (l h w) c")
     colors_flat   = rearrange(gauss["sh_dc"]   [idx], "l c h w -> (l h w) 1 c")
-    if "sh_rest" in gauss:
-      colors_flat = pack(
+    if "sh_rest" in gauss:   # max_sh_degree > 0: (N, 1 + K, 3), the DC band first
+      colors_flat, _ = pack(
         [
-          colors_flat[idx],
-          rearrange(gauss["sh_rest"], "l (k c) h w -> (l h w) k c", c=3)
+          colors_flat,
+          rearrange(gauss["sh_rest"][idx], "l (k c) h w -> (l h w) k c", c=3)
         ],
         "n * c",
       )
