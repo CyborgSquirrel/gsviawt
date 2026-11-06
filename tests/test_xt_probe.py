@@ -103,16 +103,28 @@ def test_err_copy_closed_form():
     assert abs(float(out[t]["err_copy"].mean()) - want) < 0.03 * want, t
 
 
-def test_gain_does_not_depend_on_gain_delta():
-  """A smooth head is locally linear: the gain at half / double the perturbation (the same direction) is the same."""
-  feats, hit, x0_raw, seeds = data()
-  m = shell(real_head())
-  g = {d: m.xt_probe(feats, hit, x0_raw, seeds, TS, gain_delta=d) for d in (0.005, 0.01, 0.02)}
+AMBIENT = [
+  pytest.param("cpu", None, "none", id="fp32"),
+  pytest.param("cpu", torch.bfloat16, "none", id="cpu-bf16-autocast"),
+  pytest.param("cuda", torch.bfloat16, "empty", id="cuda-bf16-autocast-packed", marks=pytest.mark.cuda),
+]
+
+
+@pytest.mark.parametrize("device, autocast, token_drop", AMBIENT)
+def test_gain_does_not_depend_on_gain_delta(device, autocast, token_drop):
+  """A smooth head is locally linear: the gain at half / double the perturbation (the same direction) is the same -- also under
+  the validation's bf16 autocast, which the gain's two forwards turn off (in bf16 a perturbation of 0.005-0.02 would be mostly
+  rounding; cuda + empty: the err_model forward through the varlen flash kernel, the fp32 pair through the SDPA fallback)."""
+  feats, hit, x0_raw, seeds = (x.to(device) if torch.is_tensor(x) else x for x in data())
+  m = shell(real_head().to(device), token_drop)
+  ctx = torch.autocast(device_type=device, dtype=autocast) if autocast is not None else torch.autocast(device, enabled=False)
+  with ctx:
+    g = {d: m.xt_probe(feats, hit, x0_raw, seeds, TS, gain_delta=d) for d in (0.005, 0.01, 0.02)}
   for t in TS:
     assert float(g[0.01][t]["gain"].abs().min()) > 1e-4, t          # not vacuous
     for d in (0.005, 0.02):
       torch.testing.assert_close(g[d][t]["gain"], g[0.01][t]["gain"], rtol=2e-2, atol=1e-5)
-    assert torch.equal(g[d][t]["err_model"], g[0.01][t]["err_model"])   # only the gain sees it
+      assert torch.equal(g[d][t]["err_model"], g[0.01][t]["err_model"])   # only the gain sees it
 
 
 @pytest.mark.parametrize("mode", ["empty", "empty_except_layer0"])

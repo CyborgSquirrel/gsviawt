@@ -381,8 +381,9 @@ diffusion:
   #   gain       the prediction's response to a small seeded perturbation of x_t (of size gain_delta, two fp32 forwards):
   #              -> 1 / (1-t) ~ 1 at low t when it uses x_t, -> 0 at t = 1; ~ 0 at every t for an image-only lookup
   # and probe/n_volumes. Logging only: no rendering, no change to any other logged number, the training or its random streams.
-  # Cost per probed volume: 1 backbone pass + 3 head forwards per t (2 of them in fp32). Run configs without the key (runs from
-  # before it): off, as they were
+  # Cost per probed volume: 1 backbone pass + 3 head forwards per t (2 of them in fp32). A run config without the key (a saved
+  # config of a run from before it, e.g. loaded by eval_diffusion.py): off. A resume composed from this file (ckpt_path=...) gets it
+  # on: it only adds probe/ keys (diffusion.probe.enabled=false to keep an old run's logs exactly as they were)
   probe:
     enabled: true
     ts: [1.0, 0.5, 0.2, 0.1, 0.02]
