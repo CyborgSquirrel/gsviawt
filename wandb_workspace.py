@@ -89,7 +89,8 @@ def build(cfg):
   ]
   return ws.Workspace(
     entity=cfg.entity, project=cfg.project, name=cfg.name, sections=sections,
-    settings=ws.WorkspaceSettings(x_axis=x, max_runs=int(cfg.max_runs), smoothing_type="none", group_by_prefix="first"),
+    settings=ws.WorkspaceSettings(x_axis=x, max_runs=int(cfg.max_runs), smoothing_type="none", group_by_prefix="first",
+                                  remove_legends_from_panels=not cfg.legends),
     runset_settings=ws.RunsetSettings(query=cfg.query, regex_query=True))
 
 

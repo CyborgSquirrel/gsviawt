@@ -10,6 +10,7 @@ probe_ts: [1, 0.5, 0.2, 0.1, 0.02]   # diffusion.probe.ts of the runs (the x_t r
 x_axis: train_seconds        # the runs' x-axis (logged on every row by train_gs.py's ProgressWandbLogger)
 max_runs: 20
 orbit_columns: 4             # runs side by side in each set's orbit panel
-train_smoothing: 0.95        # exponential smoothing of the per-step train panels (0: off); validation panels are never smoothed
+legends: false               # false: no legend in any panel (W&B's workspace setting "remove legends from panels"); runs by hover
+train_smoothing: 0.95       # exponential smoothing of the per-step train panels (0: off); validation panels are never smoothed
 save: false                  # false: print the layout only; true: save the view to W&B (writes to the project)
 url: null                    # with save=true: an existing view's URL to update in place (its runset kept); null: create a new view
