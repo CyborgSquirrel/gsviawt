@@ -740,7 +740,8 @@ class GSLightningModule(pl.LightningModule):
     image, hit, seeds, _ = self.model.inputs(batch, self.device)
     x0_in = batch.get("x0_input_raw")   # augment.slot_shuffle_target canonical (training items only): the shuffled grid, noised
     return self.model.training_loss(image, hit, batch["x0_raw"].to(self.device), seeds=seeds if seeded else None, return_pred=True,
-                                    x0_input_raw=None if x0_in is None else x0_in.to(self.device))
+                                    x0_input_raw=None if x0_in is None else x0_in.to(self.device),
+                                    **({} if seeded else {"weighted": True}))   # diffusion.x0_t_weight: the training step's loss only
 
   def _photom_active(self):
     """diffusion.photom is on, and the train clock is past its start_seconds."""
@@ -830,7 +831,9 @@ class GSLightningModule(pl.LightningModule):
     loss, parts, counts, x0_hat, t = self._diffusion_losses(batch)
     # diffusion.cond_dropout (p > 0 only): the (B,) mask of the samples whose image condition was the null this step
     cond_drop = parts.pop("cond_drop", None)
-    x0_loss = loss.detach()
+    unweighted = parts.pop("unweighted", None)   # diffusion.x0_t_weight on: loss is the weighted x0 loss, this the plain one
+    x0_loss = loss.detach() if unweighted is None else unweighted
+    x0_weighted = loss.detach()
     loss = float(self.cfg.diffusion.get("x0_weight", 1.0)) * loss   # 0: the x0 loss is only logged (diffusion.photom alone trains)
     held = []   # the rendering loss's logs: like train/loss and the x0 loss's, accepted steps only
     if self._photom_active():
@@ -849,6 +852,8 @@ class GSLightningModule(pl.LightningModule):
     self.pixels_seen += B * int(np.prod(batch["x0_raw"].shape[-2:]))
     self._log_metric("train", "loss", loss.detach(), B)
     self._log_metric("train", "loss/x0", x0_loss, B)   # like train/loss and its parts: accepted steps only
+    if unweighted is not None:
+      self._log_metric("train", "loss/x0_weighted", x0_weighted, B)
     self._log_parts("train", "loss/x0", parts, counts)   # the validations' keys: <set>/<name>/loss/x0/<part>
     if cond_drop is not None:
       self._log_metric("train", "cond_dropped", cond_drop.float().mean(), B)   # the realized fraction of null-condition samples

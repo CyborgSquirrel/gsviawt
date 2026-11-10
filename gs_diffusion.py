@@ -662,6 +662,16 @@ def segment_attention(q, k, v, cu, max_len):
                     .transpose(0, 1) for a, e in zip(bounds[:-1], bounds[1:])])
 
 
+X0_T_WEIGHTS = ("none", "inv_t2")
+
+
+def x0_t_weight_mean(schedule, phase, clip, n=400_000):
+  """The mean of 1 / max(t, clip)^2 over the schedule's training timesteps (all layers), from a fixed-seed draw: the inv_t2
+  weight's normalizer, so the weight averages 1 over training."""
+  t = schedule.sample(n // schedule.num_layers + 1, phase=phase, generator=torch.Generator().manual_seed(0)).double()
+  return float(t.clamp_min(clip).pow(-2).mean())
+
+
 def sinusoidal_embedding(t, dim=256, theta=10_000.0):
   """WT's (Wan 2.1's) timestep embedding: [cos, sin] of t * theta^(-k / (dim / 2)); t: (N,) -> (N, dim) float32."""
   half = dim // 2
@@ -970,6 +980,16 @@ class GSDiffusionModel(nn.Module):
     self.phase = int(d.schedule.get("phase", 1))
     if self.phase not in (1, 2):
       raise SystemExit(f"diffusion.schedule.phase must be 1 or 2, got {self.phase}")
+    tw = d.get("x0_t_weight") or {}   # (configs without the key: no weighting)
+    self.x0_t_weight = str(tw.get("mode", "none"))
+    if self.x0_t_weight not in X0_T_WEIGHTS:
+      raise SystemExit(f"diffusion.x0_t_weight.mode must be one of {X0_T_WEIGHTS}, got {self.x0_t_weight!r}")
+    self.x0_t_weight_clip = float(tw.get("clip", 0.05))
+    self.x0_t_weight_norm = 1.0
+    if self.x0_t_weight != "none":
+      if not 0 < self.x0_t_weight_clip <= 1:
+        raise SystemExit(f"diffusion.x0_t_weight.clip must be in (0, 1], got {self.x0_t_weight_clip}")
+      self.x0_t_weight_norm = x0_t_weight_mean(self.schedule, self.phase, self.x0_t_weight_clip)
     self.steps = int(d.steps)
     self.eval_seed = int(d.eval_seed)
     self.token_drop = str(d.get("token_drop", "none"))   # (configs without the key: every token, as before)
@@ -1068,7 +1088,8 @@ class GSDiffusionModel(nn.Module):
       return x_net
     return (1 - a).expand_as(x_net).to(x_net.dtype)
 
-  def training_loss(self, image, hit, x0_raw, seeds=None, return_pred=False, t=None, condition=None, x0_input_raw=None):
+  def training_loss(self, image, hit, x0_raw, seeds=None, return_pred=False, t=None, condition=None, x0_input_raw=None,
+                    weighted=False):
     """The masked x0 loss. Returns (loss, parts, counts): parts = per-field and per-t-bucket detached means, counts the number of valid
     slots each is a mean over (a bucket can be empty: it is not a mean then, and must not be logged). seeds: per-volume seeds
     for the timesteps and the noise (validation); None: the global random stream. return_pred: also the prediction x0_hat
@@ -1081,7 +1102,11 @@ class GSDiffusionModel(nn.Module):
     dropout was drawn, parts also holds "cond_drop" (the (B,) bool mask; not a mean: the caller pops it) and the x0 loss over
     the conditioned / dropped samples' valid slots as "cond_kept" / "cond_dropped" (counts: their slots).
     x0_input_raw: the grid the noised input is built from, when it differs from the target x0_raw (augment.slot_shuffle_target
-    canonical: the slot-shuffled grid, same validity mask); None: x0_raw itself."""
+    canonical: the slot-shuffled grid, same validity mask); None: x0_raw itself.
+    weighted: the training step's loss, with diffusion.x0_t_weight (inv_t2: each layer's error weighted by 1 / max(t, clip)^2,
+    divided by that weight's mean over the training timesteps). The returned loss is then the weighted one, and parts holds the
+    unweighted x0 loss as "unweighted" (not a mean over a part: the caller pops it); the per-field / per-bucket parts stay
+    unweighted. Mode none or weighted False: the loss as before."""
     feats = self._feats(image)
     x0 = self.normalize(x0_raw)
     x0_in = x0 if x0_input_raw is None else self.normalize(x0_input_raw)
@@ -1109,8 +1134,15 @@ class GSDiffusionModel(nn.Module):
     err = (x0_hat.float() - x0).square()                                            # (B, L, C, H, W)
     valid = a.sum().clamp_min(1)
     loss = (err * a).sum() / (valid * CHANNELS)
+    unweighted = None
+    if weighted and self.x0_t_weight == "inv_t2":
+      w = t.float().clamp_min(self.x0_t_weight_clip).pow(-2) / self.x0_t_weight_norm   # (B, L)
+      unweighted = loss.detach()
+      loss = (err * a * w[:, :, None, None, None]).sum() / (valid * CHANNELS)
     with torch.no_grad():
       parts, counts = {}, {}
+      if unweighted is not None:
+        parts["unweighted"] = unweighted
       if drop is not None:
         parts["cond_drop"] = drop
         for name, sel in (("cond_kept", ~drop), ("cond_dropped", drop)):

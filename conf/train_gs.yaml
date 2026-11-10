@@ -452,6 +452,13 @@ diffusion:
                                # all = every render of the mesh except the held-out grid views (validation pools unchanged)
   ema:
     decay: 0.9995              # WT's, after a warmup ramp; validations with `ema: true` use these weights
+  # Per-timestep weighting of the x0 loss in TRAINING (validations stay unweighted): none | inv_t2 (each layer's squared error
+  # times 1 / max(t, clip)^2 -- x0 prediction with a velocity loss, since |v_hat - v| = |x0_hat - x0| / t -- divided by that
+  # weight's mean over the training timesteps, so it averages 1 and the x0 : rendering balance is kept on average). Logs
+  # train/loss/x0 unweighted (comparable) and train/loss/x0_weighted. Configs without the key: none
+  x0_t_weight:
+    mode: none
+    clip: 0.05
   x0_weight: 1.0               # weight of the x0 loss in training; 0: only diffusion.photom trains (the x0 loss is still logged,
                                # train/loss/x0 and the validations' loss/x0)
   spike_skip:
