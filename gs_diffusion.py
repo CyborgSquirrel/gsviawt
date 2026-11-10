@@ -810,6 +810,7 @@ class DiTTrunk(nn.Module):
 
 
 READOUTS = ("linear", "slice")
+IN_PROJS = ("shared", "split")
 
 
 class DiffusionHead(nn.Module):
@@ -819,12 +820,15 @@ class DiffusionHead(nn.Module):
 
   def __init__(self, feature_dim, num_layers, channels=CHANNELS, patch_size=14, dim=None, num_blocks=3, mlp_ratio=4.0,
                layer_scale_init=1e-4, t_embed_channels=256, img_token_scale=0.3, checkpoint_activations=False, cond_null="zeros",
-               readout="linear"):
+               readout="linear", in_proj="shared", in_proj_image_dim=None):
     """cond_null (diffusion.cond_dropout.null): what a dropped sample's image tokens become -- zeros (the z-scored features' mean;
     no parameter) | learned (a learned (feature_dim,) vector, zero-initialized: the parameter `null_cond` exists only then).
     readout (diffusion.readout): linear (the zero-initialized output projection `out`) | slice (no output layer: x0_hat IS the
     trunk's final residual stream at the token's noisy-value channels -- the stream starts as the token itself, so a fresh model
-    returns its input x_net there; needs the lossless width, no in_proj)."""
+    returns its input x_net there; needs the lossless width, no in_proj).
+    in_proj (diffusion.in_proj), below the lossless width: shared (one Linear maps the whole token [features | noisy values] to dim)
+    | split (two: the image features to in_proj_image_dim, the noisy values to dim - in_proj_image_dim, concatenated -- the two
+    kinds of information enter the stream in separate channels, and the noisy values get an explicit share of the width)."""
     super().__init__()
     if cond_null not in COND_NULLS:
       raise ValueError(f"cond_null must be one of {COND_NULLS}, got {cond_null!r}")
@@ -836,8 +840,18 @@ class DiffusionHead(nn.Module):
     self.dim = dim or int(math.ceil(in_dim / 64) * 64)
     if self.dim % 64:
       raise ValueError(f"diffusion.dim={self.dim} must be a multiple of 64")
-    self.in_proj = nn.Linear(in_dim, self.dim) if self.dim < in_dim else None   # below the lossless width: projected
-    self.pad = self.dim - in_dim if self.in_proj is None else 0
+    if in_proj not in IN_PROJS:
+      raise ValueError(f"in_proj must be one of {IN_PROJS}, got {in_proj!r}")
+    self.projected = self.dim < in_dim   # below the lossless width: the token is projected to dim
+    self.in_proj = nn.Linear(in_dim, self.dim) if self.projected and in_proj == "shared" else None
+    if self.projected and in_proj == "split":
+      if in_proj_image_dim is None or not 0 < int(in_proj_image_dim) < self.dim:
+        raise ValueError(f"in_proj=split needs 0 < in_proj_image_dim < dim={self.dim}, got {in_proj_image_dim!r}")
+      self.in_proj_image = nn.Linear(feature_dim, int(in_proj_image_dim))
+      self.in_proj_noise = nn.Linear(self.noise_dim, self.dim - int(in_proj_image_dim))
+    elif in_proj == "split":
+      raise ValueError(f"in_proj=split needs a projected token (diffusion.dim below the lossless {in_dim}), got dim={self.dim}")
+    self.pad = 0 if self.projected else self.dim - in_dim
     self.time_embed = nn.Sequential(nn.Linear(t_embed_channels, self.dim), nn.SiLU(), nn.Linear(self.dim, self.dim))
     self.time_proj = nn.Sequential(nn.SiLU(), nn.Linear(self.dim, 6 * self.dim))
     self.trunk = DiTTrunk(self.dim, num_layers, num_blocks, self.dim // 64, mlp_ratio, layer_scale_init, checkpoint_activations)
@@ -845,7 +859,7 @@ class DiffusionHead(nn.Module):
       raise ValueError(f"readout must be one of {READOUTS}, got {readout!r}")
     self.readout = readout
     if readout == "slice":
-      if self.in_proj is not None:
+      if self.projected:
         raise ValueError(f"readout=slice needs the lossless token width (diffusion.dim null or >= {in_dim}), got dim={self.dim}")
       self.feature_dim = feature_dim   # the noisy values sit at channels [feature_dim, feature_dim + noise_dim) of the stream
     else:
@@ -882,7 +896,11 @@ class DiffusionHead(nn.Module):
       pack = None                          # graph (a loss of 0 with zero gradients) without an empty attention
     if pack is not None:   # the feature z-scoring above stays over all tokens; everything after it is per token
       feats, patches = pack.gather(feats), pack.gather(patches)
-    tokens = torch.cat([feats if uncond is not None else feats * self.img_token_scale, patches.to(feats.dtype)], dim=-1)
+    feats = feats if uncond is not None else feats * self.img_token_scale
+    if hasattr(self, "in_proj_image"):   # in_proj split: each part projected on its own
+      tokens = torch.cat([self.in_proj_image(feats), self.in_proj_noise(patches.to(feats.dtype))], dim=-1)
+    else:
+      tokens = torch.cat([feats, patches.to(feats.dtype)], dim=-1)
     if self.in_proj is not None:
       tokens = self.in_proj(tokens)
     elif self.pad:
@@ -925,7 +943,8 @@ class GSDiffusionModel(nn.Module):
       int(cfg.model.feature_dim), self.num_layers, patch_size=self.patch_size, dim=d.get("dim"), num_blocks=int(d.num_blocks),
       img_token_scale=float(d.img_token_scale), checkpoint_activations=bool(d.get("checkpoint_activations", False)),
       layer_scale_init=float(cfg.model.transformer.layer_scale_init), cond_null=cond_dropout["null"],
-      readout=str(d.get("readout", "linear")))   # (configs without the key, older runs: the linear output projection)
+      readout=str(d.get("readout", "linear")),   # (configs without the key, older runs: the linear output projection)
+      in_proj=str(d.get("in_proj", "shared")), in_proj_image_dim=d.get("in_proj_image_dim"))   # (without the keys: one shared projection)
     mean, std, lo, hi = stats
     self.register_buffer("x0_mean", mean.clone().float())
     self.register_buffer("x0_std", std.clone().float())

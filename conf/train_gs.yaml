@@ -369,6 +369,10 @@ diffusion:
   # the x0 prediction from the trunk's output: linear (a zero-initialized Linear projection to the noisy values) | slice (no output
   # layer: the prediction is the residual stream's own noisy-value channels -- a fresh model copies its input; lossless width only)
   readout: linear
+  # below the lossless width (dim set): shared (one Linear maps the whole token to dim) | split (the image features to
+  # in_proj_image_dim and the noisy values to dim - in_proj_image_dim, separately, then concatenated)
+  in_proj: shared
+  in_proj_image_dim: null
   cond_dropout:
     p: 0.0                     # 0 = off: nothing is drawn, the random streams and the loss exactly as without dropout
     "null": zeros              # zeros (the features' mean after the z-score; no parameter) | learned (a learned feature_dim
