@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from diffusion_schedule import (LayerAwareSchedule, logit_normal_pdf, plateau_logit_normal_pdf, plateau_mode,
-                                sample_logit_normal, sample_plateau_logit_normal)
+                                sample_logit_normal, sample_plateau_logit_normal, T_MIN)
 
 T = torch.linspace(1e-4, 1 - 1e-4, 200001, dtype=torch.float64)
 
@@ -49,3 +49,23 @@ def test_layer_aware_schedule():
   assert s2.standard == dict(mu=0.3, sigma=1.0) and s2.plateau == dict(mu=0.0, sigma=0.9, mirror=False)
   d = s.densities(T)
   assert torch.allclose(d["mixture"], 0.5 * (d["standard"] + d["plateau"]))
+
+
+def test_uniform_phase1_per_layer_phase2_shared():
+  s = LayerAwareSchedule(6, uniform=True)
+  t = s.sample(20000, phase=1, generator=torch.Generator().manual_seed(0))
+  assert t.shape == (20000, 6) and t.dtype == torch.float32
+  assert t.min() >= T_MIN and t.max() <= 1 - T_MIN
+  for l in range(6):                                                   # every layer uniform, including layer 0 (no plateau)
+    assert abs(t[:, l].mean().item() - 0.5) < 0.01
+    assert abs((t[:, l] < 0.1).float().mean().item() - 0.1) < 0.01
+  assert abs(torch.corrcoef(t[:, :2].T)[0, 1].item()) < 0.03          # independent layers
+  t2 = s.sample(1000, phase=2, generator=torch.Generator().manual_seed(1))
+  assert (t2 == t2[:, :1]).all() and abs(t2[:, 0].mean().item() - 0.5) < 0.03
+
+
+def test_uniform_off_is_the_default_and_unchanged():
+  g = lambda: torch.Generator().manual_seed(3)
+  assert torch.equal(LayerAwareSchedule(6).sample(64, 1, generator=g()), LayerAwareSchedule(6, uniform=False).sample(64, 1, generator=g()))
+  assert not LayerAwareSchedule(6).uniform
+  assert (LayerAwareSchedule(6, uniform=True, fixed_t=1.0).sample(4, 1) == 1).all()   # fixed_t (the control) wins

@@ -965,6 +965,7 @@ class GSDiffusionModel(nn.Module):
                        f"same-architecture control), with diffusion.steps=1 (one step from noise = the x0 prediction); got "
                        f"fixed_t={fixed_t}, steps={d.steps}")
     self.schedule = LayerAwareSchedule(self.num_layers, standard=dict(d.schedule.standard), plateau=dict(d.schedule.plateau),
+                                       uniform=bool(d.schedule.get("uniform", False)),   # (configs without the key: logit-normal)
                                        fixed_t=fixed_t)
     self.phase = int(d.schedule.get("phase", 1))
     if self.phase not in (1, 2):

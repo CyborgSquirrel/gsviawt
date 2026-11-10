@@ -419,6 +419,10 @@ diffusion:
     phase: 1                   # 1: an independent t per layer (layer 0 plateaued, the rest standard); 2: one t per volume shared by
                                # all its layers (as in the sampler), from the 50/50 mixture of the two. The validations' seeded
                                # timesteps (loss/x0, the gated loss/photom) follow it
+    uniform: false             # true: every t uniform on [0, 1] instead of the two densities above (per layer in phase 1, shared in
+                               # phase 2): as much training near clean input (low t) as anywhere; the logit-normal(0, 1) puts ~1.4%
+                               # of its mass below t = 0.1. The validations' seeded timesteps follow it (loss/x0 not comparable
+                               # with a logit-normal run's; the full-sample metrics are)
     fixed_t: null              # 1.0: a deterministic regressor from the image with the same architecture / data / loss (the control
                                # for "does diffusion help"): t = 1 always, and the network input is only the validity mask (no
                                # noise); needs diffusion.steps=1
