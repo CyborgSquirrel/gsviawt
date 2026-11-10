@@ -266,17 +266,19 @@ def augment_x0_batch(x0_raw, source, slot_shuffle_block=2, slot_shuffle_max_px=3
   """augment_x0's slot shuffle in torch, on a collated batch where it already is (the training step's device:
   diffusion.augment.slot_shuffle_device=gpu, so the dataloader workers don't pay for it). x0_raw (B, CHANNELS, L, H, W) raw
   (un-normalized: the dataset's "x0_raw", float16 in transit), source the batch's "source" (xyz_cam (B, L, H, W, 3) NaN where no hit,
-  hit (B, L, H, W), K_depth (B, 3, 3)). Returns a new float32 tensor, every item shuffled independently with augment_x0's semantics
-  (slot_shuffle_index: where each slot's Gaussian comes from), every channel moved by one gather, then the offsets re-anchored in
-  float32 (offset + old anchor - new anchor: anchors of metres against offsets of ~1 cm). The randomness: torch's global streams
-  (the tilings' shifts from the CPU one, without a sync; the permutations from x0_raw's device's)."""
+  hit (B, L, H, W), K_depth (B, 3, 3)). Returns a new tensor of x0_raw's dtype, every item shuffled independently with augment_x0's
+  semantics (slot_shuffle_index: where each slot's Gaussian comes from), every channel moved by one gather, then the offsets
+  re-anchored in float32 (offset + old anchor - new anchor: anchors of metres against offsets of ~1 cm) and rounded to the dtype
+  once -- as the numpy path's float32 shuffle and its float16 transit. The randomness: torch's global streams (the tilings' shifts
+  from the CPU one, without a sync; the permutations from x0_raw's device's)."""
   b, c = x0_raw.shape[:2]
   anchor = source["xyz_cam"].float()
   idx = torch.stack([slot_shuffle_index(anchor[i], source["hit"][i].bool(), source["K_depth"][i, 0, 0].float(),
                                         int(slot_shuffle_block), float(slot_shuffle_max_px)) for i in range(b)])   # (B, L*H*W)
-  out = x0_raw.flatten(2).gather(2, idx[:, None].expand(b, c, -1)).float()                    # (B, C, L*H*W)
+  out = x0_raw.flatten(2).gather(2, idx[:, None].expand(b, c, -1))                            # (B, C, L*H*W)
   a = torch.nan_to_num(anchor.flatten(1, 3), nan=0.0)                                         # (B, L*H*W, 3); a slot that stays: + 0
-  out[:, OFFSET] += (a.gather(1, idx[..., None].expand(-1, -1, 3)) - a).transpose(1, 2)        # mean = old anchor + offset kept
+  moved = (a.gather(1, idx[..., None].expand(-1, -1, 3)) - a).transpose(1, 2)                 # mean = old anchor + offset kept
+  out[:, OFFSET] = (out[:, OFFSET].float() + moved).to(out.dtype)
   return out.view(x0_raw.shape)
 
 

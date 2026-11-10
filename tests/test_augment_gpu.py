@@ -72,14 +72,17 @@ def test_items_are_shuffled_independently(device):
 
 @pytest.mark.parametrize("device", DEVICES)
 def test_half_input_reanchors_in_float32(device):
-  """The batch's x0_raw is float16 in transit: the means (anchor + offset) of the shuffled grid are those of the half grid, to float32
-  precision (a re-anchoring in half precision would lose the ~1 cm offsets against the metre-sized anchors)."""
+  """The batch's x0_raw is float16 in transit (and so is the output): the re-anchoring is done in float32 and rounded once, so the
+  shuffled grid's means (anchor + offset) are the half grid's to within half an ulp of the offset (~1e-5 m here), as the numpy path's
+  float32 shuffle + float16 transit; a re-anchoring in half precision would be off by ~1e-3 (half an ulp of the metre-sized anchors)."""
   x0, src = scene(0)
   half = x0.astype(np.float16).astype(np.float32)
   for seed in range(3):
     out = shuffle([(x0, src)], device, seed, half=True)[0]
-    np.testing.assert_allclose(gaussians(out, src)[:, -3:], gaussians(half, src)[:, -3:], rtol=0, atol=1e-6)
-    np.testing.assert_allclose(gaussians(out, src), gaussians(half, src), rtol=0, atol=1e-5)
+    assert out.dtype == np.float16
+    out = out.astype(np.float32)
+    np.testing.assert_allclose(gaussians(out, src)[:, -3:], gaussians(half, src)[:, -3:], rtol=0, atol=2e-5)
+    np.testing.assert_allclose(gaussians(out, src)[:, :-3], gaussians(half, src)[:, :-3], rtol=0, atol=1e-5)
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -231,10 +234,10 @@ def test_training_step_applies_it(target):
   else:
     assert "x0_input_raw" not in out
     shuffled = out["x0_raw"]
-  assert shuffled.device == b["x0_raw"].device and shuffled.dtype == torch.float32
+  assert shuffled.device == b["x0_raw"].device and shuffled.dtype == b["x0_raw"].dtype
   assert not torch.equal(shuffled, b["x0_raw"].float())
-  for (_, src), o, x in zip(scenes, shuffled.cpu().numpy(), b["x0_raw"].float().cpu().numpy()):
-    np.testing.assert_allclose(gaussians(o, src), gaussians(x, src), rtol=0, atol=1e-5)
+  for (_, src), o, x in zip(scenes, shuffled.float().cpu().numpy(), b["x0_raw"].float().cpu().numpy()):
+    np.testing.assert_allclose(gaussians(o, src), gaussians(x, src), rtol=0, atol=2e-5)
 
 
 @pytest.mark.parametrize("augment", [{"slot_shuffle_device": "cpu"}, {}, {"slot_shuffle": False, "slot_shuffle_device": "gpu"}])
