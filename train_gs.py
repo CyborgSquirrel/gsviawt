@@ -393,6 +393,20 @@ def flatten_gaussians(b, gauss, xyz_cam, hit):
 # training loop
 # ---------------------------------------------------------------------------
 
+def gpu_slot_shuffle(cfg, batch):
+  """diffusion.augment.slot_shuffle with slot_shuffle_device=gpu: a training batch slot-shuffled where it is (the training step's
+  device; gs_diffusion.augment_x0_batch -- the dataset left its items unaugmented), as the dataset's numpy shuffle would have:
+  shuffled = the shuffled grid replaces "x0_raw" (the target and the noised input) | canonical = it is "x0_input_raw" (the noised
+  input only). Any other setting: the batch as it is."""
+  aug = cfg.diffusion.get("augment")
+  if aug is None or not aug.get("slot_shuffle", False) or gs_diffusion.slot_shuffle_device(aug) != "gpu":
+    return batch
+  shuffled = gs_diffusion.augment_x0_batch(batch["x0_raw"], batch["source"], aug.get("slot_shuffle_block", 2),
+                                           aug.get("slot_shuffle_max_px", 3.0))
+  key = "x0_input_raw" if aug.get("slot_shuffle_target", "shuffled") == "canonical" else "x0_raw"
+  return {**batch, key: shuffled}
+
+
 class GSDataModule(pl.LightningDataModule):
   """Train/val over cached feature volumes (data.item: one row, a list of rows, or null for all of them),
   split with master's two stages on the render catalog the volumes' source views are rows of:
@@ -827,6 +841,7 @@ class GSLightningModule(pl.LightningModule):
     """WT's loss: the squared distance of the predicted x0 to x0 on the valid slots. A loss above `factor` times its running
     average is skipped (no optimizer step), as in WT's recipe, and so is a non-finite one (gs_diffusion.SpikeSkip)."""
     B = batch["batch_size"]
+    batch = gpu_slot_shuffle(self.cfg, batch)   # (diffusion.augment.slot_shuffle_device=gpu only; validations are never augmented)
     loss, parts, counts, x0_hat, t = self._diffusion_losses(batch)
     # diffusion.cond_dropout (p > 0 only): the (B,) mask of the samples whose image condition was the null this step
     cond_drop = parts.pop("cond_drop", None)

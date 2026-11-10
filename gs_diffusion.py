@@ -250,6 +250,70 @@ def shuffle_slots(x0, source, rng, n, max_px):
   x0[:, :, rows, cols] = Xn.reshape(c, l, hb, wb, n, n).transpose(0, 1, 2, 4, 3, 5).reshape(c, l, hb * n, wb * n)
 
 
+SHUFFLE_DEVICES = ("cpu", "gpu")
+
+
+def slot_shuffle_device(augment):
+  """diffusion.augment's slot_shuffle_device (cpu | gpu; a config without the key: cpu), validated."""
+  device = str((augment or {}).get("slot_shuffle_device", "cpu"))
+  if device not in SHUFFLE_DEVICES:
+    raise ValueError(f"augment.slot_shuffle_device must be one of {SHUFFLE_DEVICES}, got {device!r}")
+  return device
+
+
+@torch.no_grad()
+def augment_x0_batch(x0_raw, source, slot_shuffle_block=2, slot_shuffle_max_px=3.0):
+  """augment_x0's slot shuffle in torch, on a collated batch where it already is (the training step's device:
+  diffusion.augment.slot_shuffle_device=gpu, so the dataloader workers don't pay for it). x0_raw (B, CHANNELS, L, H, W) raw
+  (un-normalized: the dataset's "x0_raw", float16 in transit), source the batch's "source" (xyz_cam (B, L, H, W, 3) NaN where no hit,
+  hit (B, L, H, W), K_depth (B, 3, 3)). Returns a new float32 tensor (the re-anchoring, old anchor + offset - new anchor, in float32:
+  anchors of metres against offsets of ~1 cm), every item shuffled independently with augment_x0's semantics (shuffle_slots_torch).
+  The randomness: torch's global streams (the tilings' shifts from the CPU one, without a sync; the permutations from x0_raw's
+  device's)."""
+  out = x0_raw.float().clone()
+  for i in range(out.shape[0]):   # the tiling's shift differs per item: one item at a time, each vectorized over its layers
+    shuffle_slots_torch(out[i], source["xyz_cam"][i].float(), source["hit"][i].bool(), source["K_depth"][i, 0, 0].float(),
+                        int(slot_shuffle_block), float(slot_shuffle_max_px))
+  return out
+
+
+def shuffle_slots_torch(x0, anchor, hit, fx, n, max_px):
+  """shuffle_slots in torch, in place on one item's float32 x0 (CHANNELS, L, H, W), anchor (L, H, W, 3), hit (L, H, W), fx the
+  depth camera's focal length (a number or a 0-d tensor). The same steps (and the same distribution: a uniform shift, a uniform permutation of each block's
+  taking slots); a different random stream."""
+  c, l, h, w = x0.shape
+  sy, sx = (int(v) for v in torch.randint(n, (2,)))                 # the tiling's shift, 0..n-1 slots (CPU: no sync)
+  hb, wb = (h - sy) // n, (w - sx) // n
+  if hb == 0 or wb == 0:
+    return
+  rows, cols = slice(sy, sy + hb * n), slice(sx, sx + wb * n)
+  nn_ = n * n
+
+  A = anchor[:, rows, cols].reshape(l, hb, n, wb, n, 3).permute(0, 1, 3, 2, 4, 5).reshape(l, hb, wb, nn_, 3)
+  V = hit[:, rows, cols].reshape(l, hb, n, wb, n).permute(0, 1, 3, 2, 4).reshape(l, hb, wb, nn_)
+  X = x0[:, :, rows, cols].reshape(c, l, hb, n, wb, n).permute(0, 1, 2, 4, 3, 5).reshape(c, l, hb, wb, nn_)
+
+  centre = torch.nanmean(torch.where(V[..., None], A, float("nan")), dim=3, keepdim=True)          # (L, hb, wb, 1, 3)
+  dist = torch.linalg.vector_norm(A - centre, dim=-1)                                                # NaN at invalid slots
+  footprint = torch.nan_to_num(A[..., 2], nan=0.0) / fx
+  take = V & (dist <= max_px * footprint)                            # (L, hb, wb, n*n); NaN compares False
+
+  # a uniform random permutation of each block's taking slots among themselves; the others map to themselves
+  pos = torch.arange(nn_, device=x0.device).expand(take.shape)
+  dest = torch.where(take, pos, nn_).sort(dim=-1).values             # the taking slots, in order (then n*n padding)
+  keys = torch.where(take, torch.rand(take.shape, device=x0.device), 2.0)
+  src = torch.gather(pos, -1, keys.argsort(dim=-1))
+  first = pos < take.sum(-1, keepdim=True)                           # the first k entries are real
+  perm = torch.cat([pos, pos.new_zeros(take.shape[:-1] + (1,))], -1)
+  perm = perm.scatter(-1, torch.where(first, dest, nn_), src)[..., :nn_]   # slot -> the slot its Gaussian comes from (padding ->
+                                                                     #   the extra column, dropped)
+  Xn = torch.gather(X, -1, perm.expand(X.shape))
+  An = torch.gather(A, -2, perm[..., None].expand(A.shape))          # the Gaussians' old anchors
+  off = Xn[OFFSET] + An.movedim(-1, 0) - A.movedim(-1, 0)            # mean = old anchor + offset, re-anchored to the new slot
+  Xn[OFFSET] = torch.where(take, off, X[OFFSET])
+  x0[:, :, rows, cols] = Xn.reshape(c, l, hb, wb, n, n).permute(0, 1, 2, 4, 3, 5).reshape(c, l, hb * n, wb * n)
+
+
 def quat_to_matrix(q):
   """(N, 4) unit wxyz quaternions -> (N, 3, 3) rotation matrices (torch; scipy's convention)."""
   w, x, y, z = q.unbind(-1)
@@ -435,7 +499,11 @@ class GridTargetDataset(Dataset):
     self.shuffle_target = str(augment.pop("slot_shuffle_target", "shuffled"))
     if self.shuffle_target not in SHUFFLE_TARGETS:
       raise ValueError(f"augment.slot_shuffle_target must be one of {SHUFFLE_TARGETS}, got {self.shuffle_target!r}")
-    self.augment = augment if augment.get("slot_shuffle") else None   # the default: off
+    # slot_shuffle_device (not an augment_x0 argument either): cpu = augment_x0 here, in the dataloader workers, as before | gpu =
+    # not here: the training step shuffles the collated batch on its device (augment_x0_batch), so the items are the unaugmented ones
+    self.shuffle_device = slot_shuffle_device(augment)
+    augment.pop("slot_shuffle_device", None)
+    self.augment = augment if augment.get("slot_shuffle") and self.shuffle_device == "cpu" else None   # the default: off
     self.grid_index = grid_index
     self.encoding = normalize_encoding(encoding)
     self.volumes = inner.volumes   # the preview code reads the volumes' mesh/view columns

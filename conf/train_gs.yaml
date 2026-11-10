@@ -444,6 +444,8 @@ diffusion:
     slot_shuffle_max_px: 3.0   # ... only slots whose anchors are within this many pixel footprints of the block's mean anchor
     slot_shuffle_target: shuffled  # shuffled: the shuffled grid is noised AND is the target (as before) | canonical: only the noised
                                # input is built from the shuffled grid, the target stays the grid as fitted (shuffled -> unshuffled)
+    slot_shuffle_device: cpu   # where the shuffle runs: cpu (gs_diffusion.augment_x0, per item in the dataloader workers) | gpu
+                               # (gs_diffusion.augment_x0_batch, on the collated batch in the training step: the workers skip it)
   train_targets: grid           # the training volumes' supervision (target) views: grid = the training grid views of the mesh;
                                # all = every render of the mesh except the held-out grid views (validation pools unchanged)
   ema:
