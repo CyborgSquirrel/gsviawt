@@ -414,6 +414,9 @@ def make_listing(grid_index, source_h5, out_path):
   return out_path
 
 
+SHUFFLE_TARGETS = ("shuffled", "canonical")
+
+
 class GridTargetDataset(Dataset):
   """Wraps a dataset of render items (gs_dataset.WTFeatureDataset) and adds each item's ground-truth Gaussians, "x0_raw"
   (CHANNELS, L, H, W) (see encode_grid, with `encoding`: its scale_order / scale_floor_px / rot_form), read from the grid file of its source view."""
@@ -426,6 +429,12 @@ class GridTargetDataset(Dataset):
     self.seeded = seeded
     self.seed_targets = seeded   # eval_diffusion turns this off: it seeds the target views itself (its own, older convention)
     augment = dict(augment or {})
+    # slot_shuffle_target (not an augment_x0 argument): shuffled = the shuffled grid is the target (and the noised input), as
+    # before | canonical = only the noised INPUT is built from the shuffled grid ("x0_input_raw"); the target "x0_raw" stays the
+    # grid as fitted, so the model has to put each Gaussian back in its own slot
+    self.shuffle_target = str(augment.pop("slot_shuffle_target", "shuffled"))
+    if self.shuffle_target not in SHUFFLE_TARGETS:
+      raise ValueError(f"augment.slot_shuffle_target must be one of {SHUFFLE_TARGETS}, got {self.shuffle_target!r}")
     self.augment = augment if augment.get("slot_shuffle") else None   # the default: off
     self.grid_index = grid_index
     self.encoding = normalize_encoding(encoding)
@@ -453,7 +462,11 @@ class GridTargetDataset(Dataset):
     rng = np.random.default_rng(int(item["source_view"])) if self.seeded else None
     x0 = encode_grid(grid, item["source"], rng=rng, **self.encoding)
     if self.augment:   # a fresh stream per call: torch's RNG is seeded per dataloader worker
-      x0 = augment_x0(x0, item["source"], np.random.default_rng(int(torch.randint(2 ** 62, ()))), **self.augment)
+      shuffled = augment_x0(x0, item["source"], np.random.default_rng(int(torch.randint(2 ** 62, ()))), **self.augment)
+      if self.shuffle_target == "canonical":
+        item["x0_input_raw"] = torch.from_numpy(shuffled).half()
+      else:
+        x0 = shuffled
     item["x0_raw"] = torch.from_numpy(x0).half()
     return item
 
@@ -1013,7 +1026,7 @@ class GSDiffusionModel(nn.Module):
       return x_net
     return (1 - a).expand_as(x_net).to(x_net.dtype)
 
-  def training_loss(self, image, hit, x0_raw, seeds=None, return_pred=False, t=None, condition=None):
+  def training_loss(self, image, hit, x0_raw, seeds=None, return_pred=False, t=None, condition=None, x0_input_raw=None):
     """The masked x0 loss. Returns (loss, parts, counts): parts = per-field and per-t-bucket detached means, counts the number of valid
     slots each is a mean over (a bucket can be empty: it is not a mean then, and must not be logged). seeds: per-volume seeds
     for the timesteps and the noise (validation); None: the global random stream. return_pred: also the prediction x0_hat
@@ -1024,9 +1037,12 @@ class GSDiffusionModel(nn.Module):
     the timesteps and the noise; with p = 0 nothing is drawn); seeded calls (validations) are conditional. True | False | a (B,)
     bool tensor (True = that sample conditioned): that, explicitly (e.g. the unconditional branch's validation loss). When a
     dropout was drawn, parts also holds "cond_drop" (the (B,) bool mask; not a mean: the caller pops it) and the x0 loss over
-    the conditioned / dropped samples' valid slots as "cond_kept" / "cond_dropped" (counts: their slots)."""
+    the conditioned / dropped samples' valid slots as "cond_kept" / "cond_dropped" (counts: their slots).
+    x0_input_raw: the grid the noised input is built from, when it differs from the target x0_raw (augment.slot_shuffle_target
+    canonical: the slot-shuffled grid, same validity mask); None: x0_raw itself."""
     feats = self._feats(image)
     x0 = self.normalize(x0_raw)
+    x0_in = x0 if x0_input_raw is None else self.normalize(x0_input_raw)
     b, l = x0.shape[:2]
     if seeds is None:
       if t is not None:
@@ -1039,7 +1055,7 @@ class GSDiffusionModel(nn.Module):
       t = t_seeded if t is None or self.schedule.fixed_t is not None else t.to(x0.device, t_seeded.dtype)
     t5 = t[:, :, None, None, None]
     a = hit[:, :, None].to(x0.dtype)                                                 # (B, L, 1, H, W): the validity mask
-    x_net = self._net_input(a * ((1 - t5) * x0 + t5 * eps) + (1 - a) * eps, a)     # WT Eq. 7: invalid slots see the max noise
+    x_net = self._net_input(a * ((1 - t5) * x0_in + t5 * eps) + (1 - a) * eps, a)  # WT Eq. 7: invalid slots see the max noise
     drop = None
     if condition is None:
       if seeds is None and self.cond_dropout_p > 0:   # (p = 0: no draw, the random streams as without dropout)

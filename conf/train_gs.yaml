@@ -435,6 +435,8 @@ diffusion:
                                # randomly permuted among its slots (offsets re-anchored); all or nothing
     slot_shuffle_block: 2      # n: the strength
     slot_shuffle_max_px: 3.0   # ... only slots whose anchors are within this many pixel footprints of the block's mean anchor
+    slot_shuffle_target: shuffled  # shuffled: the shuffled grid is noised AND is the target (as before) | canonical: only the noised
+                               # input is built from the shuffled grid, the target stays the grid as fitted (shuffled -> unshuffled)
   train_targets: grid           # the training volumes' supervision (target) views: grid = the training grid views of the mesh;
                                # all = every render of the mesh except the held-out grid views (validation pools unchanged)
   ema:
