@@ -366,6 +366,9 @@ diffusion:
   # loss alike (one forward); the validations stay conditional. Logs train/cond_dropped (the realized fraction) and the x0 /
   # rendering losses over the kept / dropped samples (train/loss/x0/cond_kept|cond_dropped, train/loss/photom_cond|photom_uncond).
   # Configs without the key: off. A run trained with p = 0 has no meaningful unconditional branch (diffusion.cfg below).
+  # the x0 prediction from the trunk's output: linear (a zero-initialized Linear projection to the noisy values) | slice (no output
+  # layer: the prediction is the residual stream's own noisy-value channels -- a fresh model copies its input; lossless width only)
+  readout: linear
   cond_dropout:
     p: 0.0                     # 0 = off: nothing is drawn, the random streams and the loss exactly as without dropout
     "null": zeros              # zeros (the features' mean after the z-score; no parameter) | learned (a learned feature_dim

@@ -809,15 +809,22 @@ class DiTTrunk(nn.Module):
     return x
 
 
+READOUTS = ("linear", "slice")
+
+
 class DiffusionHead(nn.Module):
   """(image features (B, L, P, D), the network's noisy x (B, L, C, H, W), t (B, L)) -> x0_hat (B, L, C, H, W).
   Token = [normalized features | the patch's raw noisy values | zero pad]: nothing is squeezed through a projection -- unless dim is
   set below that width (diffusion.dim): then a learned Linear maps the token to dim (DiT's patch embedding), a smaller trunk."""
 
   def __init__(self, feature_dim, num_layers, channels=CHANNELS, patch_size=14, dim=None, num_blocks=3, mlp_ratio=4.0,
-               layer_scale_init=1e-4, t_embed_channels=256, img_token_scale=0.3, checkpoint_activations=False, cond_null="zeros"):
+               layer_scale_init=1e-4, t_embed_channels=256, img_token_scale=0.3, checkpoint_activations=False, cond_null="zeros",
+               readout="linear"):
     """cond_null (diffusion.cond_dropout.null): what a dropped sample's image tokens become -- zeros (the z-scored features' mean;
-    no parameter) | learned (a learned (feature_dim,) vector, zero-initialized: the parameter `null_cond` exists only then)."""
+    no parameter) | learned (a learned (feature_dim,) vector, zero-initialized: the parameter `null_cond` exists only then).
+    readout (diffusion.readout): linear (the zero-initialized output projection `out`) | slice (no output layer: x0_hat IS the
+    trunk's final residual stream at the token's noisy-value channels -- the stream starts as the token itself, so a fresh model
+    returns its input x_net there; needs the lossless width, no in_proj)."""
     super().__init__()
     if cond_null not in COND_NULLS:
       raise ValueError(f"cond_null must be one of {COND_NULLS}, got {cond_null!r}")
@@ -834,9 +841,23 @@ class DiffusionHead(nn.Module):
     self.time_embed = nn.Sequential(nn.Linear(t_embed_channels, self.dim), nn.SiLU(), nn.Linear(self.dim, self.dim))
     self.time_proj = nn.Sequential(nn.SiLU(), nn.Linear(self.dim, 6 * self.dim))
     self.trunk = DiTTrunk(self.dim, num_layers, num_blocks, self.dim // 64, mlp_ratio, layer_scale_init, checkpoint_activations)
-    self.out = nn.Linear(self.dim, self.noise_dim)
-    nn.init.zeros_(self.out.weight)
-    nn.init.zeros_(self.out.bias)
+    if readout not in READOUTS:
+      raise ValueError(f"readout must be one of {READOUTS}, got {readout!r}")
+    self.readout = readout
+    if readout == "slice":
+      if self.in_proj is not None:
+        raise ValueError(f"readout=slice needs the lossless token width (diffusion.dim null or >= {in_dim}), got dim={self.dim}")
+      self.feature_dim = feature_dim   # the noisy values sit at channels [feature_dim, feature_dim + noise_dim) of the stream
+    else:
+      self.out = nn.Linear(self.dim, self.noise_dim)
+      nn.init.zeros_(self.out.weight)
+      nn.init.zeros_(self.out.bias)
+
+  def _read(self, h):
+    """The trunk's output (..., dim) -> the x0 prediction (..., noise_dim)."""
+    if self.readout == "slice":
+      return h[..., self.feature_dim:self.feature_dim + self.noise_dim]
+    return self.out(h)
 
   def adaln(self, t):
     """t: (B, L) in [0, 1] -> (B, L, 6, D), in fp32 (WT computes the time embedding outside autocast)."""
@@ -867,9 +888,9 @@ class DiffusionHead(nn.Module):
     elif self.pad:
       tokens = F.pad(tokens, (0, self.pad))
     if pack is None:
-      out = self.out(self.trunk(tokens, self.adaln(t)))
+      out = self._read(self.trunk(tokens, self.adaln(t)))
     else:
-      out = pack.scatter(self.out(self.trunk.forward_packed(tokens, self.adaln(t), pack)))
+      out = pack.scatter(self._read(self.trunk.forward_packed(tokens, self.adaln(t), pack)))
     grid = int(round(p ** 0.5))
     return rearrange(out, "b l (h w) (c py px) -> b l c (h py) (w px)", h=grid, w=grid, py=self.patch_size, px=self.patch_size)
 
@@ -903,7 +924,8 @@ class GSDiffusionModel(nn.Module):
     self.head = DiffusionHead(
       int(cfg.model.feature_dim), self.num_layers, patch_size=self.patch_size, dim=d.get("dim"), num_blocks=int(d.num_blocks),
       img_token_scale=float(d.img_token_scale), checkpoint_activations=bool(d.get("checkpoint_activations", False)),
-      layer_scale_init=float(cfg.model.transformer.layer_scale_init), cond_null=cond_dropout["null"])
+      layer_scale_init=float(cfg.model.transformer.layer_scale_init), cond_null=cond_dropout["null"],
+      readout=str(d.get("readout", "linear")))   # (configs without the key, older runs: the linear output projection)
     mean, std, lo, hi = stats
     self.register_buffer("x0_mean", mean.clone().float())
     self.register_buffer("x0_std", std.clone().float())
