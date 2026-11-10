@@ -183,7 +183,7 @@ def main(cfg):
             if gt_depth.shape[-2:] != gt.shape[-2:]:
               gt_depth = None                                # the depth peel is at another resolution than the images
             angle = view_angles(batch, views)
-            image, hit, _, floor = model.inputs(batch, device)
+            image, hit, _, floor, pos = model.inputs(batch, device)
             project = None
             if cfg.get("project_format"):   # the sampler's intermediate x0 predictions put into the training grids' format
               enc = train_gs.x0_encoding(run)
@@ -194,13 +194,14 @@ def main(cfg):
             seeds = [base + k for k in range(K)]
             M = lambda r: metrics(r[0], gt, dssim, lpips, r[1], gt_alpha, r[2], gt_depth)
             once = {"fit": M(render(model, batch, model.decode(model.normalize(batch["x0_raw"].to(device).float()), floor), views, device)),
-                    "onestep": M(render(model, batch, model.sample(image, hit, seeds=seeds[:1], steps=1, project=project, floor=floor), views,
+                    "onestep": M(render(model, batch, model.sample(image, hit, seeds=seeds[:1], steps=1, project=project, floor=floor,
+                                                                pos=pos), views,
                                         device))}
             key = {"checkpoint": ckpt_path, "weights": weights, "set": set_name, "volume": i,
                    "mesh": int(item["mesh_index"]), "source_view": int(item["source_view"])}
             for steps in outs:
               g = model.sample(image.expand(K, *image.shape[1:]), hit.expand(K, *hit.shape[1:]), seeds=seeds, steps=steps,
-                               project=project, floor=floor)
+                               project=project, floor=floor, pos=None if pos is None else pos.expand(K, *pos.shape[1:]))
               samples = [render(model, batch, {k: v[j:j + 1] for k, v in g.items()}, views, device) for j in range(K)]
               per = dict(once)
               ks = [M(r) for r in samples]

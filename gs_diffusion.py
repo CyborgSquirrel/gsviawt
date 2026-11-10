@@ -662,6 +662,53 @@ def segment_attention(q, k, v, cu, max_len):
                     .transpose(0, 1) for a, e in zip(bounds[:-1], bounds[1:])])
 
 
+ROPES = ("2d", "xyz_mean")
+
+
+def rope_xyz_cos_sin(pos, head_dim, base=100.0):
+  """3D RoPE tables from continuous positions: pos (..., 3) (x, y, z, in patch units) -> (cos, sin), each (..., head_dim), in the
+  layout apply_rope rotates (rotate-half within each half of head_dim). The head_dim / 2 rotation pairs are split over the axes
+  (z gets a third, rounded down; x and y share the rest: 11 / 11 / 10 at head_dim 64), each axis with its own geometric ladder of
+  frequencies over the 2D RoPE's range (rope_cos_sin: 1 down to base^(-(half - 2) / half) rad per unit)."""
+  half = head_dim // 2                       # = the number of rotation pairs
+  nz = half // 3
+  nx = (half - nz + 1) // 2
+  ny = half - nz - nx
+  lo = math.log(base) * (half - 2) / half
+  ladder = lambda n: torch.exp(-torch.linspace(0.0, lo, n, device=pos.device, dtype=torch.float32))
+  ang = torch.cat([pos[..., a:a + 1].float() * ladder(n) for a, n in enumerate((nx, ny, nz))], dim=-1)   # (..., half)
+  q = half // 2                              # pair k: dims (k, k + q) of the first half (k < q), else of the second
+  ang = torch.cat([ang[..., :q], ang[..., :q], ang[..., q:], ang[..., q:]], dim=-1)                       # (..., head_dim)
+  return ang.cos(), ang.sin()
+
+
+def token_positions(xyz_cam, K, patch_size, z_ref):
+  """The per-token positions of diffusion.rope xyz_mean: xyz_cam (B, L, H, W, 3) camera-space hit points (NaN where no hit), K
+  (B, 3, 3) the depth camera's intrinsics -> (B, L, P, 3) float32: each token's (layer's patch) mean hit point, centred on the
+  sample's median token position and scaled by fx / (patch_size z_ref) -- one unit = one patch width at depth z_ref, the 2D RoPE's
+  unit there; the same scale on x, y and z. A token without a hit: its patch centre's ray at the sample's median depth (only
+  reachable with token_drop none / empty_except_layer0; token_drop empty never runs such a token)."""
+  b, l, h, w, _ = xyz_cam.shape
+  gh, gw = h // patch_size, w // patch_size
+  pts = rearrange(xyz_cam.float(), "b l (gh py) (gw px) c -> b l (gh gw) (py px) c", py=patch_size, px=patch_size)
+  ok = torch.isfinite(pts[..., 2])                                                  # (B, L, P, S)
+  n = ok.sum(-1)
+  mean = torch.where(ok[..., None], pts, 0.0).sum(-2) / n.clamp_min(1)[..., None]   # (B, L, P, 3)
+  has = n > 0
+  z = torch.where(has, mean[..., 2], float("nan")).reshape(b, -1)
+  z_med = torch.nan_to_num(z.nanmedian(dim=1).values, nan=float(z_ref))             # (B,)
+  ys, xs = torch.meshgrid(torch.arange(gh, device=pts.device), torch.arange(gw, device=pts.device), indexing="ij")
+  pix = torch.stack([(xs.reshape(-1) + 0.5) * patch_size, (ys.reshape(-1) + 0.5) * patch_size,
+                     torch.ones(gh * gw, device=pts.device)], -1).float()           # (P, 3) patch centres, homogeneous pixels
+  rays = torch.einsum("bij,pj->bpi", torch.linalg.inv(K.float()), pix)              # (B, P, 3) unit-depth rays
+  fallback = (rays * z_med[:, None, None])[:, None]                                 # (B, 1, P, 3)
+  pos = torch.where(has[..., None], mean, fallback)
+  flat = torch.where(has[..., None], pos, float("nan")).reshape(b, -1, 3)
+  centre = torch.nan_to_num(flat.nanmedian(dim=1).values)                           # (B, 3)
+  scale = K[:, 0, 0].float() / (patch_size * float(z_ref))                          # (B,)
+  return (pos - centre[:, None, None]) * scale[:, None, None, None]
+
+
 def sinusoidal_embedding(t, dim=256, theta=10_000.0):
   """WT's (Wan 2.1's) timestep embedding: [cos, sin] of t * theta^(-k / (dim / 2)); t: (N,) -> (N, dim) float32."""
   half = dim // 2
@@ -700,11 +747,19 @@ class DiTBlock(AttentionBlock):
     return self.proj(out.reshape(n, s, d))
 
   def _mix(self, h, cos, sin, b, l, p, d):
+    """cos / sin: (P, hd) per patch (the 2D RoPE, the same on every layer and sample) or (B, L, P, hd) per token (rope xyz_mean)."""
+    per_token = cos.dim() == 4
     if self.mode == "frame":
+      if per_token:
+        cos, sin = cos.reshape(b * l, p, -1), sin.reshape(b * l, p, -1)
       return self._attend_normed(h.reshape(b * l, p, d), cos, sin).reshape(b, l, p, d)
     if self.mode == "ray":
       return self._attend_short(h.transpose(1, 2).reshape(b * p, l, d)).reshape(b, p, l, d).transpose(1, 2)
-    return self._attend_normed(h.reshape(b, l * p, d), cos.repeat(l, 1), sin.repeat(l, 1)).reshape(b, l, p, d)
+    if per_token:
+      cos, sin = cos.reshape(b, l * p, -1), sin.reshape(b, l * p, -1)
+    else:
+      cos, sin = cos.repeat(l, 1), sin.repeat(l, 1)
+    return self._attend_normed(h.reshape(b, l * p, d), cos, sin).reshape(b, l, p, d)
 
   def forward(self, x, cos, sin, adaln):
     b, l, p, d = x.shape
@@ -769,10 +824,17 @@ class DiTTrunk(nn.Module):
       self._rope[key] = (cos.to(device), sin.to(device))
     return self._rope[key]
 
-  def forward(self, x, adaln):
+  def _head_dim(self):
+    return self.blocks[0].qkv.in_features // self.num_heads
+
+  def forward(self, x, adaln, pos=None):
+    """pos: (B, L, P, 3) per-token positions (diffusion.rope xyz_mean: token_positions) for the frame and global blocks' RoPE;
+    None: the 2D RoPE on the patch grid."""
     _, num_layers, num_patches, _ = x.shape
-    grid = int(round(num_patches ** 0.5))
-    cos, sin = self._rope_tables(grid, x.device)
+    if pos is None:
+      cos, sin = self._rope_tables(int(round(num_patches ** 0.5)), x.device)
+    else:
+      cos, sin = rope_xyz_cos_sin(pos, self._head_dim())
     gamma, beta = self.film(self.layer_embed(torch.arange(num_layers, device=x.device))).chunk(2, dim=-1)
     gamma, beta = gamma[None, :, None], beta[None, :, None]
     adaln_mean = adaln.mean(1, keepdim=True)
@@ -786,12 +848,16 @@ class DiTTrunk(nn.Module):
         x = block(x, cos, sin, a)
     return x
 
-  def forward_packed(self, x, adaln, pack):
+  def forward_packed(self, x, adaln, pack, pos=None):
     """forward on the kept tokens of `pack` only: x (T, D) packed rows, adaln (B, L, 6, D) -> (T, D). What forward computes for
-    them when the dropped tokens are left out of every block (as keys too): the same weights, FiLM, RoPE and AdaLN per token."""
+    them when the dropped tokens are left out of every block (as keys too): the same weights, FiLM, RoPE and AdaLN per token.
+    pos: (T, 3) the rows' positions (rope xyz_mean), or None (the 2D RoPE)."""
     b, num_layers = adaln.shape[:2]
-    cos, sin = self._rope_tables(int(round(pack.P ** 0.5)), x.device)
-    cos_r, sin_r = cos[pack.p], sin[pack.p]                           # RoPE at each row's own patch position
+    if pos is None:
+      cos, sin = self._rope_tables(int(round(pack.P ** 0.5)), x.device)
+      cos_r, sin_r = cos[pack.p], sin[pack.p]                         # RoPE at each row's own patch position
+    else:
+      cos_r, sin_r = rope_xyz_cos_sin(pos, self._head_dim())
     gamma, beta = self.film(self.layer_embed(torch.arange(num_layers, device=x.device))).chunk(2, dim=-1)   # (L, D)
     gamma, beta = gamma[pack.l], beta[pack.l]
     adaln_frame = adaln.reshape(b * num_layers, *adaln.shape[2:])
@@ -820,7 +886,7 @@ class DiffusionHead(nn.Module):
 
   def __init__(self, feature_dim, num_layers, channels=CHANNELS, patch_size=14, dim=None, num_blocks=3, mlp_ratio=4.0,
                layer_scale_init=1e-4, t_embed_channels=256, img_token_scale=0.3, checkpoint_activations=False, cond_null="zeros",
-               readout="linear", in_proj="shared", in_proj_image_dim=None):
+               readout="linear", in_proj="shared", in_proj_image_dim=None, rope="2d"):
     """cond_null (diffusion.cond_dropout.null): what a dropped sample's image tokens become -- zeros (the z-scored features' mean;
     no parameter) | learned (a learned (feature_dim,) vector, zero-initialized: the parameter `null_cond` exists only then).
     readout (diffusion.readout): linear (the zero-initialized output projection `out`) | slice (no output layer: x0_hat IS the
@@ -828,8 +894,13 @@ class DiffusionHead(nn.Module):
     returns its input x_net there; needs the lossless width, no in_proj).
     in_proj (diffusion.in_proj), below the lossless width: shared (one Linear maps the whole token [features | noisy values] to dim)
     | split (two: the image features to in_proj_image_dim, the noisy values to dim - in_proj_image_dim, concatenated -- the two
-    kinds of information enter the stream in separate channels, and the noisy values get an explicit share of the width)."""
+    kinds of information enter the stream in separate channels, and the noisy values get an explicit share of the width).
+    rope (diffusion.rope): 2d (the frame and global blocks' RoPE on the patch's row and column, the same on every layer) | xyz_mean
+    (on the token's mean 3D hit point: forward needs pos; no parameters either way)."""
     super().__init__()
+    if rope not in ROPES:
+      raise ValueError(f"rope must be one of {ROPES}, got {rope!r}")
+    self.rope = rope
     if cond_null not in COND_NULLS:
       raise ValueError(f"cond_null must be one of {COND_NULLS}, got {cond_null!r}")
     if cond_null == "learned":
@@ -880,12 +951,15 @@ class DiffusionHead(nn.Module):
       emb = self.time_embed(sinusoidal_embedding(t.reshape(-1) * 1000.0, self.t_embed_channels))
       return self.time_proj(emb).reshape(b, l, 6, self.dim)
 
-  def forward(self, feats, x_net, t, pack=None, uncond=None):
+  def forward(self, feats, x_net, t, pack=None, uncond=None, pos=None):
     """pack: a PackIndex (diffusion.token_drop): the trunk and the output projection run on its kept tokens only, and the
     prediction is 0 at the dropped ones (fully empty patches: nothing reads them). None: every token (the dense path).
     uncond: (B,) bool, the samples whose image condition is replaced by the null (diffusion.cond_dropout): every token of the sample
     (all layers, all patches) gets the null instead of its z-scored, img_token_scale-scaled features; None: no sample (the call
-    exactly as before)."""
+    exactly as before).
+    pos: (B, L, P, 3) the tokens' positions (token_positions) -- required with rope xyz_mean, not accepted with 2d."""
+    if (pos is None) != (self.rope == "2d"):
+      raise ValueError(f"rope={self.rope}: pos must be {'None' if self.rope == '2d' else 'the tokens positions (B, L, P, 3)'}")
     b, l, p, _ = feats.shape
     feats = (feats - feats.mean((1, 2, 3), keepdim=True)) / (feats.var((1, 2, 3), keepdim=True, unbiased=False) + 1e-6).sqrt()
     if uncond is not None:   # after the per-sample z-score and the scale (a null before them would be renormalized), before packing
@@ -906,9 +980,10 @@ class DiffusionHead(nn.Module):
     elif self.pad:
       tokens = F.pad(tokens, (0, self.pad))
     if pack is None:
-      out = self._read(self.trunk(tokens, self.adaln(t)))
+      out = self._read(self.trunk(tokens, self.adaln(t), pos=pos))
     else:
-      out = pack.scatter(self._read(self.trunk.forward_packed(tokens, self.adaln(t), pack)))
+      rows = None if pos is None else pack.gather(pos)
+      out = pack.scatter(self._read(self.trunk.forward_packed(tokens, self.adaln(t), pack, pos=rows)))
     grid = int(round(p ** 0.5))
     return rearrange(out, "b l (h w) (c py px) -> b l c (h py) (w px)", h=grid, w=grid, py=self.patch_size, px=self.patch_size)
 
@@ -944,7 +1019,10 @@ class GSDiffusionModel(nn.Module):
       img_token_scale=float(d.img_token_scale), checkpoint_activations=bool(d.get("checkpoint_activations", False)),
       layer_scale_init=float(cfg.model.transformer.layer_scale_init), cond_null=cond_dropout["null"],
       readout=str(d.get("readout", "linear")),   # (configs without the key, older runs: the linear output projection)
-      in_proj=str(d.get("in_proj", "shared")), in_proj_image_dim=d.get("in_proj_image_dim"))   # (without the keys: one shared projection)
+      in_proj=str(d.get("in_proj", "shared")), in_proj_image_dim=d.get("in_proj_image_dim"),   # (without the keys: one shared projection)
+      rope=str(d.get("rope", "2d")))   # (configs without the key, older runs: the 2D RoPE)
+    self.rope = self.head.rope
+    self.rope_z_ref = float(d.get("rope_z_ref", 1.8))
     mean, std, lo, hi = stats
     self.register_buffer("x0_mean", mean.clone().float())
     self.register_buffer("x0_std", std.clone().float())
@@ -981,9 +1059,11 @@ class GSDiffusionModel(nn.Module):
       return None
     return PackIndex(token_keep(hit, self.patch_size, self.token_drop))
 
-  def _head(self, feats, x_net, t, pack, uncond=None):
-    """self.head, with the pack only when there is one (token_drop none: the head's call exactly as before), and the null-condition
-    mask uncond (B,) only when there is one."""
+  def _head(self, feats, x_net, t, pack, uncond=None, pos=None):
+    """self.head, with the pack only when there is one (token_drop none: the head's call exactly as before), the null-condition
+    mask uncond (B,) and the token positions pos (rope xyz_mean) only when there are."""
+    if pos is not None:
+      return self.head(feats, x_net, t, pack, uncond=uncond, pos=pos)
     if uncond is not None:
       return self.head(feats, x_net, t, pack, uncond=uncond)
     return self.head(feats, x_net, t) if pack is None else self.head(feats, x_net, t, pack)
@@ -1001,24 +1081,26 @@ class GSDiffusionModel(nn.Module):
       raise ValueError(f"condition must be True, False or a ({b},) bool tensor, got {condition.dtype} {tuple(condition.shape)}")
     return ~condition
 
-  def predict_x0(self, image, hit, x_net, t, condition=True, feats=None):
+  def predict_x0(self, image, hit, x_net, t, condition=True, feats=None, pos=None):
     """The head's x0 prediction (B, L, C, H, W, normalized) for the network input x_net (B, L, C, H, W: the noisy grid, invalid
     slots already noise, as training_loss / sample build it) at timesteps t (B, L), with diffusion.token_drop's packing from hit.
     condition: True (conditional) | False (unconditional: every sample's image tokens the null) | a (B,) bool tensor (True = that
-    sample conditioned). feats: the backbone's features of image, if already computed (then image is not read)."""
+    sample conditioned). feats: the backbone's features of image, if already computed (then image is not read). pos: the token
+    positions (token_pos; rope xyz_mean only)."""
     feats = self._feats(image) if feats is None else feats
     a = hit[:, :, None].to(x_net.dtype)
-    return self._head(feats, self._net_input(x_net, a), t, self.pack(hit), self._uncond(condition, x_net.shape[0], x_net.device))
+    return self._head(feats, self._net_input(x_net, a), t, self.pack(hit), self._uncond(condition, x_net.shape[0], x_net.device),
+                      pos=pos)
 
-  def _guided_x0(self, feats, x_net, t, pack, guidance):
+  def _guided_x0(self, feats, x_net, t, pack, guidance, pos=None):
     """The guided x0 prediction (float) of one sampler step inside the guidance interval: x0_u + scale * (x0_c - x0_u), on
     guidance["fields"] only (the other channels: the conditional prediction). Scale 0 on all fields: the unconditional forward
     alone."""
     s, fields = guidance["scale"], guidance["fields"]
-    x_u = self._head(feats, x_net, t, pack, torch.ones(x_net.shape[0], dtype=torch.bool, device=x_net.device)).float()
+    x_u = self._head(feats, x_net, t, pack, torch.ones(x_net.shape[0], dtype=torch.bool, device=x_net.device), pos=pos).float()
     if s == 0.0 and fields is None:
       return x_u
-    x_c = self._head(feats, x_net, t, pack).float()
+    x_c = self._head(feats, x_net, t, pack, pos=pos).float()
     out = x_u + s * (x_c - x_u)
     if fields is not None:
       on = torch.zeros(CHANNELS, dtype=torch.bool, device=out.device)
@@ -1028,9 +1110,19 @@ class GSDiffusionModel(nn.Module):
     return out
 
   def inputs(self, batch, device):
-    """(image, hit mask, per-volume seeds, floor context): the noise of a sample is a function of its volume (see eval_noise)."""
+    """(image, hit mask, per-volume seeds, floor context, token positions): the noise of a sample is a function of its volume (see
+    eval_noise); the positions are token_pos's (None with rope 2d)."""
     seeds = [self.eval_seed + int(v) for v in batch["source_view"]]
-    return batch["image"].to(device), batch["source"]["hit"].to(device), seeds, self.floor_context(batch, device)
+    return (batch["image"].to(device), batch["source"]["hit"].to(device), seeds, self.floor_context(batch, device),
+            self.token_pos(batch, device))
+
+  def token_pos(self, batch, device):
+    """diffusion.rope xyz_mean: the tokens' positions (B, L, P, 3) from the batch's depth-peel hit points (token_positions, scaled
+    with diffusion.rope_z_ref); rope 2d: None."""
+    if self.rope == "2d":
+      return None
+    src = batch["source"]
+    return token_positions(src["xyz_cam"].to(device), src["K_depth"].to(device), self.patch_size, self.rope_z_ref)
 
   def floor_context(self, batch, device):
     """What decode needs of the batch for scale_floor_mode add (decode_x0's floor), else None."""
@@ -1067,7 +1159,7 @@ class GSDiffusionModel(nn.Module):
       return x_net
     return (1 - a).expand_as(x_net).to(x_net.dtype)
 
-  def training_loss(self, image, hit, x0_raw, seeds=None, return_pred=False, t=None, condition=None, x0_input_raw=None):
+  def training_loss(self, image, hit, x0_raw, seeds=None, return_pred=False, t=None, condition=None, x0_input_raw=None, pos=None):
     """The masked x0 loss. Returns (loss, parts, counts): parts = per-field and per-t-bucket detached means, counts the number of valid
     slots each is a mean over (a bucket can be empty: it is not a mean then, and must not be logged). seeds: per-volume seeds
     for the timesteps and the noise (validation); None: the global random stream. return_pred: also the prediction x0_hat
@@ -1080,7 +1172,8 @@ class GSDiffusionModel(nn.Module):
     dropout was drawn, parts also holds "cond_drop" (the (B,) bool mask; not a mean: the caller pops it) and the x0 loss over
     the conditioned / dropped samples' valid slots as "cond_kept" / "cond_dropped" (counts: their slots).
     x0_input_raw: the grid the noised input is built from, when it differs from the target x0_raw (augment.slot_shuffle_target
-    canonical: the slot-shuffled grid, same validity mask); None: x0_raw itself."""
+    canonical: the slot-shuffled grid, same validity mask); None: x0_raw itself.
+    pos: the token positions (token_pos; rope xyz_mean only)."""
     feats = self._feats(image)
     x0 = self.normalize(x0_raw)
     x0_in = x0 if x0_input_raw is None else self.normalize(x0_input_raw)
@@ -1104,7 +1197,7 @@ class GSDiffusionModel(nn.Module):
       uncond = drop
     else:
       uncond = self._uncond(condition, b, x0.device)
-    x0_hat = self._head(feats, x_net, t, self.pack(hit), uncond)
+    x0_hat = self._head(feats, x_net, t, self.pack(hit), uncond, pos=pos)
     err = (x0_hat.float() - x0).square()                                            # (B, L, C, H, W)
     valid = a.sum().clamp_min(1)
     loss = (err * a).sum() / (valid * CHANNELS)
@@ -1130,7 +1223,7 @@ class GSDiffusionModel(nn.Module):
     return loss, parts, counts
 
   @torch.no_grad()
-  def xt_probe(self, image, hit, x0_raw, seeds, ts, gain_delta=0.01):
+  def xt_probe(self, image, hit, x0_raw, seeds, ts, gain_delta=0.01, pos=None):
     """The x_t reliance probe (diffusion.probe): does the x0 prediction use the noisy input, or only the image? Per volume and per
     shared timestep t in ts (every layer at t, as in the sampler), from x_t = (1 - t) x0 + t eps with the volume's own seeded noise
     (eval_noise: the validation loss's; invalid slots at the noise, through _net_input, as the model always sees them):
@@ -1144,7 +1237,7 @@ class GSDiffusionModel(nn.Module):
                  is not lost to bf16
     Returns {t: {"err_model", "err_copy", "gain", "valid"}}, each (B,) float32 on the device (valid: the volume's valid slots; a
     volume without any has NaN values). The volumes run one at a time (bounded memory, and each volume's values do not depend on
-    the batch it came in); nothing draws from a global random stream."""
+    the batch it came in); nothing draws from a global random stream. pos: the token positions (token_pos; rope xyz_mean only)."""
     device = image.device
     b, l = hit.shape[:2]
     x0_all = self.normalize(x0_raw.to(device).float())                               # (B, L, C, H, W)
@@ -1153,6 +1246,7 @@ class GSDiffusionModel(nn.Module):
     fp32 = torch.autocast(device_type=device.type, enabled=False)
     for i in range(b):
       x0, h = x0_all[i:i + 1], hit[i:i + 1]
+      pos_i = None if pos is None else pos[i:i + 1]
       feats = self._feats(image[i:i + 1])
       pack = self.pack(h)
       _, eps = self.eval_noise([seeds[i]], x0.shape, device)
@@ -1168,7 +1262,7 @@ class GSDiffusionModel(nn.Module):
         # the deterministic control (schedule.fixed_t) has no other timestep (as training_loss); its input has no x_t anyway
         t_in = torch.full((1, l), float(self.schedule.fixed_t) if self.schedule.fixed_t is not None else t, device=device)
         x_t = (1 - t) * x0 + t * eps
-        head = lambda x, f=feats: self._head(f, self._net_input(a * x + (1 - a) * eps, a), t_in, pack).float()
+        head = lambda x, f=feats: self._head(f, self._net_input(a * x + (1 - a) * eps, a), t_in, pack, pos=pos_i).float()
         masked_mse = lambda pred: ((pred - x0).square() * a).sum() / n
         res["err_model"][i] = masked_mse(head(x_t))
         res["err_copy"][i] = masked_mse((1 - t) / ((1 - t) ** 2 + t ** 2) * x_t)
@@ -1183,14 +1277,15 @@ class GSDiffusionModel(nn.Module):
     return out
 
   @torch.no_grad()
-  def sample(self, image, hit, seeds=None, steps=None, project=None, floor=None, guidance=None):
+  def sample(self, image, hit, seeds=None, steps=None, project=None, floor=None, guidance=None, pos=None):
     """20 Euler steps of the flow from pure noise -> the Gaussian dict. The noise of volume i is a function of seeds[i] (default:
     eval_seed + i): reproducible. Invalid slots stay at the noise. project: applied to every step's x0 prediction before it is used
     (e.g. format_projection; the last step's x0 prediction is the output).
     guidance: classifier-free guidance (diffusion.cfg's keys; None: the model's, self.guidance). scale 1: the conditional
     prediction only (one forward per step, as without guidance); otherwise, at the steps whose t is in interval (inclusive):
     x0_u + scale * (x0_c - x0_u) on the raw (normalized) predictions of fields (null: all), before project and the decode's clamp
-    (scale 0 on all fields: the unconditional prediction, one forward); outside the interval: the conditional prediction."""
+    (scale 0 on all fields: the unconditional prediction, one forward); outside the interval: the conditional prediction.
+    pos: the token positions (token_pos; rope xyz_mean only)."""
     if guidance is None:
       guidance = self.guidance
     else:
@@ -1210,9 +1305,9 @@ class GSDiffusionModel(nn.Module):
       x_net = self._net_input(a * x + (1 - a) * eps, a)
       lo, hi = guidance["interval"]
       if guidance["scale"] != 1.0 and lo <= float(t) <= hi:
-        x0_hat = self._guided_x0(feats, x_net, t.expand(b, l), pack, guidance)
+        x0_hat = self._guided_x0(feats, x_net, t.expand(b, l), pack, guidance, pos=pos)
       else:
-        x0_hat = self._head(feats, x_net, t.expand(b, l), pack).float()
+        x0_hat = self._head(feats, x_net, t.expand(b, l), pack, pos=pos).float()
       if project is not None:
         x0_hat = project(x0_hat)
       x = x - (t - ts[i + 1]) * (x - x0_hat) / t.clamp(min=T_MIN_CLAMP)
@@ -1226,8 +1321,8 @@ class GSDiffusionModel(nn.Module):
     return decode_x0(x0.float(), self.x0_mean, self.x0_std, self.x0_lo, self.x0_hi, clamp=self.decode_clamp, floor=floor)
 
   def forward(self, inputs):
-    image, hit, seeds, floor = inputs
-    return self.sample(image, hit, seeds, floor=floor)
+    image, hit, seeds, floor, pos = inputs
+    return self.sample(image, hit, seeds, floor=floor, pos=pos)
 
 
 # ---------------------------------------------------------------------------

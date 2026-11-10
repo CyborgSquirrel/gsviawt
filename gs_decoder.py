@@ -135,11 +135,11 @@ def rope_cos_sin(grid, head_dim, base=100.0):
 
 
 def apply_rope(t, cos, sin):
-  """t: (..., S, H, head_dim); cos/sin: (S, head_dim)."""
+  """t: (..., S, H, head_dim); cos/sin: (S, head_dim), or (..., S, head_dim) (a table per sequence, e.g. per-token positions)."""
   halves = t.unflatten(-1, (2, -1))                                           # (..., 2, half)
   a, b = halves[..., : halves.shape[-1] // 2], halves[..., halves.shape[-1] // 2 :]
   rotated = torch.cat([-b, a], dim=-1).flatten(-2)                            # rotate-half in each half
-  return t * cos[:, None, :] + rotated * sin[:, None, :]
+  return t * cos.unsqueeze(-2) + rotated * sin.unsqueeze(-2)
 
 
 class AttentionBlock(nn.Module):

@@ -233,6 +233,11 @@ class GSModel(nn.Module):
     return self.head(features)
 
 
+def _pos_kw(pos):
+  """The token positions (diffusion.rope xyz_mean) as a keyword argument, or none at all with rope 2d (the call as before)."""
+  return {} if pos is None else {"pos": pos}
+
+
 def _check_grid(gauss, xyz_cam):
   """The head's pixel grid must be exactly the depth-peel grid -- everything
   downstream indexes gauss and xyz_cam/hit pixel-for-pixel."""
@@ -737,10 +742,10 @@ class GSLightningModule(pl.LightningModule):
 
   def _diffusion_losses(self, batch, seeded=False):
     """(loss, parts, counts, x0_hat, t); seeded: the timesteps and noise of each volume are a function of the volume (validation)."""
-    image, hit, seeds, _ = self.model.inputs(batch, self.device)
+    image, hit, seeds, _, pos = self.model.inputs(batch, self.device)
     x0_in = batch.get("x0_input_raw")   # augment.slot_shuffle_target canonical (training items only): the shuffled grid, noised
     return self.model.training_loss(image, hit, batch["x0_raw"].to(self.device), seeds=seeds if seeded else None, return_pred=True,
-                                    x0_input_raw=None if x0_in is None else x0_in.to(self.device))
+                                    x0_input_raw=None if x0_in is None else x0_in.to(self.device), **_pos_kw(pos))
 
   def _photom_active(self):
     """diffusion.photom is on, and the train clock is past its start_seconds."""
@@ -883,8 +888,9 @@ class GSLightningModule(pl.LightningModule):
     k = min(int(p.volumes) - sum(int(r["n"]) for r in rows), int(batch["batch_size"]))
     if k <= 0:
       return
-    image, hit, seeds, _ = self.model.inputs(batch, self.device)
-    vals = self.model.xt_probe(image[:k], hit[:k], batch["x0_raw"][:k], seeds[:k], [float(t) for t in p.ts], float(p.gain_delta))
+    image, hit, seeds, _, pos = self.model.inputs(batch, self.device)
+    vals = self.model.xt_probe(image[:k], hit[:k], batch["x0_raw"][:k], seeds[:k], [float(t) for t in p.ts], float(p.gain_delta),
+                               **_pos_kw(None if pos is None else pos[:k]))
     rows.append({"n": k, "vals": vals})
 
   def _log_probe(self):
@@ -944,10 +950,10 @@ class GSLightningModule(pl.LightningModule):
     t (t = 1: the 1-step sample, the x0 prediction from pure noise). One forward and one render for the whole batch."""
     B = batch["batch_size"]
     tv = torch.tensor([self._pop_val_t(stage) for _ in range(B)], device=self.device)   # (B,)
-    image, hit, seeds, floor = self.model.inputs(batch, self.device)
+    image, hit, seeds, floor, pos = self.model.inputs(batch, self.device)
     L = hit.shape[1]
     x0_hat = self.model.training_loss(image, hit, batch["x0_raw"].to(self.device), seeds=seeds, return_pred=True,
-                                      t=tv[:, None].expand(B, L))[3]
+                                      t=tv[:, None].expand(B, L), **_pos_kw(pos))[3]
     per = self._photom_per_volume(batch, self.model.decode(x0_hat, floor))
     for v in sorted(set(tv.tolist())):
       self._log_photom(stage, per, (tv == v).float(), f"loss/photom_t{v:g}")

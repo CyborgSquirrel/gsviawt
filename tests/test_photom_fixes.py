@@ -92,7 +92,8 @@ def val_t_run(seed=42, eval_seed=0):
   fake = types.SimpleNamespace(
     cfg=OmegaConf.create({"diffusion": {"eval_seed": eval_seed, "val_t": VAL_T}}), device=torch.device("cpu"),
     trainer=types.SimpleNamespace(datamodule=dm, sanity_checking=False),
-    model=types.SimpleNamespace(inputs=lambda batch, dev: ("img", torch.ones(batch["batch_size"], 6, 4, 4), [0] * batch["batch_size"], None),
+    model=types.SimpleNamespace(inputs=lambda batch, dev: ("img", torch.ones(batch["batch_size"], 6, 4, 4), [0] * batch["batch_size"], None,
+                                                         None),
                                 training_loss=training_loss, decode=lambda x, floor=None: x),
     _photom_per_volume=lambda batch, gauss: {"l1": gauss + 1, "total": gauss + 1}, _log_metric=lambda *a: None)
   fake._pop_val_t = lambda stage: M._pop_val_t(fake, stage)
@@ -143,7 +144,8 @@ def test_val_t_logs_one_shared_t_per_volume():
   fake = types.SimpleNamespace(
     cfg=OmegaConf.create({"diffusion": {"eval_seed": 0, "val_t": VAL_T}}), device=torch.device("cpu"),
     trainer=types.SimpleNamespace(datamodule=dm),
-    model=types.SimpleNamespace(inputs=lambda batch, dev: ("img", torch.ones(batch["batch_size"], 6, 4, 4), [0] * batch["batch_size"], None),
+    model=types.SimpleNamespace(inputs=lambda batch, dev: ("img", torch.ones(batch["batch_size"], 6, 4, 4), [0] * batch["batch_size"], None,
+                                                         None),
                                 training_loss=training_loss, decode=lambda x, floor=None: x),
     _photom_per_volume=lambda batch, gauss: {"l1": gauss + 1, "total": gauss + 1},
     _log_metric=lambda stage, k, v, n: logged.append((stage, k, n)))

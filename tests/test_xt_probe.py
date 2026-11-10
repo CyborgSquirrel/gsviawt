@@ -186,7 +186,8 @@ def fake_module(probe):
     return {t: {"err_model": s * t, "err_copy": torch.full_like(s, t), "gain": s + t, "valid": torch.ones_like(s)} for t in ts}
 
   model = types.SimpleNamespace(
-    inputs=lambda batch, dev: (batch["image"], batch["hit"], list(batch["source_view"]), None), xt_probe=xt_probe,
+    inputs=lambda batch, dev: (batch["image"], batch["hit"], list(batch["source_view"]), None, None),
+    xt_probe=xt_probe,
     training_loss=lambda *a, **k: (torch.tensor(0.5), {"opacity": torch.tensor(0.1)}, {"opacity": 10}, None, None))
   fake = types.SimpleNamespace(
     cfg=OmegaConf.create({"diffusion": diffusion}), device=torch.device("cpu"), model=model,
