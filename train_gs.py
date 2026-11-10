@@ -738,7 +738,9 @@ class GSLightningModule(pl.LightningModule):
   def _diffusion_losses(self, batch, seeded=False):
     """(loss, parts, counts, x0_hat, t); seeded: the timesteps and noise of each volume are a function of the volume (validation)."""
     image, hit, seeds, _ = self.model.inputs(batch, self.device)
-    return self.model.training_loss(image, hit, batch["x0_raw"].to(self.device), seeds=seeds if seeded else None, return_pred=True)
+    x0_in = batch.get("x0_input_raw")   # augment.slot_shuffle_target canonical (training items only): the shuffled grid, noised
+    return self.model.training_loss(image, hit, batch["x0_raw"].to(self.device), seeds=seeds if seeded else None, return_pred=True,
+                                    x0_input_raw=None if x0_in is None else x0_in.to(self.device))
 
   def _photom_active(self):
     """diffusion.photom is on, and the train clock is past its start_seconds."""

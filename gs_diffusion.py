@@ -414,6 +414,9 @@ def make_listing(grid_index, source_h5, out_path):
   return out_path
 
 
+SHUFFLE_TARGETS = ("shuffled", "canonical")
+
+
 class GridTargetDataset(Dataset):
   """Wraps a dataset of render items (gs_dataset.WTFeatureDataset) and adds each item's ground-truth Gaussians, "x0_raw"
   (CHANNELS, L, H, W) (see encode_grid, with `encoding`: its scale_order / scale_floor_px / rot_form), read from the grid file of its source view."""
@@ -426,6 +429,12 @@ class GridTargetDataset(Dataset):
     self.seeded = seeded
     self.seed_targets = seeded   # eval_diffusion turns this off: it seeds the target views itself (its own, older convention)
     augment = dict(augment or {})
+    # slot_shuffle_target (not an augment_x0 argument): shuffled = the shuffled grid is the target (and the noised input), as
+    # before | canonical = only the noised INPUT is built from the shuffled grid ("x0_input_raw"); the target "x0_raw" stays the
+    # grid as fitted, so the model has to put each Gaussian back in its own slot
+    self.shuffle_target = str(augment.pop("slot_shuffle_target", "shuffled"))
+    if self.shuffle_target not in SHUFFLE_TARGETS:
+      raise ValueError(f"augment.slot_shuffle_target must be one of {SHUFFLE_TARGETS}, got {self.shuffle_target!r}")
     self.augment = augment if augment.get("slot_shuffle") else None   # the default: off
     self.grid_index = grid_index
     self.encoding = normalize_encoding(encoding)
@@ -453,7 +462,11 @@ class GridTargetDataset(Dataset):
     rng = np.random.default_rng(int(item["source_view"])) if self.seeded else None
     x0 = encode_grid(grid, item["source"], rng=rng, **self.encoding)
     if self.augment:   # a fresh stream per call: torch's RNG is seeded per dataloader worker
-      x0 = augment_x0(x0, item["source"], np.random.default_rng(int(torch.randint(2 ** 62, ()))), **self.augment)
+      shuffled = augment_x0(x0, item["source"], np.random.default_rng(int(torch.randint(2 ** 62, ()))), **self.augment)
+      if self.shuffle_target == "canonical":
+        item["x0_input_raw"] = torch.from_numpy(shuffled).half()
+      else:
+        x0 = shuffled
     item["x0_raw"] = torch.from_numpy(x0).half()
     return item
 
@@ -796,15 +809,26 @@ class DiTTrunk(nn.Module):
     return x
 
 
+READOUTS = ("linear", "slice")
+IN_PROJS = ("shared", "split")
+
+
 class DiffusionHead(nn.Module):
   """(image features (B, L, P, D), the network's noisy x (B, L, C, H, W), t (B, L)) -> x0_hat (B, L, C, H, W).
   Token = [normalized features | the patch's raw noisy values | zero pad]: nothing is squeezed through a projection -- unless dim is
   set below that width (diffusion.dim): then a learned Linear maps the token to dim (DiT's patch embedding), a smaller trunk."""
 
   def __init__(self, feature_dim, num_layers, channels=CHANNELS, patch_size=14, dim=None, num_blocks=3, mlp_ratio=4.0,
-               layer_scale_init=1e-4, t_embed_channels=256, img_token_scale=0.3, checkpoint_activations=False, cond_null="zeros"):
+               layer_scale_init=1e-4, t_embed_channels=256, img_token_scale=0.3, checkpoint_activations=False, cond_null="zeros",
+               readout="linear", in_proj="shared", in_proj_image_dim=None):
     """cond_null (diffusion.cond_dropout.null): what a dropped sample's image tokens become -- zeros (the z-scored features' mean;
-    no parameter) | learned (a learned (feature_dim,) vector, zero-initialized: the parameter `null_cond` exists only then)."""
+    no parameter) | learned (a learned (feature_dim,) vector, zero-initialized: the parameter `null_cond` exists only then).
+    readout (diffusion.readout): linear (the zero-initialized output projection `out`) | slice (no output layer: x0_hat IS the
+    trunk's final residual stream at the token's noisy-value channels -- the stream starts as the token itself, so a fresh model
+    returns its input x_net there; needs the lossless width, no in_proj).
+    in_proj (diffusion.in_proj), below the lossless width: shared (one Linear maps the whole token [features | noisy values] to dim)
+    | split (two: the image features to in_proj_image_dim, the noisy values to dim - in_proj_image_dim, concatenated -- the two
+    kinds of information enter the stream in separate channels, and the noisy values get an explicit share of the width)."""
     super().__init__()
     if cond_null not in COND_NULLS:
       raise ValueError(f"cond_null must be one of {COND_NULLS}, got {cond_null!r}")
@@ -816,14 +840,38 @@ class DiffusionHead(nn.Module):
     self.dim = dim or int(math.ceil(in_dim / 64) * 64)
     if self.dim % 64:
       raise ValueError(f"diffusion.dim={self.dim} must be a multiple of 64")
-    self.in_proj = nn.Linear(in_dim, self.dim) if self.dim < in_dim else None   # below the lossless width: projected
-    self.pad = self.dim - in_dim if self.in_proj is None else 0
+    if in_proj not in IN_PROJS:
+      raise ValueError(f"in_proj must be one of {IN_PROJS}, got {in_proj!r}")
+    self.projected = self.dim < in_dim   # below the lossless width: the token is projected to dim
+    self.in_proj = nn.Linear(in_dim, self.dim) if self.projected and in_proj == "shared" else None
+    if self.projected and in_proj == "split":
+      if in_proj_image_dim is None or not 0 < int(in_proj_image_dim) < self.dim:
+        raise ValueError(f"in_proj=split needs 0 < in_proj_image_dim < dim={self.dim}, got {in_proj_image_dim!r}")
+      self.in_proj_image = nn.Linear(feature_dim, int(in_proj_image_dim))
+      self.in_proj_noise = nn.Linear(self.noise_dim, self.dim - int(in_proj_image_dim))
+    elif in_proj == "split":
+      raise ValueError(f"in_proj=split needs a projected token (diffusion.dim below the lossless {in_dim}), got dim={self.dim}")
+    self.pad = 0 if self.projected else self.dim - in_dim
     self.time_embed = nn.Sequential(nn.Linear(t_embed_channels, self.dim), nn.SiLU(), nn.Linear(self.dim, self.dim))
     self.time_proj = nn.Sequential(nn.SiLU(), nn.Linear(self.dim, 6 * self.dim))
     self.trunk = DiTTrunk(self.dim, num_layers, num_blocks, self.dim // 64, mlp_ratio, layer_scale_init, checkpoint_activations)
-    self.out = nn.Linear(self.dim, self.noise_dim)
-    nn.init.zeros_(self.out.weight)
-    nn.init.zeros_(self.out.bias)
+    if readout not in READOUTS:
+      raise ValueError(f"readout must be one of {READOUTS}, got {readout!r}")
+    self.readout = readout
+    if readout == "slice":
+      if self.projected:
+        raise ValueError(f"readout=slice needs the lossless token width (diffusion.dim null or >= {in_dim}), got dim={self.dim}")
+      self.feature_dim = feature_dim   # the noisy values sit at channels [feature_dim, feature_dim + noise_dim) of the stream
+    else:
+      self.out = nn.Linear(self.dim, self.noise_dim)
+      nn.init.zeros_(self.out.weight)
+      nn.init.zeros_(self.out.bias)
+
+  def _read(self, h):
+    """The trunk's output (..., dim) -> the x0 prediction (..., noise_dim)."""
+    if self.readout == "slice":
+      return h[..., self.feature_dim:self.feature_dim + self.noise_dim]
+    return self.out(h)
 
   def adaln(self, t):
     """t: (B, L) in [0, 1] -> (B, L, 6, D), in fp32 (WT computes the time embedding outside autocast)."""
@@ -848,15 +896,19 @@ class DiffusionHead(nn.Module):
       pack = None                          # graph (a loss of 0 with zero gradients) without an empty attention
     if pack is not None:   # the feature z-scoring above stays over all tokens; everything after it is per token
       feats, patches = pack.gather(feats), pack.gather(patches)
-    tokens = torch.cat([feats if uncond is not None else feats * self.img_token_scale, patches.to(feats.dtype)], dim=-1)
+    feats = feats if uncond is not None else feats * self.img_token_scale
+    if hasattr(self, "in_proj_image"):   # in_proj split: each part projected on its own
+      tokens = torch.cat([self.in_proj_image(feats), self.in_proj_noise(patches.to(feats.dtype))], dim=-1)
+    else:
+      tokens = torch.cat([feats, patches.to(feats.dtype)], dim=-1)
     if self.in_proj is not None:
       tokens = self.in_proj(tokens)
     elif self.pad:
       tokens = F.pad(tokens, (0, self.pad))
     if pack is None:
-      out = self.out(self.trunk(tokens, self.adaln(t)))
+      out = self._read(self.trunk(tokens, self.adaln(t)))
     else:
-      out = pack.scatter(self.out(self.trunk.forward_packed(tokens, self.adaln(t), pack)))
+      out = pack.scatter(self._read(self.trunk.forward_packed(tokens, self.adaln(t), pack)))
     grid = int(round(p ** 0.5))
     return rearrange(out, "b l (h w) (c py px) -> b l c (h py) (w px)", h=grid, w=grid, py=self.patch_size, px=self.patch_size)
 
@@ -890,7 +942,9 @@ class GSDiffusionModel(nn.Module):
     self.head = DiffusionHead(
       int(cfg.model.feature_dim), self.num_layers, patch_size=self.patch_size, dim=d.get("dim"), num_blocks=int(d.num_blocks),
       img_token_scale=float(d.img_token_scale), checkpoint_activations=bool(d.get("checkpoint_activations", False)),
-      layer_scale_init=float(cfg.model.transformer.layer_scale_init), cond_null=cond_dropout["null"])
+      layer_scale_init=float(cfg.model.transformer.layer_scale_init), cond_null=cond_dropout["null"],
+      readout=str(d.get("readout", "linear")),   # (configs without the key, older runs: the linear output projection)
+      in_proj=str(d.get("in_proj", "shared")), in_proj_image_dim=d.get("in_proj_image_dim"))   # (without the keys: one shared projection)
     mean, std, lo, hi = stats
     self.register_buffer("x0_mean", mean.clone().float())
     self.register_buffer("x0_std", std.clone().float())
@@ -1013,7 +1067,7 @@ class GSDiffusionModel(nn.Module):
       return x_net
     return (1 - a).expand_as(x_net).to(x_net.dtype)
 
-  def training_loss(self, image, hit, x0_raw, seeds=None, return_pred=False, t=None, condition=None):
+  def training_loss(self, image, hit, x0_raw, seeds=None, return_pred=False, t=None, condition=None, x0_input_raw=None):
     """The masked x0 loss. Returns (loss, parts, counts): parts = per-field and per-t-bucket detached means, counts the number of valid
     slots each is a mean over (a bucket can be empty: it is not a mean then, and must not be logged). seeds: per-volume seeds
     for the timesteps and the noise (validation); None: the global random stream. return_pred: also the prediction x0_hat
@@ -1024,9 +1078,12 @@ class GSDiffusionModel(nn.Module):
     the timesteps and the noise; with p = 0 nothing is drawn); seeded calls (validations) are conditional. True | False | a (B,)
     bool tensor (True = that sample conditioned): that, explicitly (e.g. the unconditional branch's validation loss). When a
     dropout was drawn, parts also holds "cond_drop" (the (B,) bool mask; not a mean: the caller pops it) and the x0 loss over
-    the conditioned / dropped samples' valid slots as "cond_kept" / "cond_dropped" (counts: their slots)."""
+    the conditioned / dropped samples' valid slots as "cond_kept" / "cond_dropped" (counts: their slots).
+    x0_input_raw: the grid the noised input is built from, when it differs from the target x0_raw (augment.slot_shuffle_target
+    canonical: the slot-shuffled grid, same validity mask); None: x0_raw itself."""
     feats = self._feats(image)
     x0 = self.normalize(x0_raw)
+    x0_in = x0 if x0_input_raw is None else self.normalize(x0_input_raw)
     b, l = x0.shape[:2]
     if seeds is None:
       if t is not None:
@@ -1039,7 +1096,7 @@ class GSDiffusionModel(nn.Module):
       t = t_seeded if t is None or self.schedule.fixed_t is not None else t.to(x0.device, t_seeded.dtype)
     t5 = t[:, :, None, None, None]
     a = hit[:, :, None].to(x0.dtype)                                                 # (B, L, 1, H, W): the validity mask
-    x_net = self._net_input(a * ((1 - t5) * x0 + t5 * eps) + (1 - a) * eps, a)     # WT Eq. 7: invalid slots see the max noise
+    x_net = self._net_input(a * ((1 - t5) * x0_in + t5 * eps) + (1 - a) * eps, a)  # WT Eq. 7: invalid slots see the max noise
     drop = None
     if condition is None:
       if seeds is None and self.cond_dropout_p > 0:   # (p = 0: no draw, the random streams as without dropout)

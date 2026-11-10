@@ -366,6 +366,13 @@ diffusion:
   # loss alike (one forward); the validations stay conditional. Logs train/cond_dropped (the realized fraction) and the x0 /
   # rendering losses over the kept / dropped samples (train/loss/x0/cond_kept|cond_dropped, train/loss/photom_cond|photom_uncond).
   # Configs without the key: off. A run trained with p = 0 has no meaningful unconditional branch (diffusion.cfg below).
+  # the x0 prediction from the trunk's output: linear (a zero-initialized Linear projection to the noisy values) | slice (no output
+  # layer: the prediction is the residual stream's own noisy-value channels -- a fresh model copies its input; lossless width only)
+  readout: linear
+  # below the lossless width (dim set): shared (one Linear maps the whole token to dim) | split (the image features to
+  # in_proj_image_dim and the noisy values to dim - in_proj_image_dim, separately, then concatenated)
+  in_proj: shared
+  in_proj_image_dim: null
   cond_dropout:
     p: 0.0                     # 0 = off: nothing is drawn, the random streams and the loss exactly as without dropout
     "null": zeros              # zeros (the features' mean after the z-score; no parameter) | learned (a learned feature_dim
@@ -435,6 +442,8 @@ diffusion:
                                # randomly permuted among its slots (offsets re-anchored); all or nothing
     slot_shuffle_block: 2      # n: the strength
     slot_shuffle_max_px: 3.0   # ... only slots whose anchors are within this many pixel footprints of the block's mean anchor
+    slot_shuffle_target: shuffled  # shuffled: the shuffled grid is noised AND is the target (as before) | canonical: only the noised
+                               # input is built from the shuffled grid, the target stays the grid as fitted (shuffled -> unshuffled)
   train_targets: grid           # the training volumes' supervision (target) views: grid = the training grid views of the mesh;
                                # all = every render of the mesh except the held-out grid views (validation pools unchanged)
   ema:
