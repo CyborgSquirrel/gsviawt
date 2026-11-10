@@ -49,6 +49,21 @@ def test_preserves_gaussians_and_moves_within_blocks(device):
 
 
 @pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("levels", [1, 2])
+def test_tied_keys_still_permute(monkeypatch, device, levels):
+  """The permutation's random keys tie (float32 uniforms over ~1.5M blocks per batch: now and then): the position breaks the tie,
+  so every block is still a permutation (no Gaussian duplicated, none lost). levels 1: every key equal; 2: two values."""
+  real = torch.rand
+  monkeypatch.setattr(torch, "rand", lambda *a, **k: (real(*a, **k) * levels).floor() / levels)
+  scenes = [scene(0), scene(1)]
+  for seed in range(3):
+    for n in (2, 3):
+      for (x0, src), o in zip(scenes, shuffle(scenes, device, seed, n)):
+        np.testing.assert_allclose(gaussians(o, src), gaussians(x0, src), atol=1e-5)
+        assert (o[:, ~src["hit"].numpy()] == 0).all()
+
+
+@pytest.mark.parametrize("device", DEVICES)
 def test_items_are_shuffled_independently(device):
   x0, src = scene(0)
   out = shuffle([(x0, src)] * 4, device, 0)
