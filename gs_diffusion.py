@@ -266,52 +266,56 @@ def augment_x0_batch(x0_raw, source, slot_shuffle_block=2, slot_shuffle_max_px=3
   """augment_x0's slot shuffle in torch, on a collated batch where it already is (the training step's device:
   diffusion.augment.slot_shuffle_device=gpu, so the dataloader workers don't pay for it). x0_raw (B, CHANNELS, L, H, W) raw
   (un-normalized: the dataset's "x0_raw", float16 in transit), source the batch's "source" (xyz_cam (B, L, H, W, 3) NaN where no hit,
-  hit (B, L, H, W), K_depth (B, 3, 3)). Returns a new float32 tensor (the re-anchoring, old anchor + offset - new anchor, in float32:
-  anchors of metres against offsets of ~1 cm), every item shuffled independently with augment_x0's semantics (shuffle_slots_torch).
-  The randomness: torch's global streams (the tilings' shifts from the CPU one, without a sync; the permutations from x0_raw's
-  device's)."""
-  out = x0_raw.float().clone()
-  for i in range(out.shape[0]):   # the tiling's shift differs per item: one item at a time, each vectorized over its layers
-    shuffle_slots_torch(out[i], source["xyz_cam"][i].float(), source["hit"][i].bool(), source["K_depth"][i, 0, 0].float(),
-                        int(slot_shuffle_block), float(slot_shuffle_max_px))
-  return out
+  hit (B, L, H, W), K_depth (B, 3, 3)). Returns a new float32 tensor, every item shuffled independently with augment_x0's semantics
+  (slot_shuffle_index: where each slot's Gaussian comes from), every channel moved by one gather, then the offsets re-anchored in
+  float32 (offset + old anchor - new anchor: anchors of metres against offsets of ~1 cm). The randomness: torch's global streams
+  (the tilings' shifts from the CPU one, without a sync; the permutations from x0_raw's device's)."""
+  b, c = x0_raw.shape[:2]
+  anchor = source["xyz_cam"].float()
+  idx = torch.stack([slot_shuffle_index(anchor[i], source["hit"][i].bool(), source["K_depth"][i, 0, 0].float(),
+                                        int(slot_shuffle_block), float(slot_shuffle_max_px)) for i in range(b)])   # (B, L*H*W)
+  out = x0_raw.flatten(2).gather(2, idx[:, None].expand(b, c, -1)).float()                    # (B, C, L*H*W)
+  a = torch.nan_to_num(anchor.flatten(1, 3), nan=0.0)                                         # (B, L*H*W, 3); a slot that stays: + 0
+  out[:, OFFSET] += (a.gather(1, idx[..., None].expand(-1, -1, 3)) - a).transpose(1, 2)        # mean = old anchor + offset kept
+  return out.view(x0_raw.shape)
 
 
-def shuffle_slots_torch(x0, anchor, hit, fx, n, max_px):
-  """shuffle_slots in torch, in place on one item's float32 x0 (CHANNELS, L, H, W), anchor (L, H, W, 3), hit (L, H, W), fx the
-  depth camera's focal length (a number or a 0-d tensor). The same steps (and the same distribution: a uniform shift, a uniform permutation of each block's
-  taking slots); a different random stream."""
-  c, l, h, w = x0.shape
+def slot_shuffle_index(anchor, hit, fx, n, max_px):
+  """shuffle_slots' permutation in torch, for one item: anchor (L, H, W, 3) (NaN where no hit), hit (L, H, W), fx the depth camera's
+  focal length (a number or a 0-d tensor) -> (L*H*W,) the flat slot each slot's Gaussian comes from (itself where nothing moves).
+  The same steps and distribution as shuffle_slots (a uniform shift of the n x n tiling, a uniform permutation of each block's
+  taking slots, the same depth guard); a different random stream."""
+  l, h, w = hit.shape
+  idx = torch.arange(l * h * w, device=hit.device).view(l, h, w)
   sy, sx = (int(v) for v in torch.randint(n, (2,)))                 # the tiling's shift, 0..n-1 slots (CPU: no sync)
   hb, wb = (h - sy) // n, (w - sx) // n
   if hb == 0 or wb == 0:
-    return
+    return idx.view(-1)
   rows, cols = slice(sy, sy + hb * n), slice(sx, sx + wb * n)
   nn_ = n * n
-
-  A = anchor[:, rows, cols].reshape(l, hb, n, wb, n, 3).permute(0, 1, 3, 2, 4, 5).reshape(l, hb, wb, nn_, 3)
-  V = hit[:, rows, cols].reshape(l, hb, n, wb, n).permute(0, 1, 3, 2, 4).reshape(l, hb, wb, nn_)
-  X = x0[:, :, rows, cols].reshape(c, l, hb, n, wb, n).permute(0, 1, 2, 4, 3, 5).reshape(c, l, hb, wb, nn_)
+  blocks = lambda t: t.reshape(l, hb, n, wb, n, *t.shape[3:]).transpose(2, 3).reshape(l, hb, wb, nn_, *t.shape[3:])
+  A, V = blocks(anchor[:, rows, cols]), blocks(hit[:, rows, cols])  # (L, hb, wb, n*n, 3), (L, hb, wb, n*n)
 
   centre = torch.nanmean(torch.where(V[..., None], A, float("nan")), dim=3, keepdim=True)          # (L, hb, wb, 1, 3)
   dist = torch.linalg.vector_norm(A - centre, dim=-1)                                                # NaN at invalid slots
   footprint = torch.nan_to_num(A[..., 2], nan=0.0) / fx
   take = V & (dist <= max_px * footprint)                            # (L, hb, wb, n*n); NaN compares False
 
-  # a uniform random permutation of each block's taking slots among themselves; the others map to themselves
-  pos = torch.arange(nn_, device=x0.device).expand(take.shape)
-  dest = torch.where(take, pos, nn_).sort(dim=-1).values             # the taking slots, in order (then n*n padding)
-  keys = torch.where(take, torch.rand(take.shape, device=x0.device), 2.0)
-  src = torch.gather(pos, -1, keys.argsort(dim=-1))
-  first = pos < take.sum(-1, keepdim=True)                           # the first k entries are real
-  perm = torch.cat([pos, pos.new_zeros(take.shape[:-1] + (1,))], -1)
-  perm = perm.scatter(-1, torch.where(first, dest, nn_), src)[..., :nn_]   # slot -> the slot its Gaussian comes from (padding ->
-                                                                     #   the extra column, dropped)
-  Xn = torch.gather(X, -1, perm.expand(X.shape))
-  An = torch.gather(A, -2, perm[..., None].expand(A.shape))          # the Gaussians' old anchors
-  off = Xn[OFFSET] + An.movedim(-1, 0) - A.movedim(-1, 0)            # mean = old anchor + offset, re-anchored to the new slot
-  Xn[OFFSET] = torch.where(take, off, X[OFFSET])
-  x0[:, :, rows, cols] = Xn.reshape(c, l, hb, wb, n, n).permute(0, 1, 2, 4, 3, 5).reshape(c, l, hb * n, wb * n)
+  # a uniform random permutation of each block's taking slots among themselves (shuffle_slots' construction without its sorts,
+  # which are slow on n*n-long rows): the j-th taking slot (index order) gets the Gaussian of the taking slot with the j-th
+  # smallest random key (ties broken by position); the others map to themselves
+  pos = torch.arange(nn_, device=hit.device)
+  key = torch.where(take, torch.rand(take.shape, device=hit.device), 2.0)
+  ki, kj = key[..., :, None], key[..., None, :]                      # (.., i, j)
+  before = pos < pos[:, None]                                        # (i, j): j < i
+  rank = ((kj < ki) | ((kj == ki) & before)).sum(-1)                 # (L, hb, wb, n*n): slot i's key's rank (taking ones: 0..k-1)
+  order = (take[..., None, :] & before).sum(-1)                      # slot s's rank among the taking slots in index order (a
+                                                                     #   cumsum, which CUDA is slow at on n*n-long rows)
+  src = ((take[..., None, :] & (rank[..., None, :] == order[..., :, None])) * pos).sum(-1)   # (.., s): the i with rank_i == order_s
+  perm = torch.where(take, src, pos)                                 # slot -> the slot its Gaussian comes from
+  moved = torch.gather(blocks(idx[:, rows, cols]), -1, perm)
+  idx[:, rows, cols] = moved.reshape(l, hb, wb, n, n).transpose(2, 3).reshape(l, hb * n, wb * n)
+  return idx.view(-1)
 
 
 def quat_to_matrix(q):
