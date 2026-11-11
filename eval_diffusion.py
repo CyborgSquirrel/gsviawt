@@ -115,6 +115,8 @@ def volume_subset(n, max_volumes, seed, set_name):
 def load_checkpoint(module, path):
   ckpt = torch.load(path, map_location="cpu", weights_only=False)
   missing, unexpected = module.load_state_dict(ckpt["state_dict"], strict=False)
+  # diffusion.learn_grids runs: their checkpoints also hold the learnable grids (grids.*), training data, not the model
+  unexpected = [k for k in unexpected if not k.startswith("grids.")]
   if missing or unexpected:
     raise SystemExit(f"{path}: state_dict mismatch: missing {missing[:5]}, unexpected {unexpected[:5]}")
   has_ema = "ema" in ckpt and module.ema is not None

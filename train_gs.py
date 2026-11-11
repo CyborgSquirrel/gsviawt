@@ -1121,7 +1121,7 @@ class GSLightningModule(pl.LightningModule):
     for k, v in metrics.items():
       self.log(k, v, add_dataloader_idx=False)
     log.info("learn_grids at step %d: %s", step, {k: round(v, 3) for k, v in metrics.items()
-                                                    if k.endswith(("/psnr", "/fg_psnr", "/lpips", "frac_degenerate"))})
+                                                    if k.endswith(("/psnr", "/fg_psnr", "/lpips", "frac_degenerate")) or "/drift/" in k})
 
   def on_train_end(self):
     if getattr(self, "grids", None) is not None:
