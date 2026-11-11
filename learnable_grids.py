@@ -1,8 +1,10 @@
 """Learnable x0 grids (diffusion.learn_grids): the diffusion model's training data -- one layered 3DGS grid per training volume --
-as parameters, optimized only THROUGH the model's rendering loss on its x0 prediction.
+as parameters, optimized only THROUGH the model's losses on its x0 prediction (the rendering loss; the x0 loss too with
+x0_grad through_input).
 
 Each training volume's grid is its valid slots' raw x0 channels (gs_diffusion.encode_grid's 14 channels, CHANNELS order, in the raw
-encoding: no sort, no floor, quaternions as fitted), stored sparsely: one (N, d) tensor per channel group (X0_FIELDS) over the rows
+encoding: no sort, no floor, quaternions as fitted; the scale channels log-scales or, with scale_param cumulative, (a, b, c): see
+gs_diffusion.log_to_cumulative), stored sparsely: one (N, d) tensor per channel group (X0_FIELDS) over the rows
 of all volumes, a volume's rows in np.nonzero(hit) order (layer, y, x: the grid files' order). A training step scatters a batch's
 rows into the dense (B, CHANNELS, L, H, W) grid the model normalizes and noises; the gradient reaches the rows through the noisy
 input x_t = (1 - t) x0 + t eps only (the x0 target is the detached copy), so at t = 1 it is zero.
@@ -26,10 +28,12 @@ import torch.nn as nn
 
 from gaussians import SH_C0, X0_CHANNELS, X0_FIELDS, X0_SLICES
 from grid_io import Grid
+from gs_diffusion import cumulative_to_log, log_to_cumulative
 
 log = logging.getLogger(__name__)
 
 INITS = ("pretrained", "fresh")
+X0_GRADS = ("through_input", "none")   # diffusion.learn_grids.x0_grad
 COLORS = ("peel_rgb", "image")
 # the anchored fitter's parameter groups (conf/fit_anchored.yaml lr.*) for each x0 channel group
 LR_KEYS = {"opacity": "opacities", "scale": "scales", "rotation": "quats", "sh_dc": "sh0", "offset": "offset"}
@@ -65,11 +69,19 @@ def read_colors(h5, row, color, num_layers):
   return np.broadcast_to(rgb, (num_layers, dh, dw, 3)).copy()
 
 
-def fresh_rows(source, colors, opacity=0.1):
+def log_scales(rows, scale_param="log"):
+  """The (n, 3) log-scales of raw x0 rows (n, CHANNELS) (numpy or torch): the scale channels, or with scale_param cumulative their
+  cumulative_to_log."""
+  s = rows[:, X0_SLICES["scale"]]
+  return cumulative_to_log(s) if scale_param == "cumulative" else s
+
+
+def fresh_rows(source, colors, opacity=0.1, scale_param="log"):
   """anchored_3dgs.init_params for one slot each, as raw x0 rows (N, CHANNELS) float32 in np.nonzero(hit) order: opacity logit of
   `opacity`, the 3 log-scales log(footprint) (footprint = one depth pixel at the slot's depth, z / fx: an isotropic Gaussian a pixel
   wide), the identity quaternion, sh_dc (colour - 0.5) / SH_C0, offset 0 (the mean on the depth-peel hit). source: an item's
-  "source" dict; colors (L, H, W, 3) (read_colors)."""
+  "source" dict; colors (L, H, W, 3) (read_colors). scale_param cumulative: the isotropic scale as (a, b, c) = (log footprint,
+  softplus^-1(CUM_GAP_FLOOR) twice): the axes 1e-4 (in log) apart, the encode's floor for tied axes."""
   hit = np.asarray(source["hit"])
   li, yi, xi = np.nonzero(hit)
   z = np.asarray(source["xyz_cam"])[li, yi, xi, 2]
@@ -77,6 +89,8 @@ def fresh_rows(source, colors, opacity=0.1):
   rows = np.zeros((len(li), X0_CHANNELS), np.float32)
   rows[:, X0_SLICES["opacity"]] = np.log(opacity / (1 - opacity))
   rows[:, X0_SLICES["scale"]] = np.log(foot)[:, None]
+  if scale_param == "cumulative":
+    rows[:, X0_SLICES["scale"]] = log_to_cumulative(rows[:, X0_SLICES["scale"]].astype(np.float64))
   rows[:, X0_SLICES["rotation"].start] = 1.0
   rows[:, X0_SLICES["sh_dc"]] = (colors[li, yi, xi] - 0.5) / SH_C0
   return rows
@@ -131,7 +145,8 @@ def build_init(lg, inner, grid_index, encoding, encode_grid, read_grid):
         rows = fitted
       else:
         rows = fresh_rows({k: src[k].numpy() for k in ("hit", "xyz_cam", "K_depth")},
-                          read_colors(h5, v, str(lg.fresh.color), hit.shape[0]), float(lg.fresh.opacity))
+                          read_colors(h5, v, str(lg.fresh.color), hit.shape[0]), float(lg.fresh.opacity),
+                          encoding.get("scale_param", "log"))
         out["ref_rows"].append(np.ascontiguousarray(fitted, np.float32))
       anchor = src["xyz_cam"].numpy()[hit]
       out["views"].append(v)
@@ -172,9 +187,12 @@ class LearnableGrids(nn.Module):
   docstring). Non-persistent buffers: what build_init recomputes identically on a resume (the init itself, footprints, neighbour
   pairs); the checkpoint holds only the learnable rows."""
 
-  def __init__(self, init, learnable=True):
+  def __init__(self, init, learnable=True, scale_param="log"):
+    """scale_param: the encoding's (diffusion.scale_encoding.scale_param): what the rows' scale channels are (stats and the dump read
+    the log-scales through log_scales); the rows are stored as the x0 channels either way."""
     super().__init__()
     self.learnable = bool(learnable)
+    self.scale_param = scale_param
     self.views = [int(v) for v in init["views"]]
     self.mesh = [int(m) for m in init["mesh"]]
     self.index = {v: i for i, v in enumerate(self.views)}
@@ -260,7 +278,7 @@ class LearnableGrids(nn.Module):
     hit = self.hit[i]
     rows = {
       "gaussian_means": (means_cam @ c2w[:3, :3].T + c2w[:3, 3]).astype(np.float32),
-      "gaussian_scales": np.exp(raw[:, X0_SLICES["scale"]]).astype(np.float32),
+      "gaussian_scales": np.exp(log_scales(raw, self.scale_param)).astype(np.float32),
       "gaussian_quats": q_world.astype(np.float32),
       "gaussian_opacities": (1 / (1 + np.exp(-raw[:, X0_SLICES["opacity"].start]))).astype(np.float32),
       "gaussian_colors": (raw[:, X0_SLICES["sh_dc"]] * SH_C0 + 0.5).astype(np.float32),
@@ -276,12 +294,12 @@ STAT_QUANTILES = (0.05, 0.5, 0.95)
 MAX_QUANTILE_ELEMENTS = 1 << 22
 
 
-def stat_space(rows, foot):
+def stat_space(rows, foot, scale_param="log"):
   """The groups of raw rows (n, CHANNELS) in the units their statistics are logged in: opacity in [0, 1] (sigmoid), scale the 3
   log-scales, rotation the raw quaternion, sh_dc the rgb colour (sh_dc SH_C0 + 0.5), offset in pixel footprints (offset / foot)."""
   return {
     "opacity": torch.sigmoid(rows[:, X0_SLICES["opacity"]]),
-    "scale": rows[:, X0_SLICES["scale"]],
+    "scale": log_scales(rows, scale_param),
     "rotation": rows[:, X0_SLICES["rotation"]],
     "sh_dc": rows[:, X0_SLICES["sh_dc"]] * SH_C0 + 0.5,
     "offset": rows[:, X0_SLICES["offset"]] / foot[:, None],
@@ -296,7 +314,7 @@ def _quantiles(x, qs):
 
 
 @torch.no_grad()
-def param_stats(rows, foot, pairs, init_rows=None):
+def param_stats(rows, foot, pairs, init_rows=None, scale_param="log"):
   """The grids' parameter statistics, {name: float}: per group (stat_space's units) mean / std / p5 / p50 / p95 (offset: of the
   offset's length in footprints; rotation: of the quaternion's length; scale: also of log(largest axis / footprint) as scale_rel);
   the fraction of degenerate Gaussians (frac_transparent opacity < 0.01, frac_huge largest axis > 10 footprints, frac_tiny largest
@@ -304,9 +322,9 @@ def param_stats(rows, foot, pairs, init_rows=None):
   the per-row L2 distance, stat_space units) and the smoothness (smooth/<group>: the mean over neighbouring slot pairs, same layer,
   of the squared L2 difference, stat_space units)."""
   rows, foot = rows.float(), foot.float()
-  s = stat_space(rows, foot)
+  s = stat_space(rows, foot, scale_param)
   out = {}
-  log_rel = rows[:, X0_SLICES["scale"]].amax(1) - torch.log(foot)
+  log_rel = s["scale"].amax(1) - torch.log(foot)
   summary = {"opacity": s["opacity"], "scale": s["scale"], "rotation": s["rotation"].norm(dim=1), "sh_dc": s["sh_dc"],
              "offset": s["offset"].norm(dim=1), "scale_rel": log_rel}
   for name, x in summary.items():
@@ -322,7 +340,7 @@ def param_stats(rows, foot, pairs, init_rows=None):
     for name, m in (("transparent", transparent), ("huge", huge), ("tiny", tiny), ("degenerate", transparent | huge | tiny)):
       out[f"frac_{name}"] = float(m.float().mean())
   if init_rows is not None and len(rows):
-    s0 = stat_space(init_rows.float(), foot)
+    s0 = stat_space(init_rows.float(), foot, scale_param)
     for name in X0_FIELDS:
       out[f"drift/{name}"] = float((s[name] - s0[name]).square().sum(1).mean().sqrt())
   if len(pairs):

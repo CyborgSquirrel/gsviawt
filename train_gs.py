@@ -452,9 +452,11 @@ class GSDataModule(pl.LightningDataModule):
         raise SystemExit("diffusion mode needs data.depth_size=null (or the grids' own size): the grids are at the depth peel's own resolution")
       lg = learnable_grids.learn_grids_config(cfg)
       if lg is not None:
-        if x0_encoding(cfg) != gs_diffusion.normalize_encoding(None):
+        if {**x0_encoding(cfg), "scale_param": "log"} != gs_diffusion.normalize_encoding(None):
           raise SystemExit(f"diffusion.learn_grids needs the raw encoding (diffusion.scale_encoding.scale_order=keep, scale_floor_px=null, "
-                           f"rot_form=keep), got {x0_encoding(cfg)}")
+                           f"rot_form=keep; scale_param log or cumulative), got {x0_encoding(cfg)}")
+        if str(lg.get("x0_grad", "through_input")) not in learnable_grids.X0_GRADS:
+          raise SystemExit(f"diffusion.learn_grids.x0_grad must be one of {learnable_grids.X0_GRADS}, got {lg.x0_grad!r}")
         aug = cfg.diffusion.get("augment")
         if aug is not None and aug.get("slot_shuffle"):
           raise SystemExit("diffusion.learn_grids: no augmentation (diffusion.augment.slot_shuffle=false)")
@@ -677,7 +679,12 @@ class GSLightningModule(pl.LightningModule):
     self.grid_opt = None
     self._grid_opt_state = None   # a resumed run's grid optimizer state, loaded once the optimizer exists
     if grid_init is not None:
-      self.grids = learnable_grids.LearnableGrids(grid_init, learnable=bool(learnable_grids.learn_grids_config(cfg).learnable))
+      lg = learnable_grids.learn_grids_config(cfg)
+      self.grids = learnable_grids.LearnableGrids(grid_init, learnable=bool(lg.learnable), scale_param=x0_encoding(cfg)["scale_param"])
+      # x0_grad none: the grids' gradient is the rendering loss's alone (_diffusion_train_step computes it, backward() keeps the
+      # total loss's off the grids, optimizer_step installs it)
+      self._grid_x0_grad = str(lg.get("x0_grad", "through_input"))
+      self._grid_grads = None
       self._grid_eval = grid_init["eval"]
       self._grid_logged = {}   # what the grid metrics logged once already (the reference / init) and the last step they ran
 
@@ -743,7 +750,8 @@ class GSLightningModule(pl.LightningModule):
           f"the checkpoint was trained with diffusion.scale_encoding={saved}, this config has {now}: its x0 statistics and targets "
           f"would not match. Resume with the checkpoint's own encoding, e.g. diffusion.scale_encoding.scale_order="
           f"{saved['scale_order']} diffusion.scale_encoding.scale_floor_px={saved['scale_floor_px'] if saved['scale_floor_px'] is not None else 'null'}"
-          f" diffusion.scale_encoding.scale_floor_mode={saved['scale_floor_mode']} diffusion.scale_encoding.rot_form={saved['rot_form']}")
+          f" diffusion.scale_encoding.scale_floor_mode={saved['scale_floor_mode']} diffusion.scale_encoding.rot_form={saved['rot_form']}"
+          f" diffusion.scale_encoding.scale_param={saved['scale_param']}")
     if self.ema is not None and "ema" in checkpoint:
       self.ema.load_state_dict(checkpoint["ema"])
       self._ema_fresh = False
@@ -789,8 +797,12 @@ class GSLightningModule(pl.LightningModule):
       self.ema.update(self.model)
     if getattr(self, "grid_opt", None) is not None:   # diffusion.learn_grids: the grids step with the model (a skipped loss moves neither)
       if self._accepted_since_step:
+        if self._grid_grads is not None:   # x0_grad none: the rendering loss's gradient
+          for p, g in zip(self.grids.parameters(), self._grid_grads):
+            p.grad = g
         self.grid_opt.step()
       self.grid_opt.zero_grad(set_to_none=True)
+      self._grid_grads = None
     self._accepted_since_step = False
 
   def training_step(self, batch, batch_idx):
@@ -821,7 +833,8 @@ class GSLightningModule(pl.LightningModule):
     x0_raw = batch["x0_raw"].to(self.device)
     if getattr(self, "grids", None) is not None and not seeded:
       # diffusion.learn_grids, training: the volumes' grids instead of the dataset's; learnable: the noised input carries the graph to
-      # them, the x0 target is the detached copy (the x0 loss never moves a grid, whatever its weight)
+      # them, the x0 target is the detached copy (stop-gradient on the target only; learn_grids.x0_grad none: the x0 loss's
+      # gradient is kept from the grids altogether, see _diffusion_train_step)
       x0_in = self.grids.dense(batch["source_view"], hit)
       x0_raw = x0_in.detach()
       if not self.grids.learnable:
@@ -920,9 +933,11 @@ class GSLightningModule(pl.LightningModule):
     x0_loss = loss.detach()
     loss = float(self.cfg.diffusion.get("x0_weight", 1.0)) * loss   # 0: the x0 loss is only logged (diffusion.photom alone trains)
     held = []   # the rendering loss's logs: like train/loss and the x0 loss's, accepted steps only
+    photom = None
     if self._photom_active():
-      loss = loss + float(self.cfg.diffusion.photom.weight) * self._diffusion_photom(
+      photom = float(self.cfg.diffusion.photom.weight) * self._diffusion_photom(
         "train", batch, x0_hat, t, log=lambda *a: held.append(a), **({"cond_drop": cond_drop} if cond_drop is not None else {}))
+      loss = loss + photom
     value = float(loss.detach())
     skipped = self.spike_skip.check(value)
     self._log_metric("train", "skipped", float(skipped), B)
@@ -941,7 +956,25 @@ class GSLightningModule(pl.LightningModule):
       self._log_metric("train", "cond_dropped", cond_drop.float().mean(), B)   # the realized fraction of null-condition samples
     for a in held:
       self._log_metric(*a)
+    if getattr(self, "grids", None) is not None and self.grids.learnable and self._grid_x0_grad == "none":
+      self._grid_grads = self._rendering_grid_grads(photom)
     return loss
+
+  def _rendering_grid_grads(self, photom):
+    """diffusion.learn_grids.x0_grad none: the grids' gradient from the weighted rendering loss `photom` alone (zeros when it is
+    off or has no graph), one extra backward pass through the model to x_t (the graph is kept for the total loss's backward)."""
+    params = list(self.grids.parameters())
+    if photom is None or not photom.requires_grad:
+      return [torch.zeros_like(p) for p in params]
+    grads = torch.autograd.grad(photom, params, retain_graph=True, allow_unused=True)
+    return [torch.zeros_like(p) if g is None else g for p, g in zip(params, grads)]
+
+  def backward(self, loss, *args, **kwargs):
+    # diffusion.learn_grids.x0_grad none: the total loss's gradient goes to the model only; the grids get the rendering loss's
+    # (_rendering_grid_grads, installed by optimizer_step)
+    if getattr(self, "_grid_grads", None) is not None:
+      kwargs = {**kwargs, "inputs": [p for n, p in self.named_parameters() if p.requires_grad and not n.startswith("grids.")]}
+    super().backward(loss, *args, **kwargs)
 
   @torch.no_grad()
   def _diffusion_val_loss(self, stage, batch):
@@ -1030,7 +1063,7 @@ class GSLightningModule(pl.LightningModule):
       elif str(lg.init) == "fresh":
         src = {k: batch["source"][k][b].cpu().numpy() for k in ("hit", "xyz_cam", "K_depth")}
         colors = learnable_grids.read_colors(_get_h5(self._grid_eval["source_h5"]), v, str(lg.fresh.color), src["hit"].shape[0])
-        rows = torch.from_numpy(learnable_grids.fresh_rows(src, colors, float(lg.fresh.opacity))).to(self.device)
+        rows = torch.from_numpy(learnable_grids.fresh_rows(src, colors, float(lg.fresh.opacity), self.grids.scale_param)).to(self.device)
         x0[b] = 0
         x0[b][:, hit[b]] = rows.T
     return {**batch, "x0_raw": x0}
@@ -1114,9 +1147,10 @@ class GSLightningModule(pl.LightningModule):
           sources["grids_init"] = (lambda i: g.volume_rows(i, init=True), g.rows(init=True))
         for prefix, (rows_of, all_rows) in sources.items():
           metrics |= {f"{prefix}/{k}": v for k, v in self._grid_quality(rows_of).items()}
-          metrics |= {f"{prefix}/stats/{k}": v for k, v in learnable_grids.param_stats(all_rows.float(), g.foot, g.pairs).items()}
+          metrics |= {f"{prefix}/stats/{k}": v for k, v in learnable_grids.param_stats(all_rows.float(), g.foot, g.pairs,
+                                                                                         scale_param=g.scale_param).items()}
       metrics |= {f"grids/{k}": v for k, v in self._grid_quality(lambda i: g.volume_rows(i).detach()).items()}
-      stats = learnable_grids.param_stats(g.rows().detach(), g.foot, g.pairs, init_rows=g.rows(init=True))
+      stats = learnable_grids.param_stats(g.rows().detach(), g.foot, g.pairs, init_rows=g.rows(init=True), scale_param=g.scale_param)
       metrics |= {f"grids/stats/{k}": v for k, v in stats.items()}
     for k, v in metrics.items():
       self.log(k, v, add_dataloader_idx=False)

@@ -434,6 +434,10 @@ diffusion:
     rot_form: keep             # which of each Gaussian's 4 equivalent quaternions (two axes flipped) is stored, after the sort:
                                # keep (as fitted; after the sort effectively random) | canonical (largest |w|) | random (fresh per encode;
                                # for rendering-only training: with the x0 loss the rotation target is then unpredictable)
+    scale_param: log           # the 3 scale channels: log (the log-scales) | cumulative (every Gaussian's axes sorted ascending, the
+                               # rotation permuted to match; the channels (a, b, c): log-scales a, a + softplus(b), a + softplus(b) +
+                               # softplus(c), so every decoded Gaussian -- grid or prediction -- is sorted by construction; an encode
+                               # writes gaps of at least 1e-4 (tied axes). Needs scale_order=keep, scale_floor_px=null, decode_clamp=channel)
   # Render-invariant augmentation of the TRAINING grids (gs_diffusion.augment_x0; the statistics, validations and eval are not
   # augmented): the same Gaussians written down differently. Meant for rendering-only training (x0_weight=0): with the x0 loss on, a
   # shuffled target is unpredictable.
@@ -464,11 +468,11 @@ diffusion:
     start_seconds: 0           # off until the train clock reaches this
     validate: true             # also log <set>/<name>/loss/photom in the validations (gated like the training's), when enabled
   # Learnable x0 data (learnable_grids.py): every TRAINING volume's grid (its valid slots' 14 raw x0 channels, stored sparsely) is a
-  # parameter, optimized only through the rendering loss of the model's x0 prediction (diffusion.photom): the gradient reaches it
-  # through the noisy input x_t = (1 - t) x0 + t eps alone (zero at t = 1); the x0 target is the detached grid (the x0 loss, whatever
-  # x0_weight, never moves a grid), and the grid itself is never rendered for training. The x0 normalization stays the fitted grids'
-  # (compute_stats, frozen). Needs the raw encoding (scale_encoding scale_order=keep, scale_floor_px=null, rot_form=keep) and no
-  # augmentation. The validations' x_t (loss/x0, loss/photom, val_t, the probe) are built from these grids for the training volumes;
+  # parameter, optimized only through the model's losses on its x0 prediction: the gradient reaches it through the noisy input
+  # x_t = (1 - t) x0 + t eps alone (zero at t = 1) -- the x0 target is the detached grid (stop-gradient on the target only) -- from
+  # the rendering loss (diffusion.photom) and, with x0_grad through_input and x0_weight > 0, the x0 loss; the grid itself is never
+  # rendered for training. The x0 normalization stays the fitted grids' (compute_stats, frozen). Needs the raw encoding
+  # (scale_encoding scale_order=keep, scale_floor_px=null, rot_form=keep; scale_param log or cumulative) and no augmentation. The validations' x_t (loss/x0, loss/photom, val_t, the probe) are built from these grids for the training volumes;
   # a held-out source keeps its fitted grid (init pretrained) or gets its fresh init (init fresh). The grids and their optimizer
   # state are in the checkpoints; the final grids go to <output_dir>/learned_grids/ (the fitted files' format and names, + x0_raw).
   # Logged at every validation step: grids/<set>/{psnr,fg_psnr,bg_l1,dssim,lpips} (the grids rendered as they are at the set's views
@@ -481,6 +485,10 @@ diffusion:
     init: pretrained           # pretrained (the fitted grids, as the dataset encodes them) | fresh (anchored_3dgs.init_params per slot:
                                # offset 0, isotropic scale = the slot's pixel footprint z / fx, identity rotation, opacity below, colour below)
     learnable: true            # false: frozen (the same grids as plain data, no gradient, no optimizer: the control)
+    # through_input: the grids get the gradient of the whole training loss (the rendering loss and, x0_weight > 0, the x0 loss --
+    # both through x_t only, the x0 target is detached) | none: the rendering loss's alone (the model still gets both): one extra
+    # backward pass through the model per step (the rendering loss to the grids, graph kept), then the total loss to the model only
+    x0_grad: through_input
     fresh:
       opacity: 0.1
       color: peel_rgb          # peel_rgb (the slot's own layer colour, the render's depth_peel_rgb) | image (the source image's pixel,

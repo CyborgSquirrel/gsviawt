@@ -77,11 +77,41 @@ def sort_scale_axes(scale, quat):
   return permute_scale_axes(scale, quat, np.argsort(-scale, axis=1))
 
 
-ENCODING_DEFAULTS = dict(scale_order="keep", scale_floor_px=None, scale_floor_mode="max", rot_form="keep")   # what a config without the key means
+ENCODING_DEFAULTS = dict(scale_order="keep", scale_floor_px=None, scale_floor_mode="max", rot_form="keep",
+                         scale_param="log")   # what a config without the key means
 SCALE_ORDERS = ("keep", "sorted", "random")
 ROT_FORMS = ("keep", "canonical", "random")
 SCALE_FLOOR_MODES = ("max", "add")
+SCALE_PARAMS = ("log", "cumulative")
 FLOOR_ADD_EPS = 0.1   # scale_floor_mode add: an axis at (or under) the floor is stored as this fraction of the floor above it
+CUM_GAP_FLOOR = 1e-4  # scale_param cumulative: the smallest log-scale gap an encode writes (tied axes: softplus^-1(0) is -inf)
+
+
+def softplus_inv(y):
+  """numpy / torch softplus^-1(y) = y + log(1 - e^-y), y > 0."""
+  if isinstance(y, torch.Tensor):
+    return y + torch.log(-torch.expm1(-y))
+  return y + np.log(-np.expm1(-y))
+
+
+def log_to_cumulative(log_scale):
+  """scale_param cumulative: (N, 3) log-scales sorted ASCENDING -> the (a, b, c) channels, a = the smallest log-scale, b / c =
+  softplus^-1 of the two gaps (each at least CUM_GAP_FLOOR). numpy or torch. cumulative_to_log inverts it (up to the floor)."""
+  lib = torch if isinstance(log_scale, torch.Tensor) else np
+  a = log_scale[:, :1]
+  gaps = log_scale[:, 1:] - log_scale[:, :-1]
+  gaps = gaps.clamp_min(CUM_GAP_FLOOR) if lib is torch else np.maximum(gaps, CUM_GAP_FLOOR)
+  return lib.concatenate([a, softplus_inv(gaps)], 1) if lib is np else torch.cat([a, softplus_inv(gaps)], 1)
+
+
+def cumulative_to_log(abc, dim=1):
+  """scale_param cumulative: the (a, b, c) channels (along `dim`) -> the 3 log-scales a, a + softplus(b), a + softplus(b) +
+  softplus(c): sorted ascending whatever a, b, c are. numpy or torch."""
+  if isinstance(abc, torch.Tensor):
+    a, bc = abc.narrow(dim, 0, 1), F.softplus(abc.narrow(dim, 1, 2))
+    return torch.cat([a, a + torch.cumsum(bc, dim)], dim)
+  a, bc = np.take(abc, [0], axis=dim), np.logaddexp(0, np.take(abc, [1, 2], axis=dim))
+  return np.concatenate([a, a + np.cumsum(bc, axis=dim)], dim)
 
 
 def normalize_encoding(encoding):
@@ -102,6 +132,11 @@ def normalize_encoding(encoding):
     raise ValueError(f"rot_form must be one of {ROT_FORMS}, got {e['rot_form']!r}")
   if e["scale_floor_mode"] not in SCALE_FLOOR_MODES:
     raise ValueError(f"scale_floor_mode must be one of {SCALE_FLOOR_MODES}, got {e['scale_floor_mode']!r}")
+  if e["scale_param"] not in SCALE_PARAMS:
+    raise ValueError(f"scale_param must be one of {SCALE_PARAMS}, got {e['scale_param']!r}")
+  if e["scale_param"] == "cumulative" and (e["scale_order"] != "keep" or e["scale_floor_px"] is not None):
+    raise ValueError("scale_param cumulative sorts the axes itself (ascending) and has no floor: it needs scale_order=keep and "
+                     f"scale_floor_px=null, got scale_order={e['scale_order']}, scale_floor_px={e['scale_floor_px']}")
   return e
 
 
@@ -118,7 +153,7 @@ def set_rot_form(q, rot_form, rng=None):
 
 
 def encode_grid(grid, source, scale_order=None, scale_floor_px=None, rot_form="keep", rng=None, scale_sort=None,
-                scale_floor_mode="max"):
+                scale_floor_mode="max", scale_param="log"):
   """The grid's Gaussians as raw (un-normalized) x0 channels, (CHANNELS, L, H, W) float32, zero at the slots without a Gaussian.
   `grid`: a grid_io.Grid (read_grid: a sparse file's rows, used as they are) or load_grid's dense dict (gathered into one first: the
   same rows, so the same x0 bit for bit).
@@ -134,10 +169,14 @@ def encode_grid(grid, source, scale_order=None, scale_floor_px=None, rot_form="k
   call). scale_sort: the legacy boolean (True = sorted). Both render the same as the grid (bla/_test_scale_reencode.py: floor 0.1 px >= 56 dB PSNR
   against the original render over 5000 renders). rot_form (set_rot_form, after the sort): which of a Gaussian's 4 equivalent
   quaternions is stored -- keep (as fitted, in the camera frame: after the sort an effectively random one), canonical (largest
-  |w|), random (a fresh random one per call; rng: its generator, default a fresh one)."""
+  |w|), random (a fresh random one per call; rng: its generator, default a fresh one).
+  scale_param: log (the 3 scale channels the log-scales) | cumulative (every Gaussian's axes sorted ASCENDING, the rotation permuted
+  to match, as sort_scale_axes; the channels (a, b, c) of log_to_cumulative: cumulative_to_log gives the sorted log-scales back,
+  render-equal up to the CUM_GAP_FLOOR of tied axes; needs scale_order keep, no floor)."""
   # scale_order None: keep, or the legacy flag's choice; both given must agree
   e = normalize_encoding({**({"scale_order": scale_order} if scale_order is not None else {}), "scale_floor_px": scale_floor_px,
-                          "scale_floor_mode": scale_floor_mode, "rot_form": rot_form, **({"scale_sort": scale_sort} if scale_sort is not None else {})})
+                          "scale_floor_mode": scale_floor_mode, "rot_form": rot_form, "scale_param": scale_param,
+                          **({"scale_sort": scale_sort} if scale_sort is not None else {})})
   scale_order, rot_form = e["scale_order"], e["rot_form"]
   if "random" in (scale_order, rot_form) and rng is None:
     rng = np.random.default_rng()
@@ -176,6 +215,8 @@ def encode_grid(grid, source, scale_order=None, scale_floor_px=None, rot_form="k
       scales, q = sort_scale_axes(scales, q)
     elif scale_order == "random":
       scales, q = permute_scale_axes(scales, q, np.argsort(rng.random((len(q), 3)), axis=1))
+    if e["scale_param"] == "cumulative":   # smallest -> largest (stable: tied axes keep their order)
+      scales, q = permute_scale_axes(scales, q, np.argsort(scales, axis=1, kind="stable"))
     q = np.where(q[:, :1] < 0, -q, q)                                # q and -q are one rotation: w >= 0
     quat[:] = set_rot_form(q, rot_form, rng)
 
@@ -184,6 +225,8 @@ def encode_grid(grid, source, scale_order=None, scale_floor_px=None, rot_form="k
   if floor is not None and scale_floor_mode == "add":   # (after the sort: the excess has the axes' order, the floor is per Gaussian)
     scales = np.maximum(scales - floor, FLOOR_ADD_EPS * floor)
   scale = np.log(np.maximum(scales, 1e-8))
+  if e["scale_param"] == "cumulative":
+    scale = log_to_cumulative(scale.astype(np.float64))
   color = (take("gaussian_colors") - 0.5) / SH_C0
 
   x0 = np.zeros((CHANNELS,) + valid.shape, np.float32)
@@ -278,7 +321,7 @@ def matrix_to_quat(R):
 
 
 def format_projection(mean, std, hit, anchor_z, fx, scale_sort=False, scale_floor_px=None, scale_order=None, rot_form="keep",
-                      scale_floor_mode="max", quat="unit"):
+                      scale_floor_mode="max", quat="unit", scale_param="log"):
   """A function on normalized x0 predictions (B, L, CHANNELS, H, W) that puts the valid slots' Gaussians into the training grids'
   format (encode_grid with this encoding): the scale axes ordered largest -> smallest (the rotation permuted to match, as
   sort_scale_axes), every axis at least scale_floor_px pixel footprints, the rotation a unit quaternion with w >= 0. For the sampler's
@@ -287,7 +330,13 @@ def format_projection(mean, std, hit, anchor_z, fx, scale_sort=False, scale_floo
   focal length. Takes the run's encoding as keywords: scale_order (keep | sorted | random; only sorted is projected) or the legacy
   scale_sort, rot_form (canonical: the quaternion form with the largest |w|; keep / random: left as predicted). quat: unit (the
   rotation becomes a unit quaternion with w >= 0) | keep (the predicted quaternion is left exactly as it is,
-  except where the sort reorders the axes: there the permuted rotation at the predicted length, its sign as matrix_to_quat gives it)."""
+  except where the sort reorders the axes: there the permuted rotation at the predicted length, its sign as matrix_to_quat gives it).
+  scale_param cumulative: the (a, b, c) scale channels are left as predicted (sorted by construction; the encoding has no sort and
+  no floor to project), only the rotation is projected."""
+  if scale_param not in SCALE_PARAMS:
+    raise ValueError(f"format_projection: scale_param must be one of {SCALE_PARAMS}, got {scale_param!r}")
+  if scale_param == "cumulative" and (scale_sort or scale_order == "sorted" or scale_floor_px is not None):
+    raise NotImplementedError("format_projection: scale_param cumulative with a scale sort or floor")
   if scale_floor_px is not None and scale_floor_mode != "max":
     raise NotImplementedError("format_projection: only scale_floor_mode max (with add the decode applies the floor itself)")
   if quat not in ("unit", "keep"):
@@ -337,7 +386,7 @@ def format_projection(mean, std, hit, anchor_z, fx, scale_sort=False, scale_floo
 DECODE_CLAMPS = ("channel", "scale")
 
 
-def decode_x0(x0, mean, std, lo=None, hi=None, clamp="channel", floor=None):
+def decode_x0(x0, mean, std, lo=None, hi=None, clamp="channel", floor=None, scale_param="log"):
   """Normalized x0 (B, L, CHANNELS, H, W) -> the Gaussian dict flatten_gaussians reads (gs_decoder.activate_gaussians' layout).
   lo / hi (CHANNELS,): the range of every channel in the training grids (an unbounded exp(scale) of a half-trained sampler would
   otherwise become a scene-sized Gaussian). clamp (diffusion.decode_clamp): channel = every channel clamped into its own range;
@@ -345,7 +394,10 @@ def decode_x0(x0, mean, std, lo=None, hi=None, clamp="channel", floor=None):
   per-axis range would cut an axis written into the "wrong" channel), every other channel unclamped (as gs_decoder's head).
   A clamped value has no gradient. floor (scale_floor_mode add; GSDiffusionModel.floor_context): {"px": scale_floor_px, "anchor_z"
   (B, L, H, W), "fx" (B,)}: scale = floor + exp(channel), the floor scale_floor_px pixel footprints at the Gaussian's mean depth
-  (anchor + offset z, as encode_grid's), raw_scale its log."""
+  (anchor + offset z, as encode_grid's), raw_scale its log. scale_param cumulative: the scale channels are (a, b, c) (clamped as
+  channels, clamp channel only), the log-scales cumulative_to_log's -- sorted ascending for any prediction."""
+  if scale_param == "cumulative" and (floor is not None or (lo is not None and clamp == "scale")):
+    raise ValueError("decode_x0: scale_param cumulative has no floor and no clamp=scale (its channels are not log-scales)")
   raw = x0 * std[None, None, :, None, None] + mean[None, None, :, None, None]
   if lo is not None:
     if clamp == "scale":
@@ -356,6 +408,8 @@ def decode_x0(x0, mean, std, lo=None, hi=None, clamp="channel", floor=None):
       raise ValueError(f"decode clamp must be one of {DECODE_CLAMPS}, got {clamp!r}")
     raw = torch.maximum(torch.minimum(raw, hi[None, None, :, None, None]), lo[None, None, :, None, None])
   opacity, scale, rotation, sh_dc, offset = raw.split(DIMS, dim=2)
+  if scale_param == "cumulative":
+    scale = cumulative_to_log(scale, dim=2)
   size = torch.exp(scale)
   if floor is not None:
     z = floor["anchor_z"][:, :, None].to(raw) + offset[:, :, 2:3]                   # (B, L, 1, H, W): the mean's depth
@@ -478,6 +532,7 @@ def encoding_tag(encoding):
   parts = parts + ([f"floor{float(e['scale_floor_px']):g}px" + ("add" if e["scale_floor_mode"] == "add" else "")]
                    if e["scale_floor_px"] is not None else [])
   parts += [f"rot{e['rot_form']}"] if e["rot_form"] != "keep" else []
+  parts += ["cumulative"] if e["scale_param"] == "cumulative" else []
   return "_".join(parts)
 
 
@@ -921,6 +976,7 @@ class GSDiffusionModel(nn.Module):
   phase = 1   # diffusion.schedule.phase (set in __init__)
   decode_clamp = "channel"   # diffusion.decode_clamp (set in __init__)
   floor_add_px = None        # diffusion.scale_encoding.scale_floor_px with scale_floor_mode add (set in __init__): the decode adds it
+  scale_param = "log"        # diffusion.scale_encoding.scale_param (set in __init__): what the decode reads the scale channels as
   token_drop = "none"        # diffusion.token_drop (set in __init__)
   cond_dropout_p = 0.0       # diffusion.cond_dropout.p (set in __init__): 0 = never dropped, nothing drawn
   guidance = GUIDANCE_DEFAULTS   # diffusion.cfg, normalized (set in __init__): scale 1 = conditional only, one forward per step
@@ -956,6 +1012,10 @@ class GSDiffusionModel(nn.Module):
                          else None)
     if self.decode_clamp not in DECODE_CLAMPS:
       raise SystemExit(f"diffusion.decode_clamp must be one of {DECODE_CLAMPS}, got {self.decode_clamp!r}")
+    self.scale_param = enc["scale_param"]
+    if self.scale_param == "cumulative" and self.decode_clamp == "scale":
+      raise SystemExit("diffusion.scale_encoding.scale_param=cumulative needs diffusion.decode_clamp=channel (its scale channels are "
+                       "not log-scales)")
     fixed_t = d.schedule.get("fixed_t")
     if fixed_t is not None and cfg.diffusion.get("photom") is not None and cfg.diffusion.photom.enabled:
       raise SystemExit("diffusion.schedule.fixed_t with diffusion.photom: the rendering loss's t gate never opens at t = 1, the "
@@ -1223,7 +1283,8 @@ class GSDiffusionModel(nn.Module):
     with scale_floor_mode add)."""
     if self.floor_add_px is not None and floor is None:
       raise ValueError("scale_floor_mode add: decode needs the floor context (GSDiffusionModel.floor_context)")
-    return decode_x0(x0.float(), self.x0_mean, self.x0_std, self.x0_lo, self.x0_hi, clamp=self.decode_clamp, floor=floor)
+    return decode_x0(x0.float(), self.x0_mean, self.x0_std, self.x0_lo, self.x0_hi, clamp=self.decode_clamp, floor=floor,
+                     **({"scale_param": self.scale_param} if self.scale_param != "log" else {}))
 
   def forward(self, inputs):
     image, hit, seeds, floor = inputs

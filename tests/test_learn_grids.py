@@ -297,3 +297,171 @@ def test_dump_is_the_grid_format(tmp_path):
   back = gd.encode_grid(read_grid(tmp_path / "g.h5"), {**src, "pose_gl": torch.from_numpy(pose)})
   np.testing.assert_allclose(back[:, hit].T, rows, atol=2e-5)
   np.testing.assert_allclose(raw, rows, rtol=1e-6, atol=1e-8)   # (offsets: stored / extent, x extent back)
+
+
+# ---------------------------------------------------------------------------- scale_encoding.scale_param cumulative
+
+def world_grid(seed=0):
+  """test_augment's scene as a grid file's Grid (world frame, a random pose) and its source dict (with pose_gl)."""
+  from test_augment import scene
+  x0, src = scene(seed)
+  pose = np.eye(4, dtype=np.float32)
+  pose[:3, :3] = Rotation.from_euler("xyz", [0.3, -0.5, 1.1]).as_matrix()
+  pose[:3, 3] = [0.5, -1.0, 2.0]
+  hit = src["hit"].numpy()
+  n = int(hit.sum())
+  init = {"views": [7], "mesh": [0], "rows": [x0[:, hit].T.copy()], "extent": [1.0], "foot": [np.full(n, 0.02, np.float32)],
+          "hit": [hit], "anchor": [src["xyz_cam"].numpy()[hit]], "pose": [pose], "pairs": lgm.neighbour_pairs(hit, 0), "ref_rows": None}
+  grid, _ = lgm.LearnableGrids(init).to_grid(0)
+  grid.rows["gaussian_scales"][:5] = grid.rows["gaussian_scales"][:5, :1]   # a few tied (isotropic) Gaussians
+  return grid, {**src, "pose_gl": torch.from_numpy(pose)}
+
+
+def as_log(x0, scale_param):
+  """(C, L, H, W) x0 with its scale channels turned into log-scales (test_augment.gaussians reads those)."""
+  out = x0.copy()
+  out[gd.SCALE] = np.moveaxis(gd.cumulative_to_log(np.moveaxis(x0[gd.SCALE], 0, -1).reshape(-1, 3)).reshape(
+    *x0.shape[1:], 3), -1, 0) if scale_param == "cumulative" else x0[gd.SCALE]
+  return out
+
+
+def test_cumulative_encode_decode_round_trip():
+  from test_augment import gaussians
+  grid, src = world_grid()
+  hit = src["hit"].numpy()
+  x_log = gd.encode_grid(grid, src)
+  x_cum = gd.encode_grid(grid, src, scale_param="cumulative")
+  logs = as_log(x_cum, "cumulative")[:, hit][gd.SCALE].T
+  assert (np.diff(logs, axis=1) > 0).all()                                     # sorted ascending (ties: the 1e-4 floor apart)
+  np.testing.assert_allclose(gaussians(as_log(x_cum, "cumulative"), src), gaussians(x_log, src), rtol=1e-3, atol=1e-6)   # render-equal
+  # decode_x0 reads them the same way
+  c = gd.CHANNELS
+  g_cum = gd.decode_x0(torch.from_numpy(x_cum).permute(1, 0, 2, 3)[None], torch.zeros(c), torch.ones(c), scale_param="cumulative")
+  torch.testing.assert_close(g_cum["raw_scale"][0].permute(1, 0, 2, 3)[:, torch.from_numpy(hit)].T, torch.from_numpy(logs))
+
+
+def test_cumulative_decode_is_sorted_for_any_prediction():
+  g = torch.Generator().manual_seed(0)
+  x = 5 * torch.randn(3, 2, gd.CHANNELS, 8, 8, generator=g)
+  c = gd.CHANNELS
+  lo, hi = -2 * torch.ones(c), 2 * torch.ones(c)
+  for kw in ({}, {"lo": lo, "hi": hi}):
+    s = gd.decode_x0(x, torch.zeros(c), torch.ones(c), scale_param="cumulative", **kw)["raw_scale"]   # (B, L, 3, H, W)
+    assert (s[:, :, 1] >= s[:, :, 0]).all() and (s[:, :, 2] >= s[:, :, 1]).all()
+  with pytest.raises(ValueError):
+    gd.decode_x0(x, torch.zeros(c), torch.ones(c), lo, hi, clamp="scale", scale_param="cumulative")
+  with pytest.raises(ValueError):
+    gd.normalize_encoding({"scale_param": "cumulative", "scale_order": "sorted"})
+
+
+def test_default_log_encoding_and_decode_unchanged():
+  grid, src = world_grid()
+  assert np.array_equal(gd.encode_grid(grid, src), gd.encode_grid(grid, src, scale_param="log"))
+  assert gd.normalize_encoding(None)["scale_param"] == "log" and gd.encoding_tag(None) == ""
+  assert gd.encoding_tag({"scale_param": "cumulative"}) == "cumulative"
+  x = torch.randn(2, 2, gd.CHANNELS, 4, 4)
+  c = gd.CHANNELS
+  a = gd.decode_x0(x, torch.zeros(c), torch.ones(c))
+  torch.testing.assert_close(a["raw_scale"], x[:, :, gd.SCALE])
+
+
+def cumulative_init(seed=0):
+  init = synthetic_init(seed)
+  for r in init["rows"]:
+    r[:, gd.SCALE] = gd.log_to_cumulative(np.sort(r[:, gd.SCALE], axis=1).astype(np.float64))
+  return init
+
+
+def test_cumulative_learnable_grid_stays_sorted():
+  g = lgm.LearnableGrids(cumulative_init(), scale_param="cumulative")
+  opt = torch.optim.Adam(g.param_groups({"offset": 1e-3, "sh0": 1e-2, "opacities": 1e-2, "scales": 0.5, "quats": 1e-2}), eps=1e-15)
+  gen = torch.Generator().manual_seed(0)
+  for _ in range(50):   # big steps, random gradients: the channels go anywhere, the decoded axes stay sorted
+    for p in g.parameters():
+      p.grad = torch.randn(p.shape, generator=gen)
+    opt.step()
+  s = lgm.log_scales(g.rows().detach(), "cumulative")
+  assert (s[:, 1] >= s[:, 0]).all() and (s[:, 2] >= s[:, 1]).all()
+  assert float((g.params["scale"].detach() - g.init_scale).abs().max()) > 1
+  st = lgm.param_stats(g.rows().detach(), g.foot, g.pairs, init_rows=g.rows(init=True), scale_param="cumulative")
+  assert np.isfinite(list(st.values())).all() and st["drift/scale"] > 0
+
+
+def test_fresh_rows_cumulative():
+  from test_augment import FX, scene
+  _, src = scene()
+  src = {"hit": src["hit"].numpy(), "xyz_cam": src["xyz_cam"].numpy(), "K_depth": src["K_depth"]}
+  colors = np.zeros((*src["hit"].shape, 3), np.float32)
+  rows = lgm.fresh_rows(src, colors, scale_param="cumulative")
+  z = src["xyz_cam"][src["hit"]][:, 2]
+  logs = lgm.log_scales(rows, "cumulative")
+  np.testing.assert_allclose(logs[:, 0], np.log(z / FX), rtol=1e-6)
+  np.testing.assert_allclose(np.diff(logs, axis=1), gd.CUM_GAP_FLOOR, rtol=1e-2)   # isotropic up to the floor gaps (float32)
+
+
+def test_cumulative_gradient_path_unchanged():
+  batch = batch_of()
+  for t, expect in ((0.3, True), (1.0, False)):
+    g = lgm.LearnableGrids(cumulative_init(), scale_param="cumulative")
+    fake = fake_module(g, t=t)
+    loss, x0_hat, _ = losses(fake, batch)
+    (loss + x0_hat.float().square().mean()).backward()
+    total = sum(float(p.grad.abs().sum()) for p in g.parameters() if p.grad is not None)
+    assert (total > 0) == expect, (t, total)
+
+
+# ---------------------------------------------------------------------------- learn_grids.x0_grad
+
+def train_step(g, x0_weight, x0_grad, t=0.3):
+  """_diffusion_train_step on a shell module (rendering loss stand-in: mean square of the x0 prediction) -> (loss, the fake)."""
+  from omegaconf import OmegaConf
+  fake = fake_module(g, t=t)
+  fake.cfg = OmegaConf.create({"diffusion": {"x0_weight": x0_weight, "photom": {"enabled": True, "weight": 10.0}}})
+  fake.views_seen = fake.pixels_seen = 0
+  fake._accepted_since_step = False
+  fake._grid_x0_grad = x0_grad
+  fake._grid_grads = None
+  fake.spike_skip = types.SimpleNamespace(check=lambda v: False, average=None)
+  fake._photom_active = lambda: True
+  fake._diffusion_photom = lambda stage, batch, x0_hat, t, log=None: x0_hat.float().square().mean()
+  fake._log_metric = lambda *a: None
+  fake._log_parts = lambda *a: None
+  for name in ("_diffusion_losses", "_rendering_grid_grads"):
+    setattr(fake, name, (lambda f: lambda *a, **k: f(fake, *a, **k))(getattr(train_gs.GSLightningModule, name)))
+  torch.manual_seed(123)
+  return train_gs.GSLightningModule._diffusion_train_step(fake, batch_of()), fake
+
+
+def test_x0_grad_none_gives_the_grids_the_rendering_loss_gradient_only():
+  ref_g = lgm.LearnableGrids(synthetic_init())
+  loss, _ = train_step(ref_g, 0.0, "through_input")   # the rendering loss alone
+  loss.backward()
+  ref = [p.grad.clone() for p in ref_g.parameters()]
+  g = lgm.LearnableGrids(synthetic_init())
+  loss, fake = train_step(g, 1.0, "none")
+  assert fake._grid_grads is not None
+  for a, b in zip(fake._grid_grads, ref):
+    torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-8)
+  # the model still gets both losses: the total loss's backward (graph kept by the extra pass) differs from the rendering-only one
+  loss.backward()
+  # through_input: unchanged -- nothing stashed, the grids' gradient is the whole loss's (x0 loss included: not the reference)
+  g2 = lgm.LearnableGrids(synthetic_init())
+  loss2, fake2 = train_step(g2, 1.0, "through_input")
+  loss2.backward()
+  assert fake2._grid_grads is None
+  assert any(not torch.allclose(p.grad, r) for p, r in zip(g2.parameters(), ref))
+
+
+def test_backward_keeps_the_total_loss_off_the_grids(tmp_path, monkeypatch):
+  monkeypatch.setattr(pl.LightningModule, "optimizer_step", lambda self, *a, **k: None)
+  m = module(tmp_path)
+  m.on_train_start()
+  w = next(p for n, p in m.named_parameters() if not n.startswith("grids.") and p.requires_grad)
+  stash = [torch.full_like(p, 0.5) for p in m.grids.parameters()]
+  m._grid_grads = stash
+  m.backward(w.sum() + sum(p.sum() for p in m.grids.parameters()))
+  assert w.grad is not None and all(p.grad is None for p in m.grids.parameters())
+  before = [p.detach().clone() for p in m.grids.parameters()]
+  m._accepted_since_step = True
+  m.optimizer_step(0, 0, None)   # installs the stash and steps
+  assert all(not torch.equal(a, p) for a, p in zip(before, m.grids.parameters())) and m._grid_grads is None
