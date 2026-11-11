@@ -463,6 +463,42 @@ diffusion:
     t_reduce: max              # max (the noisiest layer) | mean | layer0
     start_seconds: 0           # off until the train clock reaches this
     validate: true             # also log <set>/<name>/loss/photom in the validations (gated like the training's), when enabled
+  # Learnable x0 data (learnable_grids.py): every TRAINING volume's grid (its valid slots' 14 raw x0 channels, stored sparsely) is a
+  # parameter, optimized only through the rendering loss of the model's x0 prediction (diffusion.photom): the gradient reaches it
+  # through the noisy input x_t = (1 - t) x0 + t eps alone (zero at t = 1); the x0 target is the detached grid (the x0 loss, whatever
+  # x0_weight, never moves a grid), and the grid itself is never rendered for training. The x0 normalization stays the fitted grids'
+  # (compute_stats, frozen). Needs the raw encoding (scale_encoding scale_order=keep, scale_floor_px=null, rot_form=keep) and no
+  # augmentation. The validations' x_t (loss/x0, loss/photom, val_t, the probe) are built from these grids for the training volumes;
+  # a held-out source keeps its fitted grid (init pretrained) or gets its fresh init (init fresh). The grids and their optimizer
+  # state are in the checkpoints; the final grids go to <output_dir>/learned_grids/ (the fitted files' format and names, + x0_raw).
+  # Logged at every validation step: grids/<set>/{psnr,fg_psnr,bg_l1,dssim,lpips} (the grids rendered as they are at the set's views
+  # of metrics.volumes training volumes: train_views = the volume's training targets, val_views = the view split's held-out views
+  # of its mesh, nogrid_views = its mesh's renders without a grid file), grids/stats/... (learnable_grids.param_stats over all
+  # training volumes: per group mean/std/percentiles, the degenerate fractions, drift from the init, neighbour smoothness); once,
+  # the same of the fitted grids (grids_ref/...) and, with init fresh, of the init (grids_init/...).
+  learn_grids:
+    enabled: false
+    init: pretrained           # pretrained (the fitted grids, as the dataset encodes them) | fresh (anchored_3dgs.init_params per slot:
+                               # offset 0, isotropic scale = the slot's pixel footprint z / fx, identity rotation, opacity below, colour below)
+    learnable: true            # false: frozen (the same grids as plain data, no gradient, no optimizer: the control)
+    fresh:
+      opacity: 0.1
+      color: peel_rgb          # peel_rgb (the slot's own layer colour, the render's depth_peel_rgb) | image (the source image's pixel,
+                               # every layer: anchored_3dgs.load_view's)
+    # The grids' own Adam (anchored_3dgs.make_adam: eps 1e-15, no weight decay), the anchored fitter's learning rates
+    # (conf/fit_anchored.yaml lr.*) per channel group: opacity <- opacities, scale <- scales, rotation <- quats, sh_dc <- sh0,
+    # offset <- offset x the fit's scene_extent (the grid's own config_json anchored.scene_extent). Constant (no schedule, no
+    # gradient clipping); it steps exactly when the model's optimizer does (a skipped loss, diffusion.spike_skip, moves neither).
+    lr:
+      offset: 0.00016
+      sh0: 0.0025
+      opacities: 0.025
+      scales: 0.005
+      quats: 0.001
+    metrics:
+      volumes: 8               # training volumes rendered for grids/<set>/... (evenly spaced in source-view order); null: all
+      chunk: 16                # views per render call
+      lpips: vgg               # torchmetrics LPIPS network (vgg | alex | squeeze); null: not logged
 
 optim:
   _target_: torch.optim.AdamW

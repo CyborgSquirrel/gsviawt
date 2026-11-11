@@ -40,6 +40,7 @@ gsplat JIT-compiles CUDA kernels on first import; the CUDA toolchain
 it needs is set up at the image level (see Dockerfile).
 """
 
+import collections
 import contextlib as ctl
 import functools as ft
 import logging
@@ -63,10 +64,11 @@ from torch.utils.data import ConcatDataset, DataLoader
 import wandb
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
-from gs_dataset import (OPENGL_TO_OPENCV, WTFeatureDataset, _EmptyDataset,  # noqa: E402
+from gs_dataset import (OPENGL_TO_OPENCV, WTFeatureDataset, _build_item, _EmptyDataset, _get_h5,  # noqa: E402
                         render_catalog, rotate_quats_wxyz, sample_matching_sources)
 from gs_decoder import PatchGaussianHead  # noqa: E402
 import gs_diffusion  # noqa: E402
+import learnable_grids  # noqa: E402
 from module import (DSSIMLoss, Events, ProgressWandbLogger, SameDirCheckpointIO, TrainClock, _completed_steps,  # noqa: E402
                     make_scheduler, needs_clock)
 from util import collate_with_batch_size, pipe, set_mode, timed  # noqa: E402
@@ -428,6 +430,7 @@ class GSDataModule(pl.LightningDataModule):
     cfg = self.cfg
     d = cfg.data
     self.diffusion_stats = None
+    self.grid_init = None   # diffusion.learn_grids: the learnable grids' init (learnable_grids.build_init), for the module
     grid_index = None
     if not diffusion_enabled(cfg):
       features_h5 = d.features_h5
@@ -447,6 +450,16 @@ class GSDataModule(pl.LightningDataModule):
         log.warning("data.item=%s: the diffusion run trains on that one listed grid only (data.item=null: all of them)", d.item)
       if d.depth_size not in (None, d.image_size):
         raise SystemExit("diffusion mode needs data.depth_size=null (or the grids' own size): the grids are at the depth peel's own resolution")
+      lg = learnable_grids.learn_grids_config(cfg)
+      if lg is not None:
+        if x0_encoding(cfg) != gs_diffusion.normalize_encoding(None):
+          raise SystemExit(f"diffusion.learn_grids needs the raw encoding (diffusion.scale_encoding.scale_order=keep, scale_floor_px=null, "
+                           f"rot_form=keep), got {x0_encoding(cfg)}")
+        aug = cfg.diffusion.get("augment")
+        if aug is not None and aug.get("slot_shuffle"):
+          raise SystemExit("diffusion.learn_grids: no augmentation (diffusion.augment.slot_shuffle=false)")
+        if bool(lg.learnable) and (ph is None or not ph.enabled):
+          raise SystemExit("diffusion.learn_grids.learnable: the grids train only through diffusion.photom, which is off")
       grid_index, grids_source = gs_diffusion.build_grid_index(cfg.diffusion.grids_dir, cfg.diffusion.get("source_h5"))
       gs_diffusion.check_grids(grid_index, int(d.image_size), int(cfg.model.patch_size), int(d.num_layers))
       os.makedirs(cfg.output_dir, exist_ok=True)   # the module makes it too, but later
@@ -544,11 +557,39 @@ class GSDataModule(pl.LightningDataModule):
         WTFeatureDataset(features_h5, train_pool, rows=stats_rows, **kwargs), grid_index, enc)
       self.diffusion_stats = gs_diffusion.compute_stats(
         stats_ds, grid_index, os.path.join(cfg.diffusion.grids_dir, ".x0_moments"))
+      lg = learnable_grids.learn_grids_config(cfg)
+      if lg is not None:
+        self.grid_init = self._grid_init(lg, grid_index, enc, val_views, full_catalog)
     log.info(
       "volumes: %d train, validation sets %s", len(self.train_ds),
       {n: len(ds) for n, ds in self.val_datasets.items()})
     if not self.val_datasets:
       self.val_datasets = {"val": _EmptyDataset()}
+
+  def _grid_init(self, lg, grid_index, enc, val_views, full_catalog):
+    """diffusion.learn_grids: learnable_grids.build_init over the training volumes, plus "eval": what the grids' own render metrics
+    render -- "volumes", the source views of learn_grids.metrics.volumes training volumes (evenly spaced over them in source-view
+    order; null: all), and per set, for each of them, its target views: train_views (the training pool of its mesh, without the
+    source unless data.allow_source_as_target: the views its training renders), val_views (the view split's held-out views of the
+    mesh) and nogrid_views (the mesh's renders that have no grid file: never seen by the fit either)."""
+    inner = self.train_ds.inner
+    init = learnable_grids.build_init(lg, inner, grid_index, enc, gs_diffusion.encode_grid, gs_diffusion.read_grid)
+    init["paths"] = [grid_index[v] for v in init["views"]]
+    n = lg.metrics.volumes
+    pick = (list(range(len(init["views"]))) if n is None or int(n) >= len(init["views"])
+            else sorted({int(round(i)) for i in np.linspace(0, len(init["views"]) - 1, int(n))}))
+    vols = [(init["views"][i], init["mesh"][i]) for i in pick]
+    of_mesh = lambda cat, m: sorted(v for mm, v in zip(cat.df["mesh_id"].to_list(), cat.df["view_idx"].to_list()) if mm == m)
+    sets = {"train_views": {}, "val_views": {}, "nogrid_views": {}}
+    for v, m in vols:
+      pool = inner.pool[m]
+      sets["train_views"][v] = sorted(u for u in pool if u != v or self.cfg.data.allow_source_as_target)
+      sets["val_views"][v] = of_mesh(val_views, m)
+      sets["nogrid_views"][v] = [u for u in of_mesh(full_catalog, m) if u not in grid_index]
+    init["eval"] = {"source_h5": inner.source_h5, "volumes": vols, "sets": sets}
+    log.info("learn_grids metrics: %d volumes, views per set %s", len(vols),
+             {k: sum(len(t) for t in s.values()) for k, s in sets.items()})
+    return init
 
   def train_dataloader(self):
     # data.repeat: an epoch is that many passes over the training volumes (each access draws its own targets, t and noise);
@@ -608,7 +649,8 @@ class GSDataModule(pl.LightningDataModule):
 
 
 class GSLightningModule(pl.LightningModule):
-  def __init__(self, cfg, diffusion_stats=None):
+  def __init__(self, cfg, diffusion_stats=None, grid_init=None):
+    """grid_init: diffusion.learn_grids' init (GSDataModule.grid_init); None: the grids are the dataset's x0_raw, as always."""
     super().__init__()
     self.cfg = cfg
     self.clock = None   # a module.TrainClock, set by main() for time-driven LR schedulers
@@ -628,6 +670,16 @@ class GSLightningModule(pl.LightningModule):
       else:
         self.model = GSModel(cfg)
     self.dssim = DSSIMLoss(reduction="none")
+
+    # diffusion.learn_grids: the training volumes' grids as parameters (learnable_grids.LearnableGrids; frozen: buffers), with their
+    # own Adam (made in on_train_start, on the device), stepped with the model's optimizer
+    self.grids = None
+    self.grid_opt = None
+    self._grid_opt_state = None   # a resumed run's grid optimizer state, loaded once the optimizer exists
+    if grid_init is not None:
+      self.grids = learnable_grids.LearnableGrids(grid_init, learnable=bool(learnable_grids.learn_grids_config(cfg).learnable))
+      self._grid_eval = grid_init["eval"]
+      self._grid_logged = {}   # what the grid metrics logged once already (the reference / init) and the last step they ran
 
     # One directory for everything this run produces (currently just
     # checkpoints, but named generically for whatever else lands here later
@@ -674,6 +726,8 @@ class GSLightningModule(pl.LightningModule):
         checkpoint["state_dict"][f"model.{name}"] = live.detach()
     if self.spike_skip is not None:
       checkpoint["spike_skip"] = self.spike_skip.state_dict()   # nor the loss average and its warmup
+    if getattr(self, "grid_opt", None) is not None:   # (the learnable grids themselves are parameters: in state_dict)
+      checkpoint["grid_optimizer"] = self.grid_opt.state_dict()
 
   def on_load_checkpoint(self, checkpoint):
     # .get: checkpoints written before this hook existed have no such key.
@@ -697,6 +751,13 @@ class GSLightningModule(pl.LightningModule):
       self.spike_skip.load_state_dict(checkpoint["spike_skip"])
     if self.cfg.get("reset_scheduler"):
       checkpoint["lr_schedulers"] = []   # Lightning then restores no scheduler state: the config's scheduler stays as built
+    if getattr(self, "grids", None) is not None and self.grids.learnable:
+      if "grid_optimizer" not in checkpoint:
+        raise SystemExit("diffusion.learn_grids.learnable: the checkpoint has no grid optimizer state (not a learnable-grid run's)")
+      self._grid_opt_state = checkpoint["grid_optimizer"]   # loaded in on_train_start, once the optimizer is on the device
+      if self.grid_opt is not None:
+        self.grid_opt.load_state_dict(self._grid_opt_state)
+        self._grid_opt_state = None
 
   def on_fit_start(self):
     if self.spike_skip is not None and self.spike_skip.factor is not None and self.trainer.world_size > 1:
@@ -707,6 +768,18 @@ class GSLightningModule(pl.LightningModule):
   def on_train_start(self):
     if self.ema is not None and self._ema_fresh:
       self.ema = gs_diffusion.EMAWeights(self.model, self.cfg.diffusion.ema.decay)   # from the weights training starts with
+    if getattr(self, "grids", None) is not None and self.grids.learnable and self.grid_opt is None:
+      self.grid_opt = self.make_grid_optimizer()
+      if self._grid_opt_state is not None:
+        self.grid_opt.load_state_dict(self._grid_opt_state)
+        self._grid_opt_state = None
+
+  def make_grid_optimizer(self):
+    """The learnable grids' Adam: the anchored fitter's (anchored_3dgs.make_adam: eps 1e-15, no weight decay) with its per-group
+    learning rates (diffusion.learn_grids.lr), constant (no schedule, no gradient clipping: neither the model's LR schedule nor
+    trainer.gradient_clip_val touch it)."""
+    lr = learnable_grids.learn_grids_config(self.cfg).lr
+    return torch.optim.Adam(self.grids.param_groups(lr), eps=1e-15, weight_decay=0.0)
 
   def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure=None):
     super().optimizer_step(epoch, batch_idx, optimizer, optimizer_closure)   # the closure runs training_step + backward
@@ -714,6 +787,10 @@ class GSLightningModule(pl.LightningModule):
     # after a step whose loss was skipped, which left the weights as they were.
     if self.ema is not None and self._accepted_since_step:
       self.ema.update(self.model)
+    if getattr(self, "grid_opt", None) is not None:   # diffusion.learn_grids: the grids step with the model (a skipped loss moves neither)
+      if self._accepted_since_step:
+        self.grid_opt.step()
+      self.grid_opt.zero_grad(set_to_none=True)
     self._accepted_since_step = False
 
   def training_step(self, batch, batch_idx):
@@ -724,6 +801,8 @@ class GSLightningModule(pl.LightningModule):
   def validation_step(self, batch, batch_idx, dataloader_idx=0):
     # dataloader_idx: Lightning omits it with a single val loader, hence the default.
     stage = list(self.trainer.datamodule.val_datasets)[dataloader_idx]
+    if getattr(self, "grids", None) is not None:   # (getattr: the tests' module shells have no grids)
+      batch = self._with_grids(batch)
     # the sampled Gaussians, rendered and compared with the views; diffusion: the full sample, as loss/photom_full (loss/photom is
     # the training's rendering term, see _diffusion_val_loss)
     out = self._step(stage, batch, batch_idx, photom_key="loss/photom_full" if diffusion_enabled(self.cfg) else "loss/photom")
@@ -739,7 +818,15 @@ class GSLightningModule(pl.LightningModule):
     """(loss, parts, counts, x0_hat, t); seeded: the timesteps and noise of each volume are a function of the volume (validation)."""
     image, hit, seeds, _ = self.model.inputs(batch, self.device)
     x0_in = batch.get("x0_input_raw")   # augment.slot_shuffle_target canonical (training items only): the shuffled grid, noised
-    return self.model.training_loss(image, hit, batch["x0_raw"].to(self.device), seeds=seeds if seeded else None, return_pred=True,
+    x0_raw = batch["x0_raw"].to(self.device)
+    if getattr(self, "grids", None) is not None and not seeded:
+      # diffusion.learn_grids, training: the volumes' grids instead of the dataset's; learnable: the noised input carries the graph to
+      # them, the x0 target is the detached copy (the x0 loss never moves a grid, whatever its weight)
+      x0_in = self.grids.dense(batch["source_view"], hit)
+      x0_raw = x0_in.detach()
+      if not self.grids.learnable:
+        x0_in = None
+    return self.model.training_loss(image, hit, x0_raw, seeds=seeds if seeded else None, return_pred=True,
                                     x0_input_raw=None if x0_in is None else x0_in.to(self.device))
 
   def _photom_active(self):
@@ -923,6 +1010,141 @@ class GSLightningModule(pl.LightningModule):
   def on_validation_epoch_end(self):
     if self.__dict__.get("_probe"):
       self._log_probe()
+    if getattr(self, "grids", None) is not None and not self.trainer.sanity_checking:
+      self._log_grid_metrics()
+
+  # ---- diffusion.learn_grids -------------------------------------------------------------------------------------------------
+
+  @torch.no_grad()
+  def _with_grids(self, batch):
+    """A validation batch with x0_raw (float32) the volumes' learnable grids where they have one (the training volumes: val_train,
+    val_views_strain); the others (held-out sources) keep the dataset's fitted grid with the pretrained init, and get their fresh
+    init with the fresh one (what a training volume started from), so every x_t a validation builds is from the run's own data."""
+    lg = learnable_grids.learn_grids_config(self.cfg)
+    x0 = batch["x0_raw"].to(self.device).float().clone()
+    hit = batch["source"]["hit"].to(self.device)
+    for b, v in enumerate(batch["source_view"]):
+      v = int(v)
+      if self.grids.has(v):
+        x0[b] = self.grids.dense([v], hit[b:b + 1])[0]
+      elif str(lg.init) == "fresh":
+        src = {k: batch["source"][k][b].cpu().numpy() for k in ("hit", "xyz_cam", "K_depth")}
+        colors = learnable_grids.read_colors(_get_h5(self._grid_eval["source_h5"]), v, str(lg.fresh.color), src["hit"].shape[0])
+        rows = torch.from_numpy(learnable_grids.fresh_rows(src, colors, float(lg.fresh.opacity))).to(self.device)
+        x0[b] = 0
+        x0[b][:, hit[b]] = rows.T
+    return {**batch, "x0_raw": x0}
+
+  def _grid_render(self, rows, view, mesh, targets):
+    """Per target view (V,) image metrics of one volume's raw rows (n, CHANNELS) rendered as they are (no clamp, no model) at the
+    render rows `targets`: psnr, fg_psnr, bg_l1 (image_quality), dssim (1 - SSIM, the photometric loss's), lpips
+    (learn_grids.metrics.lpips's network; left out when it is null or unavailable)."""
+    lg = learnable_grids.learn_grids_config(self.cfg)
+    path = self._grid_eval["source_h5"]
+    item = _build_item(_get_h5(path), path, view, targets, int(self.cfg.data.num_layers), mesh,
+                       depth_size=self.cfg.data.depth_size, target_depth=False)
+    batch = collate_with_batch_size([item])
+    hit = batch["source"]["hit"].to(self.device)
+    x = rows.new_zeros((1, gs_diffusion.CHANNELS, *hit.shape[1:]))
+    x[0][:, hit[0]] = rows.T
+    c = gs_diffusion.CHANNELS
+    gauss = gs_diffusion.decode_x0(x.permute(0, 2, 1, 3, 4).float(), torch.zeros(c, device=self.device), torch.ones(c, device=self.device))
+    per = collections.defaultdict(list)
+    chunk = int(lg.metrics.chunk)
+    for lo in range(1, len(targets) + 1, chunk):
+      rvi = list(range(lo, min(lo + chunk, len(targets) + 1)))
+      pred = model_forward(self.model, batch, need_render=True, render_view_idx=rvi, gauss=gauss, device=self.device)["rgb"][0]
+      gt = batch["views"]["rgb"][0, rvi].to(self.device)
+      for k, v in image_quality(pred[None], gt[None], batch["views"]["alpha"][0, rvi].to(self.device)[None]).items():
+        per[k].append(v[0])
+      per["dssim"].append(self.dssim(pred, gt).flatten(1).mean(1))
+      lp = self._lpips()
+      if lp is not None:
+        per["lpips"].append(torch.cat([lp(pred[i:i + 1], gt[i:i + 1]) for i in range(len(rvi))]))   # (one at a time: VGG at 504^2)
+    return {k: torch.cat(v) for k, v in per.items()}
+
+  def _lpips(self):
+    """learn_grids.metrics.lpips's per-image LPIPS (torchmetrics, inputs in [0, 1]), made once and kept out of the module's state
+    (no checkpoint entry); None when off or when it can't be made (warned once)."""
+    if "_lpips_fn" not in self.__dict__:
+      net = learnable_grids.learn_grids_config(self.cfg).metrics.get("lpips")
+      fn = None
+      if net is not None:
+        try:
+          from torchmetrics.functional.image.lpips import _NoTrainLpips
+          lp = _NoTrainLpips(net=str(net)).to(self.device).eval()
+          fn = lambda a, b: lp(a, b, normalize=True).flatten()
+        except Exception as e:   # no weights offline, ...: the other metrics still run
+          log.warning("learn_grids: LPIPS (%s) unavailable, not logged: %s: %s", net, type(e).__name__, e)
+      self.__dict__["_lpips_fn"] = fn
+    return self.__dict__["_lpips_fn"]
+
+  @torch.no_grad()
+  def _grid_quality(self, rows_of):
+    """{<set>/<metric>: mean over the metric volumes of the mean over the set's views} of the grids rows_of(i) (volume i's raw rows)."""
+    out = collections.defaultdict(list)
+    for view, mesh in self._grid_eval["volumes"]:
+      rows = rows_of(self.grids.index[view]).to(self.device).float()
+      for name, targets in self._grid_eval["sets"].items():
+        if targets[view]:
+          with torch.autocast(device_type=self.device.type, enabled=False):
+            for k, v in self._grid_render(rows, view, mesh, targets[view]).items():
+              out[f"{name}/{k}"].append(float(v.mean()))
+    return {k: float(np.mean(v)) for k, v in out.items()} | {"n_volumes": float(len(self._grid_eval["volumes"]))}
+
+  @torch.no_grad()
+  def _log_grid_metrics(self):
+    """At every validation step (once, whichever validation runs first there): the learnable grids' own render quality (_grid_quality)
+    and parameter statistics (learnable_grids.param_stats, over all training volumes) as grids/<...>; once, at the first one, the
+    same of the fitted grids as grids_ref/<...> and of the init as grids_init/<...> (fresh init only: pretrained, the init is the
+    reference)."""
+    step = int(self.global_step)
+    if self._grid_logged.get("step") == step:
+      return
+    self._grid_logged["step"] = step
+    g = self.grids
+    with timed("learn_grids metrics"):
+      metrics = {}
+      if not self._grid_logged.get("once"):
+        self._grid_logged["once"] = True
+        ref = (lambda i: g.volume_rows(i, init=True)) if g.ref_rows is None else (
+          lambda i: g.ref_rows[int(g.starts[i]):int(g.starts[i + 1])])
+        sources = {"grids_ref": (ref, g.rows(init=True) if g.ref_rows is None else g.ref_rows.to(self.device))}
+        if g.ref_rows is not None:
+          sources["grids_init"] = (lambda i: g.volume_rows(i, init=True), g.rows(init=True))
+        for prefix, (rows_of, all_rows) in sources.items():
+          metrics |= {f"{prefix}/{k}": v for k, v in self._grid_quality(rows_of).items()}
+          metrics |= {f"{prefix}/stats/{k}": v for k, v in learnable_grids.param_stats(all_rows.float(), g.foot, g.pairs).items()}
+      metrics |= {f"grids/{k}": v for k, v in self._grid_quality(lambda i: g.volume_rows(i).detach()).items()}
+      stats = learnable_grids.param_stats(g.rows().detach(), g.foot, g.pairs, init_rows=g.rows(init=True))
+      metrics |= {f"grids/stats/{k}": v for k, v in stats.items()}
+    for k, v in metrics.items():
+      self.log(k, v, add_dataloader_idx=False)
+    log.info("learn_grids at step %d: %s", step, {k: round(v, 3) for k, v in metrics.items()
+                                                    if k.endswith(("/psnr", "/fg_psnr", "/lpips", "frac_degenerate"))})
+
+  def on_train_end(self):
+    if getattr(self, "grids", None) is not None:
+      self.dump_grids(os.path.join(self.output_dir, "learned_grids"))
+
+  @torch.no_grad()
+  def dump_grids(self, out_dir):
+    """The grids as grid files (grid_io.write_sparse, the fitted files' format and attributes, plus learn_grids_* attributes), one
+    per volume: <out_dir>/<the fitted file's name>; each also holds its raw x0 rows as the dataset x0_raw (N, CHANNELS)."""
+    from grid_io import write_sparse
+    os.makedirs(out_dir, exist_ok=True)
+    lg = learnable_grids.learn_grids_config(self.cfg)
+    for i, path in enumerate(self.grids.paths):
+      with h5py.File(path, "r") as f:
+        attrs = {k: f.attrs[k] for k in f.attrs if k not in ("layout", "layout_version", "grid_shape", "row_order", "index")}
+      attrs |= {"learn_grids_init": str(lg.init), "learn_grids_learnable": bool(self.grids.learnable),
+                "learn_grids_step": int(self.global_step)}
+      grid, raw = self.grids.to_grid(i, attrs)
+      dest = os.path.join(out_dir, os.path.basename(path))
+      write_sparse(dest, grid)
+      with h5py.File(dest, "a") as f:
+        f.create_dataset("x0_raw", data=raw, compression="gzip", compression_opts=4)
+    log.info("learn_grids: %d grids written to %s", len(self.grids.paths), out_dir)
 
   def _pop_val_t(self, stage):
     """The next timestep of the validation set's bag of diffusion.val_t (refilled, shuffled, when empty). The shuffles of a
@@ -1257,7 +1479,7 @@ def main(cfg: DictConfig) -> None:
     # TODO: Grad accum logic
     cfg.total_steps = len(datamodule.train_dataloader()) * cfg.trainer.max_epochs
 
-  model = GSLightningModule(cfg, datamodule.diffusion_stats)
+  model = GSLightningModule(cfg, datamodule.diffusion_stats, grid_init=datamodule.grid_init)
 
   # Stashed into cfg (not just logged) so it lands in wandb's persisted run
   # config below (OmegaConf.to_container(cfg, ...)) -- unlike the console-only
@@ -1266,7 +1488,7 @@ def main(cfg: DictConfig) -> None:
   # default (adding a key not in the yaml schema would otherwise raise
   # ConfigAttributeError).
   with open_dict(cfg):
-    cfg.model.num_params = sum(p.numel() for p in model.parameters())
+    cfg.model.num_params = sum(p.numel() for n, p in model.named_parameters() if not n.startswith("grids."))   # (not the learnable grids)
 
   # A TrainClock stops the run after max_seconds of training time; a time-driven LR scheduler
   # (sched=time_wsd, module.TimeWSD) reads the same clock, which configure_optimizers hands it; so do
