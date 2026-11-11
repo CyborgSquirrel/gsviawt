@@ -196,3 +196,71 @@ def test_model_inputs_and_config():
   pos = m3.inputs(batch(), torch.device("cpu"))[4]
   assert pos.shape == (2, L, P, 3) and m3.rope_z_ref == 2.0
   m3.load_state_dict(m2.state_dict(), strict=True)     # no parameters either way
+
+
+# ---------------------------------------------------------------------------- xyz_sub2: 2x2 sub-positions, one per group of heads
+
+def test_sub_positions_quarter_means_and_fallback():
+  ps, g = 2, 2
+  K = torch.tensor([[[10.0, 0, 2.0], [0, 10.0, 2.0], [0, 0, 1]]])
+  xyz = torch.arange(1, 1 + 1 * g * ps * g * ps * 3, dtype=torch.float32).reshape(1, 1, g * ps, g * ps, 3) / 10
+  xyz[0, 0, 0, 0] = float("nan")                                     # patch 0's top-left quarter (1 slot at ps 2) has no hit
+  mean = gd.token_positions(xyz, K, ps, 2.0)                         # (1, 1, P, 3)
+  sub = gd.token_positions(xyz, K, ps, 2.0, sub=2)                   # (1, 1, P, 4, 3)
+  assert sub.shape == (1, 1, g * g, 4, 3)
+  scale = 10.0 / (ps * 2.0)
+  # same centre and scale: differences of quarter positions are the raw differences times the scale
+  torch.testing.assert_close(sub[0, 0, 1, 1] - sub[0, 0, 1, 0], (xyz[0, 0, 0, 3] - xyz[0, 0, 0, 2]) * scale)
+  torch.testing.assert_close(sub[0, 0, 0, 0], mean[0, 0, 0])         # the empty quarter takes the token's position
+  torch.testing.assert_close(sub[0, 0, 0, 3] - mean[0, 0, 0], (xyz[0, 0, 1, 1] - xyz[0, 0, :2, :2].reshape(-1, 3)[1:].mean(0)) * scale)
+
+
+def test_sub_heads_use_their_groups_position():
+  h = head("xyz_sub2")
+  feats, x_net, t = inputs(None, 2)
+  pos = 5.0 * torch.randn(2, L, P, 4, 3, generator=torch.Generator().manual_seed(4))
+  heads = h.trunk.num_heads                                           # 2 heads here: head 0 -> part 0, head 1 -> part 2
+  with torch.no_grad():
+    a = h(feats, x_net, t, pos=pos)
+    b = h(feats, x_net, t, pos=pos + torch.tensor([3.0, -7.0, 11.0]))          # translation: no change
+    moved = pos.clone()
+    moved[..., 1, :] += 50.0 * torch.randn(2, L, P, 3)                          # a part no head uses (heads 2: parts 0, 2)
+    c = h(feats, x_net, t, pos=moved)
+    moved[..., 2, :] += 50.0 * torch.randn(2, L, P, 3)
+    d = h(feats, x_net, t, pos=moved)
+  assert heads == 2
+  torch.testing.assert_close(a, b, rtol=1e-4, atol=1e-5)
+  torch.testing.assert_close(a, c, rtol=0, atol=0)
+  assert (a - d).abs().max() > 1e-3
+
+
+def test_sub_equal_parts_match_xyz_mean():
+  """Four equal positions per token: exactly the single-position RoPE."""
+  hs, hm = head("xyz_sub2"), head("xyz_mean")
+  hm.load_state_dict(hs.state_dict())
+  feats, x_net, t = inputs(None, 2)
+  pos = positions(2)
+  with torch.no_grad():
+    torch.testing.assert_close(hs(feats, x_net, t, pos=pos[..., None, :].expand(-1, -1, -1, 4, -1)), hm(feats, x_net, t, pos=pos),
+                               rtol=1e-5, atol=1e-6)
+
+
+def test_sub_dense_and_packed_agree_and_shape_checks():
+  h = head("xyz_sub2")
+  feats, x_net, t = inputs(None, 4)
+  pos = 5.0 * torch.randn(4, L, P, 4, 3, generator=torch.Generator().manual_seed(5))
+  full = torch.ones(4, L, H, H, dtype=torch.bool)
+  with torch.no_grad():
+    dense = h(feats, x_net, t, pos=pos)
+    packed = h(feats, x_net, t, gd.PackIndex(gd.token_keep(full, PS, "empty")), pos=pos)
+  torch.testing.assert_close(packed, dense, rtol=1e-4, atol=1e-5)
+  with pytest.raises(ValueError, match="pos must be"):
+    h(feats, x_net, t, pos=positions(4))
+  with pytest.raises(ValueError, match="pos must be"):
+    head("xyz_mean")(feats, x_net, t, pos=pos)
+
+
+def test_sub_model_inputs():
+  m = gd.GSDiffusionModel(model_cfg(rope="xyz_sub2"), stats())
+  pos = m.inputs(batch(), torch.device("cpu"))[4]
+  assert pos.shape == (2, L, P, 4, 3)

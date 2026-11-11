@@ -662,7 +662,8 @@ def segment_attention(q, k, v, cu, max_len):
                     .transpose(0, 1) for a, e in zip(bounds[:-1], bounds[1:])])
 
 
-ROPES = ("2d", "xyz_mean")
+ROPES = ("2d", "xyz_mean", "xyz_sub2")
+ROPE_SUB = {"xyz_mean": 1, "xyz_sub2": 2}   # positions per token: sub x sub quarters of the patch
 
 
 def rope_xyz_cos_sin(pos, head_dim, base=100.0):
@@ -682,12 +683,14 @@ def rope_xyz_cos_sin(pos, head_dim, base=100.0):
   return ang.cos(), ang.sin()
 
 
-def token_positions(xyz_cam, K, patch_size, z_ref):
+def token_positions(xyz_cam, K, patch_size, z_ref, sub=1):
   """The per-token positions of diffusion.rope xyz_mean: xyz_cam (B, L, H, W, 3) camera-space hit points (NaN where no hit), K
   (B, 3, 3) the depth camera's intrinsics -> (B, L, P, 3) float32: each token's (layer's patch) mean hit point, centred on the
   sample's median token position and scaled by fx / (patch_size z_ref) -- one unit = one patch width at depth z_ref, the 2D RoPE's
   unit there; the same scale on x, y and z. A token without a hit: its patch centre's ray at the sample's median depth (only
-  reachable with token_drop none / empty_except_layer0; token_drop empty never runs such a token)."""
+  reachable with token_drop none / empty_except_layer0; token_drop empty never runs such a token).
+  sub > 1 (rope xyz_sub2: 2): -> (B, L, P, sub * sub, 3): the mean hit point of each of the patch's sub x sub equal parts
+  (row-major), with the same centre and scale; a part without a hit takes the token's position."""
   b, l, h, w, _ = xyz_cam.shape
   gh, gw = h // patch_size, w // patch_size
   pts = rearrange(xyz_cam.float(), "b l (gh py) (gw px) c -> b l (gh gw) (py px) c", py=patch_size, px=patch_size)
@@ -706,6 +709,16 @@ def token_positions(xyz_cam, K, patch_size, z_ref):
   flat = torch.where(has[..., None], pos, float("nan")).reshape(b, -1, 3)
   centre = torch.nan_to_num(flat.nanmedian(dim=1).values)                           # (B, 3)
   scale = K[:, 0, 0].float() / (patch_size * float(z_ref))                          # (B,)
+  if sub > 1:
+    if patch_size % sub:
+      raise ValueError(f"rope sub-positions: patch_size {patch_size} is not divisible by {sub}")
+    q = patch_size // sub
+    parts = rearrange(xyz_cam.float(), "b l (gh sy qy) (gw sx qx) c -> b l (gh gw) (sy sx) (qy qx) c", sy=sub, sx=sub, qy=q, qx=q)
+    ok = torch.isfinite(parts[..., 2])                                              # (B, L, P, G, S)
+    n = ok.sum(-1)
+    part_mean = torch.where(ok[..., None], parts, 0.0).sum(-2) / n.clamp_min(1)[..., None]   # (B, L, P, G, 3)
+    pos = torch.where((n > 0)[..., None], part_mean, pos[:, :, :, None])
+    return (pos - centre[:, None, None, None]) * scale[:, None, None, None, None]
   return (pos - centre[:, None, None]) * scale[:, None, None, None]
 
 
@@ -747,16 +760,17 @@ class DiTBlock(AttentionBlock):
     return self.proj(out.reshape(n, s, d))
 
   def _mix(self, h, cos, sin, b, l, p, d):
-    """cos / sin: (P, hd) per patch (the 2D RoPE, the same on every layer and sample) or (B, L, P, hd) per token (rope xyz_mean)."""
-    per_token = cos.dim() == 4
+    """cos / sin: (P, hd) per patch (the 2D RoPE, the same on every layer and sample), (B, L, P, hd) per token (rope xyz_mean) or
+    (B, L, P, H, hd) per token and head (rope xyz_sub2)."""
+    per_token = cos.dim() >= 4
     if self.mode == "frame":
       if per_token:
-        cos, sin = cos.reshape(b * l, p, -1), sin.reshape(b * l, p, -1)
+        cos, sin = cos.reshape(b * l, p, *cos.shape[3:]), sin.reshape(b * l, p, *sin.shape[3:])
       return self._attend_normed(h.reshape(b * l, p, d), cos, sin).reshape(b, l, p, d)
     if self.mode == "ray":
       return self._attend_short(h.transpose(1, 2).reshape(b * p, l, d)).reshape(b, p, l, d).transpose(1, 2)
     if per_token:
-      cos, sin = cos.reshape(b, l * p, -1), sin.reshape(b, l * p, -1)
+      cos, sin = cos.reshape(b, l * p, *cos.shape[3:]), sin.reshape(b, l * p, *sin.shape[3:])
     else:
       cos, sin = cos.repeat(l, 1), sin.repeat(l, 1)
     return self._attend_normed(h.reshape(b, l * p, d), cos, sin).reshape(b, l, p, d)
@@ -827,14 +841,24 @@ class DiTTrunk(nn.Module):
   def _head_dim(self):
     return self.blocks[0].qkv.in_features // self.num_heads
 
+  def _pos_tables(self, pos, grouped):
+    """RoPE tables from token positions: pos (..., 3) -> (..., hd); grouped (rope xyz_sub2): pos (..., G, 3), one position per
+    part of the patch -> (..., H, hd), head h rotating by part (h * G) // H (contiguous groups of heads per part)."""
+    cos, sin = rope_xyz_cos_sin(pos, self._head_dim())
+    if not grouped:
+      return cos, sin
+    g = pos.shape[-2]
+    idx = (torch.arange(self.num_heads, device=pos.device) * g) // self.num_heads
+    return cos.index_select(-2, idx), sin.index_select(-2, idx)
+
   def forward(self, x, adaln, pos=None):
-    """pos: (B, L, P, 3) per-token positions (diffusion.rope xyz_mean: token_positions) for the frame and global blocks' RoPE;
-    None: the 2D RoPE on the patch grid."""
+    """pos: (B, L, P, 3) per-token positions (diffusion.rope xyz_mean: token_positions) or (B, L, P, G, 3) per part of the patch
+    (xyz_sub2) for the frame and global blocks' RoPE; None: the 2D RoPE on the patch grid."""
     _, num_layers, num_patches, _ = x.shape
     if pos is None:
       cos, sin = self._rope_tables(int(round(num_patches ** 0.5)), x.device)
     else:
-      cos, sin = rope_xyz_cos_sin(pos, self._head_dim())
+      cos, sin = self._pos_tables(pos, grouped=pos.dim() == 5)
     gamma, beta = self.film(self.layer_embed(torch.arange(num_layers, device=x.device))).chunk(2, dim=-1)
     gamma, beta = gamma[None, :, None], beta[None, :, None]
     adaln_mean = adaln.mean(1, keepdim=True)
@@ -851,13 +875,13 @@ class DiTTrunk(nn.Module):
   def forward_packed(self, x, adaln, pack, pos=None):
     """forward on the kept tokens of `pack` only: x (T, D) packed rows, adaln (B, L, 6, D) -> (T, D). What forward computes for
     them when the dropped tokens are left out of every block (as keys too): the same weights, FiLM, RoPE and AdaLN per token.
-    pos: (T, 3) the rows' positions (rope xyz_mean), or None (the 2D RoPE)."""
+    pos: (T, 3) the rows' positions (rope xyz_mean) or (T, G, 3) per part of the patch (xyz_sub2), or None (the 2D RoPE)."""
     b, num_layers = adaln.shape[:2]
     if pos is None:
       cos, sin = self._rope_tables(int(round(pack.P ** 0.5)), x.device)
       cos_r, sin_r = cos[pack.p], sin[pack.p]                         # RoPE at each row's own patch position
     else:
-      cos_r, sin_r = rope_xyz_cos_sin(pos, self._head_dim())
+      cos_r, sin_r = self._pos_tables(pos, grouped=pos.dim() == 3)
     gamma, beta = self.film(self.layer_embed(torch.arange(num_layers, device=x.device))).chunk(2, dim=-1)   # (L, D)
     gamma, beta = gamma[pack.l], beta[pack.l]
     adaln_frame = adaln.reshape(b * num_layers, *adaln.shape[2:])
@@ -896,7 +920,8 @@ class DiffusionHead(nn.Module):
     | split (two: the image features to in_proj_image_dim, the noisy values to dim - in_proj_image_dim, concatenated -- the two
     kinds of information enter the stream in separate channels, and the noisy values get an explicit share of the width).
     rope (diffusion.rope): 2d (the frame and global blocks' RoPE on the patch's row and column, the same on every layer) | xyz_mean
-    (on the token's mean 3D hit point: forward needs pos; no parameters either way)."""
+    (on the token's mean 3D hit point: forward needs pos (B, L, P, 3)) | xyz_sub2 (on the mean hit points of the patch's 2x2
+    quarters, one per group of heads: pos (B, L, P, 4, 3)); no parameters either way."""
     super().__init__()
     if rope not in ROPES:
       raise ValueError(f"rope must be one of {ROPES}, got {rope!r}")
@@ -960,6 +985,8 @@ class DiffusionHead(nn.Module):
     pos: (B, L, P, 3) the tokens' positions (token_positions) -- required with rope xyz_mean, not accepted with 2d."""
     if (pos is None) != (self.rope == "2d"):
       raise ValueError(f"rope={self.rope}: pos must be {'None' if self.rope == '2d' else 'the tokens positions (B, L, P, 3)'}")
+    if pos is not None and pos.dim() != (5 if self.rope == "xyz_sub2" else 4):
+      raise ValueError(f"rope={self.rope}: pos must be (B, L, P, {'4, ' if self.rope == 'xyz_sub2' else ''}3), got {tuple(pos.shape)}")
     b, l, p, _ = feats.shape
     feats = (feats - feats.mean((1, 2, 3), keepdim=True)) / (feats.var((1, 2, 3), keepdim=True, unbiased=False) + 1e-6).sqrt()
     if uncond is not None:   # after the per-sample z-score and the scale (a null before them would be renormalized), before packing
@@ -1122,7 +1149,8 @@ class GSDiffusionModel(nn.Module):
     if self.rope == "2d":
       return None
     src = batch["source"]
-    return token_positions(src["xyz_cam"].to(device), src["K_depth"].to(device), self.patch_size, self.rope_z_ref)
+    return token_positions(src["xyz_cam"].to(device), src["K_depth"].to(device), self.patch_size, self.rope_z_ref,
+                           sub=ROPE_SUB[self.rope])
 
   def floor_context(self, batch, device):
     """What decode needs of the batch for scale_floor_mode add (decode_x0's floor), else None."""

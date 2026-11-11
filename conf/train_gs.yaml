@@ -377,7 +377,9 @@ diffusion:
   # xyz_mean (on the token's mean 3D hit point, camera space: attention scores depend on the tokens' 3D offset; 11 / 11 / 10 of a
   # 64-dim head's 32 rotation pairs on x / y / z, the 2D RoPE's frequency range). The positions are scaled so one unit is one
   # patch width at depth rope_z_ref (the renders' median depth ~1.8), the same scale on all three axes. No parameters; the ray
-  # block has no RoPE either way. Configs without the key (older runs): 2d
+  # block has no RoPE either way. xyz_sub2: as xyz_mean, but with 4 positions per token -- the mean hit points of the patch's 2x2
+  # quarters (7x7 slots each; a quarter without a hit takes the patch's mean) -- the heads split into 4 contiguous groups, each
+  # rotating by one quarter's position. Configs without the key (older runs): 2d
   rope: 2d
   rope_z_ref: 1.8
   cond_dropout:
