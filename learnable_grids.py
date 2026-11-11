@@ -76,6 +76,15 @@ def log_scales(rows, scale_param="log"):
   return cumulative_to_log(s) if scale_param == "cumulative" else s
 
 
+def decode_raw(x0_raw, scale_param="log"):
+  """Raw grids (B, CHANNELS, L, H, W) (the dataset's x0_raw layout) -> the Gaussian dict, as they are (no normalization, no clamp),
+  the scale channels read as the encoding's scale_param says."""
+  from gs_diffusion import decode_x0
+  c = X0_CHANNELS
+  ones = torch.ones(c, device=x0_raw.device)
+  return decode_x0(x0_raw.permute(0, 2, 1, 3, 4).float(), ones * 0, ones, scale_param=scale_param)
+
+
 def fresh_rows(source, colors, opacity=0.1, scale_param="log"):
   """anchored_3dgs.init_params for one slot each, as raw x0 rows (N, CHANNELS) float32 in np.nonzero(hit) order: opacity logit of
   `opacity`, the 3 log-scales log(footprint) (footprint = one depth pixel at the slot's depth, z / fx: an isotropic Gaussian a pixel

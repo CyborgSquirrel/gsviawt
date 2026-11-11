@@ -1080,8 +1080,7 @@ class GSLightningModule(pl.LightningModule):
     hit = batch["source"]["hit"].to(self.device)
     x = rows.new_zeros((1, gs_diffusion.CHANNELS, *hit.shape[1:]))
     x[0][:, hit[0]] = rows.T
-    c = gs_diffusion.CHANNELS
-    gauss = gs_diffusion.decode_x0(x.permute(0, 2, 1, 3, 4).float(), torch.zeros(c, device=self.device), torch.ones(c, device=self.device))
+    gauss = learnable_grids.decode_raw(x, self.grids.scale_param)
     per = collections.defaultdict(list)
     chunk = int(lg.metrics.chunk)
     for lo in range(1, len(targets) + 1, chunk):

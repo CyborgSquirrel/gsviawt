@@ -465,3 +465,16 @@ def test_backward_keeps_the_total_loss_off_the_grids(tmp_path, monkeypatch):
   m._accepted_since_step = True
   m.optimizer_step(0, 0, None)   # installs the stash and steps
   assert all(not torch.equal(a, p) for a, p in zip(before, m.grids.parameters())) and m._grid_grads is None
+
+
+def test_decode_raw_reads_the_encodings_scales():
+  """The grids' own render metrics decode (a, b, c) as cumulative scales: the same Gaussians as the log encoding of the grid."""
+  grid, src = world_grid()
+  x_log = torch.from_numpy(gd.encode_grid(grid, src))[None]
+  x_cum = torch.from_numpy(gd.encode_grid(grid, src, scale_param="cumulative"))[None]
+  hit = src["hit"]
+  a, b = lgm.decode_raw(x_log, "log"), lgm.decode_raw(x_cum, "cumulative")
+  vol = lambda g: g["scale"].prod(2)[0][hit]                      # the axes are permuted: compare what doesn't depend on the order
+  torch.testing.assert_close(vol(b), vol(a), rtol=2e-3, atol=0)
+  torch.testing.assert_close(b["scale"].sort(2).values[0].permute(1, 0, 2, 3)[:, hit], a["scale"].sort(2).values[0].permute(1, 0, 2, 3)[:, hit],
+                             rtol=2e-3, atol=0)
