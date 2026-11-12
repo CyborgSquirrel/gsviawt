@@ -200,8 +200,24 @@ class LearnableGrids(nn.Module):
     """scale_param: the encoding's (diffusion.scale_encoding.scale_param): what the rows' scale channels are (stats and the dump read
     the log-scales through log_scales); the rows are stored as the x0 channels either way."""
     super().__init__()
+    rows, ext = self._common(init, learnable, scale_param)
+    self.params = nn.ParameterDict() if self.learnable else None
+    for name, sl in X0_SLICES.items():
+      data = rows[:, sl].clone()
+      if name == "offset":
+        data = data / ext[:, None]
+      self.register_buffer(f"init_{name}", data.clone(), persistent=False)
+      if self.learnable:
+        self.params[name] = nn.Parameter(data)
+      else:
+        self.register_buffer(f"frozen_{name}", data, persistent=False)
+
+  def _common(self, init, learnable, scale_param):
+    """What every grid storage keeps of build_init's dict (volumes, masks, poses, footprints, neighbour pairs); returns its rows
+    (N, CHANNELS) and their per-row extent (N,)."""
     self.learnable = bool(learnable)
     self.scale_param = scale_param
+    self.touched = set()   # the volumes (indices) whose grids a training step built since the last grid optimizer step
     self.views = [int(v) for v in init["views"]]
     self.mesh = [int(m) for m in init["mesh"]]
     self.index = {v: i for i, v in enumerate(self.views)}
@@ -219,16 +235,7 @@ class LearnableGrids(nn.Module):
     self.register_buffer("foot", torch.from_numpy(np.concatenate(init["foot"]) if counts else np.zeros(0, np.float32)),
                          persistent=False)
     self.register_buffer("pairs", torch.from_numpy(np.asarray(init["pairs"], np.int64)), persistent=False)
-    self.params = nn.ParameterDict() if self.learnable else None
-    for name, sl in X0_SLICES.items():
-      data = rows[:, sl].clone()
-      if name == "offset":
-        data = data / ext[:, None]
-      self.register_buffer(f"init_{name}", data.clone(), persistent=False)
-      if self.learnable:
-        self.params[name] = nn.Parameter(data)
-      else:
-        self.register_buffer(f"frozen_{name}", data, persistent=False)
+    return rows, ext
 
   def group(self, name):
     """The (N, d) stored rows of a channel group (offset: / extent)."""
@@ -258,6 +265,8 @@ class LearnableGrids(nn.Module):
       i = self.index.get(int(v))
       if i is None:
         raise KeyError(f"learn_grids: source view {int(v)} has no learnable grid (not a training volume)")
+      if self.learnable and torch.is_grad_enabled():   # a training step's: the rows the lazy grid optimizer may step
+        self.touched.add(i)
       r = self.volume_rows(i)
       h = h.to(r.device).bool()
       if int(h.sum()) != len(r):
@@ -271,6 +280,13 @@ class LearnableGrids(nn.Module):
     """The grid optimizer's groups: one per channel group, at the anchored fitter's learning rate of that group (LR_KEYS; offset:
     lr.offset on offset / extent, i.e. lr.offset x scene_extent on the offsets)."""
     return [{"params": [self.params[name]], "lr": float(lr[LR_KEYS[name]]), "name": f"grids/{name}"} for name in X0_FIELDS]
+
+  def touched_rows(self):
+    """{parameter name: (n,) bool}: the parameter rows the touched volumes' grids are built from (here: their own rows)."""
+    mask = torch.zeros(len(self.row_extent), dtype=torch.bool, device=self.row_extent.device)
+    for i in self.touched:
+      mask[int(self.starts[i]):int(self.starts[i + 1])] = True
+    return {name: mask for name in self.params}
 
   @torch.no_grad()
   def to_grid(self, i, attrs=None):
@@ -293,6 +309,217 @@ class LearnableGrids(nn.Module):
       "gaussian_colors": (raw[:, X0_SLICES["sh_dc"]] * SH_C0 + 0.5).astype(np.float32),
     }
     return Grid(hit, np.nonzero(hit), rows, dict(attrs or {})), raw
+
+
+# ---------------------------------------------------------------------------
+# the lazy optimizer
+# ---------------------------------------------------------------------------
+
+ADAMS = ("dense", "lazy")   # diffusion.learn_grids.adam
+
+
+class LazyRowAdam:
+  """Adam (torch.optim.Adam's update, no weight decay) that steps only the given ROWS of each parameter (sparse / lazy Adam): a row
+  whose grid no training step built keeps its moments, its step count and its value. (Dense Adam steps every row every step: a row
+  not in the batch has a zero gradient, but its decaying momentum keeps moving it for ~1 / (1 - beta1) steps after each visit.) Per
+  row its own step count, for the bias correction. param_groups as torch's ({"params": [p], "lr", "name"}); step(rows) with rows
+  {name: (n,) bool}."""
+
+  def __init__(self, groups, betas=(0.9, 0.999), eps=1e-15):
+    self.param_groups = [dict(g) for g in groups]
+    self.betas, self.eps = betas, float(eps)
+    self.state = {}
+
+  def _state(self, p):
+    st = self.state.get(id(p))
+    if st is None:
+      st = self.state[id(p)] = {"step": torch.zeros(len(p), dtype=torch.int64, device=p.device),
+                                "exp_avg": torch.zeros_like(p), "exp_avg_sq": torch.zeros_like(p)}
+    return st
+
+  @torch.no_grad()
+  def step(self, rows):
+    b1, b2 = self.betas
+    for g in self.param_groups:
+      p = g["params"][0]
+      if p.grad is None:
+        continue
+      idx = rows[g["name"].split("/")[-1]].to(p.device).nonzero()[:, 0]
+      if not len(idx):
+        continue
+      st = self._state(p)
+      st["step"][idx] += 1
+      t = st["step"][idx].to(p.dtype).reshape(-1, *([1] * (p.dim() - 1)))
+      grad = p.grad[idx]
+      m = st["exp_avg"][idx].mul_(b1).add_(grad, alpha=1 - b1)
+      v = st["exp_avg_sq"][idx].mul_(b2).addcmul_(grad, grad, value=1 - b2)
+      st["exp_avg"][idx], st["exp_avg_sq"][idx] = m, v
+      denom = (v / (1 - b2 ** t)).sqrt().add_(self.eps)
+      p[idx] -= g["lr"] * (m / (1 - b1 ** t)) / denom
+
+  def zero_grad(self, set_to_none=True):
+    for g in self.param_groups:
+      g["params"][0].grad = None
+
+  def state_dict(self):
+    return {"kind": "lazy", "state": [{k: v.detach().cpu().clone() for k, v in self.state[id(g["params"][0])].items()}
+                                      if id(g["params"][0]) in self.state else None for g in self.param_groups],
+            "lr": [g["lr"] for g in self.param_groups]}
+
+  def load_state_dict(self, sd):
+    if sd.get("kind") != "lazy":
+      raise ValueError("LazyRowAdam: not a lazy grid optimizer's state (learn_grids.adam must match the checkpoint's)")
+    for g, st in zip(self.param_groups, sd["state"]):
+      if st is not None:
+        p = g["params"][0]
+        self.state[id(p)] = {k: v.to(p.device).clone() for k, v in st.items()}
+
+
+# ---------------------------------------------------------------------------
+# shared anchors (learn_grids.share anchors)
+# ---------------------------------------------------------------------------
+
+ANCHOR_KEYS = ("offset", "scales", "quats", "opacities", "sh0")   # anchored_3dgs.PARAM_KEYS (its learning-rate names)
+SHARES = ("none", "anchors")
+
+
+def quat_mul(a, b):
+  """(N, 4) x (N, 4) wxyz Hamilton products a b (the rotation b, then a): as scipy's Rotation(a) * Rotation(b), unnormalized."""
+  aw, ax, ay, az = a.unbind(-1)
+  bw, bx, by, bz = b.unbind(-1)
+  return torch.stack([aw * bw - ax * bx - ay * by - az * bz, aw * bx + ax * bw + ay * bz - az * by,
+                      aw * by - ax * bz + ay * bw + az * bx, aw * bz + ax * by - ay * bx + az * bw], -1)
+
+
+def build_anchors_init(init, source_h5, cfg_a):
+  """learn_grids.share anchors: the anchored fitter's anchors over the training volumes of build_init's dict `init`, per mesh:
+  its volumes' slots (anchored_3dgs.load_view, in source-view order) merged by anchored_3dgs.build_anchors (cluster_slots: r, k,
+  max_rounds; deterministic), `levels` density levels; the init per anchor anchored_3dgs.init_params (offset 0, the anchor's
+  footprint with the levels an octave apart, identity, init_opacity, SH0 of its first slot's colour). Returns {"pos" (A, 3) world,
+  "foot" (A,), "extent" (A,), "params" {ANCHOR_KEYS: numpy}, "label" [per volume (N_i,) global anchor index], "level" [per volume
+  (N_i,)]}, every per-volume array in the volume's row order (np.nonzero of its hit mask; load_view's order is permuted to it, and
+  its points are checked against the volume's depth-peel points)."""
+  import anchored_3dgs as an
+  from gs_dataset import OPENGL_TO_OPENCV
+  n_levels = int(cfg_a.levels)
+  out = {"pos": [], "foot": [], "extent": [], "params": {k: [] for k in ANCHOR_KEYS}, "label": [None] * len(init["views"]),
+         "level": [None] * len(init["views"])}
+  base = 0
+  with h5py.File(source_h5, "r") as f:
+    for mesh in sorted(set(init["mesh"])):
+      vols = [i for i, m in enumerate(init["mesh"]) if m == mesh]   # (source-view order: build_init's)
+      views, perms = [], []
+      for i in vols:
+        w = an.load_view(f, init["views"][i])
+        if not np.array_equal(w["valid"].transpose(2, 0, 1), init["hit"][i]):
+          raise ValueError(f"learn_grids anchors: view {init['views'][i]}'s depth peel differs from its volume's hit mask")
+        perm = np.lexsort((w["u"].astype(np.int64), w["v"].astype(np.int64), w["layer"]))   # -> layer, y, x: the rows' order
+        w2c = np.linalg.inv(init["pose"][i] @ OPENGL_TO_OPENCV)
+        cam = w["points"][perm] @ w2c[:3, :3].T + w2c[:3, 3]
+        err = float(np.abs(cam - init["anchor"][i]).max()) if len(cam) else 0.0
+        if err > 1e-3 * max(1.0, float(np.abs(init["anchor"][i]).max())):
+          raise ValueError(f"learn_grids anchors: view {init['views'][i]}'s slots are {err:.3g} off its depth-peel points")
+        views.append(w)
+        perms.append(perm)
+      a = an.build_anchors(views, float(cfg_a.r), n_levels, int(cfg_a.k), int(cfg_a.max_rounds))
+      p = an.init_params(a, n_levels, float(cfg_a.init_opacity), "cpu")
+      for i, lab, lev, perm in zip(vols, an.per_view(a["labels"], a["slot_counts"]), an.per_view(a["levels"], a["slot_counts"]), perms):
+        out["label"][i] = lab[perm] + base
+        out["level"][i] = lev[perm]
+      n = len(a["pos"])
+      out["pos"].append(a["pos"].astype(np.float32))
+      out["foot"].append(a["foot"].astype(np.float32))
+      out["extent"].append(np.full(n, init["extent"][vols[0]], np.float32))
+      for k in ANCHOR_KEYS:
+        v = p[k].numpy()
+        out["params"][k].append(v[:, 0] if k == "sh0" else v)   # sh0 (A, 1, 3) -> (A, 3)
+      base += n
+  for k in ("pos", "foot", "extent"):
+    out[k] = np.concatenate(out[k])
+  out["params"] = {k: np.concatenate(v) for k, v in out["params"].items()}
+  log.info("learn_grids anchors: %d anchors for %d volumes (%d slots)", base, len(init["views"]), sum(len(x) for x in out["label"]))
+  return out
+
+
+class AnchorGrids(LearnableGrids):
+  """learn_grids.share anchors: ONE Gaussian set per mesh (the anchored fitter's anchors, build_anchors_init) instead of a grid per
+  volume; every volume's grid is GATHERED from it (no per-view residual): per slot, its anchor's world mean (anchor position +
+  offset) in the volume's camera minus the slot's depth-peel point (the offset channel), its quaternion rotated world -> camera
+  (w >= 0, as encode_grid), log-scales and opacity logit of the slot's density level, its SH0. The anchor parameters (anchored_3dgs
+  init_params' layout; offset / scene extent, as LearnableGrids) are Parameters when learnable, else buffers; the gradient reaches
+  them through the gather. Raw log-scale encoding only."""
+
+  def __init__(self, init, anchors, learnable=True, scale_param="log"):
+    nn.Module.__init__(self)
+    if scale_param != "log":
+      raise ValueError("learn_grids.share anchors: scale_param log only")
+    self._common(init, learnable, scale_param)
+    cat = lambda xs, dt: torch.from_numpy(np.concatenate(xs).astype(dt)) if len(xs) else torch.zeros(0, dtype=getattr(torch, dt))
+    counts = [len(x) for x in init["rows"]]
+    from gs_dataset import OPENGL_TO_OPENCV
+    from gs_diffusion import matrix_to_quat
+    w2c = torch.from_numpy(np.stack([np.linalg.inv(p @ OPENGL_TO_OPENCV) for p in init["pose"]]).astype(np.float32))
+    self.register_buffer("w2c", w2c, persistent=False)
+    self.register_buffer("q_w2c", matrix_to_quat(w2c[:, :3, :3].double()).float(), persistent=False)
+    self.register_buffer("label", cat(anchors["label"], "int64"), persistent=False)
+    self.register_buffer("level", cat(anchors["level"], "int64"), persistent=False)
+    self.register_buffer("row_volume", torch.from_numpy(np.repeat(np.arange(len(counts)), counts)), persistent=False)
+    self.register_buffer("slot_cam", cat(init["anchor"], "float32"), persistent=False)
+    self.register_buffer("anchor_pos", torch.from_numpy(np.asarray(anchors["pos"], np.float32)), persistent=False)
+    self.register_buffer("anchor_foot", torch.from_numpy(np.asarray(anchors["foot"], np.float32)), persistent=False)
+    self.register_buffer("anchor_extent", torch.from_numpy(np.asarray(anchors["extent"], np.float32)), persistent=False)
+    self.params = nn.ParameterDict() if self.learnable else None
+    for k in ANCHOR_KEYS:
+      data = torch.from_numpy(np.asarray(anchors["params"][k], np.float32)).clone()
+      if k == "offset":
+        data = data / self.anchor_extent[:, None]
+      self.register_buffer(f"init_{k}", data.clone(), persistent=False)
+      if self.learnable:
+        self.params[k] = nn.Parameter(data)
+      else:
+        self.register_buffer(f"frozen_{k}", data, persistent=False)
+
+  def rows(self, lo=0, hi=None, init=False):
+    """The gathered raw x0 rows [lo, hi) (all by default), (n, CHANNELS); init: from the init's anchor parameters."""
+    hi = len(self.label) if hi is None else hi
+    g = (lambda k: getattr(self, f"init_{k}")) if init else self.group
+    lab, lev, vol = self.label[lo:hi], self.level[lo:hi], self.row_volume[lo:hi]
+    mean_w = self.anchor_pos[lab] + g("offset")[lab] * self.anchor_extent[lab, None]
+    w2c = self.w2c[vol]
+    mean_c = (w2c[:, :3, :3] @ mean_w[:, :, None])[:, :, 0] + w2c[:, :3, 3]
+    q = quat_mul(self.q_w2c[vol], g("quats")[lab])                     # world -> this volume's camera
+    q = torch.where(q[:, :1] < 0, -q, q)                               # (w >= 0, as encode_grid)
+    return torch.cat([g("opacities")[lab, lev][:, None], g("scales")[lab, lev], q, g("sh0")[lab],
+                      mean_c - self.slot_cam[lo:hi]], 1)
+
+  def param_groups(self, lr):
+    """One group per anchor parameter at the anchored fitter's learning rate (offset: lr.offset on offset / extent)."""
+    return [{"params": [self.params[k]], "lr": float(lr[k]), "name": f"anchors/{k}"} for k in ANCHOR_KEYS]
+
+  def touched_rows(self):
+    """{name: (A,) bool}: the anchors the touched volumes' grids gather."""
+    mask = torch.zeros(len(self.anchor_pos), dtype=torch.bool, device=self.anchor_pos.device)
+    for i in self.touched:
+      mask[self.label[int(self.starts[i]):int(self.starts[i + 1])]] = True
+    return {k: mask for k in ANCHOR_KEYS}
+
+  @torch.no_grad()
+  def anchor_stats(self):
+    """{name: float}: count; per parameter the drift from the init (drift/<key>: the RMS over the anchors of the L2 distance of all
+    its entries; offset in world units); frac_transparent (every level's opacity < 0.01), frac_huge / frac_tiny (the middle
+    level's largest axis > 10 / < 0.1 anchor footprints)."""
+    out = {"count": float(len(self.anchor_pos))}
+    for k in ANCHOR_KEYS:
+      d = self.group(k) - getattr(self, f"init_{k}")
+      if k == "offset":
+        d = d * self.anchor_extent[:, None]
+      out[f"drift/{k}"] = float(d.reshape(len(d), -1).square().sum(1).mean().sqrt())
+    op = torch.sigmoid(self.group("opacities"))
+    mid = self.group("scales")[:, self.group("scales").shape[1] // 2].amax(1) - torch.log(self.anchor_foot)
+    out["frac_transparent"] = float((op < 0.01).all(1).float().mean())
+    out["frac_huge"] = float((mid > np.log(10.0)).float().mean())
+    out["frac_tiny"] = float((mid < np.log(0.1)).float().mean())
+    return out
 
 
 # ---------------------------------------------------------------------------

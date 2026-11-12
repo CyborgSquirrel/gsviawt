@@ -457,6 +457,13 @@ class GSDataModule(pl.LightningDataModule):
                            f"rot_form=keep; scale_param log or cumulative), got {x0_encoding(cfg)}")
         if str(lg.get("x0_grad", "through_input")) not in learnable_grids.X0_GRADS:
           raise SystemExit(f"diffusion.learn_grids.x0_grad must be one of {learnable_grids.X0_GRADS}, got {lg.x0_grad!r}")
+        if str(lg.get("adam", "dense")) not in learnable_grids.ADAMS:
+          raise SystemExit(f"diffusion.learn_grids.adam must be one of {learnable_grids.ADAMS}, got {lg.adam!r}")
+        share = str(lg.get("share", "none"))
+        if share not in learnable_grids.SHARES:
+          raise SystemExit(f"diffusion.learn_grids.share must be one of {learnable_grids.SHARES}, got {share!r}")
+        if share == "anchors" and (str(lg.init) != "fresh" or x0_encoding(cfg)["scale_param"] != "log"):
+          raise SystemExit("diffusion.learn_grids.share=anchors: init fresh (anchored_3dgs.init_params) and scale_param log only")
         aug = cfg.diffusion.get("augment")
         if aug is not None and aug.get("slot_shuffle"):
           raise SystemExit("diffusion.learn_grids: no augmentation (diffusion.augment.slot_shuffle=false)")
@@ -577,6 +584,9 @@ class GSDataModule(pl.LightningDataModule):
     inner = self.train_ds.inner
     init = learnable_grids.build_init(lg, inner, grid_index, enc, gs_diffusion.encode_grid, gs_diffusion.read_grid)
     init["paths"] = [grid_index[v] for v in init["views"]]
+    if str(lg.get("share", "none")) == "anchors":   # one shared Gaussian set per mesh: the anchored fitter's anchors
+      with timed("learn_grids anchors"):
+        init["anchors"] = learnable_grids.build_anchors_init(init, inner.source_h5, lg.anchors)
     n = lg.metrics.volumes
     pick = (list(range(len(init["views"]))) if n is None or int(n) >= len(init["views"])
             else sorted({int(round(i)) for i in np.linspace(0, len(init["views"]) - 1, int(n))}))
@@ -680,7 +690,12 @@ class GSLightningModule(pl.LightningModule):
     self._grid_opt_state = None   # a resumed run's grid optimizer state, loaded once the optimizer exists
     if grid_init is not None:
       lg = learnable_grids.learn_grids_config(cfg)
-      self.grids = learnable_grids.LearnableGrids(grid_init, learnable=bool(lg.learnable), scale_param=x0_encoding(cfg)["scale_param"])
+      if "anchors" in grid_init:   # learn_grids.share anchors
+        self.grids = learnable_grids.AnchorGrids(grid_init, grid_init["anchors"], learnable=bool(lg.learnable))
+      else:
+        self.grids = learnable_grids.LearnableGrids(grid_init, learnable=bool(lg.learnable),
+                                                    scale_param=x0_encoding(cfg)["scale_param"])
+      self._grid_lazy = str(lg.get("adam", "dense")) == "lazy"
       # x0_grad none: the grids' gradient is the rendering loss's alone (_diffusion_train_step computes it, backward() keeps the
       # total loss's off the grids, optimizer_step installs it)
       self._grid_x0_grad = str(lg.get("x0_grad", "through_input"))
@@ -762,6 +777,9 @@ class GSLightningModule(pl.LightningModule):
     if getattr(self, "grids", None) is not None and self.grids.learnable:
       if "grid_optimizer" not in checkpoint:
         raise SystemExit("diffusion.learn_grids.learnable: the checkpoint has no grid optimizer state (not a learnable-grid run's)")
+      lazy = isinstance(checkpoint["grid_optimizer"], dict) and checkpoint["grid_optimizer"].get("kind") == "lazy"
+      if lazy != self._grid_lazy:
+        raise SystemExit(f"the checkpoint's grid optimizer is {'lazy' if lazy else 'dense'}: set diffusion.learn_grids.adam to match")
       self._grid_opt_state = checkpoint["grid_optimizer"]   # loaded in on_train_start, once the optimizer is on the device
       if self.grid_opt is not None:
         self.grid_opt.load_state_dict(self._grid_opt_state)
@@ -785,8 +803,11 @@ class GSLightningModule(pl.LightningModule):
   def make_grid_optimizer(self):
     """The learnable grids' Adam: the anchored fitter's (anchored_3dgs.make_adam: eps 1e-15, no weight decay) with its per-group
     learning rates (diffusion.learn_grids.lr), constant (no schedule, no gradient clipping: neither the model's LR schedule nor
-    trainer.gradient_clip_val touch it)."""
+    trainer.gradient_clip_val touch it). learn_grids.adam lazy: the same update on the rows the step's grids were built from only
+    (learnable_grids.LazyRowAdam); dense: torch's Adam, every row every step."""
     lr = learnable_grids.learn_grids_config(self.cfg).lr
+    if self._grid_lazy:
+      return learnable_grids.LazyRowAdam(self.grids.param_groups(lr), eps=1e-15)
     return torch.optim.Adam(self.grids.param_groups(lr), eps=1e-15, weight_decay=0.0)
 
   def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure=None):
@@ -800,9 +821,13 @@ class GSLightningModule(pl.LightningModule):
         if self._grid_grads is not None:   # x0_grad none: the rendering loss's gradient
           for p, g in zip(self.grids.parameters(), self._grid_grads):
             p.grad = g
-        self.grid_opt.step()
+        if self._grid_lazy:
+          self.grid_opt.step(self.grids.touched_rows())
+        else:
+          self.grid_opt.step()
       self.grid_opt.zero_grad(set_to_none=True)
       self._grid_grads = None
+      self.grids.touched.clear()
     self._accepted_since_step = False
 
   def training_step(self, batch, batch_idx):
@@ -1150,6 +1175,8 @@ class GSLightningModule(pl.LightningModule):
                                                                                          scale_param=g.scale_param).items()}
       metrics |= {f"grids/{k}": v for k, v in self._grid_quality(lambda i: g.volume_rows(i).detach()).items()}
       stats = learnable_grids.param_stats(g.rows().detach(), g.foot, g.pairs, init_rows=g.rows(init=True), scale_param=g.scale_param)
+      if hasattr(g, "anchor_stats"):   # share anchors: the shared set itself
+        metrics |= {f"grids/anchors/{k}": v for k, v in g.anchor_stats().items()}
       metrics |= {f"grids/stats/{k}": v for k, v in stats.items()}
     for k, v in metrics.items():
       self.log(k, v, add_dataloader_idx=False)
@@ -1177,6 +1204,12 @@ class GSLightningModule(pl.LightningModule):
       write_sparse(dest, grid)
       with h5py.File(dest, "a") as f:
         f.create_dataset("x0_raw", data=raw, compression="gzip", compression_opts=4)
+    if hasattr(self.grids, "anchor_stats"):   # share anchors: the shared set too (world frame, fit layout; offsets x extent)
+      g = self.grids
+      np.savez(os.path.join(out_dir, "anchors.npz"), pos=g.anchor_pos.cpu().numpy(), foot=g.anchor_foot.cpu().numpy(),
+               label=g.label.cpu().numpy(), level=g.level.cpu().numpy(), starts=g.starts, views=np.asarray(g.views),
+               **{k: (g.group(k) * (g.anchor_extent[:, None] if k == "offset" else 1)).detach().cpu().numpy()
+                  for k in learnable_grids.ANCHOR_KEYS})
     log.info("learn_grids: %d grids written to %s", len(self.grids.paths), out_dir)
 
   def _pop_val_t(self, stage):

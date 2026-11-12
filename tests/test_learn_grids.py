@@ -478,3 +478,258 @@ def test_decode_raw_reads_the_encodings_scales():
   torch.testing.assert_close(vol(b), vol(a), rtol=2e-3, atol=0)
   torch.testing.assert_close(b["scale"].sort(2).values[0].permute(1, 0, 2, 3)[:, hit], a["scale"].sort(2).values[0].permute(1, 0, 2, 3)[:, hit],
                              rtol=2e-3, atol=0)
+
+
+# ---------------------------------------------------------------------------- learn_grids.adam lazy
+
+def test_dense_adam_moves_rows_outside_the_batch_lazy_does_not():
+  """The finding: with torch's Adam a volume not in the batch (zero gradient) still moves on its momentum; LazyRowAdam leaves it."""
+  for kind in ("dense", "lazy"):
+    g = lgm.LearnableGrids(synthetic_init())
+    groups = g.param_groups({"offset": 1e-3, "sh0": 1e-2, "opacities": 1e-2, "scales": 1e-2, "quats": 1e-2})
+    opt = torch.optim.Adam(groups, eps=1e-15) if kind == "dense" else lgm.LazyRowAdam(groups, eps=1e-15)
+    hit = hit_masks()
+    out_rows = slice(int(g.starts[1]), int(g.starts[2]))   # volume 1: only in the first batch
+    for step in range(3):
+      batch = [0, 1] if step == 0 else [0]
+      g.touched.clear()
+      loss = sum(g.dense([VIEWS[b]], hit[b:b + 1]).square().sum() for b in batch)
+      opt.zero_grad()
+      loss.backward()
+      before = g.params["sh_dc"][out_rows].detach().clone()
+      opt.step() if kind == "dense" else opt.step(g.touched_rows())
+    moved = not torch.equal(before, g.params["sh_dc"][out_rows].detach())
+    assert moved == (kind == "dense"), kind
+
+
+def test_lazy_adam_is_torch_adam_on_the_stepped_rows():
+  torch.manual_seed(0)
+  p1 = torch.nn.Parameter(torch.randn(50, 3))
+  p2 = torch.nn.Parameter(p1.detach().clone())
+  ref = torch.optim.Adam([p1], lr=1e-2, eps=1e-15)
+  lazy = lgm.LazyRowAdam([{"params": [p2], "lr": 1e-2, "name": "x/a"}], eps=1e-15)
+  for _ in range(5):
+    g = torch.randn(50, 3)
+    p1.grad, p2.grad = g.clone(), g.clone()
+    ref.step()
+    lazy.step({"a": torch.ones(50, dtype=torch.bool)})
+  torch.testing.assert_close(p2, p1, rtol=1e-5, atol=1e-6)
+  sd = lazy.state_dict()
+  p3 = torch.nn.Parameter(p2.detach().clone())
+  lazy2 = lgm.LazyRowAdam([{"params": [p3], "lr": 1e-2, "name": "x/a"}], eps=1e-15)
+  lazy2.load_state_dict(sd)
+  for opt, p in ((lazy, p2), (lazy2, p3)):
+    p.grad = torch.ones(50, 3)
+    opt.step({"a": torch.arange(50) < 20})
+  assert torch.equal(p2, p3)
+  with pytest.raises(ValueError):
+    lazy2.load_state_dict(ref.state_dict())
+
+
+# ---------------------------------------------------------------------------- learn_grids.share anchors
+
+def anchor_scene(seed=0, n_vol=3):
+  """build_init-like dict for n_vol volumes (test_token_drop's hit masks, random camera points and poses) + a random anchor set:
+  each volume's slots map to distinct anchors, levels random."""
+  g = np.random.default_rng(seed)
+  hit = hit_masks().numpy()[[0, 1, 3]][:n_vol]
+  init = {k: [] for k in ("views", "mesh", "rows", "extent", "foot", "hit", "anchor", "pose")}
+  n_anchor = 2000
+  anchors = {"label": [], "level": []}
+  pairs, start = [], 0
+  for j, h in enumerate(hit):
+    n = int(h.sum())
+    pose = np.eye(4, dtype=np.float32)
+    pose[:3, :3] = Rotation.from_euler("xyz", g.normal(size=3)).as_matrix()
+    pose[:3, 3] = g.normal(size=3)
+    init["views"].append(20 + j)
+    init["mesh"].append(0)
+    init["rows"].append(np.zeros((n, gd.CHANNELS), np.float32))
+    init["extent"].append(2.0)
+    init["foot"].append(np.full(n, 0.01, np.float32))
+    init["hit"].append(h)
+    init["anchor"].append(g.normal(size=(n, 3)).astype(np.float32) + [0, 0, 3])
+    init["pose"].append(pose)
+    anchors["label"].append(g.permutation(n_anchor)[:n])
+    anchors["level"].append(g.integers(0, 3, n))
+    pairs.append(lgm.neighbour_pairs(h, start))
+    start += n
+  init["pairs"] = np.concatenate(pairs)
+  init["ref_rows"] = None
+  q = Rotation.random(n_anchor, random_state=seed).as_quat()[:, [3, 0, 1, 2]] * g.uniform(0.5, 2, (n_anchor, 1))
+  anchors |= {"pos": g.normal(size=(n_anchor, 3)).astype(np.float32), "foot": np.full(n_anchor, 0.01, np.float32),
+              "extent": np.full(n_anchor, 2.0, np.float32),
+              "params": {"offset": g.normal(0, 0.05, (n_anchor, 3)).astype(np.float32),
+                         "scales": g.normal(-5, 1, (n_anchor, 3, 3)).astype(np.float32), "quats": q.astype(np.float32),
+                         "opacities": g.normal(0, 1, (n_anchor, 3)).astype(np.float32),
+                         "sh0": g.normal(size=(n_anchor, 3)).astype(np.float32)}}
+  return init, anchors
+
+
+def test_anchor_gather_matches_encode_grid_of_the_fitted_view():
+  """A gather is the view the fitter would write for that anchor set (anchored_3dgs.view_params: world means anchor + offset,
+  world quaternions, the slot's level), encoded by encode_grid: same rows (quaternion up to sign, which both canonicalize)."""
+  from grid_io import Grid
+  init, anchors = anchor_scene()
+  g = lgm.AnchorGrids(init, anchors)
+  P = anchors["params"]
+  for i in range(len(init["views"])):
+    lab, lev, h = anchors["label"][i], anchors["level"][i], init["hit"][i]
+    grid = Grid(h, np.nonzero(h), {
+      "gaussian_means": (anchors["pos"][lab] + P["offset"][lab]).astype(np.float32),
+      "gaussian_scales": np.exp(P["scales"][lab, lev]).astype(np.float32), "gaussian_quats": P["quats"][lab],
+      "gaussian_opacities": (1 / (1 + np.exp(-P["opacities"][lab, lev]))).astype(np.float32),
+      "gaussian_colors": (P["sh0"][lab] * gd.SH_C0 + 0.5).astype(np.float32)})
+    xyz = np.full((*h.shape, 3), np.nan, np.float32)
+    xyz[h] = init["anchor"][i]
+    src = {"hit": torch.from_numpy(h), "xyz_cam": torch.from_numpy(xyz), "pose_gl": torch.from_numpy(init["pose"][i]),
+           "K_depth": np.diag([100.0, 100.0, 1.0])}
+    want = gd.encode_grid(grid, src)[:, h].T
+    got = g.volume_rows(i).detach().numpy()
+    q_want = want[:, gd.ROTATION] / np.linalg.norm(want[:, gd.ROTATION], axis=1, keepdims=True)   # (encode_grid normalizes)
+    q_got = got[:, gd.ROTATION] / np.linalg.norm(got[:, gd.ROTATION], axis=1, keepdims=True)
+    np.testing.assert_allclose(q_got, q_want, atol=2e-5)
+    np.testing.assert_allclose(np.linalg.norm(got[:, gd.ROTATION], axis=1), np.linalg.norm(P["quats"][lab], axis=1), rtol=1e-5)
+    other = [c for c in range(gd.CHANNELS) if c not in range(gd.ROTATION.start, gd.ROTATION.stop)]
+    np.testing.assert_allclose(got[:, other], want[:, other], rtol=1e-4, atol=2e-5)
+
+
+def test_grads_reach_the_anchors_through_the_gather():
+  init, anchors = anchor_scene()
+  g = lgm.AnchorGrids(init, anchors)
+  hit = torch.from_numpy(np.stack(init["hit"]))
+  g.dense(init["views"][:1], hit[:1]).square().sum().backward()
+  used = np.zeros(2000, bool)
+  used[anchors["label"][0]] = True
+  for k, p in g.params.items():
+    nz = p.grad.reshape(2000, -1).abs().sum(1) > 0
+    assert nz[torch.from_numpy(used)].any() and not nz[torch.from_numpy(~used)].any(), k
+  assert g.touched == {0} and g.touched_rows()["offset"].numpy().tolist() == used.tolist()
+
+
+def synthetic_render_h5(path, n_views=3, H=16, L=2):
+  """A tiny render file for anchored_3dgs.load_view: two parallel planes seen from slightly different poses."""
+  import h5py
+  g = np.random.default_rng(0)
+  K = np.array([[20.0, 0, H / 2], [0, 20.0, H / 2], [0, 0, 1]], np.float32)
+  with h5py.File(path, "w") as f:
+    depth = np.full((n_views, H, H, L), np.nan, np.float32)
+    depth[..., 0], depth[..., 1] = 2.0, 3.0
+    depth[:, :3, :3, 1] = np.nan
+    f["depth_peel"] = depth
+    f["depth_intrinsics"] = np.repeat(K[None], n_views, 0)
+    f["image_intrinsics"] = np.repeat(K[None], n_views, 0)
+    poses = np.repeat(np.eye(4, dtype=np.float32)[None], n_views, 0)
+    for v in range(n_views):
+      poses[v, :3, 3] = [0.01 * v, 0.0, 0.0]
+    f["camera_pose"] = poses
+    f["images"] = g.integers(0, 255, (n_views, H, H, 4)).astype(np.uint8)
+    f["depth_peel_normals"] = np.tile(np.array([0, 0, 1], np.float16), (n_views, H, H, L, 1))
+  return poses, K
+
+
+def anchors_init_from_h5(path, poses, K):
+  from cameras import dense_unproject_camera
+  import h5py
+  init = {k: [] for k in ("views", "mesh", "rows", "extent", "foot", "hit", "anchor", "pose")}
+  with h5py.File(path, "r") as f:
+    for v in range(len(poses)):
+      xyz, hit = dense_unproject_camera(np.asarray(f["depth_peel"][v]), K)
+      h = hit.transpose(2, 0, 1)
+      cam = xyz.transpose(2, 0, 1, 3)[h]
+      init["views"].append(v); init["mesh"].append(0); init["rows"].append(np.zeros((len(cam), gd.CHANNELS), np.float32))
+      init["extent"].append(1.0); init["foot"].append(cam[:, 2] / K[0, 0]); init["hit"].append(h); init["anchor"].append(cam)
+      init["pose"].append(poses[v])
+  return init
+
+
+def test_anchor_clustering_is_deterministic_and_maps_the_slots(tmp_path):
+  from omegaconf import OmegaConf
+  poses, K = synthetic_render_h5(tmp_path / "r.h5")
+  init = anchors_init_from_h5(tmp_path / "r.h5", poses, K)
+  cfg = OmegaConf.create({"r": 1.0, "k": 8, "max_rounds": 200, "levels": 3, "init_opacity": 0.1})
+  a = lgm.build_anchors_init(init, str(tmp_path / "r.h5"), cfg)
+  b = lgm.build_anchors_init(init, str(tmp_path / "r.h5"), cfg)
+  for x, y in zip(a["label"] + a["level"], b["label"] + b["level"]):
+    assert np.array_equal(x, y)
+  assert np.array_equal(a["pos"], b["pos"]) and all(np.array_equal(a["params"][k], b["params"][k]) for k in lgm.ANCHOR_KEYS)
+  assert len(a["pos"]) < sum(len(x) for x in a["label"])            # slots of different views merged
+  for lab in a["label"]:
+    assert len(np.unique(lab)) == len(lab)                           # a view's slots: distinct anchors
+  # the fresh gather: offsets = anchor mean - slot (small: within the merge radius), isotropic footprint scale at the middle level
+  g = lgm.AnchorGrids({**init, "pairs": np.zeros((0, 2), np.int64), "ref_rows": None}, a)
+  rows = g.rows().detach()
+  assert float(rows[:, gd.OFFSET].norm(dim=1).max()) < 0.2
+  np.testing.assert_allclose(torch.sigmoid(rows[:, 0]).numpy(), 0.1, rtol=1e-5)
+  # the identity world rotation, in each view's (OpenCV) camera: that camera's world -> camera rotation
+  from gs_dataset import OPENGL_TO_OPENCV
+  for i in range(len(init["views"])):
+    R = np.linalg.inv(init["pose"][i] @ OPENGL_TO_OPENCV)[:3, :3]
+    got = gd.quat_to_matrix(g.volume_rows(i).detach()[:, gd.ROTATION]).numpy()
+    np.testing.assert_allclose(got, np.broadcast_to(R, got.shape), atol=1e-5)
+
+
+def anchor_module(tmp_path, adam="lazy"):
+  with initialize_config_dir(config_dir=os.path.join(ROOT, "conf"), version_base=None):
+    cfg = compose("train_gs", overrides=[f"output_dir={tmp_path}", "diffusion.learn_grids.enabled=true", "diffusion.learn_grids.init=fresh",
+                                         "diffusion.learn_grids.share=anchors", f"diffusion.learn_grids.adam={adam}"])
+  init, anchors = anchor_scene()
+  init["anchors"] = anchors
+  init["eval"] = {"source_h5": None, "volumes": [], "sets": {}}
+  return train_gs.GSLightningModule(cfg, grid_init=init)
+
+
+def test_anchor_grids_and_lazy_state_round_trip_through_a_checkpoint(tmp_path, monkeypatch):
+  monkeypatch.setattr(pl.LightningModule, "optimizer_step", lambda self, *a, **k: None)
+  a = anchor_module(tmp_path)
+  a.on_train_start()
+  assert isinstance(a.grids, lgm.AnchorGrids) and isinstance(a.grid_opt, lgm.LazyRowAdam)
+  hit = torch.from_numpy(np.stack([a.grids.hit[i] for i in range(3)]))
+  for step in range(3):
+    a.grids.dense([20 + step % 2], hit[step % 2:step % 2 + 1]).square().sum().backward()
+    a._accepted_since_step = True
+    a.optimizer_step(0, step, None)
+  assert not a.grids.touched
+  untouched = ~torch.from_numpy(np.isin(np.arange(2000), np.concatenate([a.grids.label[:int(a.grids.starts[2])].numpy()])))
+  assert torch.equal(a.grids.params["sh0"][untouched], a.grids.init_sh0[untouched])   # lazy: anchors of volume 2 never moved
+  ckpt = {"state_dict": a.state_dict()}
+  a.on_save_checkpoint(ckpt)
+  torch.save(ckpt, tmp_path / "c.ckpt")
+  ckpt = torch.load(tmp_path / "c.ckpt", weights_only=False)
+  b = anchor_module(tmp_path)
+  b.on_load_checkpoint(ckpt)
+  b.load_state_dict(ckpt["state_dict"])
+  b.on_train_start()
+  assert all(torch.equal(pa, pb) for pa, pb in zip(a.grids.parameters(), b.grids.parameters()))
+  for m in (a, b):
+    m.grids.dense([20], hit[:1]).square().sum().backward()
+    m._accepted_since_step = True
+    m.optimizer_step(0, 9, None)
+  assert all(torch.equal(pa, pb) for pa, pb in zip(a.grids.parameters(), b.grids.parameters()))
+  c = anchor_module(tmp_path, adam="dense")
+  with pytest.raises(SystemExit):
+    c.on_load_checkpoint(ckpt)
+
+
+def test_one_level_shares_scale_and_opacity_across_views(tmp_path):
+  from omegaconf import OmegaConf
+  poses, K = synthetic_render_h5(tmp_path / "r.h5")
+  init = anchors_init_from_h5(tmp_path / "r.h5", poses, K)
+  cfg = OmegaConf.create({"r": 1.0, "k": 8, "max_rounds": 200, "levels": 1, "init_opacity": 0.1})
+  a = lgm.build_anchors_init(init, str(tmp_path / "r.h5"), cfg)
+  assert a["params"]["scales"].shape[1] == 1 and a["params"]["opacities"].shape[1] == 1
+  assert all((lev == 0).all() for lev in a["level"])
+  np.testing.assert_allclose(a["params"]["scales"][:, 0], np.log(a["foot"])[:, None].repeat(3, 1), rtol=1e-5)   # the footprint
+  g = lgm.AnchorGrids({**init, "pairs": np.zeros((0, 2), np.int64), "ref_rows": None}, a)
+  with torch.no_grad():   # random per-anchor values: every view gathers the same scale / opacity for a shared anchor
+    g.params["scales"].normal_()
+    g.params["opacities"].normal_()
+  per_anchor = {}
+  for i in range(len(init["views"])):
+    r = g.volume_rows(i).detach()
+    for lab, row in zip(a["label"][i].tolist(), r):
+      so = torch.cat([row[:1], row[gd.SCALE]])
+      if lab in per_anchor:
+        assert torch.equal(per_anchor[lab], so)
+      per_anchor[lab] = so
+  assert len(per_anchor) < sum(len(x) for x in a["label"])   # (anchors shared by several views were compared)

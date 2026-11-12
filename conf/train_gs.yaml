@@ -489,6 +489,25 @@ diffusion:
     # both through x_t only, the x0 target is detached) | none: the rendering loss's alone (the model still gets both): one extra
     # backward pass through the model per step (the rendering loss to the grids, graph kept), then the total loss to the model only
     x0_grad: through_input
+    # the grids' optimizer: dense (torch's Adam: every row steps every step -- a row whose volume is not in the batch has a zero
+    # gradient, but its decaying momentum keeps moving it for ~10 steps after each visit) | lazy (the same update on the rows the
+    # step's grids were built from only: a row keeps its moments, step count and value until its volume is in a batch again)
+    adam: dense
+    # none: a grid per volume | anchors: ONE Gaussian set per mesh, the anchored fitter's anchors (anchored_3dgs.build_anchors over the
+    # training volumes' slots, `anchors` below, deterministic), every volume's grid gathered from it each step (per slot: its anchor's
+    # world mean in the view's camera minus the slot's depth-peel point, its quaternion rotated into the camera, scale / opacity of the
+    # slot's density level, its SH0; no per-view residual). init fresh (anchored_3dgs.init_params per anchor) and scale_param log only;
+    # held-out sources (no anchors) get the per-slot fresh init in the validations. Logs grids/anchors/{count, drift/<key>,
+    # frac_transparent, frac_huge, frac_tiny}; the dump adds learned_grids/anchors.npz
+    share: none
+    anchors:                   # the fitter's (conf/fit_anchored.yaml: merge.r / k / max_rounds, levels, init_opacity)
+      r: 1.0
+      k: 8
+      max_rounds: 200
+      levels: 3                # density levels per anchor (log-scale + opacity each, an octave apart; a view uses the level of its
+                               # sample spacing, as the fitter): 3 = the fitter's | 1 = one scale + opacity per anchor shared by every view
+                               # (init: the footprint scale -- init_params' middle level -- and init_opacity)
+      init_opacity: 0.1
     fresh:
       opacity: 0.1
       color: peel_rgb          # peel_rgb (the slot's own layer colour, the render's depth_peel_rgb) | image (the source image's pixel,
