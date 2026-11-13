@@ -437,6 +437,8 @@ diffusion:
     empty_opacity: null        # fitted Gaussians with opacity below this become the canonical empty Gaussian in x0 (opacity half of it, on
                                # the point, isotropic one pixel footprint, identity rotation, grey): the model no longer has to predict the
                                # arbitrary parameters of invisible Gaussians; the slot stays valid. null: off (as fitted)
+    empty_form: footprint      # the empty Gaussian: footprint (as above) | floor (opacity logit at the clamp -7, every axis exactly at
+                               # the scale floor: scale_floor_px of a pixel at its depth)
   # Render-invariant augmentation of the TRAINING grids (gs_diffusion.augment_x0; the statistics, validations and eval are not
   # augmented): the same Gaussians written down differently. Meant for rendering-only training (x0_weight=0): with the x0 loss on, a
   # shuffled target is unpredictable.
