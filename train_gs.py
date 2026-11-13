@@ -689,7 +689,8 @@ class GSLightningModule(pl.LightningModule):
           f"the checkpoint was trained with diffusion.scale_encoding={saved}, this config has {now}: its x0 statistics and targets "
           f"would not match. Resume with the checkpoint's own encoding, e.g. diffusion.scale_encoding.scale_order="
           f"{saved['scale_order']} diffusion.scale_encoding.scale_floor_px={saved['scale_floor_px'] if saved['scale_floor_px'] is not None else 'null'}"
-          f" diffusion.scale_encoding.scale_floor_mode={saved['scale_floor_mode']} diffusion.scale_encoding.rot_form={saved['rot_form']}")
+          f" diffusion.scale_encoding.scale_floor_mode={saved['scale_floor_mode']} diffusion.scale_encoding.rot_form={saved['rot_form']}"
+          f" diffusion.scale_encoding.empty_opacity={saved['empty_opacity'] if saved['empty_opacity'] is not None else 'null'}")
     if self.ema is not None and "ema" in checkpoint:
       self.ema.load_state_dict(checkpoint["ema"])
       self._ema_fresh = False

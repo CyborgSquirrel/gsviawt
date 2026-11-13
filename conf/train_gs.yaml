@@ -434,6 +434,9 @@ diffusion:
     rot_form: keep             # which of each Gaussian's 4 equivalent quaternions (two axes flipped) is stored, after the sort:
                                # keep (as fitted; after the sort effectively random) | canonical (largest |w|) | random (fresh per encode;
                                # for rendering-only training: with the x0 loss the rotation target is then unpredictable)
+    empty_opacity: null        # fitted Gaussians with opacity below this become the canonical empty Gaussian in x0 (opacity half of it, on
+                               # the point, isotropic one pixel footprint, identity rotation, grey): the model no longer has to predict the
+                               # arbitrary parameters of invisible Gaussians; the slot stays valid. null: off (as fitted)
   # Render-invariant augmentation of the TRAINING grids (gs_diffusion.augment_x0; the statistics, validations and eval are not
   # augmented): the same Gaussians written down differently. Meant for rendering-only training (x0_weight=0): with the x0 loss on, a
   # shuffled target is unpredictable.

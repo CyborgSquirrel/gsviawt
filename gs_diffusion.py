@@ -77,7 +77,8 @@ def sort_scale_axes(scale, quat):
   return permute_scale_axes(scale, quat, np.argsort(-scale, axis=1))
 
 
-ENCODING_DEFAULTS = dict(scale_order="keep", scale_floor_px=None, scale_floor_mode="max", rot_form="keep")   # what a config without the key means
+ENCODING_DEFAULTS = dict(scale_order="keep", scale_floor_px=None, scale_floor_mode="max", rot_form="keep",
+                         empty_opacity=None)   # what a config without the key means
 SCALE_ORDERS = ("keep", "sorted", "random")
 ROT_FORMS = ("keep", "canonical", "random")
 SCALE_FLOOR_MODES = ("max", "add")
@@ -102,6 +103,8 @@ def normalize_encoding(encoding):
     raise ValueError(f"rot_form must be one of {ROT_FORMS}, got {e['rot_form']!r}")
   if e["scale_floor_mode"] not in SCALE_FLOOR_MODES:
     raise ValueError(f"scale_floor_mode must be one of {SCALE_FLOOR_MODES}, got {e['scale_floor_mode']!r}")
+  if e["empty_opacity"] is not None and not 0 < float(e["empty_opacity"]) < 1:
+    raise ValueError(f"empty_opacity must be in (0, 1) or null, got {e['empty_opacity']!r}")
   return e
 
 
@@ -118,7 +121,7 @@ def set_rot_form(q, rot_form, rng=None):
 
 
 def encode_grid(grid, source, scale_order=None, scale_floor_px=None, rot_form="keep", rng=None, scale_sort=None,
-                scale_floor_mode="max"):
+                scale_floor_mode="max", empty_opacity=None):
   """The grid's Gaussians as raw (un-normalized) x0 channels, (CHANNELS, L, H, W) float32, zero at the slots without a Gaussian.
   `grid`: a grid_io.Grid (read_grid: a sparse file's rows, used as they are) or load_grid's dense dict (gathered into one first: the
   same rows, so the same x0 bit for bit).
@@ -134,7 +137,10 @@ def encode_grid(grid, source, scale_order=None, scale_floor_px=None, rot_form="k
   call). scale_sort: the legacy boolean (True = sorted). Both render the same as the grid (bla/_test_scale_reencode.py: floor 0.1 px >= 56 dB PSNR
   against the original render over 5000 renders). rot_form (set_rot_form, after the sort): which of a Gaussian's 4 equivalent
   quaternions is stored -- keep (as fitted, in the camera frame: after the sort an effectively random one), canonical (largest
-  |w|), random (a fresh random one per call; rng: its generator, default a fresh one)."""
+  |w|), random (a fresh random one per call; rng: its generator, default a fresh one).
+  empty_opacity: the fitted Gaussians with opacity below it are written as the canonical empty Gaussian (empty_gaussian_rows: opacity
+  empty_opacity / 2, on its point (offset 0), isotropic at one pixel footprint, identity rotation, colour 0.5 grey) instead of their
+  fitted, invisible-but-arbitrary parameters; the slot stays valid (the hit mask is the point cloud's). null: off."""
   # scale_order None: keep, or the legacy flag's choice; both given must agree
   e = normalize_encoding({**({"scale_order": scale_order} if scale_order is not None else {}), "scale_floor_px": scale_floor_px,
                           "scale_floor_mode": scale_floor_mode, "rot_form": rot_form, **({"scale_sort": scale_sort} if scale_sort is not None else {})})
@@ -186,9 +192,31 @@ def encode_grid(grid, source, scale_order=None, scale_floor_px=None, rot_form="k
   scale = np.log(np.maximum(scales, 1e-8))
   color = (take("gaussian_colors") - 0.5) / SH_C0
 
+  rows = np.concatenate([opacity[:, None], scale, quat, color, offset], axis=-1).astype(np.float32)   # (N, CHANNELS)
+  if empty_opacity is not None and len(li):
+    empty = take("gaussian_opacities").reshape(-1) < float(empty_opacity)
+    if empty.any():
+      z = source["xyz_cam"].numpy()[li[empty], yi[empty], xi[empty], 2]
+      footprint = z / float(source["K_depth"][0, 0])
+      if floor is not None:   # as the fitted axes: max -> raised to the floor; add -> the channel is the excess over it
+        f = floor[empty, 0]
+        footprint = np.maximum(footprint, f) if scale_floor_mode == "max" else np.maximum(footprint - f, FLOOR_ADD_EPS * f)
+      rows[empty] = empty_gaussian_rows(footprint, float(empty_opacity))
   x0 = np.zeros((CHANNELS,) + valid.shape, np.float32)
-  x0[:, li, yi, xi] = np.concatenate([opacity[:, None], scale, quat, color, offset], axis=-1).astype(np.float32).T
+  x0[:, li, yi, xi] = rows.T
   return x0                                                          # (CHANNELS, L, H, W)
+
+
+def empty_gaussian_rows(footprint, empty_opacity):
+  """(N, CHANNELS) raw x0 rows of the canonical empty Gaussian (encode_grid's empty_opacity) at N slots with these footprints (the
+  scale per axis, world units): opacity empty_opacity / 2 (logit), log-scale log(footprint) on all 3 axes, quaternion (1, 0, 0, 0),
+  SH0 0 (colour 0.5), offset 0."""
+  o = 0.5 * empty_opacity
+  rows = np.zeros((len(footprint), CHANNELS), np.float32)
+  rows[:, 0] = np.log(o / (1 - o))
+  rows[:, X0_SLICES["scale"]] = np.log(np.maximum(footprint, 1e-8))[:, None]
+  rows[:, X0_SLICES["rotation"].start] = 1.0
+  return rows
 
 
 SCALE, ROTATION, OFFSET = X0_SLICES["scale"], X0_SLICES["rotation"], X0_SLICES["offset"]
@@ -478,6 +506,7 @@ def encoding_tag(encoding):
   parts = parts + ([f"floor{float(e['scale_floor_px']):g}px" + ("add" if e["scale_floor_mode"] == "add" else "")]
                    if e["scale_floor_px"] is not None else [])
   parts += [f"rot{e['rot_form']}"] if e["rot_form"] != "keep" else []
+  parts += [f"empty{float(e['empty_opacity']):g}"] if e["empty_opacity"] is not None else []
   return "_".join(parts)
 
 

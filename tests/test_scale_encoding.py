@@ -71,7 +71,7 @@ def test_encoding_tag_and_dataset_encoding():
       import polars as pl
       df = pl.DataFrame({"view_idx": [3]})
   ds = gd.GridTargetDataset(Inner(), {3: "unused.h5"}, {"scale_sort": True})   # overriding a default must not raise
-  assert ds.encoding == {"scale_order": "sorted", "scale_floor_px": None, "scale_floor_mode": "max", "rot_form": "keep"}   # legacy scale_sort mapped
+  assert ds.encoding == {"scale_order": "sorted", "scale_floor_px": None, "scale_floor_mode": "max", "rot_form": "keep", "empty_opacity": None}   # legacy scale_sort mapped
 
 
 def test_default_is_sort_floor_and_checkpoints_keep_their_encoding():
@@ -82,8 +82,8 @@ def test_default_is_sort_floor_and_checkpoints_keep_their_encoding():
   import train_gs
   root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
   conf = OmegaConf.load(os.path.join(root, "conf", "train_gs.yaml"))
-  assert train_gs.x0_encoding(conf) == {"scale_order": "sorted", "scale_floor_px": 0.1, "scale_floor_mode": "max", "rot_form": "keep"}
-  off = {"scale_order": "keep", "scale_floor_px": None, "scale_floor_mode": "max", "rot_form": "keep"}
+  assert train_gs.x0_encoding(conf) == {"scale_order": "sorted", "scale_floor_px": 0.1, "scale_floor_mode": "max", "rot_form": "keep", "empty_opacity": None}
+  off = {"scale_order": "keep", "scale_floor_px": None, "scale_floor_mode": "max", "rot_form": "keep", "empty_opacity": None}
   assert train_gs.x0_encoding(OmegaConf.create({"diffusion": {"enabled": True}})) == off
 
   def module(enc):
@@ -92,7 +92,7 @@ def test_default_is_sort_floor_and_checkpoints_keep_their_encoding():
   M = train_gs.GSLightningModule
   ckpt = {}
   M.on_save_checkpoint(module({"scale_sort": True, "scale_floor_px": 0.1}), ckpt)
-  assert ckpt["x0_encoding"] == {"scale_order": "sorted", "scale_floor_px": 0.1, "scale_floor_mode": "max", "rot_form": "keep"}
+  assert ckpt["x0_encoding"] == {"scale_order": "sorted", "scale_floor_px": 0.1, "scale_floor_mode": "max", "rot_form": "keep", "empty_opacity": None}
   M.on_load_checkpoint(module({"scale_sort": True, "scale_floor_px": 0.1}), dict(ckpt))
   with pytest.raises(SystemExit, match="scale_order=sorted diffusion.scale_encoding.scale_floor_px=0.1"):
     M.on_load_checkpoint(module(off), dict(ckpt))
@@ -114,7 +114,7 @@ def test_scale_order_random_and_legacy_mapping():
   distinct = (np.diff(sa, axis=1) < -1e-7).all(1)                                    # (floored axes tie: any order is sorted)
   assert distinct.sum() > 200 and 0.08 < (np.diff(sr[distinct], axis=1) <= 0).all(1).mean() < 0.28   # about 1/6 come out sorted
   np.testing.assert_allclose(cov(r[4:8][:, hit].T, sr), cov(a[4:8][:, hit].T, sa), rtol=1e-4, atol=1e-10)
-  assert gd.normalize_encoding({"scale_sort": True, "scale_floor_px": 0.1}) == {"scale_order": "sorted", "scale_floor_px": 0.1, "scale_floor_mode": "max", "rot_form": "keep"}
+  assert gd.normalize_encoding({"scale_sort": True, "scale_floor_px": 0.1}) == {"scale_order": "sorted", "scale_floor_px": 0.1, "scale_floor_mode": "max", "rot_form": "keep", "empty_opacity": None}
   assert gd.normalize_encoding({"scale_sort": False}) == gd.ENCODING_DEFAULTS
   assert gd.encoding_tag({"scale_order": "sorted", "scale_floor_px": 0.1}) == "sort_floor0.1px"          # the existing caches
   assert gd.encoding_tag({"scale_order": "random", "scale_floor_px": 0.1}) == "randorder_floor0.1px"
@@ -124,3 +124,29 @@ def test_scale_order_random_and_legacy_mapping():
   for bad in ({"scale_sort": True, "scale_order": "keep"}, {"scale_order": "shuffled"}, {"scale_perm": True}):
     with pytest.raises(ValueError):
       gd.normalize_encoding(bad)
+
+
+def test_empty_opacity_canonical_empty_gaussian():
+  """empty_opacity: the fitted Gaussians under the threshold become the canonical empty Gaussian (opacity half the threshold, on
+  the point, isotropic at max(footprint, floor), identity rotation, grey); the others and the hit mask are untouched."""
+  grid, source, xyz_cam, hit = synthetic()
+  op = np.moveaxis(grid["gaussian_opacities"], 2, 0).copy()                    # (L, H, W)
+  op[::2] = 0.004                                                               # every other layer transparent
+  grid["gaussian_opacities"] = np.moveaxis(op, 0, 2)
+  enc = dict(scale_order="sorted", scale_floor_px=0.1)
+  a = gd.encode_grid(grid, source, **enc)
+  b = gd.encode_grid(grid, source, **enc, empty_opacity=0.01)
+  empty = hit & (op < 0.01)
+  keep = hit & ~empty
+  assert empty.any() and keep.any()
+  np.testing.assert_array_equal(a[:, keep], b[:, keep])
+  assert (b[:, ~hit] == 0).all()
+  e = b[:, empty]                                                               # (CHANNELS, n)
+  np.testing.assert_allclose(e[0], np.log(0.005 / 0.995), rtol=1e-6)
+  footprint = np.maximum(xyz_cam[empty][:, 2] / 500.0, 0.1 * xyz_cam[empty][:, 2] / 500.0)
+  np.testing.assert_allclose(np.exp(e[1:4]), np.broadcast_to(footprint, (3, len(footprint))), rtol=1e-5)
+  np.testing.assert_array_equal(e[4:8], np.repeat([[1.0], [0], [0], [0]], e.shape[1], 1))
+  assert (e[8:14] == 0).all()                                                   # grey, offset 0
+  assert gd.encoding_tag({**enc, "empty_opacity": 0.01}) == "sort_floor0.1px_empty0.01"
+  with pytest.raises(ValueError, match="empty_opacity"):
+    gd.normalize_encoding({"empty_opacity": 1.5})
