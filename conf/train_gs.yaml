@@ -373,6 +373,10 @@ diffusion:
   # in_proj_image_dim and the noisy values to dim - in_proj_image_dim, separately, then concatenated)
   in_proj: shared
   in_proj_image_dim: null
+  # the trunk's attention pattern: frame_ray_global (block i attends within its layer / along its ray / globally, i % 3) | global
+  # (every block globally). The conditioning is per block position either way (FiLM + per-layer AdaLN at the frame positions). No
+  # parameters change: checkpoints load either way
+  attention: frame_ray_global
   cond_dropout:
     p: 0.0                     # 0 = off: nothing is drawn, the random streams and the loss exactly as without dropout
     "null": zeros              # zeros (the features' mean after the z-score; no parameter) | learned (a learned feature_dim

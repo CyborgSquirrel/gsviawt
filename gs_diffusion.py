@@ -746,16 +746,24 @@ class DiTBlock(AttentionBlock):
 
 class DiTTrunk(nn.Module):
   """gs_decoder.TransformerTrunk with AdaLN blocks: frame -> ray -> global, the per-layer FiLM before every frame block, and WT's
-  timestep rule: the frame blocks get each layer's own AdaLN input, the ray and global blocks the mean over the layers."""
+  timestep rule: the frame blocks get each layer's own AdaLN input, the ray and global blocks the mean over the layers.
+  attention (diffusion.attention): frame_ray_global (as above) | global (every block attends globally; the conditioning stays per
+  POSITION: the blocks at the frame positions (0, 3, 6, ...) still get the FiLM before them and the per-layer AdaLN, the others the
+  layer-mean AdaLN -- only the attention pattern changes)."""
 
   MODES = ("frame", "ray", "global")
+  ATTENTIONS = ("frame_ray_global", "global")
 
-  def __init__(self, dim, num_layers, num_blocks, num_heads, mlp_ratio=4.0, layer_scale_init=1e-4, checkpoint_activations=False):
+  def __init__(self, dim, num_layers, num_blocks, num_heads, mlp_ratio=4.0, layer_scale_init=1e-4, checkpoint_activations=False,
+               attention="frame_ray_global"):
     super().__init__()
+    if attention not in self.ATTENTIONS:
+      raise ValueError(f"attention must be one of {self.ATTENTIONS}, got {attention!r}")
     self.checkpoint_activations = checkpoint_activations
     self.num_heads = num_heads
+    self.cond = [self.MODES[i % 3] for i in range(num_blocks)]   # each block's conditioning role (its frame/ray/global position)
     self.blocks = nn.ModuleList(
-      DiTBlock(dim, num_heads, self.MODES[i % 3], mlp_ratio, layer_scale_init) for i in range(num_blocks))
+      DiTBlock(dim, num_heads, c if attention == "frame_ray_global" else "global", mlp_ratio, layer_scale_init) for c in self.cond)
     self.layer_embed = nn.Embedding(num_layers, dim)
     self.film = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, 2 * dim))
     nn.init.zeros_(self.film[-1].weight)
@@ -776,10 +784,10 @@ class DiTTrunk(nn.Module):
     gamma, beta = self.film(self.layer_embed(torch.arange(num_layers, device=x.device))).chunk(2, dim=-1)
     gamma, beta = gamma[None, :, None], beta[None, :, None]
     adaln_mean = adaln.mean(1, keepdim=True)
-    for block in self.blocks:
-      if block.mode == "frame":
+    for block, cond in zip(self.blocks, self.cond):
+      if cond == "frame":
         x = x * (1 + gamma) + beta
-      a = adaln if block.mode == "frame" else adaln_mean
+      a = adaln if cond == "frame" else adaln_mean
       if self.checkpoint_activations and torch.is_grad_enabled():
         x = torch.utils.checkpoint.checkpoint(block, x, cos, sin, a, use_reentrant=False)
       else:
@@ -796,8 +804,8 @@ class DiTTrunk(nn.Module):
     gamma, beta = gamma[pack.l], beta[pack.l]
     adaln_frame = adaln.reshape(b * num_layers, *adaln.shape[2:])
     adaln_mean = adaln.mean(1)                                        # (B, 6, D)
-    for block in self.blocks:
-      if block.mode == "frame":
+    for block, cond in zip(self.blocks, self.cond):
+      if cond == "frame":
         x = x * (1 + gamma) + beta
         a, seg = adaln_frame, pack.frame
       else:
@@ -820,7 +828,7 @@ class DiffusionHead(nn.Module):
 
   def __init__(self, feature_dim, num_layers, channels=CHANNELS, patch_size=14, dim=None, num_blocks=3, mlp_ratio=4.0,
                layer_scale_init=1e-4, t_embed_channels=256, img_token_scale=0.3, checkpoint_activations=False, cond_null="zeros",
-               readout="linear", in_proj="shared", in_proj_image_dim=None):
+               readout="linear", in_proj="shared", in_proj_image_dim=None, attention="frame_ray_global"):
     """cond_null (diffusion.cond_dropout.null): what a dropped sample's image tokens become -- zeros (the z-scored features' mean;
     no parameter) | learned (a learned (feature_dim,) vector, zero-initialized: the parameter `null_cond` exists only then).
     readout (diffusion.readout): linear (the zero-initialized output projection `out`) | slice (no output layer: x0_hat IS the
@@ -854,7 +862,8 @@ class DiffusionHead(nn.Module):
     self.pad = 0 if self.projected else self.dim - in_dim
     self.time_embed = nn.Sequential(nn.Linear(t_embed_channels, self.dim), nn.SiLU(), nn.Linear(self.dim, self.dim))
     self.time_proj = nn.Sequential(nn.SiLU(), nn.Linear(self.dim, 6 * self.dim))
-    self.trunk = DiTTrunk(self.dim, num_layers, num_blocks, self.dim // 64, mlp_ratio, layer_scale_init, checkpoint_activations)
+    self.trunk = DiTTrunk(self.dim, num_layers, num_blocks, self.dim // 64, mlp_ratio, layer_scale_init, checkpoint_activations,
+                          attention)
     if readout not in READOUTS:
       raise ValueError(f"readout must be one of {READOUTS}, got {readout!r}")
     self.readout = readout
@@ -944,7 +953,8 @@ class GSDiffusionModel(nn.Module):
       img_token_scale=float(d.img_token_scale), checkpoint_activations=bool(d.get("checkpoint_activations", False)),
       layer_scale_init=float(cfg.model.transformer.layer_scale_init), cond_null=cond_dropout["null"],
       readout=str(d.get("readout", "linear")),   # (configs without the key, older runs: the linear output projection)
-      in_proj=str(d.get("in_proj", "shared")), in_proj_image_dim=d.get("in_proj_image_dim"))   # (without the keys: one shared projection)
+      in_proj=str(d.get("in_proj", "shared")), in_proj_image_dim=d.get("in_proj_image_dim"),   # (without the keys: one shared projection)
+      attention=str(d.get("attention", "frame_ray_global")))   # (configs without the key: the frame/ray/global pattern)
     mean, std, lo, hi = stats
     self.register_buffer("x0_mean", mean.clone().float())
     self.register_buffer("x0_std", std.clone().float())
