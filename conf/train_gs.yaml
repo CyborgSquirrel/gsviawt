@@ -463,6 +463,14 @@ diffusion:
     t_reduce: max              # max (the noisiest layer) | mean | layer0
     start_seconds: 0           # off until the train clock reaches this
     validate: true             # also log <set>/<name>/loss/photom in the validations (gated like the training's), when enabled
+    # LPIPS (lin) of the same renders, per view, added to loss.photom's L1 + D-SSIM inside this term (so: same gate, same `weight`):
+    # weight * (l1_weight * L1 + dssim_weight * D-SSIM + lpips_weight * LPIPS); logged as loss/photom_lpips (and _cond, _t<t>, ...).
+    # fp32, autocast off; the net is frozen and kept out of the checkpoints. Needs torchvision's backbone weights in
+    # $TORCH_HOME/hub/checkpoints (vgg16-397923af.pth / alexnet-owt-7be5be79.pth) or internet on first use.
+    lpips_weight: 0.0          # 0: off (no LPIPS net built, the loss exactly as without the key)
+    lpips_net: vgg             # vgg | alex
+    lpips_crop: 256            # each view cut to the square around its silhouettes (GT alpha > 0.5 or the render's; +10 % margin,
+                               # black outside the frame), resized to this; a view with neither contributes 0. null: the full render
 
 optim:
   _target_: torch.optim.AdamW

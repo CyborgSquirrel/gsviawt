@@ -55,6 +55,7 @@ import numpy as np
 import polars
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.checkpoint
 from einops import pack, rearrange
 from omegaconf import DictConfig, OmegaConf, open_dict
@@ -91,6 +92,73 @@ def image_quality(pred_rgb, gt_rgb, gt_alpha):
       "fg_psnr": -10 * torch.log10(((sq * fg).flatten(2).sum(2) / nf).clamp_min(1e-10)),
       "bg_l1": (ab * (1 - fg)).flatten(2).sum(2) / nb,
     }
+
+
+_LPIPS_NETS = {}   # (net, device) -> the frozen LPIPS net of photom_lpips; module-level, so it is never in a state_dict
+
+
+def lpips_net(net, device):
+  """torchmetrics' LPIPS (lin) with the `net` backbone (vgg | alex), built on first use per device: eval mode for good
+  (_NoTrainLpips ignores .train(), so its dropout before the lin layers never acts), frozen. Held here, not on the
+  LightningModule: as a submodule its weights (~58 MB for VGG16) would go into every checkpoint and older checkpoints would no
+  longer load strictly. Not use_dropout=False: the shipped lin weights are keyed lin<k>.model.1 (after the dropout), which
+  torchmetrics' strict=False load then silently skips -- random lin layers, an LPIPS that can go negative."""
+  key = (net, str(device))
+  if key not in _LPIPS_NETS:
+    from torchmetrics.functional.image.lpips import _NoTrainLpips
+    _LPIPS_NETS[key] = _NoTrainLpips(net=net, pretrained=True, use_dropout=True).eval().requires_grad_(False).to(device)
+  return _LPIPS_NETS[key]
+
+
+def alpha_crop_boxes(pred_alpha, gt_alpha, margin=0.1):
+  """Per image, the square crop (y0, x0, size) around the union of the silhouettes (alpha > 0.5) of pred_alpha / gt_alpha (N, [1,]
+  H, W): their bbox grown by `margin` of its longer side on each side, squared about its centre; it can reach outside the frame
+  (photom_lpips pads with black there). None for an image with neither silhouette."""
+  N, H, W = gt_alpha.shape[0], gt_alpha.shape[-2], gt_alpha.shape[-1]
+  fg = ((pred_alpha.detach().reshape(N, H, W) > 0.5) | (gt_alpha.reshape(N, H, W) > 0.5)).cpu()
+  boxes = []
+  for m in fg:
+    rows, cols = m.any(1).nonzero().flatten(), m.any(0).nonzero().flatten()
+    if len(rows) == 0:
+      boxes.append(None)
+      continue
+    y0, y1, x0, x1 = int(rows[0]), int(rows[-1]) + 1, int(cols[0]), int(cols[-1]) + 1
+    side = max(y1 - y0, x1 - x0)
+    size = side + 2 * int(math.ceil(margin * side))
+    boxes.append(((y0 + y1 - size) // 2, (x0 + x1 - size) // 2, size))
+  return boxes
+
+
+def crop_square(img, box):
+  """img (C, H, W) cut to the square box (y0, x0, size) of alpha_crop_boxes, black (zero) where it reaches outside the frame."""
+  y0, x0, size = box
+  H, W = img.shape[-2:]
+  out = img.new_zeros(img.shape[0], size, size)
+  ya, yb, xa, xb = max(y0, 0), min(y0 + size, H), max(x0, 0), min(x0 + size, W)
+  out[:, ya - y0:yb - y0, xa - x0:xb - x0] = img[:, ya:yb, xa:xb]
+  return out
+
+
+def photom_lpips(pred_rgb, gt_rgb, pred_alpha, gt_alpha, net="vgg", crop=256):
+  """LPIPS (lin, `net` backbone) of each pred_rgb / gt_rgb pair (N, 3, H, W in [0, 1], both over black) -> (N,), in fp32 with
+  autocast off (like DSSIMLoss). crop: each pair cut to the same alpha_crop_boxes square (the object, ~8 % of a 504 frame) and
+  resized to crop x crop (bilinear, antialiased); an image with no silhouette in either alpha contributes 0 (no graph through
+  it). null: the full frames, as rendered."""
+  lp = lpips_net(net, pred_rgb.device)
+  with torch.autocast(device_type=pred_rgb.device.type, enabled=False):
+    pred_rgb, gt_rgb = pred_rgb.float(), gt_rgb.float()
+    if crop is None:
+      return lp(pred_rgb.contiguous(), gt_rgb.contiguous(), normalize=True).flatten()
+    boxes = alpha_crop_boxes(pred_alpha, gt_alpha)
+    keep = [i for i, b in enumerate(boxes) if b is not None]
+    out = pred_rgb.new_zeros(len(boxes))
+    if not keep:
+      return out
+    size = (int(crop), int(crop))
+    cut = lambda imgs: torch.cat([F.interpolate(crop_square(imgs[i], boxes[i])[None], size=size, mode="bilinear",
+                                                align_corners=False, antialias=True) for i in keep])
+    vals = lp(cut(pred_rgb), cut(gt_rgb), normalize=True).flatten()
+    return out.index_put((torch.tensor(keep, device=out.device),), vals)
 
 
 def x0_encoding(cfg):
@@ -753,7 +821,7 @@ class GSLightningModule(pl.LightningModule):
   def _diffusion_photom(self, stage, batch, x0_hat, t, log=None, cond_drop=None):
     """The photometric loss of the diffusion model's x0 prediction (at the timesteps t), rendered: per volume, only the volumes
     whose timestep, reduced over the layers by diffusion.photom.t_reduce (max: the noisiest layer, mean, layer0), is in
-    diffusion.photom.t_range count (a mean over them; zero when there is none). Logs <prefix>/photom[_l1|_dssim] (over the
+    diffusion.photom.t_range count (a mean over them; zero when there is none). Logs <prefix>/photom[_l1|_dssim|_lpips] (over the
     volumes that count) and photom_frac (the fraction of volumes that count); the validations log it the same way, so
     train/loss/photom and <set>/<name>/loss/photom are one quantity. log: called instead of _log_metric (the train step holds
     its logs until the step is accepted). Returns the loss (with its graph). cond_drop: the (B,) mask of the samples trained with
@@ -784,8 +852,9 @@ class GSLightningModule(pl.LightningModule):
     return self._log_photom(stage, self._photom_per_volume(batch, gauss), keep, key, log)
 
   def _photom_per_volume(self, batch, gauss):
-    """{"l1", "dssim" (the terms with a weight), "total", and the image_quality metrics (no graph)}: per volume (B,), of gauss
-    rendered; the image metrics are means over the volume's views of the per-view values, as in eval_diffusion."""
+    """{"l1", "dssim", "lpips" (the terms with a weight; lpips: diffusion.photom.lpips_weight > 0, photom_lpips), "total", and
+    the image_quality metrics (no graph)}: per volume (B,), of gauss rendered; the image metrics are means over the volume's views
+    of the per-view values, as in eval_diffusion."""
     cfg, device, B = self.cfg, self.device, batch["batch_size"]
     V = batch["views"]["rgb"].shape[1]
     rvi = ([0] if "source" in cfg.loss.photom["for"] else []) + (list(range(1, V)) if "target" in cfg.loss.photom["for"] else [])
@@ -798,6 +867,13 @@ class GSLightningModule(pl.LightningModule):
     if cfg.loss.photom.dssim_weight > 0:
       per["dssim"] = self.dssim(pred_rgb.flatten(0, 1), gt_rgb.flatten(0, 1)).reshape(B, -1).mean(1)
     per["total"] = cfg.loss.photom.l1_weight * per.get("l1", 0) + cfg.loss.photom.dssim_weight * per.get("dssim", 0)
+    ph = OmegaConf.select(cfg, "diffusion.photom", default=None) or {}
+    lpips_weight = float(ph.get("lpips_weight", 0.0))   # configs without the key: off
+    if lpips_weight > 0:
+      alpha = batch["views"]["alpha"][:, rvi].to(device)
+      per["lpips"] = photom_lpips(pred_rgb.flatten(0, 1), gt_rgb.flatten(0, 1), pred["alpha"].flatten(0, 1), alpha.flatten(0, 1),
+                                  net=ph.get("lpips_net", "vgg"), crop=ph.get("lpips_crop", 256)).reshape(B, -1).mean(1)
+      per["total"] = per["total"] + lpips_weight * per["lpips"]
     for name, v in image_quality(pred_rgb, gt_rgb, batch["views"]["alpha"][:, rvi].to(device)).items():
       per[name] = v.mean(1)
     return per

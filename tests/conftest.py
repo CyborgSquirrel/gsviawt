@@ -115,4 +115,4 @@ def photom_setup(data_dir):
   x0 = ((batch["x0_raw"].to(dev).float().permute(0, 2, 1, 3, 4) - mean.to(dev)[None, None, :, None, None])
         / std.to(dev)[None, None, :, None, None])
   photom = lambda *a: train_gs.GSLightningModule._diffusion_photom(fake, *a)
-  return types.SimpleNamespace(batch=batch, x0=x0, photom=photom, logged=logged, B=batch["batch_size"], dev=dev)
+  return types.SimpleNamespace(batch=batch, x0=x0, photom=photom, logged=logged, B=batch["batch_size"], dev=dev, cfg=cfg, model=model)
