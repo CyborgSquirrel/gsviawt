@@ -198,9 +198,12 @@ def main(cfg):
                                         device))}
             key = {"checkpoint": ckpt_path, "weights": weights, "set": set_name, "volume": i,
                    "mesh": int(item["mesh_index"]), "source_view": int(item["source_view"])}
+            inject = None
+            if cfg.get("inject_fields"):   # oracle: those fields' ground truth fed in at every step, noised to the step's t
+              inject = (model.normalize(batch["x0_raw"].to(device).float()), list(cfg.inject_fields))
             for steps in outs:
               g = model.sample(image.expand(K, *image.shape[1:]), hit.expand(K, *hit.shape[1:]), seeds=seeds, steps=steps,
-                               project=project, floor=floor)
+                               project=project, floor=floor, inject=inject)
               samples = [render(model, batch, {k: v[j:j + 1] for k, v in g.items()}, views, device) for j in range(K)]
               per = dict(once)
               ks = [M(r) for r in samples]
@@ -209,6 +212,13 @@ def main(cfg):
                                         torch.stack([r[1] for r in samples]).mean(0), gt_alpha)
               best = int(np.argmin([float(m["loss"].mean()) for m in ks]))
               per[f"best{K}"] = ks[best]
+              if inject is not None:   # sample_gt: the sample with the injected fields' final values set to the ground truth
+                gt_g = model.decode(inject[0], floor)
+                g0 = {name: v[:1] for name, v in g.items()}
+                for f in inject[1]:
+                  for name in (f, "raw_scale") if f == "scale" else (f,):
+                    g0[name] = gt_g[name]
+                per["sample_gt"] = M(render(model, batch, g0, views, device))
               for method, m in per.items():
                 rows[steps].append({**key, "target_views": " ".join(map(str, item["target_views"])), "method": method,
                                     **{k: float(m[k].nanmean()) if torch.isfinite(m[k]).any() else float("nan") for k in METRICS}})

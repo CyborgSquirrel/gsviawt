@@ -16,6 +16,9 @@ guidance: null           # classifier-free guidance of the samples (fit is not s
                          # run's diffusion.cfg (default off); or keys of it, on the command line e.g. +guidance.scale=0 (the
                          # unconditional branch) or 'guidance={scale:2,interval:[0.5,1.0],fields:[sh_dc]}' (not guidance.scale=0:
                          # the node is null). Warns on a run trained with cond_dropout.p = 0
+inject_fields: null       # oracle test: a list of x0 fields (opacity, scale, rotation, sh_dc, offset) whose ground truth replaces the
+                          # sampler state's channels before every model call, noised to that step's t along the sampler's own noise;
+                          # adds the method sample_gt (the sample with those fields' final values set to the ground truth)
 seed: 0                  # the target views of a volume and the noise are functions of (seed, set, volume)
 grids_dir: null          # overrides for running somewhere else than the run did (null: the run's)
 source_h5: null

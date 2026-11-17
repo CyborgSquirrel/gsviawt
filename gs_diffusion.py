@@ -1183,14 +1183,18 @@ class GSDiffusionModel(nn.Module):
     return out
 
   @torch.no_grad()
-  def sample(self, image, hit, seeds=None, steps=None, project=None, floor=None, guidance=None):
+  def sample(self, image, hit, seeds=None, steps=None, project=None, floor=None, guidance=None, inject=None):
     """20 Euler steps of the flow from pure noise -> the Gaussian dict. The noise of volume i is a function of seeds[i] (default:
     eval_seed + i): reproducible. Invalid slots stay at the noise. project: applied to every step's x0 prediction before it is used
     (e.g. format_projection; the last step's x0 prediction is the output).
     guidance: classifier-free guidance (diffusion.cfg's keys; None: the model's, self.guidance). scale 1: the conditional
     prediction only (one forward per step, as without guidance); otherwise, at the steps whose t is in interval (inclusive):
     x0_u + scale * (x0_c - x0_u) on the raw (normalized) predictions of fields (null: all), before project and the decode's clamp
-    (scale 0 on all fields: the unconditional prediction, one forward); outside the interval: the conditional prediction."""
+    (scale 0 on all fields: the unconditional prediction, one forward); outside the interval: the conditional prediction.
+    inject: (x0, fields): before every model call, the state's channels of those fields (X0_FIELDS names) are replaced by the given
+    normalized x0 (B, L, C, H, W) noised to the step's t along the sampler's own noise, (1 - t) x0 + t eps (the rectified-flow path from
+    eps to x0, as in training); the other channels evolve as usual. The output keeps the model's own last prediction of those fields
+    (an oracle test, e.g. ground-truth colours: eval_diffusion's inject_fields)."""
     if guidance is None:
       guidance = self.guidance
     else:
@@ -1205,8 +1209,17 @@ class GSDiffusionModel(nn.Module):
     x = eps
     ts = torch.linspace(1.0, 0.0, steps + 1, device=image.device)
     pack = self.pack(hit)   # the same tokens at every step
+    if inject is not None:
+      inj_x0, fields = inject
+      on = torch.zeros(CHANNELS, dtype=torch.bool, device=x.device)
+      for f in fields:
+        on[X0_SLICES[f]] = True
+      on = on[None, None, :, None, None]
+      inj_x0 = inj_x0.to(x.dtype).expand_as(x)
     for i in range(steps):
       t = ts[i]
+      if inject is not None:
+        x = torch.where(on, (1 - t) * inj_x0 + t * eps, x)
       x_net = self._net_input(a * x + (1 - a) * eps, a)
       lo, hi = guidance["interval"]
       if guidance["scale"] != 1.0 and lo <= float(t) <= hi:
