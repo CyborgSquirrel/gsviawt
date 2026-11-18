@@ -21,6 +21,8 @@ inject_fields: null       # oracle test: a list of x0 fields (opacity, scale, ro
                           # adds the method sample_gt (the sample with those fields' final values set to the ground truth)
 inject_source: gt         # with inject_fields: gt (the ground truth; adds sample_gt) | onestep (the model's own one-step prediction
                           # of those fields, i.e. its t = 1 output from the same noise)
+sampler_t_min: 0.05        # the samples' Euler step divides by max(t, sampler_t_min) (WT's clamp, the default; with > 20 steps the
+                          # steps below 0.05 only partly denoise); 0: divide by t, exact (the onestep row always uses the model default)
 seed: 0                  # the target views of a volume and the noise are functions of (seed, set, volume)
 grids_dir: null          # overrides for running somewhere else than the run did (null: the run's)
 source_h5: null

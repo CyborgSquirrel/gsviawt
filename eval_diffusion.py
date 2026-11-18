@@ -206,7 +206,7 @@ def main(cfg):
               inject = (model.normalize(batch["x0_raw"].to(device).float()) if src == "gt" else "onestep", list(cfg.inject_fields))
             for steps in outs:
               g = model.sample(image.expand(K, *image.shape[1:]), hit.expand(K, *hit.shape[1:]), seeds=seeds, steps=steps,
-                               project=project, floor=floor, inject=inject)
+                               project=project, floor=floor, inject=inject, t_min=float(cfg.get("sampler_t_min", gd.T_MIN_CLAMP)))
               samples = [render(model, batch, {k: v[j:j + 1] for k, v in g.items()}, views, device) for j in range(K)]
               per = dict(once)
               ks = [M(r) for r in samples]

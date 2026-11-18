@@ -1183,7 +1183,7 @@ class GSDiffusionModel(nn.Module):
     return out
 
   @torch.no_grad()
-  def sample(self, image, hit, seeds=None, steps=None, project=None, floor=None, guidance=None, inject=None):
+  def sample(self, image, hit, seeds=None, steps=None, project=None, floor=None, guidance=None, inject=None, t_min=T_MIN_CLAMP):
     """20 Euler steps of the flow from pure noise -> the Gaussian dict. The noise of volume i is a function of seeds[i] (default:
     eval_seed + i): reproducible. Invalid slots stay at the noise. project: applied to every step's x0 prediction before it is used
     (e.g. format_projection; the last step's x0 prediction is the output).
@@ -1195,7 +1195,10 @@ class GSDiffusionModel(nn.Module):
     normalized x0 (B, L, C, H, W) noised to the step's t along the sampler's own noise, (1 - t) x0 + t eps (the rectified-flow path from
     eps to x0, as in training); the other channels evolve as usual. The output keeps the model's own last prediction of those fields
     (an oracle test, e.g. ground-truth colours: eval_diffusion's inject_fields). x0 = "onestep": the model's own first prediction (the
-    t = 1 call from the pure noise, i.e. the one-step sample) is the injected x0 from the second step on."""
+    t = 1 call from the pure noise, i.e. the one-step sample) is the injected x0 from the second step on.
+    t_min: the Euler step divides (x - x0_hat) by max(t, t_min) (WT's clamp, T_MIN_CLAMP): with more than 1 / t_min steps the steps below
+    t_min only partly denoise (at 50 steps ~1.4 % of the noise is left). 0: divide by t itself, every step lands exactly on the
+    straight path to x0_hat (the last step returns x0_hat)."""
     if guidance is None:
       guidance = self.guidance
     else:
@@ -1234,7 +1237,7 @@ class GSDiffusionModel(nn.Module):
         x0_hat = project(x0_hat)
       if inject is not None and inj_x0 is None:   # "onestep": the first (t = 1) prediction is the injected x0 from now on
         inj_x0 = x0_hat.detach().clone()
-      x = x - (t - ts[i + 1]) * (x - x0_hat) / t.clamp(min=T_MIN_CLAMP)
+      x = x - (t - ts[i + 1]) * (x - x0_hat) / (t.clamp(min=t_min) if t_min > 0 else t)
     return self.decode(x, floor)
 
   def decode(self, x0, floor=None):

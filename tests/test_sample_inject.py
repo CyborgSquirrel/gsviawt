@@ -68,3 +68,14 @@ def test_inject_onestep_uses_the_first_prediction():
   torch.testing.assert_close(inj[0][0], plain[0][0])
   for xi, t in inj[1:]:
     torch.testing.assert_close(xi[:, :, COL], ((1 - t) * first + t * eps)[:, :, COL])
+
+
+def test_t_min_zero_lands_exactly_on_the_prediction():
+  """t_min 0: every Euler step divides by t, so with a constant x0 prediction the sample equals it exactly at any step count; with the
+  default clamp (0.05) and 50 steps the steps below t = 0.05 leave a residual of the noise."""
+  hit = torch.ones(B, L, H, W, dtype=torch.bool)
+  m, _ = shell()
+  exact = m.sample(torch.zeros(B, 3, 4, 4), hit, seeds=[7, 8], steps=50, t_min=0.0)
+  torch.testing.assert_close(exact["raw_scale"], torch.full_like(exact["raw_scale"], 0.25))
+  clamped = m.sample(torch.zeros(B, 3, 4, 4), hit, seeds=[7, 8], steps=50)
+  assert (clamped["raw_scale"] - 0.25).abs().max() > 1e-3
