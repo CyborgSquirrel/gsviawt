@@ -80,6 +80,41 @@ def sample_plateau_logit_normal(shape, mu=0.0, sigma=1.0, mirror=False, generato
   return 1 - t if mirror else t
 
 
+COLOUR_NOISE_MODES = ("joint", "separate")
+COLOUR_NOISE_DRAWS = ("cond_uniform", "sorted")
+
+
+def normalize_colour_noise(cn):
+  """diffusion.colour_noise (None: a config without the key) -> {"mode", "draw"}; mode joint (the default): one t per (sample,
+  layer) for all channels, as before."""
+  cn = {**dict(mode="joint", draw="cond_uniform"), **(dict(cn) if cn is not None else {})}
+  if cn["mode"] not in COLOUR_NOISE_MODES:
+    raise ValueError(f"diffusion.colour_noise.mode must be one of {COLOUR_NOISE_MODES}, got {cn['mode']!r}")
+  if cn["draw"] not in COLOUR_NOISE_DRAWS:
+    raise ValueError(f"diffusion.colour_noise.draw must be one of {COLOUR_NOISE_DRAWS}, got {cn['draw']!r}")
+  return {"mode": str(cn["mode"]), "draw": str(cn["draw"])}
+
+
+def sample_colour_geo(batch_size, num_layers, draw, generator=None, device=None):
+  """diffusion.colour_noise separate: per (sample, layer) the geometry timestep t_g (every non-colour channel) and the colour one
+  t_c <= t_g. Returns (B, L, 2) float32, [..., 0] = t_g, [..., 1] = t_c. From one (B, L, 2) float64 uniform draw (u, v):
+    cond_uniform  t_g = u (uniform), t_c = t_g * v (density -ln t_c)
+    sorted        t_g = max(u, v) (density 2 t_g), t_c = min(u, v) (density 2 (1 - t_c)): uniform over the triangle t_c <= t_g
+  t_g is clamped to [T_MIN, 1 - T_MIN] (as the schedule's), t_c to [0, t_g] (t_c = 0 is a clean colour: nothing divides by it in
+  training). The schedule's densities (standard / plateau / uniform) are not used."""
+  uv = torch.rand((batch_size, num_layers, 2), generator=generator, device=device, dtype=torch.float64)
+  u, v = uv[..., 0], uv[..., 1]
+  if draw == "cond_uniform":
+    t_g, t_c = u, u * v
+  elif draw == "sorted":
+    t_g, t_c = torch.maximum(u, v), torch.minimum(u, v)
+  else:
+    raise ValueError(f"draw must be one of {COLOUR_NOISE_DRAWS}, got {draw!r}")
+  t_g = t_g.clamp(T_MIN, 1 - T_MIN)
+  t_c = torch.minimum(t_c, t_g).clamp_min(0.0)
+  return torch.stack([t_g, t_c], dim=-1).float()
+
+
 class LayerAwareSchedule:
   def __init__(self, num_layers, standard=None, plateau=None, fixed_t=None, uniform=False):
     """fixed_t: every timestep is this value, in both phases (1.0: always pure noise -- the deterministic control).

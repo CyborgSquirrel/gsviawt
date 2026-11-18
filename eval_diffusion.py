@@ -22,6 +22,8 @@ Methods:
 steps: one sampler step count, or a list of them (the run's diffusion.steps when null): with a list, every step count gets its own
 <out>/steps<N>/ with the same files as a single run (the same numbers: the noise and target views do not depend on the step
 count), but the volumes, the fit and the onestep are loaded / rendered / scored once for all of them.
+colour_schedule / colour_schedules (diffusion.colour_noise separate runs): the sampler's colour schedule (GSDiffusionModel.sample),
+or several, each to <out>/cs_<name>/ (steps<N>/ below it as above).
 Writes <out>/views.csv (one row per checkpoint, weights, set, volume, method, target view), <out>/volumes.csv (the same averaged
 over the volume's target views) and <out>/summary.json (mean and standard error over volumes per checkpoint, weights, set, method;
 volumes, not views, are the unit). mean<K> has no depth (an average of renders has no single depth)."""
@@ -155,6 +157,19 @@ def main(cfg):
     outs = {int(cfg.steps) if cfg.steps is not None else model.steps: cfg.out}
   else:
     outs = {int(s): os.path.join(cfg.out, f"steps{int(s)}") for s in cfg.steps}
+  # the colour schedules (colour_noise separate runs): one (name, schedule) per sampler sweep; name None: outs as they are
+  if cfg.get("colour_schedule") is not None and cfg.get("colour_schedules") is not None:
+    raise SystemExit("colour_schedule and colour_schedules: give one of them")
+  if cfg.get("colour_schedules") is not None:
+    schedules = [(str(n), OmegaConf.to_container(c)) for n, c in cfg.colour_schedules.items()]
+  else:
+    cs = cfg.get("colour_schedule")
+    schedules = [(None, None if cs is None else OmegaConf.to_container(cs))]
+  if any(c is not None for _, c in schedules) and not model.colour_separate:
+    raise SystemExit("colour_schedule(s): only for a diffusion.colour_noise.mode=separate run")
+  outs = {(n, st): d if n is None else os.path.join(cfg.out, f"cs_{n}", os.path.relpath(d, cfg.out))
+          for n, _ in schedules for st, d in outs.items()}
+  schedule_of = dict(schedules)
   sets = list(cfg.val_sets) if cfg.val_sets is not None else list(dm.val_datasets)
 
   rows, view_rows = {s: [] for s in outs}, {s: [] for s in outs}
@@ -207,14 +222,16 @@ def main(cfg):
             lock = None
             if cfg.get("lock_layers"):   # oracle: those depth layers held at the ground truth, only the others denoised
               lock = (model.normalize(batch["x0_raw"].to(device).float()), [int(v) for v in cfg.lock_layers])
-            for steps in outs:
+            for out_key in outs:
+              cs_name, steps = out_key
               if cfg.get("layer_stages"):   # the depth-layer groups denoised one after the other, `steps` steps each
                 g = model.sample_staged(image.expand(K, *image.shape[1:]), hit.expand(K, *hit.shape[1:]),
                                         [list(map(int, grp)) for grp in cfg.layer_stages], seeds=seeds, steps=steps, floor=floor,
                                         t_min=float(cfg.get("sampler_t_min", 0.0)))
               else:
                 g = model.sample(image.expand(K, *image.shape[1:]), hit.expand(K, *hit.shape[1:]), seeds=seeds, steps=steps,
-                                 project=project, floor=floor, inject=inject, t_min=float(cfg.get("sampler_t_min", 0.0)), lock=lock)
+                                 project=project, floor=floor, inject=inject, t_min=float(cfg.get("sampler_t_min", 0.0)), lock=lock,
+                                 **({"colour_schedule": schedule_of[cs_name]} if schedule_of[cs_name] is not None else {}))
               samples = [render(model, batch, {k: v[j:j + 1] for k, v in g.items()}, views, device) for j in range(K)]
               per = dict(once)
               ks = [M(r) for r in samples]
@@ -225,7 +242,8 @@ def main(cfg):
               per[f"best{K}"] = ks[best]
               if lock is not None:   # plain_swap: the plain sample (no lock, same noise) with the locked layers swapped to the ground truth
                 gp = model.sample(image.expand(K, *image.shape[1:]), hit.expand(K, *hit.shape[1:]), seeds=seeds, steps=steps,
-                                  project=project, floor=floor, inject=inject, t_min=float(cfg.get("sampler_t_min", 0.0)))
+                                  project=project, floor=floor, inject=inject, t_min=float(cfg.get("sampler_t_min", 0.0)),
+                                  **({"colour_schedule": schedule_of[cs_name]} if schedule_of[cs_name] is not None else {}))
                 gt_g = model.decode(lock[0], floor)
                 gp = {name: v[:1].clone() for name, v in gp.items()}
                 for name in gp:
@@ -239,16 +257,16 @@ def main(cfg):
                     g0[name] = gt_g[name]
                 per["sample_gt"] = M(render(model, batch, g0, views, device))
               for method, m in per.items():
-                rows[steps].append({**key, "target_views": " ".join(map(str, item["target_views"])), "method": method,
+                rows[out_key].append({**key, "target_views": " ".join(map(str, item["target_views"])), "method": method,
                                     **{k: float(m[k].nanmean()) if torch.isfinite(m[k]).any() else float("nan") for k in METRICS}})
                 for v, tv in enumerate(item["target_views"]):
-                  view_rows[steps].append({**key, "target_view": int(tv), "angle": float(angle[v]), "method": method,
+                  view_rows[out_key].append({**key, "target_view": int(tv), "angle": float(angle[v]), "method": method,
                                            **{k: float(m[k][v]) for k in METRICS}})
-            print(f"{os.path.basename(str(ckpt_path))} {weights} {set_name} {k + 1}/{n} (volume {i}), steps {steps}:",
+            print(f"{os.path.basename(str(ckpt_path))} {weights} {set_name} {k + 1}/{n} (volume {i}), {out_key}:",
                   {m: round(float(v["loss"].mean()), 4) for m, v in per.items()}, flush=True)
 
-  for steps, out_dir in outs.items():
-    write_outputs(cfg, out_dir, rows[steps], view_rows[steps])
+  for out_key, out_dir in outs.items():
+    write_outputs(cfg, out_dir, rows[out_key], view_rows[out_key])
 
 
 def write_outputs(cfg, out_dir, rows, view_rows):

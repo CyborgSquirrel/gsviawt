@@ -377,6 +377,21 @@ diffusion:
   # (every block globally). The conditioning is per block position either way (FiLM + per-layer AdaLN at the frame positions). No
   # parameters change: checkpoints load either way
   attention: frame_ray_global
+  # the per-depth-layer FiLM (layer_embed -> MLP -> gamma, beta): frame (one FiLM, before the blocks at the frame positions 0, 3, 6, ...)
+  # | every (before EVERY block, each block its own zero-initialized output projection film_heads[k] on the shared layer_embed and
+  # hidden layer: block k gets its own gamma_k, beta_k; a fresh model computes what frame's does). The AdaLN timestep rule is
+  # unchanged. Configs without the key: frame. every adds num_blocks x (dim x 2 dim) parameters (frame's checkpoints don't load into it)
+  film: frame
+  # Separate noise levels for the colour (sh_dc, 3 channels) and the other 11 channels: joint (one t per sample and layer, as
+  # before) | separate (per sample and layer t_g for the geometry, t_c <= t_g for the colour; x_t channel-group-wise; the time MLP
+  # sees the two sinusoidal embeddings concatenated (a 2x wider first layer); the rendering loss is gated on t_g, the t buckets of
+  # loss/x0 are t_g's; the probe and the shared-t validations (val_t) use t_c = t_g). The draw (separate): cond_uniform (t_g ~ U[0,1],
+  # t_c = t_g * U[0,1]) | sorted (t_g, t_c = max, min of two U[0,1]: uniform on the triangle). separate ignores schedule.standard /
+  # plateau / uniform (needs phase 1, no fixed_t). Sampling: GSDiffusionModel.sample's colour_schedule (eval_diffusion.py's; the
+  # validations, panels and orbits use the default, t_c = t_g). Configs without the key: joint
+  colour_noise:
+    mode: joint
+    draw: cond_uniform
   cond_dropout:
     p: 0.0                     # 0 = off: nothing is drawn, the random streams and the loss exactly as without dropout
     "null": zeros              # zeros (the features' mean after the z-score; no parameter) | learned (a learned feature_dim

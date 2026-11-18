@@ -38,7 +38,7 @@ import torch.utils.checkpoint
 from einops import rearrange
 from torch.utils.data import Dataset
 
-from diffusion_schedule import LayerAwareSchedule
+from diffusion_schedule import LayerAwareSchedule, normalize_colour_noise, sample_colour_geo
 # the x0 layout, SH_C0 and quat_forms live in gaussians.py (re-exported here: gs_diffusion.CHANNELS, gs_diffusion.SCALE, ...)
 from gaussians import SH_C0, X0_CHANNELS, X0_DIMS, X0_FIELDS, X0_SLICES, quat_forms  # noqa: F401
 from gs_dataset import OPENGL_TO_OPENCV, rotate_quats_wxyz
@@ -754,22 +754,47 @@ class DiTTrunk(nn.Module):
 
   MODES = ("frame", "ray", "global")
   ATTENTIONS = ("frame_ray_global", "global")
+  FILMS = ("frame", "every")
 
   def __init__(self, dim, num_layers, num_blocks, num_heads, mlp_ratio=4.0, layer_scale_init=1e-4, checkpoint_activations=False,
-               attention="frame_ray_global"):
+               attention="frame_ray_global", film="frame"):
+    """film (diffusion.film): frame (one FiLM MLP layer_embed -> Linear -> GELU -> Linear (zero-init) -> (gamma, beta) per depth
+    layer, the same before every frame-position block) | every (a FiLM before EVERY block, each block k its own (gamma_k, beta_k):
+    the layer_embed table and the MLP's hidden layer `film` (Linear -> GELU) are shared, the output projection is one zero-initialized
+    Linear per block, `film_heads[k]`; zero-init: a fresh model computes exactly what frame's does, x unchanged by every FiLM)."""
     super().__init__()
     if attention not in self.ATTENTIONS:
       raise ValueError(f"attention must be one of {self.ATTENTIONS}, got {attention!r}")
+    if film not in self.FILMS:
+      raise ValueError(f"film must be one of {self.FILMS}, got {film!r}")
+    self.film_mode = film
     self.checkpoint_activations = checkpoint_activations
     self.num_heads = num_heads
     self.cond = [self.MODES[i % 3] for i in range(num_blocks)]   # each block's conditioning role (its frame/ray/global position)
     self.blocks = nn.ModuleList(
       DiTBlock(dim, num_heads, c if attention == "frame_ray_global" else "global", mlp_ratio, layer_scale_init) for c in self.cond)
     self.layer_embed = nn.Embedding(num_layers, dim)
-    self.film = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, 2 * dim))
-    nn.init.zeros_(self.film[-1].weight)
-    nn.init.zeros_(self.film[-1].bias)
+    if film == "frame":
+      self.film = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, 2 * dim))
+      nn.init.zeros_(self.film[-1].weight)
+      nn.init.zeros_(self.film[-1].bias)
+    else:
+      self.film = nn.Sequential(nn.Linear(dim, dim), nn.GELU())
+      self.film_heads = nn.ModuleList(nn.Linear(dim, 2 * dim) for _ in range(num_blocks))
+      for h in self.film_heads:
+        nn.init.zeros_(h.weight)
+        nn.init.zeros_(h.bias)
     self._rope = {}
+
+  def _films(self, num_layers, device, index):
+    """Per block: (gamma, beta), each (L, D) put through index (to the tokens' shape), applied before it; None: no FiLM before that
+    block (film frame, a non-frame position). frame: ONE indexed pair shared by the frame blocks (the graph exactly as before)."""
+    e = self.film(self.layer_embed(torch.arange(num_layers, device=device)))
+    if self.film_mode == "frame":
+      gamma, beta = e.chunk(2, dim=-1)
+      gb = index(gamma), index(beta)
+      return [gb if cond == "frame" else None for cond in self.cond]
+    return [tuple(index(v) for v in head(e).chunk(2, dim=-1)) for head in self.film_heads]
 
   def _rope_tables(self, grid, device):
     key = (grid, device)
@@ -782,12 +807,11 @@ class DiTTrunk(nn.Module):
     _, num_layers, num_patches, _ = x.shape
     grid = int(round(num_patches ** 0.5))
     cos, sin = self._rope_tables(grid, x.device)
-    gamma, beta = self.film(self.layer_embed(torch.arange(num_layers, device=x.device))).chunk(2, dim=-1)
-    gamma, beta = gamma[None, :, None], beta[None, :, None]
+    films = self._films(num_layers, x.device, lambda v: v[None, :, None])
     adaln_mean = adaln.mean(1, keepdim=True)
-    for block, cond in zip(self.blocks, self.cond):
-      if cond == "frame":
-        x = x * (1 + gamma) + beta
+    for block, cond, gb in zip(self.blocks, self.cond, films):
+      if gb is not None:
+        x = x * (1 + gb[0]) + gb[1]
       a = adaln if cond == "frame" else adaln_mean
       if self.checkpoint_activations and torch.is_grad_enabled():
         x = torch.utils.checkpoint.checkpoint(block, x, cos, sin, a, use_reentrant=False)
@@ -801,13 +825,13 @@ class DiTTrunk(nn.Module):
     b, num_layers = adaln.shape[:2]
     cos, sin = self._rope_tables(int(round(pack.P ** 0.5)), x.device)
     cos_r, sin_r = cos[pack.p], sin[pack.p]                           # RoPE at each row's own patch position
-    gamma, beta = self.film(self.layer_embed(torch.arange(num_layers, device=x.device))).chunk(2, dim=-1)   # (L, D)
-    gamma, beta = gamma[pack.l], beta[pack.l]
+    films = self._films(num_layers, x.device, lambda v: v[pack.l])   # per block (T, D) each, or None
     adaln_frame = adaln.reshape(b * num_layers, *adaln.shape[2:])
     adaln_mean = adaln.mean(1)                                        # (B, 6, D)
-    for block, cond in zip(self.blocks, self.cond):
+    for block, cond, gb in zip(self.blocks, self.cond, films):
+      if gb is not None:
+        x = x * (1 + gb[0]) + gb[1]
       if cond == "frame":
-        x = x * (1 + gamma) + beta
         a, seg = adaln_frame, pack.frame
       else:
         a, seg = adaln_mean, pack.b
@@ -829,7 +853,8 @@ class DiffusionHead(nn.Module):
 
   def __init__(self, feature_dim, num_layers, channels=CHANNELS, patch_size=14, dim=None, num_blocks=3, mlp_ratio=4.0,
                layer_scale_init=1e-4, t_embed_channels=256, img_token_scale=0.3, checkpoint_activations=False, cond_null="zeros",
-               readout="linear", in_proj="shared", in_proj_image_dim=None, attention="frame_ray_global"):
+               readout="linear", in_proj="shared", in_proj_image_dim=None, attention="frame_ray_global", film="frame",
+               colour_separate=False):
     """cond_null (diffusion.cond_dropout.null): what a dropped sample's image tokens become -- zeros (the z-scored features' mean;
     no parameter) | learned (a learned (feature_dim,) vector, zero-initialized: the parameter `null_cond` exists only then).
     readout (diffusion.readout): linear (the zero-initialized output projection `out`) | slice (no output layer: x0_hat IS the
@@ -837,7 +862,10 @@ class DiffusionHead(nn.Module):
     returns its input x_net there; needs the lossless width, no in_proj).
     in_proj (diffusion.in_proj), below the lossless width: shared (one Linear maps the whole token [features | noisy values] to dim)
     | split (two: the image features to in_proj_image_dim, the noisy values to dim - in_proj_image_dim, concatenated -- the two
-    kinds of information enter the stream in separate channels, and the noisy values get an explicit share of the width)."""
+    kinds of information enter the stream in separate channels, and the noisy values get an explicit share of the width).
+    film (diffusion.film): DiTTrunk's. colour_separate (diffusion.colour_noise.mode separate): the timestep is a pair (t_g, t_c) per
+    (sample, layer) -- t (B, L, 2) -- and the time MLP's input is the two sinusoidal embeddings concatenated (2 * t_embed_channels
+    wide); joint (False): one t (B, L), one embedding, the parameters as before (old checkpoints load)."""
     super().__init__()
     if cond_null not in COND_NULLS:
       raise ValueError(f"cond_null must be one of {COND_NULLS}, got {cond_null!r}")
@@ -861,10 +889,12 @@ class DiffusionHead(nn.Module):
     elif in_proj == "split":
       raise ValueError(f"in_proj=split needs a projected token (diffusion.dim below the lossless {in_dim}), got dim={self.dim}")
     self.pad = 0 if self.projected else self.dim - in_dim
-    self.time_embed = nn.Sequential(nn.Linear(t_embed_channels, self.dim), nn.SiLU(), nn.Linear(self.dim, self.dim))
+    self.colour_separate = bool(colour_separate)
+    t_in = 2 * t_embed_channels if self.colour_separate else t_embed_channels
+    self.time_embed = nn.Sequential(nn.Linear(t_in, self.dim), nn.SiLU(), nn.Linear(self.dim, self.dim))
     self.time_proj = nn.Sequential(nn.SiLU(), nn.Linear(self.dim, 6 * self.dim))
     self.trunk = DiTTrunk(self.dim, num_layers, num_blocks, self.dim // 64, mlp_ratio, layer_scale_init, checkpoint_activations,
-                          attention)
+                          attention, film)
     if readout not in READOUTS:
       raise ValueError(f"readout must be one of {READOUTS}, got {readout!r}")
     self.readout = readout
@@ -884,7 +914,16 @@ class DiffusionHead(nn.Module):
     return self.out(h)
 
   def adaln(self, t):
-    """t: (B, L) in [0, 1] -> (B, L, 6, D), in fp32 (WT computes the time embedding outside autocast)."""
+    """t: (B, L) in [0, 1] -> (B, L, 6, D), in fp32 (WT computes the time embedding outside autocast). colour_separate: t (B, L, 2)
+    = (t_g, t_c), or (B, L) = both at t (t_c = t_g: the probe, the shared-t validations, staged sampling)."""
+    if self.colour_separate:
+      if t.dim() == 2:
+        t = torch.stack([t, t], dim=-1)
+      b, l, _ = t.shape
+      with torch.autocast(device_type=t.device.type, enabled=False):
+        emb = torch.cat([sinusoidal_embedding(t[..., 0].reshape(-1) * 1000.0, self.t_embed_channels),
+                         sinusoidal_embedding(t[..., 1].reshape(-1) * 1000.0, self.t_embed_channels)], dim=-1)
+        return self.time_proj(self.time_embed(emb)).reshape(b, l, 6, self.dim)
     b, l = t.shape
     with torch.autocast(device_type=t.device.type, enabled=False):
       emb = self.time_embed(sinusoidal_embedding(t.reshape(-1) * 1000.0, self.t_embed_channels))
@@ -923,6 +962,47 @@ class DiffusionHead(nn.Module):
     return rearrange(out, "b l (h w) (c py px) -> b l c (h py) (w px)", h=grid, w=grid, py=self.patch_size, px=self.patch_size)
 
 
+COLOUR_SCHEDULE_KINDS = ("first", "power")
+COLOUR_SCHEDULE_DEFAULT = {"kind": "power", "gamma": 1.0}   # t_c = t_g: colour and geometry together
+
+
+def normalize_colour_schedule(cs):
+  """The sampler's colour schedule of a colour_noise separate model (None: COLOUR_SCHEDULE_DEFAULT) -> a plain dict:
+    {kind: first, f}   colour goes 1 -> 0 linearly over the first fraction f in (0, 1] of the steps, t_c = max(0, 1 - s / f) at the
+                       step fraction s = i / N (t_g = 1 - s); f = "1/N": finished after the first step (the one-step anchor), any N
+    {kind: power, gamma}  t_c = t_g ** gamma, gamma >= 1 (1: t_c = t_g)
+  Either way t_c <= t_g at every step."""
+  cs = dict(COLOUR_SCHEDULE_DEFAULT if cs is None else cs)
+  kind = cs.get("kind")
+  if kind == "first":
+    f = cs.get("f")
+    if f != "1/N":
+      f = float(f)
+      if not 0.0 < f <= 1.0:
+        raise ValueError(f"colour_schedule first: f must be in (0, 1] or '1/N', got {f}")
+    return {"kind": "first", "f": f}
+  if kind == "power":
+    g = float(cs.get("gamma", 1.0))
+    if g < 1.0:
+      raise ValueError(f"colour_schedule power: gamma must be >= 1 (t_c <= t_g), got {g}")
+    return {"kind": "power", "gamma": g}
+  raise ValueError(f"colour_schedule kind must be one of {COLOUR_SCHEDULE_KINDS}, got {kind!r}")
+
+
+def colour_schedule_ts(cs, steps, device=None):
+  """(t_g, t_c), each (steps + 1,) float32: the sampler's geometry grid t_g = linspace(1, 0) and the colour one of the (normalized)
+  colour schedule cs; t_c[0] = 1, t_c[-1] = 0, t_c <= t_g."""
+  ts = torch.linspace(1.0, 0.0, steps + 1, device=device)
+  if cs["kind"] == "power":
+    tc = ts if cs["gamma"] == 1.0 else ts ** cs["gamma"]
+  else:
+    f = 1.0 / steps if cs["f"] == "1/N" else cs["f"]
+    s = torch.arange(steps + 1, device=device, dtype=torch.float64) / steps
+    tc = (1.0 - s / f).clamp_min(0.0).float()
+    tc = torch.minimum(tc, ts)   # (equal up to rounding; never above)
+  return ts, tc
+
+
 class GSDiffusionModel(nn.Module):
   """The frozen image backbone + DiffusionHead, with the training loss and the sampler. Same surface as train_gs.GSModel for the code
   that renders (inputs(), forward() -> the Gaussian dict, max_sh_degree, backbone, head): forward() SAMPLES."""
@@ -934,6 +1014,8 @@ class GSDiffusionModel(nn.Module):
   token_drop = "none"        # diffusion.token_drop (set in __init__)
   cond_dropout_p = 0.0       # diffusion.cond_dropout.p (set in __init__): 0 = never dropped, nothing drawn
   guidance = GUIDANCE_DEFAULTS   # diffusion.cfg, normalized (set in __init__): scale 1 = conditional only, one forward per step
+  colour_noise = {"mode": "joint", "draw": "cond_uniform"}   # diffusion.colour_noise, normalized (set in __init__)
+  colour_separate = False        # colour_noise mode separate (set in __init__)
 
   def __init__(self, cfg, stats):
     super().__init__()
@@ -948,6 +1030,8 @@ class GSDiffusionModel(nn.Module):
     self.cond_dropout_p = cond_dropout["p"]
     self.guidance = normalize_guidance(d.get("cfg"))
     warn_guidance_without_dropout(self.guidance, self.cond_dropout_p)
+    self.colour_noise = normalize_colour_noise(d.get("colour_noise"))   # (configs without the key: joint, as before)
+    self.colour_separate = self.colour_noise["mode"] == "separate"
     self.backbone = hydra.utils.instantiate(cfg.model.backbone)
     self.head = DiffusionHead(
       int(cfg.model.feature_dim), self.num_layers, patch_size=self.patch_size, dim=d.get("dim"), num_blocks=int(d.num_blocks),
@@ -955,7 +1039,9 @@ class GSDiffusionModel(nn.Module):
       layer_scale_init=float(cfg.model.transformer.layer_scale_init), cond_null=cond_dropout["null"],
       readout=str(d.get("readout", "linear")),   # (configs without the key, older runs: the linear output projection)
       in_proj=str(d.get("in_proj", "shared")), in_proj_image_dim=d.get("in_proj_image_dim"),   # (without the keys: one shared projection)
-      attention=str(d.get("attention", "frame_ray_global")))   # (configs without the key: the frame/ray/global pattern)
+      attention=str(d.get("attention", "frame_ray_global")),   # (configs without the key: the frame/ray/global pattern)
+      film=str(d.get("film", "frame")),   # (configs without the key: the FiLM at the frame positions only)
+      colour_separate=self.colour_separate)
     mean, std, lo, hi = stats
     self.register_buffer("x0_mean", mean.clone().float())
     self.register_buffer("x0_std", std.clone().float())
@@ -981,6 +1067,9 @@ class GSDiffusionModel(nn.Module):
     self.phase = int(d.schedule.get("phase", 1))
     if self.phase not in (1, 2):
       raise SystemExit(f"diffusion.schedule.phase must be 1 or 2, got {self.phase}")
+    if self.colour_separate and (fixed_t is not None or self.phase != 1):
+      raise SystemExit("diffusion.colour_noise.mode=separate draws its own per-layer (t_g, t_c) (diffusion_schedule.sample_colour_geo): "
+                       f"needs schedule.phase=1 and no schedule.fixed_t, got phase={self.phase}, fixed_t={fixed_t}")
     self.steps = int(d.steps)
     self.eval_seed = int(d.eval_seed)
     self.token_drop = str(d.get("token_drop", "none"))   # (configs without the key: every token, as before)
@@ -1061,12 +1150,29 @@ class GSDiffusionModel(nn.Module):
     x0 = x0_raw.permute(0, 2, 1, 3, 4)
     return (x0 - self.x0_mean[None, None, :, None, None]) / self.x0_std[None, None, :, None, None]
 
+  def _draw_t(self, b, generator=None):
+    """The training timesteps on the CPU: (B, L) from the schedule (colour_noise joint), or (B, L, 2) = (t_g, t_c) from
+    colour_noise.draw (separate)."""
+    if self.colour_separate:
+      return sample_colour_geo(b, self.num_layers, self.colour_noise["draw"], generator=generator)
+    return self.schedule.sample(b, phase=self.phase, generator=generator)
+
+  def _t_channels(self, t):
+    """The timesteps (B, L) or (B, L, 2) -> the per-channel noise level, broadcastable to x0 (B, L, C, H, W): (B, L, 1, 1, 1) joint;
+    (B, L, C, 1, 1) separate (the colour channels at t_c, the rest at t_g)."""
+    if t.dim() == 2:
+      return t[:, :, None, None, None]
+    colour = torch.zeros(CHANNELS, dtype=torch.bool, device=t.device)
+    colour[X0_SLICES["sh_dc"]] = True
+    return torch.where(colour[None, None, :], t[..., 1:2], t[..., 0:1])[..., None, None]
+
   def eval_noise(self, seeds, shape, device):
-    """Per-volume reproducible randomness: the timesteps (B, L) and the noise (B, L, C, H, W) of volume i are a function of seeds[i]
-    only, so a volume gets the same ones in every validation, whatever the subset or the order."""
+    """Per-volume reproducible randomness: the timesteps (B, L) -- (B, L, 2) = (t_g, t_c) with colour_noise separate -- and the noise
+    (B, L, C, H, W) of volume i are a function of seeds[i] only, so a volume gets the same ones in every validation, whatever the
+    subset or the order."""
     ts, epss = [], []
     for seed in seeds:
-      ts.append(self.schedule.sample(1, phase=self.phase, generator=torch.Generator().manual_seed(int(seed))))
+      ts.append(self._draw_t(1, generator=torch.Generator().manual_seed(int(seed))))
       gen = torch.Generator(device=device).manual_seed(int(seed))
       epss.append(torch.randn((1, *shape[1:]), device=device, generator=gen))
     return torch.cat(ts).to(device), torch.cat(epss)
@@ -1100,15 +1206,22 @@ class GSDiffusionModel(nn.Module):
     if seeds is None:
       if t is not None:
         raise ValueError("training_loss: t needs seeds (the given timesteps are a validation's, with its seeded noise)")
-      t = self.schedule.sample(b, phase=self.phase).to(x0.device)                     # (B, L)
+      t = self._draw_t(b).to(x0.device)                                               # (B, L) | separate: (B, L, 2)
       eps = torch.randn(x0.shape, device=x0.device, dtype=x0.dtype)
     else:
       t_seeded, eps = self.eval_noise(seeds, x0.shape, x0.device)
       # the deterministic control (schedule.fixed_t) has no other timestep: its prediction doesn't depend on one
       t = t_seeded if t is None or self.schedule.fixed_t is not None else t.to(x0.device, t_seeded.dtype)
-    t5 = t[:, :, None, None, None]
+      if self.colour_separate and t.dim() == 2:   # a given shared t (B, L): colour at the same t
+        t = torch.stack([t, t], dim=-1)
+    if self.colour_separate:   # x_t per channel group; the t buckets, the returned t (the rendering loss's gate): t_g
+      t_ch, t_head, t = self._t_channels(t), t, t[..., 0]
+      t5 = t[:, :, None, None, None]
+    else:
+      t_ch = t5 = t[:, :, None, None, None]
+      t_head = t
     a = hit[:, :, None].to(x0.dtype)                                                 # (B, L, 1, H, W): the validity mask
-    x_net = self._net_input(a * ((1 - t5) * x0_in + t5 * eps) + (1 - a) * eps, a)  # WT Eq. 7: invalid slots see the max noise
+    x_net = self._net_input(a * ((1 - t_ch) * x0_in + t_ch * eps) + (1 - a) * eps, a)  # WT Eq. 7: invalid slots see the max noise
     drop = None
     if condition is None:
       if seeds is None and self.cond_dropout_p > 0:   # (p = 0: no draw, the random streams as without dropout)
@@ -1116,7 +1229,7 @@ class GSDiffusionModel(nn.Module):
       uncond = drop
     else:
       uncond = self._uncond(condition, b, x0.device)
-    x0_hat = self._head(feats, x_net, t, self.pack(hit), uncond)
+    x0_hat = self._head(feats, x_net, t_head, self.pack(hit), uncond)
     err = (x0_hat.float() - x0).square()                                            # (B, L, C, H, W)
     valid = a.sum().clamp_min(1)
     loss = (err * a).sum() / (valid * CHANNELS)
@@ -1156,7 +1269,8 @@ class GSDiffusionModel(nn.Module):
                  is not lost to bf16
     Returns {t: {"err_model", "err_copy", "gain", "valid"}}, each (B,) float32 on the device (valid: the volume's valid slots; a
     volume without any has NaN values). The volumes run one at a time (bounded memory, and each volume's values do not depend on
-    the batch it came in); nothing draws from a global random stream."""
+    the batch it came in); nothing draws from a global random stream. colour_noise separate: every channel at t, the model given
+    t_c = t_g = t (the sampler's power gamma=1 path; err_copy's formula stays exact)."""
     device = image.device
     b, l = hit.shape[:2]
     x0_all = self.normalize(x0_raw.to(device).float())                               # (B, L, C, H, W)
@@ -1196,7 +1310,7 @@ class GSDiffusionModel(nn.Module):
 
   @torch.no_grad()
   def sample(self, image, hit, seeds=None, steps=None, project=None, floor=None, guidance=None, inject=None, t_min=0.0,
-             lock=None):
+             lock=None, colour_schedule=None):
     """20 Euler steps of the flow from pure noise -> the Gaussian dict. The noise of volume i is a function of seeds[i] (default:
     eval_seed + i): reproducible. Invalid slots stay at the noise. project: applied to every step's x0 prediction before it is used
     (e.g. format_projection; the last step's x0 prediction is the output).
@@ -1214,7 +1328,17 @@ class GSDiffusionModel(nn.Module):
     more than 1 / t_min steps the steps below t_min only partly denoise (at 50 steps ~1.4 % of the noise is left); <= 20 steps identical.
     lock: (x0, layers): those depth layers are held at the given normalized x0 (B, L, C, H, W) from the start and given to the model at
     t = 0 (clean) at every step; only the other layers are denoised (an oracle test, e.g. the ground-truth surface layer 0:
-    eval_diffusion's lock_layers)."""
+    eval_diffusion's lock_layers).
+    colour_schedule (colour_noise separate models only; normalize_colour_schedule, None: power gamma 1 = t_c = t_g): the colour
+    channels follow their own grid t_c (colour_schedule_ts) and the rest t_g = linspace(1, 0); each group takes the exact Euler step
+    with its own dt (x - dt (x - x0_hat) / t), the model given (t_g, t_c) per layer. Once t_c is 0 the colour is fixed (its last
+    step landed on that step's x0 prediction) and the model is given t_c = 0. Locked layers: both 0; inject: each channel at its own
+    group's t; the guidance interval is checked on t_g."""
+    if colour_schedule is not None and not self.colour_separate:
+      raise ValueError("colour_schedule: only for a diffusion.colour_noise.mode=separate model")
+    if self.colour_separate:
+      return self._sample_separate(image, hit, seeds, steps, project, floor, guidance, inject, t_min, lock,
+                                   normalize_colour_schedule(colour_schedule))
     if guidance is None:
       guidance = self.guidance
     else:
@@ -1260,6 +1384,69 @@ class GSDiffusionModel(nn.Module):
       if inject is not None and inj_x0 is None:   # "onestep": the first (t = 1) prediction is the injected x0 from now on
         inj_x0 = x0_hat.detach().clone()
       x_next = x - (t - ts[i + 1]) * (x - x0_hat) / (t.clamp(min=t_min) if t_min > 0 else t)
+      x = x_next if lock is None else torch.where(free[None, :, None, None, None], x_next, x)
+    return self.decode(x, floor)
+
+  @torch.no_grad()
+  def _sample_separate(self, image, hit, seeds, steps, project, floor, guidance, inject, t_min, lock, cs):
+    """sample() for a colour_noise separate model (see there): the geometry channels on t_g, the colour channels on cs's t_c."""
+    if guidance is None:
+      guidance = self.guidance
+    else:
+      guidance = normalize_guidance(guidance)
+      warn_guidance_without_dropout(guidance, self.cond_dropout_p)
+    steps = steps or self.steps
+    feats = self._feats(image)
+    b, l = hit.shape[:2]
+    seeds = seeds if seeds is not None else [self.eval_seed + i for i in range(b)]
+    _, eps = self.eval_noise(seeds, (b, l, CHANNELS, *hit.shape[-2:]), image.device)
+    a = hit[:, :, None].to(eps.dtype)
+    x = eps
+    ts_g, ts_c = colour_schedule_ts(cs, steps, device=image.device)
+    colour = torch.zeros(CHANNELS, dtype=torch.bool, device=x.device)
+    colour[X0_SLICES["sh_dc"]] = True
+    colour = colour[None, None, :, None, None]
+    pack = self.pack(hit)
+    if inject is not None:
+      inj_x0, fields = inject
+      onestep = isinstance(inj_x0, str)
+      if onestep and inj_x0 != "onestep":
+        raise ValueError(f"inject x0 must be a tensor or 'onestep', got {inj_x0!r}")
+      on = torch.zeros(CHANNELS, dtype=torch.bool, device=x.device)
+      for f in fields:
+        on[X0_SLICES[f]] = True
+      on = on[None, None, :, None, None]
+      inj_x0 = None if onestep else inj_x0.to(x.dtype).expand_as(x)
+    free = torch.ones(l, dtype=torch.bool, device=x.device)
+    if lock is not None:
+      lock_x0, lock_layers = lock
+      free[list(lock_layers)] = False
+      x = torch.where(free[None, :, None, None, None], x, lock_x0.to(x.dtype).expand_as(x))
+
+    def div(t):
+      return t.clamp(min=t_min) if t_min > 0 else t
+
+    for i in range(steps):
+      tg, tc = ts_g[i], ts_c[i]
+      t_l = torch.stack([tg, tc]).expand(b, l, 2)
+      if lock is not None:
+        t_l = torch.where(free[None, :, None], t_l, torch.zeros_like(t_l))
+      t_ch = torch.where(colour, tc, tg)
+      if inject is not None and inj_x0 is not None:
+        x = torch.where(on, (1 - t_ch) * inj_x0 + t_ch * eps, x)
+      x_net = self._net_input(a * x + (1 - a) * eps, a)
+      lo, hi = guidance["interval"]
+      if guidance["scale"] != 1.0 and lo <= float(tg) <= hi:
+        x0_hat = self._guided_x0(feats, x_net, t_l, pack, guidance)
+      else:
+        x0_hat = self._head(feats, x_net, t_l, pack).float()
+      if project is not None:
+        x0_hat = project(x0_hat)
+      if inject is not None and inj_x0 is None:
+        inj_x0 = x0_hat.detach().clone()
+      x_g = x - (tg - ts_g[i + 1]) * (x - x0_hat) / div(tg)
+      x_c = x - (tc - ts_c[i + 1]) * (x - x0_hat) / div(tc) if float(tc) > 0 else x   # finished colour: fixed
+      x_next = torch.where(colour, x_c, x_g)
       x = x_next if lock is None else torch.where(free[None, :, None, None, None], x_next, x)
     return self.decode(x, floor)
 
