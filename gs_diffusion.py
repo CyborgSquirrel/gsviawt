@@ -962,7 +962,7 @@ class DiffusionHead(nn.Module):
     return rearrange(out, "b l (h w) (c py px) -> b l c (h py) (w px)", h=grid, w=grid, py=self.patch_size, px=self.patch_size)
 
 
-COLOUR_SCHEDULE_KINDS = ("first", "power")
+COLOUR_SCHEDULE_KINDS = ("first", "power", "lead")
 COLOUR_SCHEDULE_DEFAULT = {"kind": "power", "gamma": 1.0}   # t_c = t_g: colour and geometry together
 
 
@@ -971,7 +971,9 @@ def normalize_colour_schedule(cs):
     {kind: first, f}   colour goes 1 -> 0 linearly over the first fraction f in (0, 1] of the steps, t_c = max(0, 1 - s / f) at the
                        step fraction s = i / N (t_g = 1 - s); f = "1/N": finished after the first step (the one-step anchor), any N
     {kind: power, gamma}  t_c = t_g ** gamma, gamma >= 1 (1: t_c = t_g)
-  Either way t_c <= t_g at every step."""
+    {kind: lead, delta}   constant lead: t_c = max(0, t_g - delta), delta in [0, 1), except t_c[0] = 1 (the colour starts as pure
+                          noise, so the first step takes it from 1 to max(0, 1 - 1/N - delta))
+  Every way t_c <= t_g at every step."""
   cs = dict(COLOUR_SCHEDULE_DEFAULT if cs is None else cs)
   kind = cs.get("kind")
   if kind == "first":
@@ -986,6 +988,11 @@ def normalize_colour_schedule(cs):
     if g < 1.0:
       raise ValueError(f"colour_schedule power: gamma must be >= 1 (t_c <= t_g), got {g}")
     return {"kind": "power", "gamma": g}
+  if kind == "lead":
+    d = float(cs.get("delta", 0.0))
+    if not 0.0 <= d < 1.0:
+      raise ValueError(f"colour_schedule lead: delta must be in [0, 1), got {d}")
+    return {"kind": "lead", "delta": d}
   raise ValueError(f"colour_schedule kind must be one of {COLOUR_SCHEDULE_KINDS}, got {kind!r}")
 
 
@@ -995,6 +1002,9 @@ def colour_schedule_ts(cs, steps, device=None):
   ts = torch.linspace(1.0, 0.0, steps + 1, device=device)
   if cs["kind"] == "power":
     tc = ts if cs["gamma"] == 1.0 else ts ** cs["gamma"]
+  elif cs["kind"] == "lead":
+    tc = ts if cs["delta"] == 0.0 else (ts - cs["delta"]).clamp_min(0.0)
+    tc[0] = 1.0
   else:
     f = 1.0 / steps if cs["f"] == "1/N" else cs["f"]
     s = torch.arange(steps + 1, device=device, dtype=torch.float64) / steps

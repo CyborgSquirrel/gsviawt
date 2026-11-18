@@ -256,7 +256,18 @@ def test_power_schedule(gamma):
     assert tg == pytest.approx(1 - i / 6, abs=1e-6) and tc == pytest.approx(tg ** gamma, abs=1e-6) and tc <= tg + 1e-7
 
 
-@pytest.mark.parametrize("cs", [None, {"kind": "first", "f": 0.25}, {"kind": "power", "gamma": 2}])
+@pytest.mark.parametrize("delta", [0.0, 0.3, 0.5])
+def test_lead_schedule(delta):
+  feats, hit, _ = data()
+  rec = Recorder()
+  m = shell(rec, separate=True)
+  m.sample(feats, hit, seeds=[1, 2], steps=10, colour_schedule={"kind": "lead", "delta": delta})
+  for i, (tg, tc) in enumerate(_given_t(rec)):
+    want = 1.0 if i == 0 else max(0.0, tg - delta)
+    assert tg == pytest.approx(1 - i / 10, abs=1e-6) and tc == pytest.approx(want, abs=1e-6) and tc <= tg + 1e-7
+
+
+@pytest.mark.parametrize("cs", [None, {"kind": "first", "f": 0.25}, {"kind": "power", "gamma": 2}, {"kind": "lead", "delta": 0.3}])
 def test_exact_euler_lands_on_a_constant_prediction(cs):
   """Exact Euler (t_min 0, the default): a constant x0 prediction is the sample exactly, at any step count, for each group."""
   feats, hit, _ = data()
@@ -269,7 +280,8 @@ def test_exact_euler_lands_on_a_constant_prediction(cs):
 
 
 def test_colour_schedule_validation_and_joint_models():
-  for bad in ({"kind": "first", "f": 0.0}, {"kind": "first", "f": 1.5}, {"kind": "power", "gamma": 0.5}, {"kind": "geometry_first"}):
+  for bad in ({"kind": "first", "f": 0.0}, {"kind": "first", "f": 1.5}, {"kind": "power", "gamma": 0.5}, {"kind": "geometry_first"},
+              {"kind": "lead", "delta": -0.1}, {"kind": "lead", "delta": 1.0}):
     with pytest.raises(ValueError):
       gd.normalize_colour_schedule(bad)
   assert gd.normalize_colour_schedule(None) == {"kind": "power", "gamma": 1.0}
@@ -285,7 +297,7 @@ def test_one_step_sample_is_the_same_for_every_schedule():
   feats, hit, _ = data()
   m = shell(real_head(True), separate=True)
   ref = m.sample(feats, hit, seeds=[1, 2], steps=1)
-  for cs in ({"kind": "first", "f": "1/N"}, {"kind": "first", "f": 0.25}, {"kind": "power", "gamma": 4}):
+  for cs in ({"kind": "first", "f": "1/N"}, {"kind": "first", "f": 0.25}, {"kind": "power", "gamma": 4}, {"kind": "lead", "delta": 0.5}):
     g = m.sample(feats, hit, seeds=[1, 2], steps=1, colour_schedule=cs)
     assert all(torch.equal(g[k], ref[k]) for k in ref)
 
@@ -301,7 +313,7 @@ def test_lock_gives_both_zero():
 
 
 def test_colour_schedule_ts_endpoints():
-  for cs in ({"kind": "first", "f": "1/N"}, {"kind": "first", "f": 0.3}, {"kind": "power", "gamma": 2.0}):
+  for cs in ({"kind": "first", "f": "1/N"}, {"kind": "first", "f": 0.3}, {"kind": "power", "gamma": 2.0}, {"kind": "lead", "delta": 0.3}):
     for n in (1, 2, 7, 50):
       tg, tc = gd.colour_schedule_ts(gd.normalize_colour_schedule(cs), n)
       assert tg[0] == 1 and tc[0] == 1 and tg[-1] == 0 and tc[-1] == 0 and (tc <= tg).all()
