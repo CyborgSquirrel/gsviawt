@@ -199,3 +199,23 @@ def test_latent_sh1_identity_and_zero_shN_at_init():
   assert torch.allclose(m._render_params()["shN"], sh)
   assert np.allclose(m.params_np()["shN"], sh.cpu().numpy())
   assert m.latent_np()["decoded"].shape == (96, 23)
+
+
+def ramp(m, n):
+  """active degree each 1-indexed train iteration 1..n renders at (the step advances it before rendering)."""
+  out = []
+  for it in range(1, n + 1):
+    m._advance_sh_degree(it)
+    out.append(m.active_sh_degree)
+  return out
+
+
+def test_sh_degree_interval():
+  d = ramp(make_model("direct", sh_degree=1, sh_degree_interval=500), 1000)
+  assert d[:499] == [0] * 499 and d[499:] == [1] * 501                 # 1-indexed iteration 500 is the first at degree 1
+  d = ramp(make_model("direct", sh_degree=3), 3500)                     # default: the reference 1000-iter ramp, unchanged
+  assert make_model("direct").sh_degree_interval == 1000
+  assert d[998] == 0 and d[999] == 1 and d[1999] == 2 and d[2999] == 3 and d[-1] == 3
+  assert ramp(make_model("latent_mlp", sh_degree=1, sh_degree_interval=500), 600)[499] == 1
+  with pytest.raises(SystemExit):
+    make_model("direct", sh_degree_interval=0)

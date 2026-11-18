@@ -742,6 +742,9 @@ class Fit3DGSLightningModule(pl.LightningModule):
     # sh_degree_warmup (default true): the reference schedule, active degree 0 -> +1 every 1000 iters. false: the
     # full sh_degree is active from iteration 0 (for short fits, where the ramp would never reach it)
     self.active_sh_degree = 0 if bool(cfg.get("sh_degree_warmup", True)) else self.max_sh_degree
+    self.sh_degree_interval = int(cfg.get("sh_degree_interval", 1000))
+    if self.sh_degree_interval <= 0:
+      raise SystemExit(f"sh_degree_interval={self.sh_degree_interval} -- must be > 0")
     self.views_seen = 0
     self.pixels_seen = 0  # total pixels of the train-view targets supervised on so far (B * H * W per step)
     self._last_loss = None  # the last train step's loss, kept on the GPU (see final_loss)
@@ -851,6 +854,13 @@ class Fit3DGSLightningModule(pl.LightningModule):
       }
       for k, cams in preview_cams.items() if cams
     }
+
+  def _advance_sh_degree(self, iteration):
+    """The SH ramp, called at the start of every train step with its 1-indexed `iteration` (before the render): one
+    more degree each time iteration is a multiple of sh_degree_interval, up to sh_degree. So with interval N, steps
+    1..N-1 render at degree 0 and step N (0-indexed N-1) is the first at degree 1 -- the reference's convention."""
+    if iteration % self.sh_degree_interval == 0 and self.active_sh_degree < self.max_sh_degree:
+      self.active_sh_degree += 1
 
   @property
   def final_loss(self):
@@ -1009,8 +1019,7 @@ class Fit3DGSLightningModule(pl.LightningModule):
       if iteration >= int(self.cfg.iters):
         self.trainer.should_stop = True
 
-      if iteration % 1000 == 0 and self.active_sh_degree < self.max_sh_degree:
-        self.active_sh_degree += 1
+      self._advance_sh_degree(iteration)
       self.optimizers_dict["means"].param_groups[0]["lr"] = self.means_lr_fn(it)
 
     with torch.set_grad_enabled(stage == "train"):

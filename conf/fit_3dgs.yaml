@@ -74,6 +74,8 @@ seed: 42
 sh_degree: 3                          # max SH degree; active degree ramps up by 1 every 1000 iters
 sh_degree_warmup: true                # false: the full sh_degree is active from iteration 0 (no ramp; for fits
                                       # shorter than sh_degree * 1000 iters, which would otherwise never reach it)
+sh_degree_interval: 1000              # warmup ramp: +1 active degree every this many iters (the 1-indexed iteration
+                                      # N*interval is the first at degree N; 1000 = the reference schedule)
 
 lr:
   means_init: 0.00016                 # x spatial_lr_scale (== scene_extent, the NerfppNorm radius)
