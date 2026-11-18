@@ -480,20 +480,62 @@ def init_gaussians_layered(hdf5_path, primary_view_idx, max_sh_degree, init_opac
 # rendering
 # ---------------------------------------------------------------------------
 
-def render(params, active_sh_degree, viewmats, Ks, width, height, packed=True, backgrounds=None):
+COLOR_FLOORS = ("hard", "leaky", "noise")
+
+
+def leaky_floor_rgb(sh0, slope):
+  """color_floor="leaky": the DC colour SH_C0*sh0 + 0.5 (what gsplat computes at sh_degree 0), with slope*x below 0
+  instead of gsplat's clamp_min(x, 0) -- a below-floor colour keeps a (slope-scaled) gradient back up. sh0: (P,1,3)."""
+  from module import SH_C0
+  rgb_lin = SH_C0 * sh0[:, 0, :] + 0.5
+  return torch.where(rgb_lin < 0, slope * rgb_lin, rgb_lin)
+
+
+def noisy_floor_rgb(sh0, sigma):
+  """color_floor="noise", a training render: clamp_min(SH_C0*sh0 + 0.5 + sigma*|n|, 0), n ~ N(0,1) fresh per Gaussian
+  and channel on every call -- a colour just below the floor lands above it on some draws and gets a gradient then.
+  sh0: (P,1,3)."""
+  from module import SH_C0
+  rgb_lin = SH_C0 * sh0[:, 0, :] + 0.5
+  return (rgb_lin + sigma * torch.randn_like(rgb_lin).abs()).clamp_min(0.0)
+
+
+def color_noise_sigma(it, iters, sigma0, anneal_frac):
+  """color_floor="noise": the noise scale at (0-indexed) training step `it` -- sigma0 falling linearly to 0 over the
+  first anneal_frac * iters steps, exactly 0 from then on."""
+  end = float(anneal_frac) * int(iters)
+  return float(sigma0) * max(0.0, 1.0 - it / end) if end > 0 else 0.0
+
+
+def render(params, active_sh_degree, viewmats, Ks, width, height, packed=True, backgrounds=None,
+           color_floor="hard", color_floor_slope=0.01, color_noise_sigma=0.0):
   """backgrounds: None (default) -- un-composited, i.e. premultiplied by the
   rendered alpha (== rendered over black), matching gt_rgb under
   cfg.background="none". (3,) otherwise -- ONE colour shared by every
   camera in this call (gsplat's packed=True constraint, see
   Fit3DGSLightningModule._step's own comment) -- gsplat composites it in
   directly; the caller is responsible for recompositing gt_rgb onto the
-  SAME colour first (see Fit3DGSLightningModule._step/run_final_eval)."""
+  SAME colour first (see Fit3DGSLightningModule._step/run_final_eval).
+
+  color_floor: see conf/fit_3dgs.yaml. "hard" is the SH path, unchanged; "leaky" passes plain RGB (sh_degree=None,
+  colors (P,3)) from leaky_floor_rgb, so it needs a DC-only model (shN empty). "noise" with color_noise_sigma > 0
+  (training renders only -- the caller passes 0 everywhere else) is the same RGB path through noisy_floor_rgb; with
+  sigma 0 it IS the hard SH path."""
   import gsplat
-  colors = torch.cat([params["sh0"], params["shN"]], dim=1)  # (P,K,3)
+  if color_floor not in COLOR_FLOORS:
+    raise ValueError(f"color_floor={color_floor!r} -- must be one of {COLOR_FLOORS}")
+  if color_floor != "hard":
+    assert params["shN"].shape[1] == 0, f"color_floor={color_floor} is DC-only: needs sh_degree 0 (an empty shN)"
+  if color_floor == "leaky":
+    colors, sh_degree = leaky_floor_rgb(params["sh0"], float(color_floor_slope)), None      # (P,3)
+  elif color_floor == "noise" and color_noise_sigma > 0:
+    colors, sh_degree = noisy_floor_rgb(params["sh0"], float(color_noise_sigma)), None      # (P,3)
+  else:
+    colors, sh_degree = torch.cat([params["sh0"], params["shN"]], dim=1), active_sh_degree  # (P,K,3)
   rgb, alpha, info = gsplat.rasterization(
     means=params["means"], quats=F.normalize(params["quats"], dim=-1),
     scales=torch.exp(params["scales"]), opacities=torch.sigmoid(params["opacities"]),
-    colors=colors, sh_degree=active_sh_degree,
+    colors=colors, sh_degree=sh_degree,
     viewmats=viewmats, Ks=Ks, width=width, height=height,
     render_mode="RGB", packed=packed, backgrounds=backgrounds,
   )
@@ -635,6 +677,12 @@ class Fit3DGSLightningModule(pl.LightningModule):
     self._last_loss = None  # the last train step's loss, kept on the GPU (see final_loss)
     self.step_count = 0
     self.gaussian_layout = str(cfg.gaussian_layout)
+    self.color_floor = str(cfg.color_floor)
+    if self.color_floor not in COLOR_FLOORS:
+      raise SystemExit(f"color_floor={self.color_floor!r} -- must be one of {COLOR_FLOORS}")
+    if self.color_floor != "hard" and self.max_sh_degree != 0:
+      raise SystemExit(f"color_floor={self.color_floor} renders the DC colour as plain RGB -- needs sh_degree=0, "
+                       f"got {self.max_sh_degree}")
 
     # gaussian_layout="layered": means = means_original (frozen, the
     # depth-peel-seeded position -- see init_gaussians_layered) + an
@@ -853,7 +901,11 @@ class Fit3DGSLightningModule(pl.LightningModule):
       # layered mode) is what goes to the strategy/optimizers below --
       # they operate on the trainable leaf, not the resolved position.
       render_params = {**self.params, "means": self._active_means()}
-      rgb, alpha, info = render(render_params, self.active_sh_degree, viewmat, K, W, H, backgrounds=bg)
+      sigma = (color_noise_sigma(it, self.cfg.iters, self.cfg.color_noise_sigma0, self.cfg.color_noise_anneal_frac)
+               if self.color_floor == "noise" and stage == "train" else 0.0)
+      rgb, alpha, info = render(render_params, self.active_sh_degree, viewmat, K, W, H, backgrounds=bg,
+                                color_floor=self.color_floor, color_floor_slope=float(self.cfg.color_floor_slope),
+                                color_noise_sigma=sigma)
       if stage == "train" and self.strategy_active:
         # step_pre_backward calls info["means2d"].retain_grad() -- must
         # run before backward for a non-leaf tensor to keep its .grad
@@ -953,6 +1005,9 @@ class Fit3DGSLightningModule(pl.LightningModule):
         "colors": torch.cat([self.params["sh0"], self.params["shN"]], dim=1),
         "sh_degree": self.active_sh_degree,
       }
+      if self.color_floor == "leaky":   # the renderer the fit trains with (noise: the hard one, its eval renderer)
+        gauss["colors"] = leaky_floor_rgb(self.params["sh0"], float(self.cfg.color_floor_slope))
+        gauss["sh_degree"] = None
     yield {
       "gauss": gauss, "scene_scale": self.scene_extent,
       "views": {
