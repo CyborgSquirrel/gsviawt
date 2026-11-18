@@ -53,7 +53,8 @@ register_eval_resolver()
 
 FIELDS, DIMS, CHANNELS = X0_FIELDS, X0_DIMS, X0_CHANNELS   # 14 channels
 OPACITY_LOGIT_CLAMP = 7.0
-T_MIN_CLAMP = 0.05     # WT's: the x0 -> velocity conversion divides by max(t, T_MIN_CLAMP)
+T_MIN_CLAMP = 0.05     # WT's: the x0 -> velocity conversion divides by max(t, T_MIN_CLAMP) (no longer our samplers' default: below
+                       # t = 0.05 it only partly denoises, which hid how unstable our many-step sampling is; sample(t_min=T_MIN_CLAMP) restores it)
 
 
 # ---------------------------------------------------------------------------
@@ -1183,7 +1184,7 @@ class GSDiffusionModel(nn.Module):
     return out
 
   @torch.no_grad()
-  def sample(self, image, hit, seeds=None, steps=None, project=None, floor=None, guidance=None, inject=None, t_min=T_MIN_CLAMP,
+  def sample(self, image, hit, seeds=None, steps=None, project=None, floor=None, guidance=None, inject=None, t_min=0.0,
              lock=None):
     """20 Euler steps of the flow from pure noise -> the Gaussian dict. The noise of volume i is a function of seeds[i] (default:
     eval_seed + i): reproducible. Invalid slots stay at the noise. project: applied to every step's x0 prediction before it is used
@@ -1197,9 +1198,9 @@ class GSDiffusionModel(nn.Module):
     eps to x0, as in training); the other channels evolve as usual. The output keeps the model's own last prediction of those fields
     (an oracle test, e.g. ground-truth colours: eval_diffusion's inject_fields). x0 = "onestep": the model's own first prediction (the
     t = 1 call from the pure noise, i.e. the one-step sample) is the injected x0 from the second step on.
-    t_min: the Euler step divides (x - x0_hat) by max(t, t_min) (WT's clamp, T_MIN_CLAMP): with more than 1 / t_min steps the steps below
-    t_min only partly denoise (at 50 steps ~1.4 % of the noise is left). 0: divide by t itself, every step lands exactly on the
-    straight path to x0_hat (the last step returns x0_hat).
+    t_min: the Euler step divides (x - x0_hat) by max(t, t_min). 0 (the default): divide by t itself, every step lands exactly on the
+    straight path to x0_hat (the last step returns x0_hat). T_MIN_CLAMP (0.05, WT's clamp, the default before Nov 18 2026): with
+    more than 1 / t_min steps the steps below t_min only partly denoise (at 50 steps ~1.4 % of the noise is left); <= 20 steps identical.
     lock: (x0, layers): those depth layers are held at the given normalized x0 (B, L, C, H, W) from the start and given to the model at
     t = 0 (clean) at every step; only the other layers are denoised (an oracle test, e.g. the ground-truth surface layer 0:
     eval_diffusion's lock_layers)."""
@@ -1251,7 +1252,7 @@ class GSDiffusionModel(nn.Module):
       x = x_next if lock is None else torch.where(free[None, :, None, None, None], x_next, x)
     return self.decode(x, floor)
 
-  def sample_staged(self, image, hit, stages, seeds=None, steps=None, floor=None, t_min=T_MIN_CLAMP, **kw):
+  def sample_staged(self, image, hit, stages, seeds=None, steps=None, floor=None, t_min=0.0, **kw):
     """Layer-staged sampling: stages = groups of depth layers (e.g. [[0], [1, 2, 3, 4, 5]]), denoised one group after the other, each
     over `steps` Euler steps. While a group is denoised, the earlier groups are held at their finished (normalized) state and given at
     t = 0, the later groups stay at the sampler's pure noise and are given at t = 1. Same noise (seeds) as sample(). Returns the

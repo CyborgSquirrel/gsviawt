@@ -77,7 +77,7 @@ def test_t_min_zero_lands_exactly_on_the_prediction():
   m, _ = shell()
   exact = m.sample(torch.zeros(B, 3, 4, 4), hit, seeds=[7, 8], steps=50, t_min=0.0)
   torch.testing.assert_close(exact["raw_scale"], torch.full_like(exact["raw_scale"], 0.25))
-  clamped = m.sample(torch.zeros(B, 3, 4, 4), hit, seeds=[7, 8], steps=50)
+  clamped = m.sample(torch.zeros(B, 3, 4, 4), hit, seeds=[7, 8], steps=50, t_min=gd.T_MIN_CLAMP)
   assert (clamped["raw_scale"] - 0.25).abs().max() > 1e-3
 
 

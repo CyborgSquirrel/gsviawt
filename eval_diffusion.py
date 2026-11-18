@@ -211,10 +211,10 @@ def main(cfg):
               if cfg.get("layer_stages"):   # the depth-layer groups denoised one after the other, `steps` steps each
                 g = model.sample_staged(image.expand(K, *image.shape[1:]), hit.expand(K, *hit.shape[1:]),
                                         [list(map(int, grp)) for grp in cfg.layer_stages], seeds=seeds, steps=steps, floor=floor,
-                                        t_min=float(cfg.get("sampler_t_min", gd.T_MIN_CLAMP)))
+                                        t_min=float(cfg.get("sampler_t_min", 0.0)))
               else:
                 g = model.sample(image.expand(K, *image.shape[1:]), hit.expand(K, *hit.shape[1:]), seeds=seeds, steps=steps,
-                                 project=project, floor=floor, inject=inject, t_min=float(cfg.get("sampler_t_min", gd.T_MIN_CLAMP)), lock=lock)
+                                 project=project, floor=floor, inject=inject, t_min=float(cfg.get("sampler_t_min", 0.0)), lock=lock)
               samples = [render(model, batch, {k: v[j:j + 1] for k, v in g.items()}, views, device) for j in range(K)]
               per = dict(once)
               ks = [M(r) for r in samples]
@@ -225,7 +225,7 @@ def main(cfg):
               per[f"best{K}"] = ks[best]
               if lock is not None:   # plain_swap: the plain sample (no lock, same noise) with the locked layers swapped to the ground truth
                 gp = model.sample(image.expand(K, *image.shape[1:]), hit.expand(K, *hit.shape[1:]), seeds=seeds, steps=steps,
-                                  project=project, floor=floor, inject=inject, t_min=float(cfg.get("sampler_t_min", gd.T_MIN_CLAMP)))
+                                  project=project, floor=floor, inject=inject, t_min=float(cfg.get("sampler_t_min", 0.0)))
                 gt_g = model.decode(lock[0], floor)
                 gp = {name: v[:1].clone() for name, v in gp.items()}
                 for name in gp:
