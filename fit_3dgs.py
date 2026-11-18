@@ -477,6 +477,62 @@ def init_gaussians_layered(hdf5_path, primary_view_idx, max_sh_degree, init_opac
 
 
 # ---------------------------------------------------------------------------
+# param_mode="latent_mlp": each Gaussian's 14 raw numbers are decoded from a
+# learnable 14-dim code by ONE small MLP shared by the whole fit (see
+# conf/fit_3dgs.yaml). The codes live in self.params under the same keys and
+# shapes as the direct raw parameters (so the per-field optimizers / LRs / the
+# means LR schedule apply to the corresponding code dims unchanged); the
+# decoder maps them to the same raw spaces render() already activates.
+# ---------------------------------------------------------------------------
+
+PARAM_MODES = ("direct", "latent_mlp")
+# field -> width in the packed (P, 14) vector, in this order. "means" is the layered OFFSET (code / raw).
+LATENT_FIELDS = (("opacities", 1), ("scales", 3), ("quats", 4), ("sh0", 3), ("means", 3))
+LATENT_DIM = sum(w for _, w in LATENT_FIELDS)
+
+
+def pack_latent(params):
+  """{opacities (P,), scales (P,3), quats (P,4), sh0 (P,1,3), means (P,3)} -> (P, 14)."""
+  return torch.cat([params["opacities"][:, None], params["scales"], params["quats"], params["sh0"][:, 0],
+                    params["means"]], dim=1)
+
+
+def unpack_latent(x):
+  """(P, 14) -> the same per-field shapes pack_latent() takes."""
+  out, i = {}, 0
+  for k, w in LATENT_FIELDS:
+    out[k] = x[:, i:i + w]
+    i += w
+  out["opacities"] = out["opacities"][:, 0]
+  out["sh0"] = out["sh0"][:, None, :]
+  return out
+
+
+class LatentDecoder(nn.Module):
+  """f(z) = z + g(z), g: dim -> hidden (SiLU) x layers -> dim with g's last Linear zero-initialised, so f is exactly
+  the identity at init (g(z) == 0 bit for bit: 0*h + 0). The hidden layers use nn.Linear's default init, drawn from a
+  private generator seeded with `seed` (the global RNG, which the train DataLoader's shuffle uses, is left as is)."""
+
+  def __init__(self, dim=LATENT_DIM, hidden=64, layers=2, seed=0):
+    super().__init__()
+    dims = [dim] + [int(hidden)] * int(layers) + [dim]
+    with torch.random.fork_rng(devices=[]):
+      torch.manual_seed(int(seed))
+      self.linears = nn.ModuleList(nn.Linear(a, b) for a, b in zip(dims[:-1], dims[1:]))
+    nn.init.zeros_(self.linears[-1].weight)
+    nn.init.zeros_(self.linears[-1].bias)
+
+  def residual(self, z):
+    h = z
+    for lin in self.linears[:-1]:
+      h = F.silu(lin(h))
+    return self.linears[-1](h)
+
+  def forward(self, z):
+    return z + self.residual(z)
+
+
+# ---------------------------------------------------------------------------
 # rendering
 # ---------------------------------------------------------------------------
 
@@ -756,6 +812,21 @@ class Fit3DGSLightningModule(pl.LightningModule):
     # -- skip both (a means2d.retain_grad and a few bookkeeping kernels every step), same result.
     self.strategy_active = not (self.gaussian_layout == "layered" and reset_every >= int(cfg.iters))
 
+    # param_mode="latent_mlp": self.params holds the CODES (same keys/shapes as the raw parameters, initialised to
+    # them), self.latent the decoder; _decoded() is the one place the raw parameters come from in either mode.
+    self.param_mode = str(cfg.get("param_mode", "direct"))
+    if self.param_mode not in PARAM_MODES:
+      raise SystemExit(f"param_mode={self.param_mode!r} -- must be one of {PARAM_MODES}")
+    self.latent = None
+    if self.param_mode == "latent_mlp":
+      # densify/prune/opacity reset write into self.params, which would be the codes here -- not supported (none of
+      # them runs in a layered fit with opacity_reset_interval=null)
+      if self.gaussian_layout != "layered" or self.strategy_active:
+        raise SystemExit("param_mode=latent_mlp needs gaussian_layout=layered with no opacity reset inside the run "
+                         "(opacity_reset_interval=null): densify/prune/reset would act on the codes")
+      lm = cfg.latent_mlp
+      self.latent = LatentDecoder(LATENT_DIM, int(lm.hidden), int(lm.layers), seed=int(cfg.seed))
+
     # A fixed handful of preview cameras (module.PanelCallback/OrbitCallback,
     # via preview_entries() below) -- not the full train/val split (that's
     # GSFitDataModule's job), just enough to render a comparison panel.
@@ -779,9 +850,31 @@ class Fit3DGSLightningModule(pl.LightningModule):
     render()/preview_entries()/run_final_eval()/params_np() all go
     through this instead of reading self.params["means"] as if it were
     always a position."""
+    return self._render_params()["means"]
+
+  def _decoded(self):
+    """The fitter's raw parameters (opacity logit, log-scales, raw quaternion, sh0, offset/means, shN): self.params
+    itself in param_mode=direct, the decoder's f(codes) in latent_mlp (shN, not part of the 14, stays direct)."""
+    if self.latent is None:
+      return self.params
+    return {**self.params, **unpack_latent(self.latent(pack_latent(self.params)))}
+
+  def _render_params(self):
+    """_decoded() with "means" resolved to the actual position (means_original + offset in layered mode)."""
+    p = self._decoded()
     if self.gaussian_layout == "layered":
-      return self.means_original + self.params["means"]
-    return self.params["means"]
+      return {**p, "means": self.means_original + p["means"]}
+    return {**p}
+
+  def latent_np(self):
+    """latent_mlp only: codes z (P,14), decoded p = f(z) (P,14), g(z) = p - z's residual (P,14), the MLP weights."""
+    with torch.no_grad():
+      z = pack_latent(self.params)
+      out = {"codes": z, "decoded": self.latent(z), "residual": self.latent.residual(z)}
+    out = {k: v.detach().cpu().numpy() for k, v in out.items()}
+    out.update({f"mlp.{k}": v.detach().cpu().numpy() for k, v in self.latent.state_dict().items()})
+    out["fields"] = np.array([f"{k}:{w}" for k, w in LATENT_FIELDS])
+    return out
 
   def configure_optimizers(self):
     cfg = self.cfg
@@ -811,7 +904,13 @@ class Fit3DGSLightningModule(pl.LightningModule):
       "quats": torch.optim.Adam([self.params["quats"]], lr=float(cfg.lr.quats), eps=1e-15, fused=True),
     }
     self.strategy.check_sanity(self.params, self.optimizers_dict)
-    return list(self.optimizers_dict.values())
+    # every optimizer stepped each train step: the per-field ones above (on the codes in latent_mlp) + the decoder's
+    # own Adam (kept out of optimizers_dict, which check_sanity requires to match self.params' keys)
+    self.all_optimizers = list(self.optimizers_dict.values())
+    if self.latent is not None:
+      self.all_optimizers.append(
+        torch.optim.Adam(self.latent.parameters(), lr=float(cfg.latent_mlp.lr), eps=1e-15, fused=True))
+    return self.all_optimizers
 
   def _photom_loss(self, rgb, gt_rgb):
     l1 = (rgb - gt_rgb).abs().mean()
@@ -902,7 +1001,7 @@ class Fit3DGSLightningModule(pl.LightningModule):
       # elsewhere. self.params itself (offset still at "means" in
       # layered mode) is what goes to the strategy/optimizers below --
       # they operate on the trainable leaf, not the resolved position.
-      render_params = {**self.params, "means": self._active_means()}
+      render_params = self._render_params()
       sigma = (color_noise_sigma(it, self.cfg.iters, self.cfg.color_noise_sigma0, self.cfg.color_noise_anneal_frac)
                if self.color_floor == "noise" and stage == "train" else 0.0)
       rgb, alpha, info = render(render_params, self.active_sh_degree, viewmat, K, W, H, backgrounds=bg,
@@ -937,11 +1036,11 @@ class Fit3DGSLightningModule(pl.LightningModule):
       }
 
     if stage == "train":
-      for opt in self.optimizers_dict.values():
+      for opt in self.all_optimizers:
         opt.zero_grad(set_to_none=True)
       self.manual_backward(loss)
 
-      for opt in self.optimizers_dict.values():
+      for opt in self.all_optimizers:
         opt.step()
 
       # Post-backward, post-step (matches gsplat's own reference trainer's
@@ -980,13 +1079,12 @@ class Fit3DGSLightningModule(pl.LightningModule):
     return loss
 
   def params_np(self):
-    out = {k: v.detach().cpu().numpy() for k, v in self.params.items()}
     # save_output/write_ply/save_output_layered all expect "means" to be
     # the actual position -- resolve the offset here, once, rather than
-    # leak the offset/original split to every output writer.
-    if self.gaussian_layout == "layered":
-      out["means"] = self._active_means().detach().cpu().numpy()
-    return out
+    # leak the offset/original split to every output writer. latent_mlp:
+    # the DECODED raw parameters f(z) (the codes go to latent_np()).
+    with torch.no_grad():
+      return {k: v.detach().cpu().numpy() for k, v in self._render_params().items()}
 
   def preview_stages(self):
     """The stages that have preview views: "train", and "val" when there is a val split. See module.py's
@@ -1001,14 +1099,15 @@ class Fit3DGSLightningModule(pl.LightningModule):
     if p is None:
       return
     with torch.no_grad():
+      rp = self._render_params()
       gauss = {
-        "means": self._active_means(), "quats": F.normalize(self.params["quats"], dim=-1),
-        "scales": torch.exp(self.params["scales"]), "opacities": torch.sigmoid(self.params["opacities"]),
-        "colors": torch.cat([self.params["sh0"], self.params["shN"]], dim=1),
+        "means": rp["means"], "quats": F.normalize(rp["quats"], dim=-1),
+        "scales": torch.exp(rp["scales"]), "opacities": torch.sigmoid(rp["opacities"]),
+        "colors": torch.cat([rp["sh0"], rp["shN"]], dim=1),
         "sh_degree": self.active_sh_degree,
       }
       if self.color_floor == "leaky":   # the renderer the fit trains with (noise: the hard one, its eval renderer)
-        gauss["colors"] = leaky_floor_rgb(self.params["sh0"], float(self.cfg.color_floor_slope))
+        gauss["colors"] = leaky_floor_rgb(rp["sh0"], float(self.cfg.color_floor_slope))
         gauss["sh_degree"] = None
     yield {
       "gauss": gauss, "scene_scale": self.scene_extent,
@@ -1172,6 +1271,8 @@ def main(cfg: DictConfig) -> None:
       grid_h5 = os.path.join(output_dir, "gaussians.grid.h5")
       save_output_layered(grid_h5, params_np, layered_meta)
       log.info("layered grid: %s", grid_h5)
+    if model.latent is not None:   # the codes + decoder (gaussians*.h5/.ply above hold the decoded parameters)
+      np.savez(os.path.join(output_dir, "latent.npz"), **model.latent_np())
 
   results = None
   if bool(cfg.final_eval) and test_cams:

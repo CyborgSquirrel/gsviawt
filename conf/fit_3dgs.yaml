@@ -110,6 +110,23 @@ color_floor_slope: 0.01               # leaky only
 color_noise_sigma0: 0.05              # noise only
 color_noise_anneal_frac: 0.5          # noise only; null = no decay
 
+# How each Gaussian's 14 raw numbers (opacity logit 1, log-scale 3, raw quaternion 4, sh0 3, layered offset 3) are
+# parameterized. The activations downstream (sigmoid / exp / normalize / SH0 -> gsplat, means = seed + offset) are the
+# same in both modes, and so is the export (the decoded raw numbers).
+#   direct:     the raw numbers are the trainable parameters (unchanged behaviour).
+#   latent_mlp: each Gaussian has a trainable code z_i in R^14, raw_i = f(z_i) with ONE MLP f per fit, shared by all
+#               its Gaussians: f(z) = z + g(z), g = 14 -> hidden (SiLU) x layers -> 14, last layer zero-initialised,
+#               so f is the identity at init (codes initialised like the raw numbers -> the first render is the
+#               direct one's). Code dims keep their field's optimizer (lr.* above; the offset dims AdamW with
+#               lr.means_weight_decay and the means LR schedule); the MLP gets plain Adam at latent_mlp.lr, no weight
+#               decay. Codes + MLP weights -> <output_dir>/latent.npz. Needs gaussian_layout=layered with no opacity
+#               reset inside the run (densify/prune/reset would act on the codes). shN (sh_degree > 0) stays direct.
+param_mode: direct                    # direct | latent_mlp
+latent_mlp:
+  hidden: 64
+  layers: 2                           # hidden layers: 14 -> 64 -> 64 -> 14
+  lr: 0.001
+
 percent_dense: 0.01                   # -> gsplat DefaultStrategy's grow_scale3d
 init_opacity: 0.1
 knn_k: 3                              # nearest neighbours for initial scale (matches simple_knn's distCUDA2 default k)
