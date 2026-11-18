@@ -508,14 +508,24 @@ def unpack_latent(x):
   return out
 
 
-class LatentDecoder(nn.Module):
-  """f(z) = z + g(z), g: dim -> hidden (SiLU) x layers -> dim with g's last Linear zero-initialised, so f is exactly
-  the identity at init (g(z) == 0 bit for bit: 0*h + 0). The hidden layers use nn.Linear's default init, drawn from a
-  private generator seeded with `seed` (the global RNG, which the train DataLoader's shuffle uses, is left as is)."""
+def latent_out_dim(sh_degree):
+  """The decoder's output width: the 14 + the shN coefficients of sh_degree (3 * ((d+1)^2 - 1); 9 at degree 1)."""
+  return LATENT_DIM + 3 * ((int(sh_degree) + 1) ** 2 - 1)
 
-  def __init__(self, dim=LATENT_DIM, hidden=64, layers=2, seed=0):
+
+class LatentDecoder(nn.Module):
+  """f(z) = pad(z) + g(z), g: dim -> hidden (SiLU) x layers -> out_dim with g's last Linear zero-initialised, so f is
+  exactly the identity at init on the first `dim` outputs (g(z) == 0 bit for bit: 0*h + 0) and exactly 0 on the
+  out_dim - dim extra ones (the shN coefficients for sh_degree > 0: the standard zero shN init). The code stays `dim`
+  wide. The hidden layers use nn.Linear's default init, drawn from a private generator seeded with `seed` (the global
+  RNG, which the train DataLoader's shuffle uses, is left as is)."""
+
+  def __init__(self, dim=LATENT_DIM, hidden=64, layers=2, seed=0, out_dim=None):
     super().__init__()
-    dims = [dim] + [int(hidden)] * int(layers) + [dim]
+    self.dim = int(dim)
+    self.out_dim = int(dim if out_dim is None else out_dim)
+    assert self.out_dim >= self.dim
+    dims = [dim] + [int(hidden)] * int(layers) + [self.out_dim]
     with torch.random.fork_rng(devices=[]):
       torch.manual_seed(int(seed))
       self.linears = nn.ModuleList(nn.Linear(a, b) for a, b in zip(dims[:-1], dims[1:]))
@@ -529,7 +539,7 @@ class LatentDecoder(nn.Module):
     return self.linears[-1](h)
 
   def forward(self, z):
-    return z + self.residual(z)
+    return F.pad(z, (0, self.out_dim - self.dim)) + self.residual(z)
 
 
 # ---------------------------------------------------------------------------
@@ -729,7 +739,9 @@ class Fit3DGSLightningModule(pl.LightningModule):
     self.cfg = cfg
     self.scene_extent = scene_extent
     self.max_sh_degree = int(cfg.sh_degree)
-    self.active_sh_degree = 0
+    # sh_degree_warmup (default true): the reference schedule, active degree 0 -> +1 every 1000 iters. false: the
+    # full sh_degree is active from iteration 0 (for short fits, where the ramp would never reach it)
+    self.active_sh_degree = 0 if bool(cfg.get("sh_degree_warmup", True)) else self.max_sh_degree
     self.views_seen = 0
     self.pixels_seen = 0  # total pixels of the train-view targets supervised on so far (B * H * W per step)
     self._last_loss = None  # the last train step's loss, kept on the GPU (see final_loss)
@@ -825,7 +837,8 @@ class Fit3DGSLightningModule(pl.LightningModule):
         raise SystemExit("param_mode=latent_mlp needs gaussian_layout=layered with no opacity reset inside the run "
                          "(opacity_reset_interval=null): densify/prune/reset would act on the codes")
       lm = cfg.latent_mlp
-      self.latent = LatentDecoder(LATENT_DIM, int(lm.hidden), int(lm.layers), seed=int(cfg.seed))
+      self.latent = LatentDecoder(LATENT_DIM, int(lm.hidden), int(lm.layers), seed=int(cfg.seed),
+                                  out_dim=latent_out_dim(self.max_sh_degree))
 
     # A fixed handful of preview cameras (module.PanelCallback/OrbitCallback,
     # via preview_entries() below) -- not the full train/val split (that's
@@ -854,10 +867,15 @@ class Fit3DGSLightningModule(pl.LightningModule):
 
   def _decoded(self):
     """The fitter's raw parameters (opacity logit, log-scales, raw quaternion, sh0, offset/means, shN): self.params
-    itself in param_mode=direct, the decoder's f(codes) in latent_mlp (shN, not part of the 14, stays direct)."""
+    itself in param_mode=direct, the decoder's f(codes) in latent_mlp (sh_degree > 0: shN is decoded from the same
+    14-dim code, from the decoder's extra outputs)."""
     if self.latent is None:
       return self.params
-    return {**self.params, **unpack_latent(self.latent(pack_latent(self.params)))}
+    out = self.latent(pack_latent(self.params))
+    dec = {**self.params, **unpack_latent(out[:, :LATENT_DIM])}
+    if self.max_sh_degree > 0:   # shN decoded too (the shN parameter itself then sits unused)
+      dec["shN"] = out[:, LATENT_DIM:].reshape(self.params["shN"].shape)
+    return dec
 
   def _render_params(self):
     """_decoded() with "means" resolved to the actual position (means_original + offset in layered mode)."""
@@ -867,7 +885,8 @@ class Fit3DGSLightningModule(pl.LightningModule):
     return {**p}
 
   def latent_np(self):
-    """latent_mlp only: codes z (P,14), decoded p = f(z) (P,14), g(z) = p - z's residual (P,14), the MLP weights."""
+    """latent_mlp only: codes z (P,14), decoded p = f(z) (P,14 + shN dims: (P,23) at sh_degree 1, shN flattened
+    (coeff, channel)), the residual g(z) (same width), the MLP weights."""
     with torch.no_grad():
       z = pack_latent(self.params)
       out = {"codes": z, "decoded": self.latent(z), "residual": self.latent.residual(z)}

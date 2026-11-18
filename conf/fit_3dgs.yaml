@@ -72,6 +72,8 @@ gaussian_layout: set                  # set | layered
 iters: 30000
 seed: 42
 sh_degree: 3                          # max SH degree; active degree ramps up by 1 every 1000 iters
+sh_degree_warmup: true                # false: the full sh_degree is active from iteration 0 (no ramp; for fits
+                                      # shorter than sh_degree * 1000 iters, which would otherwise never reach it)
 
 lr:
   means_init: 0.00016                 # x spatial_lr_scale (== scene_extent, the NerfppNorm radius)
@@ -120,7 +122,9 @@ color_noise_anneal_frac: 0.5          # noise only; null = no decay
 #               direct one's). Code dims keep their field's optimizer (lr.* above; the offset dims AdamW with
 #               lr.means_weight_decay and the means LR schedule); the MLP gets plain Adam at latent_mlp.lr, no weight
 #               decay. Codes + MLP weights -> <output_dir>/latent.npz. Needs gaussian_layout=layered with no opacity
-#               reset inside the run (densify/prune/reset would act on the codes). shN (sh_degree > 0) stays direct.
+#               reset inside the run (densify/prune/reset would act on the codes). sh_degree > 0: the code stays
+#               14-dim, the decoder's OUTPUT grows to 14 + 3*((d+1)^2 - 1) (23 at degree 1) -- the extra outputs are
+#               shN (g only, zero at init, like the direct zero shN init); the shN parameter itself is then unused.
 param_mode: direct                    # direct | latent_mlp
 latent_mlp:
   hidden: 64

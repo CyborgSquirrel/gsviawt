@@ -153,3 +153,49 @@ def test_latent_rejects_set_layout_and_opacity_reset():
                                      {"train": [], "val": []})
   with pytest.raises(SystemExit):
     make_model("bogus")
+
+
+def test_out_dim_follows_sh_degree():
+  assert [fit_3dgs.latent_out_dim(d) for d in (0, 1, 2, 3)] == [14, 23, 38, 59]
+
+
+def test_sh_degree_warmup_option():
+  assert make_model("direct", sh_degree=1).active_sh_degree == 0                          # default: the ramp
+  assert make_model("direct", sh_degree=1, sh_degree_warmup=False).active_sh_degree == 1   # active from iteration 0
+
+
+def seed_g_sh(deg, **kw):
+  g = seed_g(**kw)
+  g["shN"] = np.zeros((len(g["means"]), (deg + 1) ** 2 - 1, 3), np.float32)
+  return g
+
+
+@pytest.mark.cuda
+def test_latent_sh1_identity_and_zero_shN_at_init():
+  kw = dict(sh_degree=1, sh_degree_warmup=False)
+  ms = {mode: fit_3dgs.Fit3DGSLightningModule(make_cfg(param_mode=mode, **kw), seed_g_sh(1), 1.0,
+                                              {"train": [], "val": []}).cuda() for mode in ("direct", "latent_mlp")}
+  m = ms["latent_mlp"]
+  assert m.latent.out_dim == 23 and m.latent.linears[-1].weight.shape == (23, 64)
+  z = fit_3dgs.pack_latent(m.params)
+  out = m.latent(z)
+  assert torch.equal(out[:, :14], z) and torch.equal(out[:, 14:], torch.zeros_like(out[:, 14:]))
+  rp, rd = m._render_params(), ms["direct"]._render_params()
+  assert rp["shN"].shape == (96, 3, 3) and torch.equal(rp["shN"], torch.zeros_like(rp["shN"]))
+  for k in rd:
+    assert torch.equal(rp[k], rd[k]), k
+  viewmat, K, W, H = camera()
+  r1 = fit_3dgs.render(rp, 1, viewmat, K, W, H)[0]
+  assert torch.equal(r1, fit_3dgs.render(rp, 0, viewmat, K, W, H)[0])   # SH1 == 0: the SH0 render
+  assert torch.equal(r1, fit_3dgs.render(rd, 1, viewmat, K, W, H)[0])
+  # gradients reach the SH1 rows of g's last layer, and the decoded shN is what render/export use
+  m.configure_optimizers()
+  target = torch.rand(1, 64, 64, 3, device="cuda")
+  ((fit_3dgs.render(m._render_params(), 1, viewmat, K, W, H)[0] - target) ** 2).mean().backward()
+  assert m.latent.linears[-1].weight.grad[14:].abs().sum() > 0
+  with torch.no_grad():
+    torch.nn.init.normal_(m.latent.linears[-1].weight, std=0.1)
+  sh = m.latent(fit_3dgs.pack_latent(m.params))[:, 14:].detach().reshape(96, 3, 3)
+  assert torch.allclose(m._render_params()["shN"], sh)
+  assert np.allclose(m.params_np()["shN"], sh.cpu().numpy())
+  assert m.latent_np()["decoded"].shape == (96, 23)
