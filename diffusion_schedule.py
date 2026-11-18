@@ -11,6 +11,8 @@ Two phases:
   1  every layer draws its own t: layer 0 from the plateaued logit-normal, layers 1.. from the logit-normal;
   2  one t per sample shared by all layers, from the equal-weight mixture of the two densities.
 `LayerAwareSchedule.sample(batch_size, phase)` returns (B, L) timesteps in either phase.
+`uniform=True` replaces both densities by the uniform one on [0, 1] (per layer in phase 1, one shared t in phase 2): as much
+training at low t (nearly clean input) as anywhere else, where the logit-normal(0, 1) puts ~1.4% of its mass below t = 0.1.
 
 The plateau starts at the mode t* = 0.5 (mu = 0, sigma = 1) and runs towards t = 1, as specified by the user
 (see `densities` and bla/_plot_schedule.py).
@@ -79,10 +81,12 @@ def sample_plateau_logit_normal(shape, mu=0.0, sigma=1.0, mirror=False, generato
 
 
 class LayerAwareSchedule:
-  def __init__(self, num_layers, standard=None, plateau=None, fixed_t=None):
-    """fixed_t: every timestep is this value, in both phases (1.0: always pure noise -- the deterministic control)."""
+  def __init__(self, num_layers, standard=None, plateau=None, fixed_t=None, uniform=False):
+    """fixed_t: every timestep is this value, in both phases (1.0: always pure noise -- the deterministic control).
+    uniform: every timestep uniform on [T_MIN, 1 - T_MIN] instead of the (plateaued) logit-normal; standard / plateau unused."""
     self.num_layers = int(num_layers)
     self.fixed_t = None if fixed_t is None else float(fixed_t)
+    self.uniform = bool(uniform)
     self.standard = {**dict(mu=0.0, sigma=1.0), **(standard or {})}
     self.plateau = {**dict(mu=0.0, sigma=1.0, mirror=False), **(plateau or {})}
 
@@ -100,6 +104,12 @@ class LayerAwareSchedule:
       if phase not in (1, 2):
         raise ValueError(f"phase must be 1 or 2, got {phase!r}")
       return torch.full((batch_size, self.num_layers), self.fixed_t, dtype=torch.float32, device=device)
+    if self.uniform:
+      if phase not in (1, 2):
+        raise ValueError(f"phase must be 1 or 2, got {phase!r}")
+      n = self.num_layers if phase == 1 else 1
+      t = T_MIN + (1 - 2 * T_MIN) * torch.rand((batch_size, n), generator=generator, device=device, dtype=torch.float64)
+      return t.expand(-1, self.num_layers).float().contiguous()
     if phase == 1:
       t0 = sample_plateau_logit_normal((batch_size, 1), **self.plateau, **kw)
       rest = sample_logit_normal((batch_size, self.num_layers - 1), **self.standard, **kw)

@@ -380,3 +380,9 @@ def test_photom_split_by_condition():
   logged.clear()
   assert float(M._diffusion_photom(fake, "train", {"batch_size": 4}, None, t)) == pytest.approx(7 / 3)
   assert "loss/photom_cond" not in logged
+
+
+def test_schedule_uniform_key():
+  assert not gd.GSDiffusionModel(model_cfg(), stats()).schedule.uniform                     # a config without the key
+  sched = {"standard": {"mu": 0.0, "sigma": 1.0}, "plateau": {"mu": 0.0, "sigma": 1.0, "mirror": False}, "uniform": True}
+  assert gd.GSDiffusionModel(model_cfg(schedule=sched), stats()).schedule.uniform
