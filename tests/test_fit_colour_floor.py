@@ -115,6 +115,7 @@ def test_noise_sigma_schedule():
   assert s(250, 1000, 0.05, 0.5) == pytest.approx(0.025)
   assert s(500, 1000, 0.05, 0.5) == 0.0 and s(999, 1000, 0.05, 0.5) == 0.0
   assert s(0, 1000, 0.05, 0.0) == 0.0
+  assert s(0, 1000, 0.05, None) == s(999, 1000, 0.05, None) == 0.05   # null: no decay
 
 
 def test_unknown_floor_raises():

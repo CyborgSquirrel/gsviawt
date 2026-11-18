@@ -502,7 +502,9 @@ def noisy_floor_rgb(sh0, sigma):
 
 def color_noise_sigma(it, iters, sigma0, anneal_frac):
   """color_floor="noise": the noise scale at (0-indexed) training step `it` -- sigma0 falling linearly to 0 over the
-  first anneal_frac * iters steps, exactly 0 from then on."""
+  first anneal_frac * iters steps, exactly 0 from then on. anneal_frac None: sigma0 for the whole fit (no decay)."""
+  if anneal_frac is None:
+    return float(sigma0)
   end = float(anneal_frac) * int(iters)
   return float(sigma0) * max(0.0, 1.0 - it / end) if end > 0 else 0.0
 

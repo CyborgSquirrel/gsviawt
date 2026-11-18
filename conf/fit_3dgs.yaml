@@ -102,11 +102,13 @@ lambda_dssim: 0.2
 #   noise: training renders use clamp_min(rgb_lin + sigma * |n|, 0), n ~ N(0,1) fresh per Gaussian/channel/step,
 #          sigma falling linearly from color_noise_sigma0 to 0 over the first color_noise_anneal_frac of `iters`
 #          (exactly hard after that, and always hard for val/final_eval). Biased bright while sigma > 0 (E|n| ~ 0.8).
+#          color_noise_anneal_frac: null keeps sigma = color_noise_sigma0 for the whole fit (then the fit never trains
+#          on the noise-free renderer its val/final_eval/export use).
 # leaky/noise render the DC colour as plain RGB (gsplat sh_degree=None), so they need sh_degree: 0.
 color_floor: hard                     # hard | leaky | noise
 color_floor_slope: 0.01               # leaky only
 color_noise_sigma0: 0.05              # noise only
-color_noise_anneal_frac: 0.5          # noise only
+color_noise_anneal_frac: 0.5          # noise only; null = no decay
 
 percent_dense: 0.01                   # -> gsplat DefaultStrategy's grow_scale3d
 init_opacity: 0.1
