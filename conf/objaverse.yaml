@@ -123,6 +123,17 @@ eevee_materials:
   use_backface_culling_shadow: false
 film_transparent: true       # RGBA with a real alpha channel
 
+# false = no view-dependent shading in the RGB pass: it renders copies of the mesh's materials with
+# every view-dependent lobe off -- Principled BSDF metallic / specular (IOR level) / coat / sheen /
+# transmission / anisotropy / thin film 0 and roughness 1, Glossy / Glass / Refraction / Sheen / Toon /
+# Hair BSDFs replaced by a Diffuse BSDF of their colour, Diffuse BSDFs made Lambertian -- so with the
+# fixed lights only Lambertian shading, shadows, emission and alpha are left (base colour, textures,
+# alpha and normal maps unchanged). Metals become diffuse in their base colour, glass opaque. Works
+# the same with CYCLES and BLENDER_EEVEE_NEXT. depth_peel / depth_peel_rgb / depth_peel_normals still
+# use the original materials, so they're the same either way. Recorded as the output's
+# `view_dependent` attr (files without one are true).
+view_dependent: true
+
 # "objaverse" = blender_script.py's key/fill/rim/bottom SUN rig on black.
 # "env" = white world + a single weak top-down key sun.
 lighting: objaverse

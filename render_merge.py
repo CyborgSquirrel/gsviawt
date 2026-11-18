@@ -78,6 +78,8 @@ def merge_parts(scan, meshes, out_path, failed=()):
     cfg.update(output_path=out_path, queue_path=None, queue_worker=None, queue_max_meshes=None,
                mesh_strategy={"_target_": "mesh_strategy.ListMeshes", "paths": list(meshes)})
     out.attrs["config_json"] = json.dumps(cfg)
+    if "view_dependent" in first.attrs:
+      out.attrs["view_dependent"] = first.attrs["view_dependent"]
     if failed:
       out.attrs["failed_mesh_indices"] = json.dumps(failed)
     out.create_dataset("mesh_paths", data=list(meshes), dtype=h5py.string_dtype("utf-8"))

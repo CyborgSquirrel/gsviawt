@@ -295,6 +295,109 @@ def _make_opaque(nt, groups):
           L.remove(link)
 
 
+# view_dependent=false: Principled BSDF inputs set to these (unlinked first) -- every lobe whose look
+# depends on the view direction off, so only the Lambertian diffuse (+ emission, alpha) is left.
+# Metallic 0 turns a metal into a diffuse surface of its base colour (the colour it reflects).
+# Inputs a Blender version lacks are skipped.
+_VIEW_INDEPENDENT_PRINCIPLED = (
+  ("Metallic", 0.0), ("Specular IOR Level", 0.0), ("Roughness", 1.0), ("Anisotropic", 0.0),
+  ("Coat Weight", 0.0), ("Sheen Weight", 0.0), ("Transmission Weight", 0.0),
+  ("Thin Film Thickness", 0.0), ("Diffuse Roughness", 0.0))
+# view-dependent BSDFs replaced by a Lambertian Diffuse BSDF of the same Color (and Normal)
+_VIEW_DEPENDENT_BSDFS = ("BSDF_GLOSSY", "BSDF_ANISOTROPIC", "BSDF_GLASS", "BSDF_REFRACTION",
+                         "BSDF_SHEEN", "BSDF_VELVET", "BSDF_TOON", "BSDF_HAIR", "BSDF_HAIR_PRINCIPLED",
+                         "EEVEE_SPECULAR")
+
+
+def _relink_input(nt, src, dst):
+  """Copy socket `src`'s link (or default value) onto socket `dst`."""
+  if src.links:
+    nt.links.new(src.links[0].from_socket, dst)
+  else:
+    dst.default_value = src.default_value
+
+
+def _make_view_independent(nt, groups):
+  """In place on node tree `nt`, recursing into node groups (copied first and appended to
+  `groups`): Principled BSDF inputs set per _VIEW_INDEPENDENT_PRINCIPLED, _VIEW_DEPENDENT_BSDFS
+  replaced by a Diffuse BSDF of their Color / Normal, Diffuse BSDF roughness 0 (Lambertian rather
+  than Oren-Nayar). Base colour, textures, alpha, emission and normal maps are left as they are."""
+  L = nt.links
+  for node in list(nt.nodes):
+    if node.type == "GROUP" and node.node_tree is not None:
+      node.node_tree = node.node_tree.copy()
+      groups.append(node.node_tree)
+      _make_view_independent(node.node_tree, groups)
+    elif node.type == "BSDF_PRINCIPLED":
+      for name, value in _VIEW_INDEPENDENT_PRINCIPLED:
+        sock = node.inputs.get(name)
+        if sock is None:
+          continue
+        for link in list(sock.links):
+          L.remove(link)
+        sock.default_value = value
+    elif node.type == "BSDF_DIFFUSE":
+      for link in list(node.inputs["Roughness"].links):
+        L.remove(link)
+      node.inputs["Roughness"].default_value = 0.0
+    elif node.type in _VIEW_DEPENDENT_BSDFS:
+      diff = nt.nodes.new("ShaderNodeBsdfDiffuse")
+      diff.inputs["Roughness"].default_value = 0.0
+      for src_name, dst_name in (("Color", "Color"), ("Base Color", "Color"), ("Normal", "Normal")):
+        if src_name in node.inputs:
+          _relink_input(nt, node.inputs[src_name], diff.inputs[dst_name])
+      for link in list(node.outputs[0].links):
+        L.new(diff.outputs["BSDF"], link.to_socket)
+      nt.nodes.remove(node)
+
+
+def build_view_independent_materials(mesh_objs):
+  """For view_dependent=false: {original material (None = empty slot): copy with
+  _make_view_independent applied} for every material on `mesh_objs` (an empty slot / no material
+  gets a grey 0.8 diffuse-only Principled, the default surface minus its specular), plus the
+  node-group copies they use. The originals are untouched: the RGB pass swaps the copies in
+  (_swapped_materials), the depth peel (depth_peel_rgb's Diffuse Color pass included) keeps
+  rendering the originals."""
+  copies, groups = {}, []
+  for obj in mesh_objs:
+    for orig in list(obj.data.materials) or [None]:
+      if orig in copies:
+        continue
+      if orig is None:
+        mat = bpy.data.materials.new("ViewIndependentDefault")
+        mat.use_nodes = True
+      else:
+        mat = orig.copy()
+        mat.use_nodes = True
+      _make_view_independent(mat.node_tree, groups)
+      copies[orig] = mat
+  return copies, groups
+
+
+@ctl.contextmanager
+def _swapped_materials(mesh_objs, copies):
+  """Within the block every material slot of `mesh_objs` holds copies[its material] (an object
+  without slots gets one, removed again afterwards)."""
+  saved = []
+  for obj in mesh_objs:
+    mats = obj.data.materials
+    added = len(mats) == 0
+    if added:
+      mats.append(None)
+    saved.append((obj, list(mats), added))
+    for i in range(len(mats)):
+      mats[i] = copies[mats[i]]
+  try:
+    yield
+  finally:
+    for obj, orig, added in saved:
+      mats = obj.data.materials
+      for i, m in enumerate(orig):
+        mats[i] = m
+      if added:
+        mats.pop(index=len(mats) - 1)
+
+
 def build_gated_material(src_mat, eps_value, groups):
   """A copy of `src_mat` (None = Blender's default grey) whose surface is transparent wherever
   View Z <= prev depth + eps and the original shader (made opaque by _make_opaque, which appends
@@ -654,7 +757,11 @@ def run(cfg):
         {k: cfg[k] for k in ("depth_width", "depth_height", "device",
                              "output_path", "source_path", "render_engine",
                              "eevee", "eevee_materials", "source_rerender_rgb",
-                             "source_max_meshes", "depth_peel_rgb", "depth_peel_normals")})
+                             "source_max_meshes", "depth_peel_rgb", "depth_peel_normals",
+                             "view_dependent")})
+      if not cfg.source_rerender_rgb and bool(cfg.view_dependent) != _view_dependent(src):
+        raise ValueError(f"view_dependent={cfg.view_dependent} differs from the source's "
+                         "(copied images); it needs source_rerender_rgb=true")
       if cfg.source_max_meshes is not None and not cfg.source_rerender_rgb:
         raise ValueError("source_max_meshes needs source_rerender_rgb=true "
                          "(copied images can't be subset)")
@@ -709,6 +816,7 @@ def run(cfg):
     tmp = stack.enter_context(TemporaryDirectory())
     hf = stack.enter_context(h5py.File(cfg.output_path, "w"))
     hf.attrs["config_json"] = json.dumps(OmegaConf.to_container(cfg, resolve=True))
+    hf.attrs["view_dependent"] = bool(cfg.view_dependent)  # also in config_json; a missing attr = true
     hf.create_dataset("mesh_paths", data=meshes, dtype=h5py.string_dtype("utf-8"))
 
     # when re-rendering depth only, the RGB images are copied from the source
@@ -761,6 +869,12 @@ def run(cfg):
       logger.warning("%d/%d meshes failed: %s", len(failed), len(meshes), failed)
 
   logger.info("wrote %s", cfg.output_path)
+
+
+def _view_dependent(f):
+  """Whether render h5 `f`'s images have view-dependent shading: its view_dependent attr; files
+  written before the option existed have none and always do."""
+  return bool(f.attrs.get("view_dependent", True))
 
 
 def _mesh_jobs(meshes, queue, worker, max_meshes):
@@ -822,6 +936,10 @@ def _render_mesh(cfg, scene, mi, mesh_path, views, W, H, DW, DH, Lmax, tmp, writ
   load_object(mesh_path)
   if cfg.normalize_object:
     normalize_object()
+  mesh_objs = scene_meshes()
+  vi_copies = None
+  if not cfg.view_dependent:  # before the eevee_materials props, so the copies get them too
+    vi_copies, _ = build_view_independent_materials(mesh_objs)
   if cfg.render_engine != "CYCLES":  # Cycles output must not depend on these
     for mat in bpy.data.materials:
       apply_props(mat, cfg.eevee_materials)
@@ -829,7 +947,6 @@ def _render_mesh(cfg, scene, mi, mesh_path, views, W, H, DW, DH, Lmax, tmp, writ
   setup_lighting(str(cfg.lighting))
   rl, comp = setup_depth_compositor(scene, bpy.context.view_layer)
   peel_mat, peel_tex, peel_eps = build_depth_peel_material()
-  mesh_objs = scene_meshes()
 
   for view_label, place in views:
     place(cam)
@@ -838,7 +955,10 @@ def _render_mesh(cfg, scene, mi, mesh_path, views, W, H, DW, DH, Lmax, tmp, writ
 
     if "images" in writer.datasets:
       scene.render.engine = str(cfg.render_engine)
-      with timed(f"{label} rgb ({scene.render.engine})"):
+      with (
+        timed(f"{label} rgb ({scene.render.engine})"),
+        ctl.nullcontext() if vi_copies is None else _swapped_materials(mesh_objs, vi_copies),
+      ):
         rgba = render_rgba(os.path.join(tmp, "rgb.png"), W, H)
     with timed(f"{label} depth peel"):
       depth_vol, _, peel_rgb, peel_normals = depth_peel(
