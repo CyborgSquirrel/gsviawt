@@ -1,5 +1,8 @@
 """fit_3dgs.render's color_floor: hard = the SH path exactly as before; leaky = slope*rgb below 0 with a gradient there;
 noise = clamp_min(rgb + sigma*|n|, 0) in training renders, == hard at sigma 0; the sigma schedule."""
+import os
+
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
@@ -121,3 +124,86 @@ def test_noise_sigma_schedule():
 def test_unknown_floor_raises():
   with pytest.raises(ValueError):
     fit_3dgs.render({"shN": torch.zeros(1, 0, 3)}, 0, None, None, 1, 1, color_floor="soft")
+
+
+def test_noise_sigma_full_anneal_ends_at_zero():
+  s = fit_3dgs.color_noise_sigma
+  assert s(0, 1000, 0.05, 1.0) == 0.05 and s(999, 1000, 0.05, 1.0) == 0.0 and s(998, 1000, 0.05, 1.0) > 0
+
+
+@pytest.mark.cuda
+def test_frozen_draw_is_reused_and_hard_at_last_step():
+  rgb = mixed_colours()
+  rgb[8] = torch.tensor([-0.01, 0.4, 0.4])
+  params, viewmat, K, W, H = scene(rgb)
+  draw = torch.randn(len(rgb), 3, generator=torch.Generator().manual_seed(0)).abs().cuda()
+  sh0 = params["sh0"].detach()
+  a = fit_3dgs.noisy_floor_rgb(sh0, 0.05, draw)
+  torch.manual_seed(123)   # the global RNG must not matter with a frozen draw
+  b = fit_3dgs.noisy_floor_rgb(sh0, 0.05, draw)
+  assert torch.equal(a, b)
+  lin = SH_C0 * sh0[:, 0] + 0.5
+  assert torch.equal(a, (lin + 0.05 * draw).clamp_min(0))
+  out1, _ = grads(fit_3dgs.render, params, viewmat, K, W, H, color_floor="noise", color_noise_sigma=0.05,
+                  color_noise_draw=draw)
+  out2, _ = grads(fit_3dgs.render, params, viewmat, K, W, H, color_floor="noise", color_noise_sigma=0.05,
+                  color_noise_draw=draw)
+  assert torch.equal(out1, out2)                           # same draw, same render
+  hard, _ = grads(fit_3dgs.render, params, viewmat, K, W, H)
+  sigma_last = fit_3dgs.color_noise_sigma(999, 1000, 0.05, 1.0)
+  last, _ = grads(fit_3dgs.render, params, viewmat, K, W, H, color_floor="noise", color_noise_sigma=sigma_last,
+                  color_noise_draw=draw)
+  assert torch.equal(last, hard)                           # sigma 0 at the last step == hard
+
+
+def _module(**over):
+  from omegaconf import OmegaConf
+  cfg = OmegaConf.load(os.path.join(os.path.dirname(fit_3dgs.__file__), "conf", "fit_3dgs.yaml"))
+  cfg.sh_degree, cfg.gaussian_layout, cfg.iters, cfg.color_floor = 0, "layered", 10, "noise"
+  for k, v in over.items():
+    cfg[k] = v
+  n = 200
+  g = {"means": np.random.default_rng(0).random((n, 3)).astype(np.float32), "scales": np.zeros((n, 3), np.float32),
+       "quats": np.tile([1.0, 0, 0, 0], (n, 1)).astype(np.float32), "opacities": np.zeros(n, np.float32),
+       "sh0": np.zeros((n, 1, 3), np.float32), "shN": np.zeros((n, 0, 3), np.float32)}
+  return fit_3dgs.Fit3DGSLightningModule(cfg, g, 1.0, {})
+
+
+def test_module_noise_kinds():
+  m = _module()                                                       # default kind: iid, nothing precomputed
+  assert m.color_noise_draw is None and m._color_noise_draw(3, 0.05) is None
+  m1, m2 = _module(color_noise_kind="frozen"), _module(color_noise_kind="frozen")
+  assert m1.color_noise_draw.shape == (200, 3) and (m1.color_noise_draw >= 0).all()
+  assert torch.equal(m1.color_noise_draw, m2.color_noise_draw)        # seeded by cfg.seed
+  assert torch.equal(m1._color_noise_draw(0, 0.05), m1._color_noise_draw(500, 0.05))   # same draw every step
+  with pytest.raises(SystemExit):
+    _module(color_noise_kind="frozen", gaussian_layout="set")
+
+
+def test_smooth_noise_is_positive_continuous_and_mean_matched():
+  g = torch.Generator().manual_seed(0)
+  x = torch.rand(20000, 3, generator=g)                               # unit cube: diagonal sqrt(3)
+  sn = fit_3dgs.SmoothNoise(x, 0.05, 200.0, g)
+  n0, n1, n100 = sn(0), sn(1), sn(100)
+  assert (n0 >= 0).all() and n0.shape == (20000, 3)
+  assert abs(float(n0.mean()) - np.sqrt(2 / np.pi)) < 0.1             # mean matched to E|N(0,1)| (c0, over 8 taus)
+  step, far = float((n1 - n0).abs().mean()), float((n100 - n0).abs().mean())
+  assert step < 0.05 * far                                             # one iteration moves it slightly
+  # nearby points similar, distant ones not: a point vs a 0.1%-of-diagonal neighbour vs a random other point
+  L = 0.05 * np.sqrt(3)
+  y = x + torch.randn(20000, 3, generator=g) * (0.01 * L)
+  sy = fit_3dgs.SmoothNoise.__new__(fit_3dgs.SmoothNoise)
+  torch.nn.Module.__init__(sy)
+  sy.x, sy.k, sy.w, sy.phi, sy.J, sy.c0 = y, sn.k, sn.w, sn.phi, sn.J, sn.c0
+  near = float((sy(0) - n0).abs().mean())
+  rand = float((n0[torch.randperm(20000, generator=g)] - n0).abs().mean())
+  assert near < 0.2 * rand
+  # channels independent
+  assert abs(float(torch.corrcoef(n0.T)[0, 1])) < 0.2
+
+
+def test_module_smooth_noise_and_hard_at_end():
+  m = _module(color_noise_kind="smooth", color_noise_anneal_frac=1.0)
+  a, b = m._color_noise_draw(0, 0.05), m._color_noise_draw(1, 0.05)
+  assert a.shape == (200, 3) and (a >= 0).all() and not torch.equal(a, b)
+  assert fit_3dgs.color_noise_sigma(9, 10, 0.05, 1.0) == 0.0                   # last step: sigma 0 -> the hard path

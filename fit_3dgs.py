@@ -104,6 +104,7 @@ CUDA_HOME/PATH/TORCH_CUDA_ARCH_LIST are already set at the image level
 
 import json
 import logging
+import math
 import os
 import sys
 import warnings
@@ -491,26 +492,61 @@ def leaky_floor_rgb(sh0, slope):
   return torch.where(rgb_lin < 0, slope * rgb_lin, rgb_lin)
 
 
-def noisy_floor_rgb(sh0, sigma):
+def noisy_floor_rgb(sh0, sigma, draw=None):
   """color_floor="noise", a training render: clamp_min(SH_C0*sh0 + 0.5 + sigma*|n|, 0), n ~ N(0,1) fresh per Gaussian
   and channel on every call -- a colour just below the floor lands above it on some draws and gets a gradient then.
-  sh0: (P,1,3)."""
+  draw: a fixed (P,3) |n| to use instead of a fresh one (color_noise_resample=false). sh0: (P,1,3)."""
   from module import SH_C0
   rgb_lin = SH_C0 * sh0[:, 0, :] + 0.5
-  return (rgb_lin + sigma * torch.randn_like(rgb_lin).abs()).clamp_min(0.0)
+  n = torch.randn_like(rgb_lin).abs() if draw is None else draw
+  return (rgb_lin + sigma * n).clamp_min(0.0)
+
+
+COLOR_NOISE_KINDS = ("iid", "frozen", "smooth")
+
+
+class SmoothNoise(nn.Module):
+  """color_noise_kind="smooth": a band-limited, Perlin-like |n_c(x, tau)| over fixed anchor positions x (P,3) and
+  iteration tau, independent per colour channel c -- random Fourier features
+    n_c(x, tau) = (1/sqrt(J)) * sum_j sin(k_jc . x + w_jc * tau + phi_jc),
+  k ~ N(0, (2 pi / L)^2 I), L = scale_frac x the anchors' bounding-box diagonal; w ~ N(0, (2 pi / time_scale)^2);
+  phi ~ U[0, 2 pi). Returned as |n| * c0, c0 set once (empirically, over the anchors at 8 taus) so that the mean
+  matches the iid half-normal's E|N(0,1)| = sqrt(2/pi) -- the same sigma0 means the same mean brightening."""
+
+  def __init__(self, x, scale_frac, time_scale, generator, J=32):
+    super().__init__()
+    diag = float(torch.linalg.norm(x.max(0).values - x.min(0).values))
+    L = max(scale_frac * diag, 1e-8)
+    self.register_buffer("x", x.float(), persistent=False)
+    self.register_buffer("k", torch.randn(3, 3 * J, generator=generator) * (2 * math.pi / L), persistent=False)
+    self.register_buffer("w", torch.randn(3 * J, generator=generator) * (2 * math.pi / time_scale), persistent=False)
+    self.register_buffer("phi", torch.rand(3 * J, generator=generator) * (2 * math.pi), persistent=False)
+    self.J, self.c0 = J, 1.0
+    with torch.no_grad():
+      m = torch.stack([self.raw(t).mean() for t in np.linspace(0, 10 * time_scale, 8)]).mean()
+    self.c0 = math.sqrt(2 / math.pi) / float(m)
+
+  def raw(self, tau):
+    """|n| (P,3) before the c0 scaling."""
+    a = torch.sin(self.x @ self.k + self.w * float(tau) + self.phi)          # (P, 3J), columns c-major: channel c = c*J..
+    return (a.view(len(self.x), 3, self.J).sum(-1) / math.sqrt(self.J)).abs()
+
+  def forward(self, tau):
+    return self.raw(tau) * self.c0
 
 
 def color_noise_sigma(it, iters, sigma0, anneal_frac):
   """color_floor="noise": the noise scale at (0-indexed) training step `it` -- sigma0 falling linearly to 0 over the
-  first anneal_frac * iters steps, exactly 0 from then on. anneal_frac None: sigma0 for the whole fit (no decay)."""
+  first anneal_frac * iters steps, exactly 0 from then on (anneal_frac 1: 0 exactly at the last step, iters - 1).
+  anneal_frac None: sigma0 for the whole fit (no decay)."""
   if anneal_frac is None:
     return float(sigma0)
-  end = float(anneal_frac) * int(iters)
+  end = min(float(anneal_frac) * int(iters), int(iters) - 1)
   return float(sigma0) * max(0.0, 1.0 - it / end) if end > 0 else 0.0
 
 
 def render(params, active_sh_degree, viewmats, Ks, width, height, packed=True, backgrounds=None,
-           color_floor="hard", color_floor_slope=0.01, color_noise_sigma=0.0):
+           color_floor="hard", color_floor_slope=0.01, color_noise_sigma=0.0, color_noise_draw=None):
   """backgrounds: None (default) -- un-composited, i.e. premultiplied by the
   rendered alpha (== rendered over black), matching gt_rgb under
   cfg.background="none". (3,) otherwise -- ONE colour shared by every
@@ -522,7 +558,7 @@ def render(params, active_sh_degree, viewmats, Ks, width, height, packed=True, b
   color_floor: see conf/fit_3dgs.yaml. "hard" is the SH path, unchanged; "leaky" passes plain RGB (sh_degree=None,
   colors (P,3)) from leaky_floor_rgb, so it needs a DC-only model (shN empty). "noise" with color_noise_sigma > 0
   (training renders only -- the caller passes 0 everywhere else) is the same RGB path through noisy_floor_rgb; with
-  sigma 0 it IS the hard SH path."""
+  sigma 0 it IS the hard SH path. color_noise_draw: a fixed (P,3) |n| (color_noise_resample=false), None = fresh."""
   import gsplat
   if color_floor not in COLOR_FLOORS:
     raise ValueError(f"color_floor={color_floor!r} -- must be one of {COLOR_FLOORS}")
@@ -531,7 +567,7 @@ def render(params, active_sh_degree, viewmats, Ks, width, height, packed=True, b
   if color_floor == "leaky":
     colors, sh_degree = leaky_floor_rgb(params["sh0"], float(color_floor_slope)), None      # (P,3)
   elif color_floor == "noise" and color_noise_sigma > 0:
-    colors, sh_degree = noisy_floor_rgb(params["sh0"], float(color_noise_sigma)), None      # (P,3)
+    colors, sh_degree = noisy_floor_rgb(params["sh0"], float(color_noise_sigma), color_noise_draw), None   # (P,3)
   else:
     colors, sh_degree = torch.cat([params["sh0"], params["shN"]], dim=1), active_sh_degree  # (P,K,3)
   rgb, alpha, info = gsplat.rasterization(
@@ -709,6 +745,25 @@ class Fit3DGSLightningModule(pl.LightningModule):
       else:
         self.params[k] = nn.Parameter(torch.from_numpy(v))
     self.dssim = DSSIMLoss()
+    # color_floor="noise": what |n| is (color_noise_kind, see conf/fit_3dgs.yaml). iid: fresh every step (None here);
+    # frozen: one draw for the whole fit; smooth: a slowly drifting field over the Gaussians' anchor positions.
+    self.color_noise_kind = str(cfg.color_noise_kind)
+    if self.color_noise_kind not in COLOR_NOISE_KINDS:
+      raise SystemExit(f"color_noise_kind={self.color_noise_kind!r} -- must be one of {COLOR_NOISE_KINDS}")
+    if self.color_floor == "noise" and self.color_noise_kind != "iid" and self.gaussian_layout != "layered":
+      raise SystemExit(f"color_noise_kind={self.color_noise_kind} is per Gaussian: needs gaussian_layout=layered "
+                       "(a fixed Gaussian count)")
+    draw, self.smooth_noise = None, None
+    if self.color_floor == "noise":
+      gen = torch.Generator().manual_seed(int(cfg.seed))
+      if self.color_noise_kind == "frozen":
+        draw = torch.randn(len(self.params["sh0"]), 3, generator=gen).abs()
+      elif self.color_noise_kind == "smooth":
+        # anchor = the seed position (layered: the depth-peel slot), fixed for the fit, so the field doesn't follow
+        # the Gaussians' own movement
+        self.smooth_noise = SmoothNoise(torch.from_numpy(np.asarray(g["means"])), float(cfg.color_noise_scale_frac),
+                                        float(cfg.color_noise_time_scale), gen)
+    self.register_buffer("color_noise_draw", draw, persistent=False)   # frozen only; None: drawn per step
 
     # gaussian_layout="layered" keeps a fixed 1:1 Gaussian<->(u,v,layer)
     # correspondence (see init_gaussians_layered/save_output_layered) --
@@ -767,6 +822,13 @@ class Fit3DGSLightningModule(pl.LightningModule):
       }
       for k, cams in preview_cams.items() if cams
     }
+
+  def _color_noise_draw(self, it, sigma):
+    """The |n| (P,3) for this step's noise render: None for iid (render draws it), the frozen buffer, or the smooth
+    field at tau = it. Only called with sigma > 0 to matter (sigma 0 renders hard)."""
+    if self.smooth_noise is not None and sigma > 0:
+      return self.smooth_noise(it)
+    return self.color_noise_draw
 
   @property
   def final_loss(self):
@@ -907,7 +969,7 @@ class Fit3DGSLightningModule(pl.LightningModule):
                if self.color_floor == "noise" and stage == "train" else 0.0)
       rgb, alpha, info = render(render_params, self.active_sh_degree, viewmat, K, W, H, backgrounds=bg,
                                 color_floor=self.color_floor, color_floor_slope=float(self.cfg.color_floor_slope),
-                                color_noise_sigma=sigma)
+                                color_noise_sigma=sigma, color_noise_draw=self._color_noise_draw(it, sigma))
       if stage == "train" and self.strategy_active:
         # step_pre_backward calls info["means2d"].retain_grad() -- must
         # run before backward for a non-leaf tensor to keep its .grad

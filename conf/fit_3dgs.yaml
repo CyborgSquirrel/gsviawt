@@ -97,18 +97,30 @@ lambda_dssim: 0.2
 # What the render does with a colour below 0 (rgb_lin = SH_C0*sh0 + 0.5). Export is the same for all three: the
 # grid's colours are clipped at 0 (save_output_layered).
 #   hard:  gsplat's own clamp_min(rgb_lin, 0) -- ZERO gradient below 0, so a colour that gets there (or starts there,
-#          like a seed from an exactly-black pixel, rgb_lin = -5.96e-8 after the SH round-trip) never moves again.
+#          like a seed from an exactly-black pixel: rgb_lin = exactly 0 after the SH round-trip) never moves again.
 #   leaky: rgb_lin below 0 renders as color_floor_slope * rgb_lin (and gets that much gradient back up).
 #   noise: training renders use clamp_min(rgb_lin + sigma * |n|, 0), n ~ N(0,1) fresh per Gaussian/channel/step,
 #          sigma falling linearly from color_noise_sigma0 to 0 over the first color_noise_anneal_frac of `iters`
 #          (exactly hard after that, and always hard for val/final_eval). Biased bright while sigma > 0 (E|n| ~ 0.8).
 #          color_noise_anneal_frac: null keeps sigma = color_noise_sigma0 for the whole fit (then the fit never trains
-#          on the noise-free renderer its val/final_eval/export use).
+#          on the noise-free renderer its val/final_eval/export use). color_noise_anneal_frac: 1 reaches 0 exactly at
+#          the last step.
+#          color_noise_kind -- what |n| is:
+#            iid:    fresh per Gaussian/channel/step (as above).
+#            frozen: drawn ONCE per Gaussian/channel at init (seeded by `seed`) and reused every step -- a fixed
+#                    per-Gaussian brightening, scaled by the same sigma schedule.
+#            smooth: a band-limited (Perlin-like) field over the Gaussians' fixed seed positions (layered: the
+#                    depth-peel slot) drifting slowly with the step: random Fourier features, 32 per channel, feature
+#                    size color_noise_scale_frac x the seed points' bounding-box diagonal, time scale
+#                    color_noise_time_scale steps; |n| scaled to the half-normal's mean, so sigma0 is comparable.
 # leaky/noise render the DC colour as plain RGB (gsplat sh_degree=None), so they need sh_degree: 0.
 color_floor: hard                     # hard | leaky | noise
 color_floor_slope: 0.01               # leaky only
 color_noise_sigma0: 0.05              # noise only
 color_noise_anneal_frac: 0.5          # noise only; null = no decay
+color_noise_kind: iid                 # noise only: iid | frozen | smooth
+color_noise_scale_frac: 0.05          # noise, smooth only
+color_noise_time_scale: 200           # noise, smooth only (steps)
 
 percent_dense: 0.01                   # -> gsplat DefaultStrategy's grow_scale3d
 init_opacity: 0.1
