@@ -198,9 +198,23 @@ def main(cfg):
                                         device))}
             key = {"checkpoint": ckpt_path, "weights": weights, "set": set_name, "volume": i,
                    "mesh": int(item["mesh_index"]), "source_view": int(item["source_view"])}
+            inject = None
+            if cfg.get("inject_fields"):   # those fields fed in at every step, noised to the step's t: the ground truth (oracle) or
+              src = str(cfg.get("inject_source", "gt"))   # the model's own one-step prediction
+              if src not in ("gt", "onestep"):
+                raise ValueError(f"inject_source must be gt or onestep, got {src!r}")
+              inject = (model.normalize(batch["x0_raw"].to(device).float()) if src == "gt" else "onestep", list(cfg.inject_fields))
+            lock = None
+            if cfg.get("lock_layers"):   # oracle: those depth layers held at the ground truth, only the others denoised
+              lock = (model.normalize(batch["x0_raw"].to(device).float()), [int(v) for v in cfg.lock_layers])
             for steps in outs:
-              g = model.sample(image.expand(K, *image.shape[1:]), hit.expand(K, *hit.shape[1:]), seeds=seeds, steps=steps,
-                               project=project, floor=floor)
+              if cfg.get("layer_stages"):   # the depth-layer groups denoised one after the other, `steps` steps each
+                g = model.sample_staged(image.expand(K, *image.shape[1:]), hit.expand(K, *hit.shape[1:]),
+                                        [list(map(int, grp)) for grp in cfg.layer_stages], seeds=seeds, steps=steps, floor=floor,
+                                        t_min=float(cfg.get("sampler_t_min", 0.0)))
+              else:
+                g = model.sample(image.expand(K, *image.shape[1:]), hit.expand(K, *hit.shape[1:]), seeds=seeds, steps=steps,
+                                 project=project, floor=floor, inject=inject, t_min=float(cfg.get("sampler_t_min", 0.0)), lock=lock)
               samples = [render(model, batch, {k: v[j:j + 1] for k, v in g.items()}, views, device) for j in range(K)]
               per = dict(once)
               ks = [M(r) for r in samples]
@@ -209,6 +223,21 @@ def main(cfg):
                                         torch.stack([r[1] for r in samples]).mean(0), gt_alpha)
               best = int(np.argmin([float(m["loss"].mean()) for m in ks]))
               per[f"best{K}"] = ks[best]
+              if lock is not None:   # plain_swap: the plain sample (no lock, same noise) with the locked layers swapped to the ground truth
+                gp = model.sample(image.expand(K, *image.shape[1:]), hit.expand(K, *hit.shape[1:]), seeds=seeds, steps=steps,
+                                  project=project, floor=floor, inject=inject, t_min=float(cfg.get("sampler_t_min", 0.0)))
+                gt_g = model.decode(lock[0], floor)
+                gp = {name: v[:1].clone() for name, v in gp.items()}
+                for name in gp:
+                  gp[name][:, lock[1]] = gt_g[name][:, lock[1]].to(gp[name].dtype)
+                per["plain_swap"] = M(render(model, batch, gp, views, device))
+              if inject is not None and not isinstance(inject[0], str):   # sample_gt: the sample with the injected fields' final values set to the ground truth
+                gt_g = model.decode(inject[0], floor)
+                g0 = {name: v[:1] for name, v in g.items()}
+                for f in inject[1]:
+                  for name in (f, "raw_scale") if f == "scale" else (f,):
+                    g0[name] = gt_g[name]
+                per["sample_gt"] = M(render(model, batch, g0, views, device))
               for method, m in per.items():
                 rows[steps].append({**key, "target_views": " ".join(map(str, item["target_views"])), "method": method,
                                     **{k: float(m[k].nanmean()) if torch.isfinite(m[k]).any() else float("nan") for k in METRICS}})
