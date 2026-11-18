@@ -1251,6 +1251,34 @@ class GSDiffusionModel(nn.Module):
       x = x_next if lock is None else torch.where(free[None, :, None, None, None], x_next, x)
     return self.decode(x, floor)
 
+  def sample_staged(self, image, hit, stages, seeds=None, steps=None, floor=None, t_min=T_MIN_CLAMP, **kw):
+    """Layer-staged sampling: stages = groups of depth layers (e.g. [[0], [1, 2, 3, 4, 5]]), denoised one group after the other, each
+    over `steps` Euler steps. While a group is denoised, the earlier groups are held at their finished (normalized) state and given at
+    t = 0, the later groups stay at the sampler's pure noise and are given at t = 1. Same noise (seeds) as sample(). Returns the
+    Gaussian dict of the final state."""
+    b, l = hit.shape[:2]
+    steps = steps or self.steps
+    feats = self._feats(image)
+    seeds = seeds if seeds is not None else [self.eval_seed + i for i in range(b)]
+    _, eps = self.eval_noise(seeds, (b, l, CHANNELS, *hit.shape[-2:]), image.device)
+    a = hit[:, :, None].to(eps.dtype)
+    pack = self.pack(hit)
+    x = eps.clone()
+    ts = torch.linspace(1.0, 0.0, steps + 1, device=image.device)
+    done = torch.zeros(l, dtype=torch.bool, device=x.device)
+    for group in stages:
+      act = torch.zeros(l, dtype=torch.bool, device=x.device)
+      act[list(group)] = True
+      for i in range(steps):
+        t = ts[i]
+        t_l = torch.where(act, t, torch.where(done, torch.zeros_like(t), torch.ones_like(t)))[None].expand(b, l)
+        x_net = self._net_input(a * x + (1 - a) * eps, a)
+        x0_hat = self._head(feats, x_net, t_l, pack).float()
+        x_next = x - (t - ts[i + 1]) * (x - x0_hat) / (t.clamp(min=t_min) if t_min > 0 else t)
+        x = torch.where(act[None, :, None, None, None], x_next, x)
+      done |= act
+    return self.decode(x, floor)
+
   def decode(self, x0, floor=None):
     """Normalized x0 (B, L, C, H, W) -> the Gaussian dict (differentiable inside the clamp range). floor: floor_context's (needed
     with scale_floor_mode add)."""

@@ -101,3 +101,32 @@ def test_lock_holds_layers_and_gives_them_t_zero():
   ref = gd.decode_x0(x0.float(), m.x0_mean, m.x0_std, m.x0_lo, m.x0_hi)
   torch.testing.assert_close(out["raw_scale"][:, 0], ref["raw_scale"][:, 0])
   torch.testing.assert_close(out["raw_scale"][:, 1:], torch.full_like(out["raw_scale"][:, 1:], 0.25))
+
+
+def test_sample_staged_layer0_first():
+  """stages [[0], [1..5]]: in stage 1 layer 0 gets t, the rest t = 1 and stay at the noise; in stage 2 layer 0 is held finished
+  (t = 0) and the rest get t; with one group of all layers it equals sample()."""
+  hit = torch.ones(B, L, H, W, dtype=torch.bool)
+  m, calls = shell()
+  ts_seen = []
+
+  class Head(torch.nn.Module):
+    def forward(self, feats, x_net, t):
+      calls.append(x_net.clone())
+      ts_seen.append(t.clone())
+      return torch.full_like(x_net, 0.25)
+  m.head = Head()
+  m.sample_staged(torch.zeros(B, 3, 4, 4), hit, [[0], [1, 2, 3, 4, 5]], seeds=[7, 8], steps=3, t_min=0.0)
+  eps = calls[0]
+  for k in range(3):                                       # stage 1
+    assert (ts_seen[k][:, 1:] == 1).all() and (k == 0 or (ts_seen[k][:, 0] < 1).all())
+    torch.testing.assert_close(calls[k][:, 1:], eps[:, 1:])
+  for k in range(3, 6):                                    # stage 2
+    assert (ts_seen[k][:, 0] == 0).all()
+    torch.testing.assert_close(calls[k][:, 0], torch.full_like(calls[k][:, 0], 0.25))
+  m2, _ = shell()
+  a = m2.sample_staged(torch.zeros(B, 3, 4, 4), hit, [list(range(L))], seeds=[7, 8], steps=3, t_min=0.0)
+  m3, _ = shell()
+  b = m3.sample(torch.zeros(B, 3, 4, 4), hit, seeds=[7, 8], steps=3, t_min=0.0)
+  for k in a:
+    torch.testing.assert_close(a[k], b[k])

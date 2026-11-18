@@ -208,8 +208,13 @@ def main(cfg):
             if cfg.get("lock_layers"):   # oracle: those depth layers held at the ground truth, only the others denoised
               lock = (model.normalize(batch["x0_raw"].to(device).float()), [int(v) for v in cfg.lock_layers])
             for steps in outs:
-              g = model.sample(image.expand(K, *image.shape[1:]), hit.expand(K, *hit.shape[1:]), seeds=seeds, steps=steps,
-                               project=project, floor=floor, inject=inject, t_min=float(cfg.get("sampler_t_min", gd.T_MIN_CLAMP)), lock=lock)
+              if cfg.get("layer_stages"):   # the depth-layer groups denoised one after the other, `steps` steps each
+                g = model.sample_staged(image.expand(K, *image.shape[1:]), hit.expand(K, *hit.shape[1:]),
+                                        [list(map(int, grp)) for grp in cfg.layer_stages], seeds=seeds, steps=steps, floor=floor,
+                                        t_min=float(cfg.get("sampler_t_min", gd.T_MIN_CLAMP)))
+              else:
+                g = model.sample(image.expand(K, *image.shape[1:]), hit.expand(K, *hit.shape[1:]), seeds=seeds, steps=steps,
+                                 project=project, floor=floor, inject=inject, t_min=float(cfg.get("sampler_t_min", gd.T_MIN_CLAMP)), lock=lock)
               samples = [render(model, batch, {k: v[j:j + 1] for k, v in g.items()}, views, device) for j in range(K)]
               per = dict(once)
               ks = [M(r) for r in samples]
