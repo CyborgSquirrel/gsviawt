@@ -23,6 +23,8 @@ inject_source: gt         # with inject_fields: gt (the ground truth; adds sampl
                           # of those fields, i.e. its t = 1 output from the same noise)
 sampler_t_min: 0.05        # the samples' Euler step divides by max(t, sampler_t_min) (WT's clamp, the default; with > 20 steps the
                           # steps below 0.05 only partly denoise); 0: divide by t, exact (the onestep row always uses the model default)
+lock_layers: null         # oracle: a list of depth layers (e.g. [0]) held at the ground truth (given at t = 0) while the others are
+                          # denoised; adds the method plain_swap (the plain sample with those layers swapped to the ground truth)
 seed: 0                  # the target views of a volume and the noise are functions of (seed, set, volume)
 grids_dir: null          # overrides for running somewhere else than the run did (null: the run's)
 source_h5: null

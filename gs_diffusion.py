@@ -1183,7 +1183,8 @@ class GSDiffusionModel(nn.Module):
     return out
 
   @torch.no_grad()
-  def sample(self, image, hit, seeds=None, steps=None, project=None, floor=None, guidance=None, inject=None, t_min=T_MIN_CLAMP):
+  def sample(self, image, hit, seeds=None, steps=None, project=None, floor=None, guidance=None, inject=None, t_min=T_MIN_CLAMP,
+             lock=None):
     """20 Euler steps of the flow from pure noise -> the Gaussian dict. The noise of volume i is a function of seeds[i] (default:
     eval_seed + i): reproducible. Invalid slots stay at the noise. project: applied to every step's x0 prediction before it is used
     (e.g. format_projection; the last step's x0 prediction is the output).
@@ -1198,7 +1199,10 @@ class GSDiffusionModel(nn.Module):
     t = 1 call from the pure noise, i.e. the one-step sample) is the injected x0 from the second step on.
     t_min: the Euler step divides (x - x0_hat) by max(t, t_min) (WT's clamp, T_MIN_CLAMP): with more than 1 / t_min steps the steps below
     t_min only partly denoise (at 50 steps ~1.4 % of the noise is left). 0: divide by t itself, every step lands exactly on the
-    straight path to x0_hat (the last step returns x0_hat)."""
+    straight path to x0_hat (the last step returns x0_hat).
+    lock: (x0, layers): those depth layers are held at the given normalized x0 (B, L, C, H, W) from the start and given to the model at
+    t = 0 (clean) at every step; only the other layers are denoised (an oracle test, e.g. the ground-truth surface layer 0:
+    eval_diffusion's lock_layers)."""
     if guidance is None:
       guidance = self.guidance
     else:
@@ -1223,21 +1227,28 @@ class GSDiffusionModel(nn.Module):
         on[X0_SLICES[f]] = True
       on = on[None, None, :, None, None]
       inj_x0 = None if onestep else inj_x0.to(x.dtype).expand_as(x)
+    free = torch.ones(l, dtype=torch.bool, device=x.device)
+    if lock is not None:
+      lock_x0, lock_layers = lock
+      free[list(lock_layers)] = False
+      x = torch.where(free[None, :, None, None, None], x, lock_x0.to(x.dtype).expand_as(x))
     for i in range(steps):
       t = ts[i]
+      t_l = t.expand(b, l) if lock is None else torch.where(free[None], t, torch.zeros_like(t)).expand(b, l)
       if inject is not None and inj_x0 is not None:
         x = torch.where(on, (1 - t) * inj_x0 + t * eps, x)
       x_net = self._net_input(a * x + (1 - a) * eps, a)
       lo, hi = guidance["interval"]
       if guidance["scale"] != 1.0 and lo <= float(t) <= hi:
-        x0_hat = self._guided_x0(feats, x_net, t.expand(b, l), pack, guidance)
+        x0_hat = self._guided_x0(feats, x_net, t_l, pack, guidance)
       else:
-        x0_hat = self._head(feats, x_net, t.expand(b, l), pack).float()
+        x0_hat = self._head(feats, x_net, t_l, pack).float()
       if project is not None:
         x0_hat = project(x0_hat)
       if inject is not None and inj_x0 is None:   # "onestep": the first (t = 1) prediction is the injected x0 from now on
         inj_x0 = x0_hat.detach().clone()
-      x = x - (t - ts[i + 1]) * (x - x0_hat) / (t.clamp(min=t_min) if t_min > 0 else t)
+      x_next = x - (t - ts[i + 1]) * (x - x0_hat) / (t.clamp(min=t_min) if t_min > 0 else t)
+      x = x_next if lock is None else torch.where(free[None, :, None, None, None], x_next, x)
     return self.decode(x, floor)
 
   def decode(self, x0, floor=None):

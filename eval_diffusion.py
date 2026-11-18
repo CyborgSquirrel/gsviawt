@@ -204,9 +204,12 @@ def main(cfg):
               if src not in ("gt", "onestep"):
                 raise ValueError(f"inject_source must be gt or onestep, got {src!r}")
               inject = (model.normalize(batch["x0_raw"].to(device).float()) if src == "gt" else "onestep", list(cfg.inject_fields))
+            lock = None
+            if cfg.get("lock_layers"):   # oracle: those depth layers held at the ground truth, only the others denoised
+              lock = (model.normalize(batch["x0_raw"].to(device).float()), [int(v) for v in cfg.lock_layers])
             for steps in outs:
               g = model.sample(image.expand(K, *image.shape[1:]), hit.expand(K, *hit.shape[1:]), seeds=seeds, steps=steps,
-                               project=project, floor=floor, inject=inject, t_min=float(cfg.get("sampler_t_min", gd.T_MIN_CLAMP)))
+                               project=project, floor=floor, inject=inject, t_min=float(cfg.get("sampler_t_min", gd.T_MIN_CLAMP)), lock=lock)
               samples = [render(model, batch, {k: v[j:j + 1] for k, v in g.items()}, views, device) for j in range(K)]
               per = dict(once)
               ks = [M(r) for r in samples]
@@ -215,6 +218,14 @@ def main(cfg):
                                         torch.stack([r[1] for r in samples]).mean(0), gt_alpha)
               best = int(np.argmin([float(m["loss"].mean()) for m in ks]))
               per[f"best{K}"] = ks[best]
+              if lock is not None:   # plain_swap: the plain sample (no lock, same noise) with the locked layers swapped to the ground truth
+                gp = model.sample(image.expand(K, *image.shape[1:]), hit.expand(K, *hit.shape[1:]), seeds=seeds, steps=steps,
+                                  project=project, floor=floor, inject=inject, t_min=float(cfg.get("sampler_t_min", gd.T_MIN_CLAMP)))
+                gt_g = model.decode(lock[0], floor)
+                gp = {name: v[:1].clone() for name, v in gp.items()}
+                for name in gp:
+                  gp[name][:, lock[1]] = gt_g[name][:, lock[1]].to(gp[name].dtype)
+                per["plain_swap"] = M(render(model, batch, gp, views, device))
               if inject is not None and not isinstance(inject[0], str):   # sample_gt: the sample with the injected fields' final values set to the ground truth
                 gt_g = model.decode(inject[0], floor)
                 g0 = {name: v[:1] for name, v in g.items()}

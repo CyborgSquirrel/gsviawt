@@ -79,3 +79,25 @@ def test_t_min_zero_lands_exactly_on_the_prediction():
   torch.testing.assert_close(exact["raw_scale"], torch.full_like(exact["raw_scale"], 0.25))
   clamped = m.sample(torch.zeros(B, 3, 4, 4), hit, seeds=[7, 8], steps=50)
   assert (clamped["raw_scale"] - 0.25).abs().max() > 1e-3
+
+
+def test_lock_holds_layers_and_gives_them_t_zero():
+  """lock (x0, [0]): layer 0 is the given x0 at every call and in the output, its t is 0, the others are denoised as usual."""
+  hit = torch.ones(B, L, H, W, dtype=torch.bool)
+  x0 = torch.randn(B, L, gd.CHANNELS, H, W)
+  m, calls = shell()
+  ts_seen = []
+
+  class Head(torch.nn.Module):
+    def forward(self, feats, x_net, t):
+      calls.append((x_net.clone(), float(t.flatten()[0])))
+      ts_seen.append(t.clone())
+      return torch.full_like(x_net, 0.25)
+  m.head = Head()
+  out = m.sample(torch.zeros(B, 3, 4, 4), hit, seeds=[7, 8], steps=4, t_min=0.0, lock=(x0, [0]))
+  for (xn, _), t in zip(calls, ts_seen):
+    torch.testing.assert_close(xn[:, 0], x0[:, 0])
+    assert (t[:, 0] == 0).all() and (t[:, 1:] == t[0, 1]).all()
+  ref = gd.decode_x0(x0.float(), m.x0_mean, m.x0_std, m.x0_lo, m.x0_hi)
+  torch.testing.assert_close(out["raw_scale"][:, 0], ref["raw_scale"][:, 0])
+  torch.testing.assert_close(out["raw_scale"][:, 1:], torch.full_like(out["raw_scale"][:, 1:], 0.25))
