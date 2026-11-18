@@ -29,6 +29,9 @@ def main():
   for path in paths:
     ro.reset_scene()
     ro.load_object(path)
+    import bpy
+    dup = ro.scene_meshes()[0].copy()  # a linked duplicate (shares the mesh datablock)
+    bpy.context.scene.collection.objects.link(dup)
     objs = ro.scene_meshes()
     before = {m.name: principled_state(m.node_tree, []) for m in bpy_materials()}
     copies, _ = ro.build_view_independent_materials(objs)

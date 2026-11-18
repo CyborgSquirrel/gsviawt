@@ -377,21 +377,22 @@ def build_view_independent_materials(mesh_objs):
 @ctl.contextmanager
 def _swapped_materials(mesh_objs, copies):
   """Within the block every material slot of `mesh_objs` holds copies[its material] (an object
-  without slots gets one, removed again afterwards)."""
+  without slots gets one, removed again afterwards). Each mesh datablock is swapped once, so
+  objects sharing one (linked duplicates, instanced glTF meshes) are handled."""
   saved = []
-  for obj in mesh_objs:
-    mats = obj.data.materials
+  for data in dict.fromkeys(obj.data for obj in mesh_objs):
+    mats = data.materials
     added = len(mats) == 0
     if added:
       mats.append(None)
-    saved.append((obj, list(mats), added))
+    saved.append((data, list(mats), added))
     for i in range(len(mats)):
       mats[i] = copies[mats[i]]
   try:
     yield
   finally:
-    for obj, orig, added in saved:
-      mats = obj.data.materials
+    for data, orig, added in saved:
+      mats = data.materials
       for i, m in enumerate(orig):
         mats[i] = m
       if added:
