@@ -1194,7 +1194,8 @@ class GSDiffusionModel(nn.Module):
     inject: (x0, fields): before every model call, the state's channels of those fields (X0_FIELDS names) are replaced by the given
     normalized x0 (B, L, C, H, W) noised to the step's t along the sampler's own noise, (1 - t) x0 + t eps (the rectified-flow path from
     eps to x0, as in training); the other channels evolve as usual. The output keeps the model's own last prediction of those fields
-    (an oracle test, e.g. ground-truth colours: eval_diffusion's inject_fields)."""
+    (an oracle test, e.g. ground-truth colours: eval_diffusion's inject_fields). x0 = "onestep": the model's own first prediction (the
+    t = 1 call from the pure noise, i.e. the one-step sample) is the injected x0 from the second step on."""
     if guidance is None:
       guidance = self.guidance
     else:
@@ -1211,14 +1212,17 @@ class GSDiffusionModel(nn.Module):
     pack = self.pack(hit)   # the same tokens at every step
     if inject is not None:
       inj_x0, fields = inject
+      onestep = isinstance(inj_x0, str)
+      if onestep and inj_x0 != "onestep":
+        raise ValueError(f"inject x0 must be a tensor or 'onestep', got {inj_x0!r}")
       on = torch.zeros(CHANNELS, dtype=torch.bool, device=x.device)
       for f in fields:
         on[X0_SLICES[f]] = True
       on = on[None, None, :, None, None]
-      inj_x0 = inj_x0.to(x.dtype).expand_as(x)
+      inj_x0 = None if onestep else inj_x0.to(x.dtype).expand_as(x)
     for i in range(steps):
       t = ts[i]
-      if inject is not None:
+      if inject is not None and inj_x0 is not None:
         x = torch.where(on, (1 - t) * inj_x0 + t * eps, x)
       x_net = self._net_input(a * x + (1 - a) * eps, a)
       lo, hi = guidance["interval"]
@@ -1228,6 +1232,8 @@ class GSDiffusionModel(nn.Module):
         x0_hat = self._head(feats, x_net, t.expand(b, l), pack).float()
       if project is not None:
         x0_hat = project(x0_hat)
+      if inject is not None and inj_x0 is None:   # "onestep": the first (t = 1) prediction is the injected x0 from now on
+        inj_x0 = x0_hat.detach().clone()
       x = x - (t - ts[i + 1]) * (x - x0_hat) / t.clamp(min=T_MIN_CLAMP)
     return self.decode(x, floor)
 

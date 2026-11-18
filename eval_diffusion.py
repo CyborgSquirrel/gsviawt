@@ -199,8 +199,11 @@ def main(cfg):
             key = {"checkpoint": ckpt_path, "weights": weights, "set": set_name, "volume": i,
                    "mesh": int(item["mesh_index"]), "source_view": int(item["source_view"])}
             inject = None
-            if cfg.get("inject_fields"):   # oracle: those fields' ground truth fed in at every step, noised to the step's t
-              inject = (model.normalize(batch["x0_raw"].to(device).float()), list(cfg.inject_fields))
+            if cfg.get("inject_fields"):   # those fields fed in at every step, noised to the step's t: the ground truth (oracle) or
+              src = str(cfg.get("inject_source", "gt"))   # the model's own one-step prediction
+              if src not in ("gt", "onestep"):
+                raise ValueError(f"inject_source must be gt or onestep, got {src!r}")
+              inject = (model.normalize(batch["x0_raw"].to(device).float()) if src == "gt" else "onestep", list(cfg.inject_fields))
             for steps in outs:
               g = model.sample(image.expand(K, *image.shape[1:]), hit.expand(K, *hit.shape[1:]), seeds=seeds, steps=steps,
                                project=project, floor=floor, inject=inject)
@@ -212,7 +215,7 @@ def main(cfg):
                                         torch.stack([r[1] for r in samples]).mean(0), gt_alpha)
               best = int(np.argmin([float(m["loss"].mean()) for m in ks]))
               per[f"best{K}"] = ks[best]
-              if inject is not None:   # sample_gt: the sample with the injected fields' final values set to the ground truth
+              if inject is not None and not isinstance(inject[0], str):   # sample_gt: the sample with the injected fields' final values set to the ground truth
                 gt_g = model.decode(inject[0], floor)
                 g0 = {name: v[:1] for name, v in g.items()}
                 for f in inject[1]:

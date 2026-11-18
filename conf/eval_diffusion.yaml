@@ -19,6 +19,8 @@ guidance: null           # classifier-free guidance of the samples (fit is not s
 inject_fields: null       # oracle test: a list of x0 fields (opacity, scale, rotation, sh_dc, offset) whose ground truth replaces the
                           # sampler state's channels before every model call, noised to that step's t along the sampler's own noise;
                           # adds the method sample_gt (the sample with those fields' final values set to the ground truth)
+inject_source: gt         # with inject_fields: gt (the ground truth; adds sample_gt) | onestep (the model's own one-step prediction
+                          # of those fields, i.e. its t = 1 output from the same noise)
 seed: 0                  # the target views of a volume and the noise are functions of (seed, set, volume)
 grids_dir: null          # overrides for running somewhere else than the run did (null: the run's)
 source_h5: null

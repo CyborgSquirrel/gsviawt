@@ -54,3 +54,17 @@ def test_one_step_sample_unchanged_by_inject():
   b = m.sample(torch.zeros(B, 3, 4, 4), hit, seeds=[7, 8], steps=1, inject=(x0, ["sh_dc"]))
   for k in a:
     torch.testing.assert_close(a[k], b[k])
+
+
+def test_inject_onestep_uses_the_first_prediction():
+  """inject x0 "onestep": from the second call on, the fields' channels are the first (t = 1) prediction noised to t."""
+  hit = torch.ones(B, L, H, W, dtype=torch.bool)
+  m, plain = shell()
+  m.sample(torch.zeros(B, 3, 4, 4), hit, seeds=[7, 8], steps=4)
+  m, inj = shell()
+  m.sample(torch.zeros(B, 3, 4, 4), hit, seeds=[7, 8], steps=4, inject=("onestep", ["sh_dc"]))
+  eps = plain[0][0]
+  first = torch.full_like(eps, 0.25)                    # the shell head's prediction
+  torch.testing.assert_close(inj[0][0], plain[0][0])
+  for xi, t in inj[1:]:
+    torch.testing.assert_close(xi[:, :, COL], ((1 - t) * first + t * eps)[:, :, COL])
