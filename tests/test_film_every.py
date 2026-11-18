@@ -73,3 +73,77 @@ def test_every_block_has_its_own_film():
     assert rel(tr(x, adaln), out) > 1e-4
     full = gd.PackIndex(torch.ones(2, L, P, dtype=torch.bool))
     assert rel(every(feats, x_net, t, full), every(feats, x_net, t)) < 1e-6
+
+
+# ---------------------------------------------------------------- the defaults bit-identical to the code before the options
+
+
+def _old_forward(tr, x, adaln):
+  """DiTTrunk.forward as it was before diffusion.film (one FiLM call, gamma / beta indexed once, applied at the frame blocks)."""
+  _, num_layers, num_patches, _ = x.shape
+  cos, sin = tr._rope_tables(int(round(num_patches ** 0.5)), x.device)
+  gamma, beta = tr.film(tr.layer_embed(torch.arange(num_layers, device=x.device))).chunk(2, dim=-1)
+  gamma, beta = gamma[None, :, None], beta[None, :, None]
+  adaln_mean = adaln.mean(1, keepdim=True)
+  for block, cond in zip(tr.blocks, tr.cond):
+    if cond == "frame":
+      x = x * (1 + gamma) + beta
+    x = block(x, cos, sin, adaln if cond == "frame" else adaln_mean)
+  return x
+
+
+def _old_forward_packed(tr, x, adaln, pack):
+  b, num_layers = adaln.shape[:2]
+  cos, sin = tr._rope_tables(int(round(pack.P ** 0.5)), x.device)
+  cos_r, sin_r = cos[pack.p], sin[pack.p]
+  gamma, beta = tr.film(tr.layer_embed(torch.arange(num_layers, device=x.device))).chunk(2, dim=-1)
+  gamma, beta = gamma[pack.l], beta[pack.l]
+  adaln_frame = adaln.reshape(b * num_layers, *adaln.shape[2:])
+  adaln_mean = adaln.mean(1)
+  for block, cond in zip(tr.blocks, tr.cond):
+    if cond == "frame":
+      x = x * (1 + gamma) + beta
+      a, seg = adaln_frame, pack.frame
+    else:
+      a, seg = adaln_mean, pack.b
+    x = block.forward_packed(x, pack, cos_r, sin_r, a, seg)
+  return x
+
+
+def _old_adaln(head, t):
+  b, l = t.shape
+  emb = head.time_embed(gd.sinusoidal_embedding(t.reshape(-1) * 1000.0, head.t_embed_channels))
+  return head.time_proj(emb).reshape(b, l, 6, head.dim)
+
+
+@pytest.mark.parametrize("attention", ["global", "frame_ray_global"])
+def test_defaults_bit_identical_to_before(attention):
+  """film frame + colour_noise joint (the defaults): the trunk's dense and packed forward and the AdaLN input are torch.equal to the
+  code before the options, and so are the dense gradients. (The packed backward is not deterministic run-to-run even in the old
+  code -- its index scatters accumulate in varying order, ~1e-12 -- so its gradients are compared with a tolerance.)"""
+  torch.manual_seed(0)
+  head = gd.DiffusionHead(FEAT, L, patch_size=PS, attention=attention)
+  g = torch.Generator().manual_seed(3)
+  with torch.no_grad():
+    for p in head.parameters():
+      p.copy_(0.05 * torch.randn(p.shape, generator=g))
+  tr = head.trunk
+  x = torch.randn(2, L, P, head.dim, generator=g)
+  t = torch.rand(2, L, generator=g)
+  keep = torch.rand(2, L, P, generator=g) < 0.5
+  keep[:, 0, 0] = True
+  pack = gd.PackIndex(keep)
+  with torch.no_grad():
+    adaln = head.adaln(t)
+    assert torch.equal(adaln, _old_adaln(head, t))
+    assert torch.equal(tr(x, adaln), _old_forward(tr, x, adaln))
+    xp = pack.gather(x)
+    assert torch.equal(tr.forward_packed(xp, adaln, pack), _old_forward_packed(tr, xp, adaln, pack))
+  params = list(head.parameters())
+  new_d, old_d = (torch.autograd.grad(f().square().sum(), params, allow_unused=True)
+                  for f in (lambda: tr(x, head.adaln(t)), lambda: _old_forward(tr, x, _old_adaln(head, t))))
+  assert all((a is None and b is None) or torch.equal(a, b) for a, b in zip(new_d, old_d))
+  new_p, old_p = (torch.autograd.grad(f().square().sum(), params, allow_unused=True)
+                  for f in (lambda: tr.forward_packed(xp, head.adaln(t), pack),
+                            lambda: _old_forward_packed(tr, xp, _old_adaln(head, t), pack)))
+  assert all((a is None and b is None) or torch.allclose(a, b, rtol=1e-9, atol=1e-9) for a, b in zip(new_p, old_p))
