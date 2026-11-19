@@ -1,0 +1,13 @@
+# kid_compare.py: KID (x 10^3, plain and object-excluded, leave-one-mesh-out jackknife SE) of eval_diffusion.py kid features.
+a: ???                   # a kid_features.npz (one checkpoint x weights)
+b: null                  # optional second one over the same (set, mesh, view) images: also the paired difference a - b and its SE
+sets: null               # list of set names; null: all of a's
+out: null                # output path without extension (.json, .csv); null: <a's dir>/kid[_vs_<b's last two dir names, _-joined>]
+hydra:
+  output_subdir: null
+  run:
+    dir: .
+defaults:
+  - _self_
+  - override hydra/job_logging: none
+  - override hydra/hydra_logging: disabled

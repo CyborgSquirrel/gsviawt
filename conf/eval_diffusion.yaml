@@ -35,6 +35,24 @@ colour_schedule: null     # diffusion.colour_noise separate runs only: the sampl
 colour_schedules: null    # a sweep instead: {name: schedule, ...}, each written to <out>/cs_<name>/[steps<N>/] (one process, the
                           # volumes / fit / onestep done once); not together with colour_schedule
 seed: 0                  # the target views of a volume and the noise are functions of (seed, set, volume)
+skip_methods: []         # methods left out of every set: fit and / or onestep (the reference renders; [] = both scored)
+extra_sets: null         # eval sets from other render files, name: {source_h5, grids_dir, max_meshes, seed, max_source_view_num,
+                         # skip_methods}: max_meshes of its meshes (a random subset by (seed, name); null: all), sources the views with
+                         # view number < max_source_view_num (null: all; 45 = the fitted views of a 50-view anchored fit), targets from
+                         # all the mesh's other views; grids_dir: its fitted grids (the 'fit'), null: none (then skip_methods: [fit]).
+                         # The x0 normalization is the run's own. E.g. on the cluster
+                         # 'extra_sets={test_shard2:{source_h5:/scratch/vc16/t26rb00/data/trellis_shard2_50views_eevee_504.h5,
+                         #  grids_dir:null,max_meshes:90,seed:0,max_source_view_num:45,skip_methods:[fit]}}'
+kid:                     # KID features (kid_features.py; scored by kid_compare.py), off by default
+  enabled: false         # on: the sets (val_sets; null: val_views_sval, val_views_strain + the extra sets) are ONE volume per mesh
+                         # (a random one of the set's sources) with views_per_mesh fixed target views from the set's own target pool
+                         # (val_views_*: the mesh's held-out views, minus the source), and <out>/[cs_<name>/][steps<N>/]kid_features.npz
+                         # gets the sample's (k = 0) and the GT's features at every target view (white background, own alpha)
+  views_per_mesh: 4      # target views per mesh (all of the pool if it has fewer: printed per set)
+  seed: 0                # the meshes' source and target views: a function of (kid.seed, set, mesh) only, the same for every run
+  noise_seed: null       # the sample noise base instead of seed (null: seed): another value = the same volumes / views, other noise
+  gt_cache: null         # directory of cached GT features (per render file, view and feature tag); null: recomputed
+  dinov2_repo: null      # local copy of the facebookresearch/dinov2 hub repo; null: <torch hub dir>/facebookresearch_dinov2_7764ea0
 grids_dir: null          # overrides for running somewhere else than the run did (null: the run's)
 source_h5: null
 out: ???                 # output directory: volumes.csv (one row per volume x method) and summary.json

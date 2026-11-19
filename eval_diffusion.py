@@ -26,7 +26,13 @@ colour_schedule / colour_schedules (diffusion.colour_noise separate runs): the s
 or several, each to <out>/cs_<name>/ (steps<N>/ below it as above).
 Writes <out>/views.csv (one row per checkpoint, weights, set, volume, method, target view), <out>/volumes.csv (the same averaged
 over the volume's target views) and <out>/summary.json (mean and standard error over volumes per checkpoint, weights, set, method;
-volumes, not views, are the unit). mean<K> has no depth (an average of renders has no single depth)."""
+volumes, not views, are the unit). mean<K> has no depth (an average of renders has no single depth).
+extra_sets: more eval sets from other render files (extra_dataset: e.g. unseen meshes), the x0 normalization still the run's.
+skip_methods (and extra_sets.<name>.skip_methods): leave out fit / onestep (e.g. a set without grids has no fit).
+kid (kid.enabled): the sets (val_sets; null: val_views_sval, val_views_strain and the extra sets) become one volume per mesh with
+kid.views_per_mesh fixed target views (kid_selection: a function of kid.seed, set and mesh only); the noise base is kid.noise_seed
+(null: seed) instead of seed; besides the usual outputs every <out>/[cs_<name>/][steps<N>/] gets kid_features.npz: the DINOv2 features
+(kid_features.py) of the sample (k = 0) and of the GT at every target view, scored by kid_compare.py."""
 import contextlib as ctl
 import csv
 import json
@@ -38,10 +44,13 @@ import gsplat
 import h5py
 import hydra
 import numpy as np
+import polars as pl
 import torch
 from omegaconf import OmegaConf, open_dict
 
+import gs_dataset
 import gs_diffusion as gd
+import kid_features
 import train_gs
 from module import DSSIMLoss
 from util import collate_with_batch_size
@@ -114,6 +123,80 @@ def volume_subset(n, max_volumes, seed, set_name):
   return sorted(rng.choice(n, int(max_volumes), replace=False).tolist())
 
 
+def kid_selection(volumes, pool, set_name, seed, views_per_mesh):
+  """The KID's volumes of a set: ONE per mesh (every mesh the set has), its source one of the set's own volumes of that mesh, its
+  targets views_per_mesh of the mesh's pool (the set's target views: the held-out views for val_views_*) other than the source,
+  all of it drawn from (seed, set, mesh) only -- the same for every run with the same split, whatever the noise. Fewer pool views
+  than views_per_mesh (+ the source): all of them. -> [(dataset index, sorted target views)], by mesh."""
+  by_mesh = {}
+  for i, (m, v) in enumerate(zip(volumes.df["mesh_id"].to_list(), volumes.df["view_idx"].to_list())):
+    by_mesh.setdefault(int(m), []).append((int(v), i))
+  out = []
+  for m in sorted(by_mesh):
+    rng = np.random.default_rng([int(seed), *map(ord, set_name), m])
+    cands = sorted(by_mesh[m])
+    src, i = cands[int(rng.integers(len(cands)))]
+    others = sorted(int(t) for t in pool[m] if int(t) != src)
+    out.append((i, sorted(rng.choice(others, min(int(views_per_mesh), len(others)), replace=False).tolist())))
+  return out
+
+
+def fixed_targets_dataset(ds, selection):
+  """ds (a GridTargetDataset or WTFeatureDataset) cut to the volumes of `selection` [(index, target views)] (one per mesh), each
+  item with exactly its listed target views: the mesh's pool is those views (the source not among them), all of which an item
+  draws (in an order of Python's global random); otherwise the same items as ds's."""
+  inner = getattr(ds, "inner", ds)
+  if len({int(inner.volumes.df["mesh_id"][i]) for i, _ in selection}) != len(selection):
+    raise ValueError("fixed_targets_dataset: one volume per mesh")
+  rows = [int(inner.volumes.df["row"][i]) for i, _ in selection]
+  targets = sorted({t for _, ts in selection for t in ts})
+  views = gs_dataset.render_catalog(inner.source_h5).filter(pl.col("view_idx").is_in(targets))
+  out = gs_dataset.WTFeatureDataset(
+    inner.features_h5, views, rows=rows, num_layers=inner.num_layers, num_views=max(len(ts) for _, ts in selection),
+    allow_source_as_target=False, depth_size=inner.depth_size, image_size=inner.image_size, read_features=inner.read_features)
+  if inner is ds:
+    return out
+  out = gd.GridTargetDataset(out, ds.grid_index, ds.encoding, seeded=True)
+  out.seed_targets = False
+  return out
+
+
+def extra_dataset(name, spec, like, encoding, patch_size, out_dir):
+  """An extra eval set (extra_sets.<name>) from another render file: max_meshes of its meshes (a random subset by (spec.seed, name);
+  null: all), as sources their views with view number < max_source_view_num (null: all), targets drawn from all of the mesh's
+  other views (the run's data.num_views per volume; kid: kid_selection). The grids of spec.grids_dir give the 'fit' and the
+  oracles; grids_dir null: none (the set has to skip 'fit'). The x0 normalization stays the run's (its training grids). `like`:
+  one of the run's validation datasets, for the item settings (layers, sizes, num_views). The listing goes to
+  <out_dir>/listing_<name>.h5."""
+  inner_like = getattr(like, "inner", like)
+  source_h5 = str(spec.source_h5)
+  cat = gs_dataset.render_catalog(source_h5)
+  meshes = sorted(cat.df["mesh_id"].unique().to_list())
+  if spec.get("max_meshes") is not None and int(spec.max_meshes) < len(meshes):
+    rng = np.random.default_rng([int(spec.get("seed", 0)), *map(ord, name)])
+    meshes = sorted(rng.choice(meshes, int(spec.max_meshes), replace=False).tolist())
+  cat = cat.filter(pl.col("mesh_id").is_in(meshes))
+  src = cat if spec.get("max_source_view_num") is None else cat.filter(pl.col("view_num") < int(spec.max_source_view_num))
+  rows = sorted(src.df["view_idx"].to_list())
+  grid_index = None
+  if spec.get("grids_dir") is not None:
+    grid_index, _ = gd.build_grid_index(str(spec.grids_dir), source_h5)
+    gd.check_grids(grid_index, int(inner_like.image_size), int(patch_size), int(inner_like.num_layers))
+    missing = sorted(set(rows) - set(grid_index))
+    if missing:
+      raise SystemExit(f"extra set {name}: source views (rows) {missing[:5]}... have no grid in {spec.grids_dir!r} (max_source_view_num)")
+  listing = gd.make_listing({r: None for r in rows}, source_h5, os.path.join(out_dir, f"listing_{name}.h5"))
+  ds = gs_dataset.WTFeatureDataset(
+    listing, cat, num_layers=inner_like.num_layers, num_views=inner_like.num_views,
+    allow_source_as_target=inner_like.allow_source_as_target, depth_size=inner_like.depth_size, image_size=inner_like.image_size,
+    read_features=inner_like.read_features)
+  if grid_index is None:
+    return ds
+  ds = gd.GridTargetDataset(ds, grid_index, encoding, seeded=True)
+  ds.seed_targets = False
+  return ds
+
+
 def load_checkpoint(module, path):
   ckpt = torch.load(path, map_location="cpu", weights_only=False)
   missing, unexpected = module.load_state_dict(ckpt["state_dict"], strict=False)
@@ -170,7 +253,38 @@ def main(cfg):
   outs = {(n, st): d if n is None else os.path.join(cfg.out, f"cs_{n}", os.path.relpath(d, cfg.out))
           for n, _ in schedules for st, d in outs.items()}
   schedule_of = dict(schedules)
-  sets = list(cfg.val_sets) if cfg.val_sets is not None else list(dm.val_datasets)
+  datasets, set_skip = dict(dm.val_datasets), {}
+  for name, spec in (cfg.get("extra_sets") or {}).items():   # extra eval sets from other render files (extra_dataset)
+    if name in datasets:
+      raise SystemExit(f"extra_sets.{name}: the run has a validation set of that name")
+    datasets[name] = extra_dataset(name, spec, next(iter(dm.val_datasets.values())), train_gs.x0_encoding(run), run.model.patch_size,
+                                   cfg.out)
+    set_skip[name] = set(spec.get("skip_methods") or [])
+  kid = cfg.get("kid")
+  kid_on = kid is not None and bool(kid.get("enabled", False))
+  if cfg.val_sets is not None:
+    sets = list(cfg.val_sets)
+  elif kid_on:
+    sets = [s for s in ("val_views_sval", "val_views_strain") if s in datasets] + list(cfg.get("extra_sets") or {})
+  else:
+    sets = list(dm.val_datasets) + list(cfg.get("extra_sets") or {})
+  for name in [*sets, *set_skip]:
+    if not set(cfg.get("skip_methods") or []) | set_skip.get(name, set()) <= {"fit", "onestep"}:
+      raise SystemExit("skip_methods: fit and / or onestep only")
+  noise_seed = int(cfg.seed)
+  if kid_on:   # the KID's volumes: one per mesh with fixed target views (kid_selection), features of the sample and the GT
+    for name in sets:
+      inner = getattr(datasets[name], "inner", datasets[name])
+      sel = kid_selection(inner.volumes, inner.pool, name, kid.seed, kid.views_per_mesh)
+      counts = sorted({len(ts) for _, ts in sel})
+      print(f"kid {name}: {len(sel)} meshes, {sum(len(ts) for _, ts in sel)} target views (per mesh {counts})", flush=True)
+      if counts != [int(kid.views_per_mesh)]:
+        print(f"WARNING kid {name}: not {int(kid.views_per_mesh)} target views for every mesh (the set's pool is smaller)", flush=True)
+      datasets[name] = fixed_targets_dataset(datasets[name], sel)
+    noise_seed = int(cfg.seed if kid.get("noise_seed") is None else kid.noise_seed)
+    gt_cache = kid_features.GTCache(kid.get("gt_cache"))
+    kid_model = kid_features.load_dinov2(kid.get("dinov2_repo"), device)
+  kid_rows = {s: [] for s in outs}
 
   rows, view_rows = {s: [] for s in outs}, {s: [] for s in outs}
   for ckpt_path in cfg.checkpoints:
@@ -182,7 +296,8 @@ def main(cfg):
       ctx = module.ema.applied(model) if weights == "ema" else ctl.nullcontext()
       with ctx, torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         for set_name in sets:
-          ds = dm.val_datasets[set_name]
+          ds = datasets[set_name]
+          skip = set(cfg.get("skip_methods") or []) | set_skip.get(set_name, set())
           idx = volume_subset(len(ds), cfg.max_volumes, cfg.seed, set_name)
           n = len(idx)
           for k, i in enumerate(idx):
@@ -192,7 +307,7 @@ def main(cfg):
             views = list(range(1, batch["views"]["rgb"].shape[1]))   # the target views (index 0 is the source)
             gt = batch["views"]["rgb"][0, views].to(device)
             gt_alpha = batch["views"]["alpha"][0, views].to(device)
-            with h5py.File(ds.inner.source_h5, "r") as f:   # the target views' first depth-peel layer (z-depth, NaN = no hit)
+            with h5py.File(getattr(ds, "inner", ds).source_h5, "r") as f:   # the target views' first depth-peel layer (z-depth, NaN = no hit)
               gt_depth = torch.from_numpy(np.stack([f["depth_peel"][int(r)][..., 0] for r in item["target_views"]]))
             gt_depth = gt_depth.float().to(device)[:, None]
             if gt_depth.shape[-2:] != gt.shape[-2:]:
@@ -205,14 +320,25 @@ def main(cfg):
               project = gd.format_projection(model.x0_mean, model.x0_std, hit, item["source"]["xyz_cam"][..., 2].to(device),
                                              float(item["source"]["K_depth"][0, 0]), **enc,
                                              quat=str(cfg.get("project_quat", "unit")))
-            base = 1_000_003 * (int(cfg.seed) + 1) + int(item["source_view"]) * 101
+            base = 1_000_003 * (noise_seed + 1) + int(item["source_view"]) * 101
             seeds = [base + k for k in range(K)]
             M = lambda r: metrics(r[0], gt, dssim, lpips, r[1], gt_alpha, r[2], gt_depth)
-            once = {"fit": M(render(model, batch, model.decode(model.normalize(batch["x0_raw"].to(device).float()), floor), views, device)),
-                    "onestep": M(render(model, batch, model.sample(image, hit, seeds=seeds[:1], steps=1, project=project, floor=floor), views,
-                                        device))}
+            if "x0_raw" not in batch and ("fit" not in skip or cfg.get("lock_layers") or cfg.get("inject_fields")):
+              raise SystemExit(f"{set_name}: no grids (grids_dir null): 'fit', lock_layers and inject_fields need them (skip_methods: [fit])")
+            once = {}
+            if "fit" not in skip:
+              once["fit"] = M(render(model, batch, model.decode(model.normalize(batch["x0_raw"].to(device).float()), floor), views, device))
+            if "onestep" not in skip:
+              once["onestep"] = M(render(model, batch, model.sample(image, hit, seeds=seeds[:1], steps=1, project=project, floor=floor),
+                                         views, device))
             key = {"checkpoint": ckpt_path, "weights": weights, "set": set_name, "volume": i,
                    "mesh": int(item["mesh_index"]), "source_view": int(item["source_view"])}
+            if kid_on:   # the GT's features (the same in every run: cached per render file and view)
+              src_h5 = getattr(ds, "inner", ds).source_h5
+              gt_feats = gt_cache.get(src_h5, item["target_views"])
+              if gt_feats is None:
+                gt_feats = kid_features.features(kid_model, kid_features.white_uint8(gt, gt_alpha, premultiplied=False), device)
+                gt_cache.put(src_h5, item["target_views"], gt_feats)
             inject = None
             if cfg.get("inject_fields"):   # those fields fed in at every step, noised to the step's t: the ground truth (oracle) or
               src = str(cfg.get("inject_source", "gt"))   # the model's own one-step prediction
@@ -236,6 +362,11 @@ def main(cfg):
               per = dict(once)
               ks = [M(r) for r in samples]
               per["sample"] = ks[0]
+              if kid_on:
+                gen_feats = kid_features.features(kid_model, kid_features.white_uint8(samples[0][0], samples[0][1], premultiplied=True),
+                                                  device)
+                for v, tv in enumerate(item["target_views"]):
+                  kid_rows[out_key].append({**key, "view": int(tv), "gen": gen_feats[v], "gt": gt_feats[v]})
               per[f"mean{K}"] = metrics(torch.stack([r[0] for r in samples]).mean(0), gt, dssim, lpips,
                                         torch.stack([r[1] for r in samples]).mean(0), gt_alpha)
               best = int(np.argmin([float(m["loss"].mean()) for m in ks]))
@@ -267,6 +398,20 @@ def main(cfg):
 
   for out_key, out_dir in outs.items():
     write_outputs(cfg, out_dir, rows[out_key], view_rows[out_key])
+    if kid_on:
+      write_kid(out_dir, kid_rows[out_key], {"feature": kid_features.FEATURE_TAG, "steps": out_key[1], "colour_schedule": out_key[0],
+                                             "noise_seed": noise_seed, "kid": OmegaConf.to_container(kid)})
+
+
+def write_kid(out_dir, rows, meta):
+  """<out_dir>/kid_features.npz: per target view image (rows), gen / gt (N, 1024) float32 features of the sample and of the GT, and
+  checkpoint, weights, set, volume, mesh, source_view, view (the target view's row of the set's render file); meta: a JSON string."""
+  os.makedirs(out_dir, exist_ok=True)
+  cols = ("checkpoint", "weights", "set", "volume", "mesh", "source_view", "view")
+  path = os.path.join(out_dir, "kid_features.npz")
+  np.savez(path, gen=np.stack([r["gen"] for r in rows]).astype(np.float32), gt=np.stack([r["gt"] for r in rows]).astype(np.float32),
+           meta=json.dumps(meta), **{c: np.array([r[c] for r in rows]) for c in cols})
+  print(f"wrote {path} ({len(rows)} images)", flush=True)
 
 
 def write_outputs(cfg, out_dir, rows, view_rows):
