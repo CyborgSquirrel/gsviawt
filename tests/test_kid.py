@@ -143,7 +143,7 @@ def test_sets_are_separate_units():
                    ["a"] * 8 + ["b"] * 8)
   r = {x["set"]: x for x in kc.compare(f)}
   assert r["a"]["n_meshes"] == r["b"]["n_meshes"] == 4
-  assert np.isclose(r["b"]["kid_objex"], 1e3 * kc.set_estimates(kc.blocks(g2, t2, m2))["kid_objex"][0])
+  assert np.isclose(r["b"]["kid_objex"], kc.SCALE * kc.set_estimates(kc.blocks(g2, t2, m2))["kid_objex"][0])
 
 
 # ---- selection ----
