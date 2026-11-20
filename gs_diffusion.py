@@ -27,6 +27,7 @@ import math
 import os
 import random
 import warnings
+import zipfile
 
 import h5py
 import hydra
@@ -491,9 +492,12 @@ def _grid_moments(dataset, i, path, cache_dir):
   stamp = np.array([st.st_size, st.st_mtime_ns], np.int64)
   cache = os.path.join(cache_dir, os.path.basename(path) + ".npz") if cache_dir else None
   if cache and os.path.exists(cache):
-    z = np.load(cache)
-    if (z["stamp"] == stamp).all():
-      return z["s"], z["s2"], int(z["n"]), z["lo"], z["hi"]
+    try:   # (a file another run is replacing right now is complete either way: the writer below is atomic; an unreadable one is
+      with np.load(cache) as z:   #  recomputed)
+        if (z["stamp"] == stamp).all():
+          return z["s"], z["s2"], int(z["n"]), z["lo"], z["hi"]
+    except (OSError, ValueError, KeyError, EOFError, zipfile.BadZipFile):
+      pass
   item = dataset.inner[i]
   grid = read_grid(path)
   x = torch.from_numpy(encode_grid(grid, item["source"], rng=np.random.default_rng(int(item["source_view"])), **dataset.encoding))[:, item["source"]["hit"]].double()   # (CHANNELS, valid slots), full precision
@@ -504,7 +508,11 @@ def _grid_moments(dataset, i, path, cache_dir):
   if cache:
     try:
       os.makedirs(cache_dir, exist_ok=True)
-      np.savez(cache, stamp=stamp, s=moments[0], s2=moments[1], n=moments[2], lo=moments[3], hi=moments[4])
+      # atomic: written to a temporary name of this process, then renamed over the cache (runs started together on a fresh grids
+      # dir compute the same files at the same time; a reader never sees a partial one)
+      tmp = f"{cache}.{os.getpid()}.tmp.npz"
+      np.savez(tmp, stamp=stamp, s=moments[0], s2=moments[1], n=moments[2], lo=moments[3], hi=moments[4])
+      os.replace(tmp, cache)
     except OSError:
       pass   # a read-only grids dir: just recompute next time
   return moments

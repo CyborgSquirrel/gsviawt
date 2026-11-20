@@ -1252,6 +1252,9 @@ def main(cfg: DictConfig) -> None:
 
   datamodule = GSDataModule(cfg)
   datamodule.setup()
+  if OmegaConf.select(cfg, "stats_only", default=False):
+    log.info("stats_only: the datasets and the x0 statistics are built, exiting")
+    return
 
   with open_dict(cfg):
     # TODO: Grad accum logic

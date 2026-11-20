@@ -29,6 +29,9 @@ train_seed: null   # the torch seed (weights init, noise, data order); null: see
                    # different train_seed is a replicate of a run on the same data
 
 torch_detect_anomaly: false
+# Diffusion mode: build the datasets (and with them the x0 normalization statistics, cached in <grids_dir>/.x0_moments), then exit
+# without a model, W&B or training -- a pre-job that fills the cache once for runs started together on a fresh grids dir
+stats_only: false
 
 # Path to a Lightning checkpoint (e.g. an earlier run's
 # ${output_dir}/final.ckpt or an event_checkpoint) to resume from --
