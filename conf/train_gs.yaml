@@ -395,6 +395,17 @@ diffusion:
   colour_noise:
     mode: joint
     draw: cond_uniform
+  # Per-token validity in the attention: the network otherwise never sees which slots of a kept token are valid (x_net puts noise
+  # at the invalid ones, so at high t they look like the valid ones). mode: none (off) | qk | qkv: the token's patch_size^2 hit
+  # bits -> a shared MLP (Linear(196, hidden) -> GELU -> Linear(hidden, dim)) -> per block a zero-initialized Linear(dim, n * D)
+  # whose output is ADDED to the block's q, k (qk) or q, k, v (qkv), per head, after the QK-norm and before RoPE. Zero-init: a
+  # fresh model computes exactly what one without it does (and the other parameters' init is the same). Every block, both
+  # attention patterns, dense and packed tokens; the mask is the same at every sampler step and in the null-condition branch.
+  # Parameters (D 2048 x 9 blocks, dim = hidden = 256): qk +9.59 M, qkv +14.33 M. Configs without the key: none (old checkpoints load)
+  mask_attn:
+    mode: none
+    dim: 256
+    hidden: 256
   cond_dropout:
     p: 0.0                     # 0 = off: nothing is drawn, the random streams and the loss exactly as without dropout
     "null": zeros              # zeros (the features' mean after the z-score; no parameter) | learned (a learned feature_dim

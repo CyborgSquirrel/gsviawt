@@ -680,57 +680,80 @@ def sinusoidal_embedding(t, dim=256, theta=10_000.0):
 
 class DiTBlock(AttentionBlock):
   """AttentionBlock with WT's DiT-style AdaLN (DecoderBlockDiT): the timestep gives, per (sample, layer), a shift / scale / gate for
-  the attention and for the MLP, added to a learned per-block modulation. adaln: (B, L or 1, 6, D)."""
+  the attention and for the MLP, added to a learned per-block modulation. adaln: (B, L or 1, 6, D).
+  mask (diffusion.mask_attn, DiTTrunk.add_mask_attn): the token's validity embedding (..., mask_attn.dim), mapped by this block's
+  zero-initialized `mask_proj` (Linear(dim_m, n * dim), n = 2: q, k | 3: q, k, v) to terms ADDED to its attention's q, k (and v),
+  per head as qkv lays them out: after the QK-norm, before RoPE (the added term is position-encoded like the rest of q / k, and
+  the norm cannot rescale it away); v has no norm. None (no mask_proj, or no mask given): the attention exactly as before."""
 
   def __init__(self, dim, num_heads, mode, mlp_ratio=4.0, layer_scale_init=1e-4):
     super().__init__(dim, num_heads, mode, mlp_ratio, layer_scale_init)
     self.modulation = nn.Parameter(torch.randn(6, dim) / dim ** 0.5)
 
-  def _attend_normed(self, h, cos, sin):
+  def _qkv(self, h, add):
+    """h (..., D) -> q, k, v (..., heads, hd): the projection, the QK-norm, and the mask terms add (..., n * D) or None."""
+    lead, d = h.shape[:-1], h.shape[-1]
+    q, k, v = self.qkv(h).reshape(*lead, 3, self.num_heads, d // self.num_heads).unbind(-3)
+    q, k = self.q_norm(q), self.k_norm(k)
+    if add is not None:
+      add = add.reshape(*lead, -1, self.num_heads, d // self.num_heads)
+      q, k = q + add[..., 0, :, :].to(q.dtype), k + add[..., 1, :, :].to(k.dtype)
+      if add.shape[-3] == 3:
+        v = v + add[..., 2, :, :].to(v.dtype)
+    return q, k, v
+
+  def _mask_add(self, mask):
+    """The block's (q, k[, v]) terms of the validity embedding mask, or None."""
+    return None if mask is None else self.mask_proj(mask)
+
+  def _attend_normed(self, h, cos, sin, add=None):
     """Like AttentionBlock._attend, with the (modulated) normalization already applied."""
     n, s, d = h.shape
-    q, k, v = self.qkv(h).reshape(n, s, 3, self.num_heads, d // self.num_heads).unbind(2)
-    q, k = self.q_norm(q), self.k_norm(k)
+    q, k, v = self._qkv(h, add)
     if cos is not None:
       q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
     out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
     return self.proj(out.transpose(1, 2).reshape(n, s, d))
 
-  def _attend_short(self, h):
+  def _attend_short(self, h, add=None):
     """Attention over sequences of a handful of tokens (the L layers of a pixel): an explicit softmax(q k^T) v. The fused kernels are
     built for long sequences: flash pads to 128 and its backward asks 9.3 GiB of scratch at batch 4 with 59 heads, this needs ~2 GiB
     with the gradients and is faster."""
     n, s, d = h.shape
     hd = d // self.num_heads
-    q, k, v = self.qkv(h).reshape(n, s, 3, self.num_heads, hd).unbind(2)                    # (n, s, heads, hd)
-    q, k = self.q_norm(q), self.k_norm(k)
+    q, k, v = self._qkv(h, add)                                                             # (n, s, heads, hd)
     att = torch.einsum("nshd,nthd->nhst", q, k) * hd ** -0.5
     out = torch.einsum("nhst,nthd->nshd", att.softmax(-1).to(v.dtype), v)
     return self.proj(out.reshape(n, s, d))
 
-  def _mix(self, h, cos, sin, b, l, p, d):
+  def _mix(self, h, cos, sin, b, l, p, d, add=None):
+    """add: the mask terms (B, L, P, n * D) or None, reshaped as h is for each attention pattern."""
     if self.mode == "frame":
-      return self._attend_normed(h.reshape(b * l, p, d), cos, sin).reshape(b, l, p, d)
+      a = None if add is None else add.reshape(b * l, p, -1)
+      return self._attend_normed(h.reshape(b * l, p, d), cos, sin, a).reshape(b, l, p, d)
     if self.mode == "ray":
-      return self._attend_short(h.transpose(1, 2).reshape(b * p, l, d)).reshape(b, p, l, d).transpose(1, 2)
-    return self._attend_normed(h.reshape(b, l * p, d), cos.repeat(l, 1), sin.repeat(l, 1)).reshape(b, l, p, d)
+      a = None if add is None else add.transpose(1, 2).reshape(b * p, l, -1)
+      return self._attend_short(h.transpose(1, 2).reshape(b * p, l, d), a).reshape(b, p, l, d).transpose(1, 2)
+    a = None if add is None else add.reshape(b, l * p, -1)
+    return self._attend_normed(h.reshape(b, l * p, d), cos.repeat(l, 1), sin.repeat(l, 1), a).reshape(b, l, p, d)
 
-  def forward(self, x, cos, sin, adaln):
+  def forward(self, x, cos, sin, adaln, mask=None):
+    """mask: the validity embedding (B, L, P, dim_m) (diffusion.mask_attn) or None."""
     b, l, p, d = x.shape
     mod = (self.modulation + adaln.float()).unbind(2)                 # six (B, L or 1, D)
     shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = (m[:, :, None, :] for m in mod)
     h = (self.norm1(x).float() * (1 + scale_a) + shift_a).to(x.dtype)
-    x = x + (self.ls1 * self._mix(h, cos, sin, b, l, p, d) * gate_a).to(x.dtype)
+    x = x + (self.ls1 * self._mix(h, cos, sin, b, l, p, d, self._mask_add(mask)) * gate_a).to(x.dtype)
     h = (self.norm2(x).float() * (1 + scale_m) + shift_m).to(x.dtype)
     return x + (self.ls2 * self.mlp(h) * gate_m).to(x.dtype)
 
-  def _mix_packed(self, h, pack, cos_r, sin_r):
+  def _mix_packed(self, h, pack, cos_r, sin_r, add=None):
     """_mix on packed rows h (T, D): the frame / global blocks attend within the rows' segments (RoPE at each row's own patch
-    position), the ray block over each column's kept layers (the explicit softmax, the dropped layers' keys masked)."""
+    position), the ray block over each column's kept layers (the explicit softmax, the dropped layers' keys masked). add: the
+    rows' mask terms (T, n * D) or None."""
     t, d = h.shape
     hd = d // self.num_heads
-    q, k, v = self.qkv(h).reshape(t, 3, self.num_heads, hd).unbind(1)                      # (T, heads, hd)
-    q, k = self.q_norm(q), self.k_norm(k)
+    q, k, v = self._qkv(h, add)                                                             # (T, heads, hd)
     if self.mode == "ray":
       idx = pack.ray_table.clamp_min(0)                                                     # (C, L)
       att = torch.einsum("cshd,cthd->chst", q[idx], k[idx]) * hd ** -0.5
@@ -742,13 +765,14 @@ class DiTBlock(AttentionBlock):
       out = segment_attention(q, k, v, cu, mx)
     return self.proj(out.reshape(t, d))
 
-  def forward_packed(self, x, pack, cos_r, sin_r, adaln, seg):
+  def forward_packed(self, x, pack, cos_r, sin_r, adaln, seg, mask=None):
     """forward on the packed rows x (T, D) of a PackIndex. adaln (N, 6, D) and seg (T,): row i is modulated by adaln[seg[i]] (the
-    frame blocks: N = B * L, one per (sample, layer); ray / global: N = B, the layers' mean)."""
+    frame blocks: N = B * L, one per (sample, layer); ray / global: N = B, the layers' mean). mask: the rows' validity embedding
+    (T, dim_m) or None."""
     mod = self.modulation + adaln.float()                                                    # (N, 6, D)
     row = lambda i: mod[:, i][seg]                                                           # (T, D), gathered when used
     h = (self.norm1(x).float() * (1 + row(1)) + row(0)).to(x.dtype)
-    x = x + (self.ls1 * self._mix_packed(h, pack, cos_r, sin_r) * row(2)).to(x.dtype)
+    x = x + (self.ls1 * self._mix_packed(h, pack, cos_r, sin_r, self._mask_add(mask)) * row(2)).to(x.dtype)
     h = (self.norm2(x).float() * (1 + row(4)) + row(3)).to(x.dtype)
     return x + (self.ls2 * self.mlp(h) * row(5)).to(x.dtype)
 
@@ -794,6 +818,15 @@ class DiTTrunk(nn.Module):
         nn.init.zeros_(h.bias)
     self._rope = {}
 
+  def add_mask_attn(self, mode, mask_dim):
+    """diffusion.mask_attn: every block gets its zero-initialized `mask_proj`, Linear(mask_dim, n * dim) (n = 2: q, k | 3: q, k,
+    v; one fused Linear = one per targeted projection), see DiTBlock. Called by DiffusionHead after everything else is built."""
+    n = {"qk": 2, "qkv": 3}[mode]
+    for block in self.blocks:
+      block.mask_proj = nn.Linear(mask_dim, n * block.qkv.in_features)
+      nn.init.zeros_(block.mask_proj.weight)
+      nn.init.zeros_(block.mask_proj.bias)
+
   def _films(self, num_layers, device, index):
     """Per block: (gamma, beta), each (L, D) put through index (to the tokens' shape), applied before it; None: no FiLM before that
     block (film frame, a non-frame position). frame: ONE indexed pair shared by the frame blocks (the graph exactly as before)."""
@@ -811,7 +844,8 @@ class DiTTrunk(nn.Module):
       self._rope[key] = (cos.to(device), sin.to(device))
     return self._rope[key]
 
-  def forward(self, x, adaln):
+  def forward(self, x, adaln, mask=None):
+    """mask: the tokens' validity embedding (B, L, P, dim_m) (diffusion.mask_attn) or None (the trunk exactly as before)."""
     _, num_layers, num_patches, _ = x.shape
     grid = int(round(num_patches ** 0.5))
     cos, sin = self._rope_tables(grid, x.device)
@@ -821,15 +855,17 @@ class DiTTrunk(nn.Module):
       if gb is not None:
         x = x * (1 + gb[0]) + gb[1]
       a = adaln if cond == "frame" else adaln_mean
+      extra = () if mask is None else (mask,)   # (no mask: the calls as before)
       if self.checkpoint_activations and torch.is_grad_enabled():
-        x = torch.utils.checkpoint.checkpoint(block, x, cos, sin, a, use_reentrant=False)
+        x = torch.utils.checkpoint.checkpoint(block, x, cos, sin, a, *extra, use_reentrant=False)
       else:
-        x = block(x, cos, sin, a)
+        x = block(x, cos, sin, a, *extra)
     return x
 
-  def forward_packed(self, x, adaln, pack):
+  def forward_packed(self, x, adaln, pack, mask=None):
     """forward on the kept tokens of `pack` only: x (T, D) packed rows, adaln (B, L, 6, D) -> (T, D). What forward computes for
-    them when the dropped tokens are left out of every block (as keys too): the same weights, FiLM, RoPE and AdaLN per token."""
+    them when the dropped tokens are left out of every block (as keys too): the same weights, FiLM, RoPE and AdaLN per token.
+    mask: the rows' validity embedding (T, dim_m) or None."""
     b, num_layers = adaln.shape[:2]
     cos, sin = self._rope_tables(int(round(pack.P ** 0.5)), x.device)
     cos_r, sin_r = cos[pack.p], sin[pack.p]                           # RoPE at each row's own patch position
@@ -843,15 +879,31 @@ class DiTTrunk(nn.Module):
         a, seg = adaln_frame, pack.frame
       else:
         a, seg = adaln_mean, pack.b
+      extra = () if mask is None else (mask,)
       if self.checkpoint_activations and torch.is_grad_enabled():
-        x = torch.utils.checkpoint.checkpoint(block.forward_packed, x, pack, cos_r, sin_r, a, seg, use_reentrant=False)
+        x = torch.utils.checkpoint.checkpoint(block.forward_packed, x, pack, cos_r, sin_r, a, seg, *extra, use_reentrant=False)
       else:
-        x = block.forward_packed(x, pack, cos_r, sin_r, a, seg)
+        x = block.forward_packed(x, pack, cos_r, sin_r, a, seg, *extra)
     return x
 
 
 READOUTS = ("linear", "slice")
 IN_PROJS = ("shared", "split")
+MASK_ATTN_MODES = ("none", "qk", "qkv")
+MASK_ATTN_DEFAULTS = dict(mode="none", dim=256, hidden=256)   # diffusion.mask_attn: what a config without the key means
+
+
+def normalize_mask_attn(m):
+  """diffusion.mask_attn (None or missing keys: the defaults, off) -> {"mode": none | qk | qkv, "dim": int, "hidden": int}."""
+  m = {**MASK_ATTN_DEFAULTS, **dict(m or {})}
+  unknown = sorted(set(m) - set(MASK_ATTN_DEFAULTS))
+  if unknown:
+    raise ValueError(f"diffusion.mask_attn: unknown keys {unknown}")
+  if m["mode"] not in MASK_ATTN_MODES:
+    raise ValueError(f"diffusion.mask_attn.mode must be one of {MASK_ATTN_MODES}, got {m['mode']!r}")
+  if int(m["dim"]) < 1 or int(m["hidden"]) < 1:
+    raise ValueError(f"diffusion.mask_attn.dim / hidden must be >= 1, got {m['dim']} / {m['hidden']}")
+  return {"mode": str(m["mode"]), "dim": int(m["dim"]), "hidden": int(m["hidden"])}
 
 
 class DiffusionHead(nn.Module):
@@ -862,7 +914,7 @@ class DiffusionHead(nn.Module):
   def __init__(self, feature_dim, num_layers, channels=CHANNELS, patch_size=14, dim=None, num_blocks=3, mlp_ratio=4.0,
                layer_scale_init=1e-4, t_embed_channels=256, img_token_scale=0.3, checkpoint_activations=False, cond_null="zeros",
                readout="linear", in_proj="shared", in_proj_image_dim=None, attention="frame_ray_global", film="frame",
-               colour_separate=False):
+               colour_separate=False, mask_attn=None):
     """cond_null (diffusion.cond_dropout.null): what a dropped sample's image tokens become -- zeros (the z-scored features' mean;
     no parameter) | learned (a learned (feature_dim,) vector, zero-initialized: the parameter `null_cond` exists only then).
     readout (diffusion.readout): linear (the zero-initialized output projection `out`) | slice (no output layer: x0_hat IS the
@@ -873,7 +925,13 @@ class DiffusionHead(nn.Module):
     kinds of information enter the stream in separate channels, and the noisy values get an explicit share of the width).
     film (diffusion.film): DiTTrunk's. colour_separate (diffusion.colour_noise.mode separate): the timestep is a pair (t_g, t_c) per
     (sample, layer) -- t (B, L, 2) -- and the time MLP's input is the two sinusoidal embeddings concatenated (2 * t_embed_channels
-    wide); joint (False): one t (B, L), one embedding, the parameters as before (old checkpoints load)."""
+    wide); joint (False): one t (B, L), one embedding, the parameters as before (old checkpoints load).
+    mask_attn (diffusion.mask_attn, normalize_mask_attn's keys; None: off): each token's validity -- the patch_size^2 hit bits of its
+    patch, in the (py px) order of its noisy values -- embedded by a shared MLP `mask_embed` (Linear(patch_size^2, hidden) -> GELU ->
+    Linear(hidden, dim)), and added to every trunk block's q, k (qk) or q, k, v (qkv) through the block's zero-initialized
+    mask_proj (DiTBlock): a fresh model computes exactly what one without it does. Built last, on a forked CPU RNG, so the other
+    parameters' init (and the random stream after the head) is the one without it; forward then needs `hit`. none: no
+    parameter (old checkpoints load)."""
     super().__init__()
     if cond_null not in COND_NULLS:
       raise ValueError(f"cond_null must be one of {COND_NULLS}, got {cond_null!r}")
@@ -914,6 +972,12 @@ class DiffusionHead(nn.Module):
       self.out = nn.Linear(self.dim, self.noise_dim)
       nn.init.zeros_(self.out.weight)
       nn.init.zeros_(self.out.bias)
+    ma = normalize_mask_attn(mask_attn)
+    self.mask_attn = ma["mode"]
+    if self.mask_attn != "none":
+      with torch.random.fork_rng(devices=[]):
+        self.mask_embed = nn.Sequential(nn.Linear(patch_size ** 2, ma["hidden"]), nn.GELU(), nn.Linear(ma["hidden"], ma["dim"]))
+        self.trunk.add_mask_attn(self.mask_attn, ma["dim"])
 
   def _read(self, h):
     """The trunk's output (..., dim) -> the x0 prediction (..., noise_dim)."""
@@ -937,12 +1001,13 @@ class DiffusionHead(nn.Module):
       emb = self.time_embed(sinusoidal_embedding(t.reshape(-1) * 1000.0, self.t_embed_channels))
       return self.time_proj(emb).reshape(b, l, 6, self.dim)
 
-  def forward(self, feats, x_net, t, pack=None, uncond=None):
+  def forward(self, feats, x_net, t, pack=None, uncond=None, hit=None):
     """pack: a PackIndex (diffusion.token_drop): the trunk and the output projection run on its kept tokens only, and the
     prediction is 0 at the dropped ones (fully empty patches: nothing reads them). None: every token (the dense path).
     uncond: (B,) bool, the samples whose image condition is replaced by the null (diffusion.cond_dropout): every token of the sample
     (all layers, all patches) gets the null instead of its z-scored, img_token_scale-scaled features; None: no sample (the call
-    exactly as before)."""
+    exactly as before). hit (B, L, H, W): the validity mask, read by mask_attn only (needed then; the null condition keeps it: it
+    is not the image)."""
     b, l, p, _ = feats.shape
     feats = (feats - feats.mean((1, 2, 3), keepdim=True)) / (feats.var((1, 2, 3), keepdim=True, unbiased=False) + 1e-6).sqrt()
     if uncond is not None:   # after the per-sample z-score and the scale (a null before them would be renormalized), before packing
@@ -951,8 +1016,17 @@ class DiffusionHead(nn.Module):
     patches = rearrange(x_net, "b l c (h py) (w px) -> b l (h w) (c py px)", py=self.patch_size, px=self.patch_size)
     if pack is not None and pack.T == 0:   # nothing kept (no valid slot in the batch): no output is read, the dense path keeps the
       pack = None                          # graph (a loss of 0 with zero gradients) without an empty attention
+    mask = None
+    if self.mask_attn != "none":
+      if hit is None:
+        raise ValueError("DiffusionHead: mask_attn needs the hit mask (forward's hit)")
+      mask = rearrange(hit.to(device=x_net.device, dtype=torch.float32), "b l (h py) (w px) -> b l (h w) (py px)",
+                       py=self.patch_size, px=self.patch_size)
     if pack is not None:   # the feature z-scoring above stays over all tokens; everything after it is per token
       feats, patches = pack.gather(feats), pack.gather(patches)
+      mask = None if mask is None else pack.gather(mask)
+    if mask is not None:
+      mask = self.mask_embed(mask)                                     # (B, L, P | T, mask_attn.dim)
     feats = feats if uncond is not None else feats * self.img_token_scale
     if hasattr(self, "in_proj_image"):   # in_proj split: each part projected on its own
       tokens = torch.cat([self.in_proj_image(feats), self.in_proj_noise(patches.to(feats.dtype))], dim=-1)
@@ -962,10 +1036,11 @@ class DiffusionHead(nn.Module):
       tokens = self.in_proj(tokens)
     elif self.pad:
       tokens = F.pad(tokens, (0, self.pad))
+    extra = () if mask is None else (mask,)   # (no mask: the trunk's calls as before)
     if pack is None:
-      out = self._read(self.trunk(tokens, self.adaln(t)))
+      out = self._read(self.trunk(tokens, self.adaln(t), *extra))
     else:
-      out = pack.scatter(self._read(self.trunk.forward_packed(tokens, self.adaln(t), pack)))
+      out = pack.scatter(self._read(self.trunk.forward_packed(tokens, self.adaln(t), pack, *extra)))
     grid = int(round(p ** 0.5))
     return rearrange(out, "b l (h w) (c py px) -> b l c (h py) (w px)", h=grid, w=grid, py=self.patch_size, px=self.patch_size)
 
@@ -1034,6 +1109,7 @@ class GSDiffusionModel(nn.Module):
   guidance = GUIDANCE_DEFAULTS   # diffusion.cfg, normalized (set in __init__): scale 1 = conditional only, one forward per step
   colour_noise = {"mode": "joint", "draw": "cond_uniform"}   # diffusion.colour_noise, normalized (set in __init__)
   colour_separate = False        # colour_noise mode separate (set in __init__)
+  mask_attn = "none"             # diffusion.mask_attn.mode (set in __init__): not none = the head is given the hit mask
 
   def __init__(self, cfg, stats):
     super().__init__()
@@ -1050,6 +1126,8 @@ class GSDiffusionModel(nn.Module):
     warn_guidance_without_dropout(self.guidance, self.cond_dropout_p)
     self.colour_noise = normalize_colour_noise(d.get("colour_noise"))   # (configs without the key: joint, as before)
     self.colour_separate = self.colour_noise["mode"] == "separate"
+    mask_attn = normalize_mask_attn(d.get("mask_attn"))   # (configs without the key: none, as before)
+    self.mask_attn = mask_attn["mode"]
     self.backbone = hydra.utils.instantiate(cfg.model.backbone)
     self.head = DiffusionHead(
       int(cfg.model.feature_dim), self.num_layers, patch_size=self.patch_size, dim=d.get("dim"), num_blocks=int(d.num_blocks),
@@ -1059,7 +1137,7 @@ class GSDiffusionModel(nn.Module):
       in_proj=str(d.get("in_proj", "shared")), in_proj_image_dim=d.get("in_proj_image_dim"),   # (without the keys: one shared projection)
       attention=str(d.get("attention", "frame_ray_global")),   # (configs without the key: the frame/ray/global pattern)
       film=str(d.get("film", "frame")),   # (configs without the key: the FiLM at the frame positions only)
-      colour_separate=self.colour_separate)
+      colour_separate=self.colour_separate, mask_attn=mask_attn)
     mean, std, lo, hi = stats
     self.register_buffer("x0_mean", mean.clone().float())
     self.register_buffer("x0_std", std.clone().float())
@@ -1100,11 +1178,14 @@ class GSDiffusionModel(nn.Module):
       return None
     return PackIndex(token_keep(hit, self.patch_size, self.token_drop))
 
-  def _head(self, feats, x_net, t, pack, uncond=None):
-    """self.head, with the pack only when there is one (token_drop none: the head's call exactly as before), and the null-condition
-    mask uncond (B,) only when there is one."""
+  def _head(self, feats, x_net, t, pack, uncond=None, hit=None):
+    """self.head, with the pack only when there is one (token_drop none: the head's call exactly as before), the null-condition
+    mask uncond (B,) only when there is one, and the hit mask (B, L, H, W) only with diffusion.mask_attn on."""
+    kw = {"hit": hit} if self.mask_attn != "none" else {}
     if uncond is not None:
-      return self.head(feats, x_net, t, pack, uncond=uncond)
+      return self.head(feats, x_net, t, pack, uncond=uncond, **kw)
+    if kw:
+      return self.head(feats, x_net, t, pack, **kw)
     return self.head(feats, x_net, t) if pack is None else self.head(feats, x_net, t, pack)
 
   @staticmethod
@@ -1127,17 +1208,18 @@ class GSDiffusionModel(nn.Module):
     sample conditioned). feats: the backbone's features of image, if already computed (then image is not read)."""
     feats = self._feats(image) if feats is None else feats
     a = hit[:, :, None].to(x_net.dtype)
-    return self._head(feats, self._net_input(x_net, a), t, self.pack(hit), self._uncond(condition, x_net.shape[0], x_net.device))
+    return self._head(feats, self._net_input(x_net, a), t, self.pack(hit), self._uncond(condition, x_net.shape[0], x_net.device),
+                      hit=hit)
 
-  def _guided_x0(self, feats, x_net, t, pack, guidance):
+  def _guided_x0(self, feats, x_net, t, pack, guidance, hit=None):
     """The guided x0 prediction (float) of one sampler step inside the guidance interval: x0_u + scale * (x0_c - x0_u), on
     guidance["fields"] only (the other channels: the conditional prediction). Scale 0 on all fields: the unconditional forward
     alone."""
     s, fields = guidance["scale"], guidance["fields"]
-    x_u = self._head(feats, x_net, t, pack, torch.ones(x_net.shape[0], dtype=torch.bool, device=x_net.device)).float()
+    x_u = self._head(feats, x_net, t, pack, torch.ones(x_net.shape[0], dtype=torch.bool, device=x_net.device), hit=hit).float()
     if s == 0.0 and fields is None:
       return x_u
-    x_c = self._head(feats, x_net, t, pack).float()
+    x_c = self._head(feats, x_net, t, pack, hit=hit).float()
     out = x_u + s * (x_c - x_u)
     if fields is not None:
       on = torch.zeros(CHANNELS, dtype=torch.bool, device=out.device)
@@ -1247,7 +1329,7 @@ class GSDiffusionModel(nn.Module):
       uncond = drop
     else:
       uncond = self._uncond(condition, b, x0.device)
-    x0_hat = self._head(feats, x_net, t_head, self.pack(hit), uncond)
+    x0_hat = self._head(feats, x_net, t_head, self.pack(hit), uncond, hit=hit)
     err = (x0_hat.float() - x0).square()                                            # (B, L, C, H, W)
     valid = a.sum().clamp_min(1)
     loss = (err * a).sum() / (valid * CHANNELS)
@@ -1312,7 +1394,7 @@ class GSDiffusionModel(nn.Module):
         # the deterministic control (schedule.fixed_t) has no other timestep (as training_loss); its input has no x_t anyway
         t_in = torch.full((1, l), float(self.schedule.fixed_t) if self.schedule.fixed_t is not None else t, device=device)
         x_t = (1 - t) * x0 + t * eps
-        head = lambda x, f=feats: self._head(f, self._net_input(a * x + (1 - a) * eps, a), t_in, pack).float()
+        head = lambda x, f=feats: self._head(f, self._net_input(a * x + (1 - a) * eps, a), t_in, pack, hit=h).float()
         masked_mse = lambda pred: ((pred - x0).square() * a).sum() / n
         res["err_model"][i] = masked_mse(head(x_t))
         res["err_copy"][i] = masked_mse((1 - t) / ((1 - t) ** 2 + t ** 2) * x_t)
@@ -1394,9 +1476,9 @@ class GSDiffusionModel(nn.Module):
       x_net = self._net_input(a * x + (1 - a) * eps, a)
       lo, hi = guidance["interval"]
       if guidance["scale"] != 1.0 and lo <= float(t) <= hi:
-        x0_hat = self._guided_x0(feats, x_net, t_l, pack, guidance)
+        x0_hat = self._guided_x0(feats, x_net, t_l, pack, guidance, hit=hit)
       else:
-        x0_hat = self._head(feats, x_net, t_l, pack).float()
+        x0_hat = self._head(feats, x_net, t_l, pack, hit=hit).float()
       if project is not None:
         x0_hat = project(x0_hat)
       if inject is not None and inj_x0 is None:   # "onestep": the first (t = 1) prediction is the injected x0 from now on
@@ -1455,9 +1537,9 @@ class GSDiffusionModel(nn.Module):
       x_net = self._net_input(a * x + (1 - a) * eps, a)
       lo, hi = guidance["interval"]
       if guidance["scale"] != 1.0 and lo <= float(tg) <= hi:
-        x0_hat = self._guided_x0(feats, x_net, t_l, pack, guidance)
+        x0_hat = self._guided_x0(feats, x_net, t_l, pack, guidance, hit=hit)
       else:
-        x0_hat = self._head(feats, x_net, t_l, pack).float()
+        x0_hat = self._head(feats, x_net, t_l, pack, hit=hit).float()
       if project is not None:
         x0_hat = project(x0_hat)
       if inject is not None and inj_x0 is None:
@@ -1490,7 +1572,7 @@ class GSDiffusionModel(nn.Module):
         t = ts[i]
         t_l = torch.where(act, t, torch.where(done, torch.zeros_like(t), torch.ones_like(t)))[None].expand(b, l)
         x_net = self._net_input(a * x + (1 - a) * eps, a)
-        x0_hat = self._head(feats, x_net, t_l, pack).float()
+        x0_hat = self._head(feats, x_net, t_l, pack, hit=hit).float()
         x_next = x - (t - ts[i + 1]) * (x - x0_hat) / (t.clamp(min=t_min) if t_min > 0 else t)
         x = torch.where(act[None, :, None, None, None], x_next, x)
       done |= act
