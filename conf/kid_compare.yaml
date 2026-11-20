@@ -1,4 +1,4 @@
-# kid_compare.py: KID (x 10^3, plain and object-excluded, leave-one-mesh-out jackknife SE) of eval_diffusion.py kid features.
+# kid_compare.py: KID (x 100, plain and object-excluded, leave-one-mesh-out jackknife SE) of eval_diffusion.py kid features.
 a: ???                   # a kid_features.npz (one checkpoint x weights)
 b: null                  # optional second one over the same (set, mesh, view) images: also the paired difference a - b and its SE
 sets: null               # list of set names; null: all of a's

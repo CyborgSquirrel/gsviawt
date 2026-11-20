@@ -1,4 +1,4 @@
-"""KID of eval_diffusion.py's kid features (<out>/[cs_<name>/][steps<N>/]kid_features.npz; conf/kid_compare.yaml), per set, x 10^3,
+"""KID of eval_diffusion.py's kid features (<out>/[cs_<name>/][steps<N>/]kid_features.npz; conf/kid_compare.yaml), per set, x 100,
 with k(x, y) = (x.y / d + 1)^3 (d = 1024 for DINOv2; the full estimators, no subsets), gen = the samples, gt = the GT renders:
   kid_plain  the standard unbiased MMD^2 (Gretton et al. 2012 eq. 3): XX and YY over all pairs of distinct images, XY over all pairs
   kid_objex  object-excluded: every pair of images of the SAME mesh dropped in XX, YY and XY (the matched gen / GT of a mesh
@@ -16,7 +16,7 @@ import hydra
 import numpy as np
 
 ESTIMATORS = ("kid_plain", "kid_objex")
-SCALE = 1e3
+SCALE = 1e2   # x 100, the TRELLIS convention for KD with DINOv2 features (arXiv:2412.01506)
 
 
 def kernel(x, y):
@@ -79,7 +79,7 @@ def order(z, idx):
 
 
 def compare(a, b=None, sets=None):
-  """[{set, n_meshes, n_images, <estimator>, <estimator>_se, (with b) <estimator>_b / _se, delta_<estimator> / _se}] x 10^3."""
+  """[{set, n_meshes, n_images, <estimator>, <estimator>_se, (with b) <estimator>_b / _se, delta_<estimator> / _se}] x 100."""
   out = []
   for s in (sets or sorted(set(a["set"].tolist()))):
     ia = order(a, np.flatnonzero(a["set"] == s))
@@ -125,7 +125,7 @@ def main(cfg):
       line += "  |  b: " + "  ".join(f"{k} {r[k + '_b']:.3f} +- {r[k + '_b_se']:.3f}" for k in ESTIMATORS)
       line += "  |  a - b: " + "  ".join(f"{k} {r['delta_' + k]:+.3f} +- {r['delta_' + k + '_se']:.3f}" for k in ESTIMATORS)
     print(line)
-  print(f"(x 10^3) wrote {out}.json, {out}.csv")
+  print(f"(x 100) wrote {out}.json, {out}.csv")
 
 
 if __name__ == "__main__":
