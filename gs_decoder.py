@@ -266,7 +266,7 @@ class PatchGaussianHead(nn.Module):
                sh_scale=1.0, scale_lambda=0.01, zero_init_last_conv=False,
                predict_mean_offset=False, num_blocks=0, num_heads=24, mlp_ratio=4.0,
                layer_scale_init=1e-4, layer_embed_dim=None, input_proj_dim=None, input_proj_identity_init=False,
-               checkpoint_activations=False):
+               checkpoint_activations=False, split_fields=None):
     super().__init__()
     self.num_layers = num_layers
     # With layer_embed_dim set, the features may be a single [1, P, D] map (e.g. one
@@ -299,6 +299,41 @@ class PatchGaussianHead(nn.Module):
     self.field_dims = gaussian_split_dims(max_sh_degree, predict_mean_offset)
     self.channels = sum(self.field_dims)
     p2 = patch_size ** 2
+    # split_fields: [[field, ...], ...] -- every group of Gaussian fields gets its own trunk and its own
+    # linear layer (e.g. [[opacity, sh_dc], [scale, rotation]]); the outputs are put back in the canonical
+    # field order. null (default): one trunk and one linear layer for all fields.
+    self.split_fields = None if not split_fields else [list(group) for group in split_fields]
+    self.has_trunk = num_blocks > 0
+    if self.split_fields is not None:
+      flat = [name for group in self.split_fields for name in group]
+      if sorted(flat) != sorted(self.field_names):
+        raise ValueError(f"split_fields must list every Gaussian field exactly once: {self.field_names}, got {self.split_fields}")
+      self.trunks = nn.ModuleList(
+        TransformerTrunk(in_dim, num_layers, num_blocks, num_heads, mlp_ratio, layer_scale_init, checkpoint_activations)
+        if num_blocks > 0 else nn.Identity()
+        for _ in self.split_fields
+      )
+      dims = dict(zip(self.field_names, self.field_dims))
+      self.group_dims = [[dims[name] for name in group] for group in self.split_fields]
+      self.projs = nn.ModuleList(nn.Linear(in_dim, sum(group) * p2) for group in self.group_dims)
+      init = dict(zip(self.field_names, zip(*gaussian_init_scales_biases(
+        max_sh_degree, opacity_scale, opacity_bias, scale_scale, scale_bias, sh_scale, predict_mean_offset))))
+      for proj, group, group_dims in zip(self.projs, self.split_fields, self.group_dims):
+        if zero_init_last_conv:
+          nn.init.zeros_(proj.weight)
+          nn.init.zeros_(proj.bias)
+          continue
+        start = 0
+        for name, dim in zip(group, group_dims):
+          scale, bias = init[name]
+          rows = slice(start * p2, (start + dim) * p2)
+          if scale is None:
+            nn.init.zeros_(proj.weight[rows])
+          else:
+            nn.init.xavier_uniform_(proj.weight[rows], scale)
+          nn.init.constant_(proj.bias[rows], bias)
+          start += dim
+      return
     self.trunk = (
       TransformerTrunk(in_dim, num_layers, num_blocks, num_heads, mlp_ratio, layer_scale_init,
                        checkpoint_activations)
@@ -332,7 +367,7 @@ class PatchGaussianHead(nn.Module):
     if self.input_proj is not None:
       features = self.input_proj(features)
     _, num_layers, num_patches, _ = features.shape
-    if num_layers == 1 and (self.layer_embed is not None or self.trunk is not None):   # one token map for all layers: the layer embedding or the trunk's FiLM tells them apart
+    if num_layers == 1 and (self.layer_embed is not None or self.has_trunk):   # one token map for all layers: the layer embedding or the trunk's FiLM tells them apart
       features = features.expand(-1, self.num_layers, -1, -1)
       num_layers = self.num_layers
     if num_layers != self.num_layers:
@@ -343,11 +378,16 @@ class PatchGaussianHead(nn.Module):
     if self.layer_embed is not None:
       embed = self.layer_embed[None, :, None, :].expand(features.shape[0], -1, num_patches, -1)
       features = torch.cat([features, embed.to(features.dtype)], dim=-1)
+    unpatch = lambda y: rearrange(
+      y, "b l (h w) (c py px) -> b l c (h py) (w px)", h=grid, w=grid, py=self.patch_size, px=self.patch_size)  # (B, L, C, H, W)
+    if self.split_fields is not None:
+      raw = {}
+      for trunk, proj, group, group_dims in zip(self.trunks, self.projs, self.split_fields, self.group_dims):
+        raw.update(zip(group, unpatch(proj(trunk(features))).split(group_dims, dim=2)))
+      raw = {name: raw[name] for name in self.field_names}
+      return activate_gaussians(raw, self.scale_lambda)
     if self.trunk is not None:
       features = self.trunk(features)
-    x = rearrange(
-      self.proj(features), "b l (h w) (c py px) -> b l c (h py) (w px)",
-      h=grid, w=grid, py=self.patch_size, px=self.patch_size,
-    )  # (B, L, C, H, W)
+    x = unpatch(self.proj(features))   # (B, L, C, H, W)
     raw = dict(zip(self.field_names, x.split(self.field_dims, dim=2)))
     return activate_gaussians(raw, self.scale_lambda)
