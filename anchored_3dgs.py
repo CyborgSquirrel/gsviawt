@@ -10,8 +10,8 @@ Per mesh (the rows of a render_objaverse.py h5 with one `mesh_index`):
     `levels` density levels of log-scale + opacity logit; a view renders its subset at, per anchor, the level of its own spacing
     relative to the anchor's mean spacing (view_levels). Each step: a random training view's subset, rendered into an independent
     random training camera, 0.8 L1 + 0.2 D-SSIM over the subset (loss.background black: render over black vs premultiplied GT;
-    noise: both over a fresh uniform-noise image every step, also in the fine-tune); dense Adam over all anchors, AdamW with decoupled weight decay
-    lr.offset_weight_decay for the offsets (pulls them back toward the anchor; an L2 loss term barely acts under Adam's
+    noise: both over a fresh uniform-noise image every step, also in the fine-tune; color: over one fresh random solid colour);
+    dense Adam over all anchors, AdamW with decoupled weight decay lr.offset_weight_decay for the offsets (pulls them back toward the anchor; an L2 loss term barely acts under Adam's
     per-parameter scaling); the offset lr decays exponentially offset_lr_start -> offset_lr_end (x base) over the run.
   - per-view fine-tune (finetune): the view's subset at its levels, flattened to one Gaussian per slot, from the combined fit's
     parameters (never from another view's fine-tune: anchors are shared), fresh optimizer, a few hundred steps with the cameras of
@@ -289,7 +289,7 @@ class Cameras:
     return rgb, alpha
 
 
-BACKGROUNDS = ("black", "noise")
+BACKGROUNDS = ("black", "noise", "color")
 
 
 def check_background(cfg):
@@ -301,11 +301,13 @@ def check_background(cfg):
 
 def step_target(cams, p, cam, background, gen):
   """(render, GT) for one training step. black: the render over black vs the premultiplied GT (unchanged). noise: both composited
-  over the same fresh per-pixel uniform RGB noise image bg ~ U[0,1]^(H,W,3) drawn from `gen`."""
+  over the same fresh per-pixel uniform RGB noise image bg ~ U[0,1]^(H,W,3) drawn from `gen`. color: both composited over one
+  fresh solid colour bg ~ U[0,1]^3 drawn from `gen`."""
   if background == "black":
     return cams.render(p, cam), cams.gt[cam]
   rgb, alpha = cams.render_rgba(p, cam)
-  bg = torch.rand(cams.H, cams.W, 3, device=cams.gt.device, generator=gen)
+  shape = (cams.H, cams.W, 3) if background == "noise" else (3,)
+  bg = torch.rand(*shape, device=cams.gt.device, generator=gen)
   return rgb + (1 - alpha) * bg, cams.gt[cam] + (1 - cams.alpha[cam]) * bg
 
 

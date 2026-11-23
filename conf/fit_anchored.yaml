@@ -45,7 +45,8 @@ lr:
 loss:
   lambda_dssim: 0.2
   background: black     # training-loss background: black (render over black vs premultiplied GT) | noise (both composited over
-                        # a fresh per-pixel uniform RGB noise image every step, combined fit and fine-tune; seeded from seed).
+                        # a fresh per-pixel uniform RGB noise image every step, combined fit and fine-tune; seeded from seed)
+                        # | color (the same, over one fresh uniform random solid RGB colour per step).
                         # Evaluation (regression mode's held-out PSNR) is always over black
 
 # regression mode: these local views are held out instead of the val_fraction split, and every written view's held-out PSNR
