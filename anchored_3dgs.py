@@ -9,7 +9,8 @@ Per mesh (the rows of a render_objaverse.py h5 with one `mesh_index`):
   - combined fit (fit_combined): per-anchor offset (free 3D, from the anchor = its slots' mean), quaternion, SH0 colour, and
     `levels` density levels of log-scale + opacity logit; a view renders its subset at, per anchor, the level of its own spacing
     relative to the anchor's mean spacing (view_levels). Each step: a random training view's subset, rendered into an independent
-    random training camera, 0.8 L1 + 0.2 D-SSIM over the subset; dense Adam over all anchors, AdamW with decoupled weight decay
+    random training camera, 0.8 L1 + 0.2 D-SSIM over the subset (loss.background black: render over black vs premultiplied GT;
+    noise: both over a fresh uniform-noise image every step, also in the fine-tune); dense Adam over all anchors, AdamW with decoupled weight decay
     lr.offset_weight_decay for the offsets (pulls them back toward the anchor; an L2 loss term barely acts under Adam's
     per-parameter scaling); the offset lr decays exponentially offset_lr_start -> offset_lr_end (x base) over the run.
   - per-view fine-tune (finetune): the view's subset at its levels, flattened to one Gaussian per slot, from the combined fit's
@@ -80,8 +81,8 @@ def scene_extent_of(poses):
 
 def load_view(f, row):
   """One h5 row's slots + camera. Slots in unproject_depth_peel order: points (N,3) world, u/v/layer (depth-peel pixel / layer),
-  foot (N,), the front image pixel's RGB (N,3) in [0,1] (not premultiplied), spacing (N,). Also the premultiplied GT image and
-  the camera (OpenCV world-to-camera viewmat, image K) and the raw depth peel (for the grid's layer_valid check)."""
+  foot (N,), the front image pixel's RGB (N,3) in [0,1] (not premultiplied), spacing (N,). Also the premultiplied GT image, its
+  alpha (H,W,1) and the camera (OpenCV world-to-camera viewmat, image K) and the raw depth peel (for the grid's layer_valid check)."""
   depth = np.asarray(f["depth_peel"][row])                        # (H,W,L) f32
   Kd = np.asarray(f["depth_intrinsics"][row])
   pose = np.asarray(f["camera_pose"][row]).astype(np.float32)
@@ -107,7 +108,7 @@ def load_view(f, row):
   rgb, alpha = (img[..., :3], img[..., 3:4]) if img.shape[-1] == 4 else (img, np.ones_like(img[..., :1]))
   return {
     "row": int(row), "points": pts, "u": u, "v": v, "layer": layer, "foot": foot, "color": color, "spacing": spacing,
-    "gt": np.ascontiguousarray(rgb * alpha), "viewmat": np.linalg.inv(pose @ OPENGL_TO_OPENCV).astype(np.float32),
+    "gt": np.ascontiguousarray(rgb * alpha), "alpha": np.ascontiguousarray(alpha), "viewmat": np.linalg.inv(pose @ OPENGL_TO_OPENCV).astype(np.float32),
     "K": np.asarray(f["image_intrinsics"][row]).astype(np.float32), "pose": pose, "valid": depth > 0,
   }
 
@@ -266,10 +267,11 @@ def flat_numpy(flat):
 
 
 class Cameras:
-  """The GPU-resident targets of a set of views: premultiplied GT (V,H,W,3), viewmats, image Ks."""
+  """The GPU-resident targets of a set of views: premultiplied GT (V,H,W,3), its alpha (V,H,W,1), viewmats, image Ks."""
 
   def __init__(self, views, device):
     self.gt = torch.tensor(np.stack([w["gt"] for w in views]), device=device)
+    self.alpha = torch.tensor(np.stack([w["alpha"] for w in views]), device=device)
     self.viewmat = torch.tensor(np.stack([w["viewmat"] for w in views]), device=device)
     self.K = torch.tensor(np.stack([w["K"] for w in views]), device=device)
     self.H, self.W = self.gt.shape[1:3]
@@ -280,6 +282,38 @@ class Cameras:
   def render(self, p, i):
     rgb, _, _ = render(p, 0, self.viewmat[[i]], self.K[[i]], self.W, self.H)
     return rgb
+
+  def render_rgba(self, p, i):
+    """(rgb (1,H,W,3) over black, alpha (1,H,W,1))"""
+    rgb, alpha, _ = render(p, 0, self.viewmat[[i]], self.K[[i]], self.W, self.H)
+    return rgb, alpha
+
+
+BACKGROUNDS = ("black", "noise")
+
+
+def check_background(cfg):
+  bg = str(cfg.loss.get("background", "black"))
+  if bg not in BACKGROUNDS:
+    raise SystemExit(f"loss.background must be one of {BACKGROUNDS}, got {bg!r}")
+  return bg
+
+
+def step_target(cams, p, cam, background, gen):
+  """(render, GT) for one training step. black: the render over black vs the premultiplied GT (unchanged). noise: both composited
+  over the same fresh per-pixel uniform RGB noise image bg ~ U[0,1]^(H,W,3) drawn from `gen`."""
+  if background == "black":
+    return cams.render(p, cam), cams.gt[cam]
+  rgb, alpha = cams.render_rgba(p, cam)
+  bg = torch.rand(cams.H, cams.W, 3, device=cams.gt.device, generator=gen)
+  return rgb + (1 - alpha) * bg, cams.gt[cam] + (1 - cams.alpha[cam]) * bg
+
+
+def noise_generator(device, seed):
+  """The torch generator of the noise backgrounds (separate from the numpy camera rng); seed: an int or a SeedSequence entropy
+  list."""
+  s = int(np.random.SeedSequence(seed).generate_state(1, np.uint64)[0] >> 1)
+  return torch.Generator(device=device).manual_seed(s)
 
 
 def photometric(dssim, rgb, gt, lambda_dssim):
@@ -311,10 +345,12 @@ def make_adam(params, lrs, offset_wd):
 # optimization
 # ---------------------------------------------------------------------------
 
-def fit_combined(params, anchors_t, cams, cfg, scene_extent, rng, log_step=None):
+def fit_combined(params, anchors_t, cams, cfg, scene_extent, rng, log_step=None, gen=None):
   """The combined fit, in place on `params` (per-anchor, requires_grad). anchors_t: {"pos": (A,3), "labels": [per-view slot ->
   anchor (N_v,)], "levels": [per-view (N_v,)]} on the device, views indexed like cams. Each step: subset view and camera drawn
-  independently from the training views. Returns (photometric, total) per-step losses (numpy)."""
+  independently from the training views; gen: the noise-background generator (loss.background noise). Returns (photometric,
+  total) per-step losses (numpy)."""
+  background = check_background(cfg)
   steps = int(cfg.combined.steps)
   lrs = {k: float(cfg.lr[k]) for k in PARAM_KEYS}
   lrs["offset"] *= scene_extent
@@ -326,8 +362,8 @@ def fit_combined(params, anchors_t, cams, cfg, scene_extent, rng, log_step=None)
     sv = int(rng.choice(views))
     cam = int(rng.choice(views))
     idx, lev = anchors_t["labels"][sv], anchors_t["levels"][sv]
-    rgb = cams.render(gather(params, anchors_t["pos"], idx, lev), cam)
-    photo = photometric(dssim, rgb, cams.gt[cam], float(cfg.loss.lambda_dssim))
+    rgb, gt = step_target(cams, gather(params, anchors_t["pos"], idx, lev), cam, background, gen)
+    photo = photometric(dssim, rgb, gt, float(cfg.loss.lambda_dssim))
     opt["offset"].param_groups[0]["lr"] = lrs["offset"] * exp_factor(
       it, steps, float(cfg.combined.offset_lr_start), float(cfg.combined.offset_lr_end))
     loss = photo
@@ -342,10 +378,11 @@ def fit_combined(params, anchors_t, cams, cfg, scene_extent, rng, log_step=None)
   return torch.stack(photo_log).cpu().numpy(), torch.stack(loss_log).cpu().numpy()
 
 
-def finetune(flat, cams, cfg, scene_extent, rng, log_step=None):
+def finetune(flat, cams, cfg, scene_extent, rng, log_step=None, gen=None):
   """Per-view fine-tune of a flattened subset (view_params; offset/scales/quats/opacities/sh0 trained, means_original frozen),
   in place, fresh Adam; cameras drawn from all training views; offset lr exponential pos_lr_start -> pos_lr_end (x the combined
-  base). Returns (photometric, total) per-step losses (numpy)."""
+  base); gen: the noise-background generator (loss.background noise). Returns (photometric, total) per-step losses (numpy)."""
+  background = check_background(cfg)
   steps = int(cfg.finetune.steps)
   params = {k: flat[k].requires_grad_(True) for k in PARAM_KEYS}
   lrs = {k: float(cfg.lr[k]) for k in PARAM_KEYS}
@@ -356,8 +393,8 @@ def finetune(flat, cams, cfg, scene_extent, rng, log_step=None):
   photo_log, loss_log = [], []   # detached GPU scalars, copied to the host once at the end (no per-step sync)
   for it in range(1, steps + 1):
     cam = int(rng.choice(views))
-    rgb = cams.render(flat_render_params(flat), cam)
-    photo = photometric(dssim, rgb, cams.gt[cam], float(cfg.loss.lambda_dssim))
+    rgb, gt = step_target(cams, flat_render_params(flat), cam, background, gen)
+    photo = photometric(dssim, rgb, gt, float(cfg.loss.lambda_dssim))
     opt["offset"].param_groups[0]["lr"] = lrs["offset"] * exp_factor(
       it, steps, float(cfg.finetune.pos_lr_start), float(cfg.finetune.pos_lr_end))
     loss = photo

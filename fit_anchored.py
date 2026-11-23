@@ -142,6 +142,8 @@ def main(cfg: DictConfig) -> None:
   # everything else the combined fit depends on (a saved fit is only reused when this matches exactly)
   combined_setup = {k: OmegaConf.to_container(cfg, resolve=True)[k]
                     for k in ("levels", "init_opacity", "seed", "combined", "lr", "loss")}
+  if an.check_background(cfg) == "black":   # the default: states saved before loss.background existed stay resumable
+    combined_setup["loss"].pop("background", None)
   if os.path.exists(done_path):
     z = np.load(combined_path)
     _check(combined_path, {"labels_sha1": str(z["labels_sha1"]), "n_anchors": int(z["n_anchors"]), **json.loads(str(z["setup"]))},
@@ -154,7 +156,7 @@ def main(cfg: DictConfig) -> None:
     torch.manual_seed(int(cfg.seed))
     params = {k: v.requires_grad_(True) for k, v in an.init_params(anchors, int(cfg.levels), float(cfg.init_opacity), dev).items()}
     photo, combined_loss = an.fit_combined(params, anchors_t, cams, cfg, scene_extent, np.random.default_rng(int(cfg.seed)),
-                                           _log_step("combined"))
+                                           _log_step("combined"), gen=an.noise_generator(dev, int(cfg.seed)))
     params = {k: v.detach() for k, v in params.items()}
     an.save_npz_atomic(combined_path, labels_sha1=digest, n_anchors=n_anchor, setup=json.dumps(combined_setup),
                        photom=photo, loss=combined_loss,
@@ -193,7 +195,8 @@ def main(cfg: DictConfig) -> None:
     if regression:   # the subset straight from the combined fit, also without shared_output_dir
       reg.setdefault("shared", {})[str(v)] = an.heldout_psnr(an.flat_render_params(flat), held_cams)
     rng = np.random.default_rng([int(cfg.seed), M, v])
-    photo, loss = an.finetune(flat, cams, cfg, scene_extent, rng, _log_step("finetune", {"finetune/view": v}))
+    photo, loss = an.finetune(flat, cams, cfg, scene_extent, rng, _log_step("finetune", {"finetune/view": v}),
+                              gen=an.noise_generator(dev, [int(cfg.seed), M, v]))
     if regression:
       reg.setdefault("finetuned", {})[str(v)] = an.heldout_psnr(an.flat_render_params(flat), held_cams)
     config = _view_config(cfg, hdf5_path, rows, train, held, v, "finetune",
