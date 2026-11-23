@@ -21,7 +21,7 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import anchored_3dgs as an  # noqa: E402
 
-COLORS = {0: "#2a78d6", 1: "#eb6834"}
+COLORS = {0: "#2a78d6", 1: "#eb6834", 2: "#1baf7a"}
 
 
 def grid_path(root, M, v):
@@ -53,13 +53,15 @@ def psnr(a, b):
 
 @torch.no_grad()
 def heldout(g, cams):
-  """(mean PSNR over black, mean PSNR over white) over the held-out cams"""
-  pb, pw = [], []
+  """(mean PSNR over black, mean PSNR over white, mean summed rendered alpha outside the GT silhouette (alpha == 0), in
+  fully-opaque-pixel equivalents) over the held-out cams"""
+  pb, pw, sp = [], [], []
   for i in range(len(cams)):
     rgb, a = render(g, cams, i)
     pb.append(psnr(rgb, cams.gt[i]))
     pw.append(psnr(rgb + (1 - a), cams.gt[i] + (1 - cams.alpha[i])))
-  return float(np.mean(pb)), float(np.mean(pw))
+    sp.append(float(a[cams.alpha[i] == 0].sum()))
+  return float(np.mean(pb)), float(np.mean(pw)), float(np.mean(sp))
 
 
 def main():
@@ -81,9 +83,10 @@ def main():
     r = res[name] = {}
     for kind, root in zip(("finetuned", "shared"), roots):
       per = [heldout(load_flat(grid_path(root, M, v), dev), cams) for v in train]
-      pb, pw = np.array(per).T
+      pb, pw, sp = np.array(per).T
       r[kind] = {"psnr_black_mean": float(pb.mean()), "psnr_black_se": float(pb.std(ddof=1) / np.sqrt(len(pb))),
                  "psnr_white_mean": float(pw.mean()), "psnr_white_se": float(pw.std(ddof=1) / np.sqrt(len(pw))),
+                 "alpha_outside_silhouette_mean": float(sp.mean()),
                  "psnr_black_per_view": pb.tolist(), "psnr_white_per_view": pw.tolist()}
       ops, cols = [], []
       for v in train:
@@ -95,6 +98,8 @@ def main():
       r[kind].update({"n_gaussians_pooled": int(len(op)), "colour_all_zero": float((col == 0).all(1).mean()),
                       "colour_any_zero": float((col == 0).any(1).mean()), "opacity_lt_0.02": float((op < 0.02).mean()),
                       "opacity_gt_0.98": float((op > 0.98).mean()), "opacity_median": float(np.median(op))})
+      zero = (col == 0).all(1)
+      r[kind]["opacity_lt_0.02_among_colour_zero"] = float((op[zero] < 0.02).mean())
       if kind == "finetuned":
         pooled[name] = (op, col.max(1))
       print(name, kind, {k: v for k, v in r[kind].items() if "per_view" not in k}, flush=True)
@@ -117,7 +122,7 @@ def main():
   for a in ax:
     a.legend(frameon=False)
     a.spines[["top", "right"]].set_visible(False)
-  fig.suptitle(f"Mesh {M}, all {len(train)} fine-tuned grids pooled, training loss over black vs over random noise")
+  fig.suptitle(f"Mesh {M}, all {len(train)} fine-tuned grids pooled, by training-loss background")
   fig.tight_layout()
   fig.savefig(os.path.join(out, "fit_noise_bg.png"), dpi=130)
 
