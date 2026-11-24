@@ -5,7 +5,8 @@ wandb-workspaces, like wandb_workspace.py for the diffusion runs.
   python wandb_workspace_reanchor.py save=true               # save it as a NEW view in the project and print its URL
   python wandb_workspace_reanchor.py save=true url=<view URL> # update that view in place (panels + settings; its runset is kept)
 
-Sections: held-out PSNR (views 45-49, over white and over black) with the three references as lines in the same panel (A as-is,
+Sections: for the full-dataset runs (data.dataset full) one per eval set (val, shard2, train_heldout: eval/<set>/* with its
+references ref/<set>/*, and on val the A-ablated eval); then the one-mesh runs' panels: held-out PSNR (views 45-49, over white and over black) with the three references as lines in the same panel (A as-is,
 B's own fit = ceiling, matched copy of A's Gaussians into B's slots = floor); the same with A ablated at eval time (does the model
 read A?); the train losses; bookkeeping (lr, grad norm, step time, memory, token counts). The runset is a regex on the run name.
 """
@@ -15,6 +16,8 @@ import wandb_workspaces.workspaces as ws
 from omegaconf import DictConfig
 
 REFS = (("A_asis", "A as-is"), ("B_fit", "B's own fit (ceiling)"), ("matched32", "matched copy (floor)"))
+FULL_SETS = (("val", "new100 val meshes (held-out views)"), ("shard2", "shard2 unseen meshes (held-out views)"),
+             ("train_heldout", "training meshes, held-out views"))
 
 
 def line(title, ys, x, smoothing=0.0, **kw):
@@ -41,8 +44,20 @@ def workspace(cfg):
   book = [line("learning rate", "train/lr", x), line("grad norm", "train/grad_norm", x, sm),
           line("seconds per step", "train/step_seconds", x, sm), line("max GPU memory (GB)", "train/max_mem_gb", x),
           line("tokens: B", "train/tokens_b", x, sm), line("tokens: A", "train/tokens_a", x, sm)]
-  sections = [section("held-out PSNR (views 45-49), with references", held),
-              section("does it use A? (A ablated at eval)", ablate),
+  full = []
+  for name, title in FULL_SETS:   # the full-dataset runs (data.dataset full): one section per eval set
+    panels = [line(f"{title}: PSNR over {bg} (model + references)", [f"eval/{name}/{bg}", *[f"ref/{name}/{k}_{bg}" for k, _ in REFS]], x)
+              for bg in ("white", "black")]
+    if name == "val":
+      panels += [line(f"{title}: model vs A ablated at eval, over {bg}", [f"eval/{name}/{bg}", f"eval/{name}/ablate_a_{bg}"], x)
+                 for bg in ("white", "black")]
+    full.append(section(f"full dataset -- {title}", panels))
+  book.append(line("data wait per step (s)", "train/data_wait_seconds", x, sm))
+  book.append(line("eval seconds", "eval/seconds", x))
+  book.append(line("LR cycle", "train/cycle", x))
+  sections = [*full,
+              section("one mesh: held-out PSNR (views 45-49), with references", held),
+              section("one mesh: does it use A? (A ablated at eval)", ablate),
               section("training", train),
               section("bookkeeping", book, columns=3, is_open=False)]
   return ws.Workspace(
