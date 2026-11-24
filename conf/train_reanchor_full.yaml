@@ -1,0 +1,61 @@
+# train_reanchor.py on the full dataset (data.dataset full): the training meshes of a render h5 (train_gs.py's mesh split), streamed
+# by DataLoader workers; the model and the loss are train_reanchor.yaml's (the one-mesh run's).
+#   python train_reanchor.py --config-name train_reanchor_full data.grids_dir=... eval.sets.shard2.render_h5=... ...
+# Each sample: a random training mesh, a random A != B of views 0 .. train_views-1, the loss at views_per_pair random views of the
+# same range. Normalization: moments over the training meshes (computed once, cached in <output_dir>/moments.pt).
+# Eval (fixed seeded pairs, the same every eval; render at the held-out data.eval_views): eval.sets, each logged as
+# eval/<set>/{black,white} with its references ref/<set>/<A_asis|B_fit|matched32>_{black,white} (computed once, cached per mesh).
+defaults:
+  - train_reanchor
+  - _self_
+
+data:
+  dataset: full
+  render_h5: /app/bla/new100/trellis_new100_50views_eevee_504.h5
+  grids_dir: ???             # <grids_dir>/mesh<M>_view<V>.h5 for every mesh of render_h5, views 0 .. train_views-1
+  mesh_split:                # train_gs.py's data/mesh_split=fraction with its default seed: the diffusion runs' val meshes
+    val_fraction: 0.1
+    seed: 42
+  train_meshes: null         # null: every training mesh of the split; a list: only these (must be training meshes; local tests)
+  workers: 12                # DataLoader workers streaming training samples
+  prefetch_factor: 4
+  moments:
+    own_views_per_mesh: 10   # output moments (own frame) + clamp range over this many random views per training mesh
+    pairs_per_mesh: 3        # A-input moments (A in B's frame) over this many random pairs per training mesh
+    seed: 12345
+
+eval:
+  seed: 0
+  ablate_sets: [val]         # sets also evaluated with A's params replaced by the mean (eval/<set>/ablate_a_*)
+  sets:
+    train_heldout:           # training meshes, at their held-out views
+      render_h5: ${data.render_h5}
+      grids_dir: ${data.grids_dir}
+      meshes: train          # train | val (data.mesh_split's) | all (every mesh of render_h5)
+      n_meshes: 20           # null: all of them
+      pairs_per_mesh: 2
+    val:                     # the split's validation meshes
+      render_h5: ${data.render_h5}
+      grids_dir: ${data.grids_dir}
+      meshes: val
+      n_meshes: null
+      pairs_per_mesh: 4
+    shard2:                  # meshes never in the training h5 (checked: no shared mesh path)
+      render_h5: ???
+      grids_dir: ???
+      meshes: all
+      n_meshes: 30
+      pairs_per_mesh: 2
+
+train:
+  pairs_per_step: 4
+  views_per_pair: 8
+  max_seconds: 28800         # 8 h of training clock
+  cycle_seconds: 7200        # 4 warmup-stable-decay cycles (the diffusion runs' time_wsd cycle_seconds)
+  decay_fraction: 0.2        # of each cycle (the diffusion runs')
+  eval_every: 2000
+  log_every: 10
+  checkpoint_every_seconds: 1800
+
+wandb:
+  tags: [reanchor, full]

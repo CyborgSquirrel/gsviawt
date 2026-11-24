@@ -6,6 +6,7 @@
 mode: train
 
 data:
+  dataset: mesh              # mesh: ONE mesh (data.mesh), GPU-resident | full: many meshes, streamed (conf/train_reanchor_full.yaml)
   render_h5: /app/bla/new100/trellis_new100_50views_eevee_504.h5
   grids_dir: /app/bla/reanchor/grids79          # <grids_dir>/mesh<M>_view<V>.h5 (dense or sparse)
   mesh: 79
@@ -39,10 +40,15 @@ train:
   lr: 1.0e-4
   weight_decay: 0.01         # AdamW's default
   warmup_steps: 500
-  decay_fraction: 0.1        # cosine to min_lr over the last fraction of max_seconds
+  decay_fraction: 0.1        # cosine to min_lr over the last fraction of max_seconds (of each cycle, with cycle_seconds)
   min_lr: 1.0e-6
+  cycle_seconds: null        # null: one warmup-stable-decay cycle over max_seconds; else cycles of this much training clock (must
+                             # divide max_seconds), each warmup -> flat -> cosine decay; the first warms up over warmup_steps steps,
+                             # the later ones from min_lr over cycle_warmup_seconds of the clock (lr_factor)
+  cycle_warmup_seconds: 150
   grad_clip: 1.0
   max_seconds: 9900          # training time (eval / checkpoint time excluded); the run stops there
+  max_wall_seconds: null     # data.dataset full: save last.pt and exit (code 0) after this much wall time since process start
   max_steps: null
   seed: 0
   log_every: 1               # W&B every step (overfit convention)

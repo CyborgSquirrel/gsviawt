@@ -115,15 +115,21 @@ def rows_to_frame(x0, xyz, c2w_from, c2w_to):
 # one mesh, GPU-resident
 # ---------------------------------------------------------------------------
 
-def encode_view(f, r, grid_path, num_layers=6):
-  """Render h5 row r (open h5py file f) and its grid file -> (xyz (N, 3) the hit slots' anchors in the view's own camera frame,
-  hit (L, H, W) bool, x0 (N, 14) the raw rows in the own frame (encode_grid, default encoding), the grid), numpy, rows in
-  np.nonzero(hit) order."""
+def view_cloud(f, r, num_layers=6):
+  """Render h5 row r's depth-peel point cloud -> (xyz_cam (L, H, W, 3) own camera frame, hit (L, H, W) bool), numpy."""
   depth = np.asarray(f["depth_peel"][r]).astype(np.float32)
   xyz_cam, hit = dense_unproject_camera(depth, np.asarray(f["depth_intrinsics"][r], np.float32))
   xyz_cam, hit = xyz_cam.transpose(2, 0, 1, 3), hit.transpose(2, 0, 1)                           # (L, H, W, .)
   if hit.shape[0] != num_layers:
     raise SystemExit(f"row {r}: {hit.shape[0]} depth-peel layers, expected {num_layers}")
+  return xyz_cam, hit
+
+
+def encode_view(f, r, grid_path, num_layers=6):
+  """Render h5 row r (open h5py file f) and its grid file -> (xyz (N, 3) the hit slots' anchors in the view's own camera frame,
+  hit (L, H, W) bool, x0 (N, 14) the raw rows in the own frame (encode_grid, default encoding), the grid), numpy, rows in
+  np.nonzero(hit) order."""
+  xyz_cam, hit = view_cloud(f, r, num_layers)
   grid = read_grid(grid_path)
   if int(grid.attrs.get("primary_view_row", r)) != r:
     raise SystemExit(f"{grid_path}: primary_view_row {grid.attrs.get('primary_view_row')} != render row {r}")
@@ -186,6 +192,16 @@ class MeshData:
   def viewmats(self, b, views):
     """(V, 4, 4) world-to-camera of `views` with "world" = B's camera frame (cameras.relative_viewmats' convention)."""
     return torch.linalg.inv(self.c2w[list(views)]) @ self.c2w[b]
+
+  def bundle(self, a, b, use_a=True, views=None):
+    """Pair (a, b) as a pair bundle (see pair_tokens; with `views`: also the render targets at those views)."""
+    bd = {"b_xyz": self.xyz[b], "b_hit": self.hit[b], "fx": self.K_depth[b][0, 0]}
+    if use_a:
+      (bd["a_rows"], bd["a_xyz"]), bd["a_hit"] = self.a_rows_in_b(a, b), self.hit[a]
+    if views is not None:
+      views = list(views)
+      bd.update(viewmats=self.viewmats(b, views), K=self.K[views], gt=self.gt[views], alpha=self.alpha[views])
+    return bd
 
 
 # ---------------------------------------------------------------------------
@@ -443,22 +459,30 @@ class Batcher:
     self.patch, self.z_ref, self.slot_scale_px, self.decode_clamp = patch_size, z_ref, slot_scale_px, decode_clamp
 
   def inputs(self, pairs, empty, use_a=True, a_override=None):
-    """pairs: [(a, b)]; empty: the model's B token (14,). a_override (optional): {i: (rows (N, 14) raw in B's frame, xyz (N, 3),
-    hit)} replacing sample i's A (identity / ablation evals)."""
-    ka, ca, pa, kb, cb, pb = [], [], [], [], [], []
+    """pairs: [(a, b)] of the MeshData; empty: the model's B token (14,). a_override (optional): {i: (rows (N, 14) raw in B's
+    frame, xyz (N, 3), hit)} replacing sample i's A (identity / ablation evals)."""
+    bundles = []
     for i, (a, b) in enumerate(pairs):
-      fx = self.d.K_depth[b][0, 0]
+      over = a_override is not None and i in a_override
+      bd = self.d.bundle(a, b, use_a and not over)
+      if use_a and over:
+        bd["a_rows"], bd["a_xyz"], bd["a_hit"] = a_override[i]
+      bundles.append(bd)
+    return self.tokens(bundles, empty, use_a)
+
+  def tokens(self, bundles, empty, use_a=True):
+    """Pair bundles (dicts: b_xyz (N_B, 3), b_hit (L, H, W), fx (B's depth fx); with use_a also a_rows (N_A, 14) raw in B's frame,
+    a_xyz (N_A, 3) in B's frame, a_hit) -> the model's inputs (content_a, pos_a, content_b, pos_b, packs)."""
+    ka, ca, pa, kb, cb, pb = [], [], [], [], [], []
+    for bd in bundles:
+      fx = bd["fx"]
       scale = fx / (self.patch * self.z_ref)                       # one unit = one patch width at depth z_ref
       rel = fx / (self.slot_scale_px * self.z_ref)
-      centre = token_centre(self.d.xyz[b], self.d.hit[b], self.patch)
-      k, c, p = branch_tokens(empty, self.d.xyz[b], self.d.hit[b], centre, scale, rel, self.patch)
+      centre = token_centre(bd["b_xyz"], bd["b_hit"], self.patch)
+      k, c, p = branch_tokens(empty, bd["b_xyz"], bd["b_hit"], centre, scale, rel, self.patch)
       kb.append(k); cb.append(c); pb.append(p)
       if use_a:
-        if a_override is not None and i in a_override:
-          rows, xyz, hit = a_override[i]
-        else:
-          (rows, xyz), hit = self.d.a_rows_in_b(a, b), self.d.hit[a]
-        k, c, p = branch_tokens((rows - self.in_mean) / self.in_std, xyz, hit, centre, scale, rel, self.patch)
+        k, c, p = branch_tokens((bd["a_rows"] - self.in_mean) / self.in_std, bd["a_xyz"], bd["a_hit"], centre, scale, rel, self.patch)
         ka.append(k); ca.append(c); pa.append(p)
     keep_b = torch.stack(kb)
     keep_a = torch.stack(ka) if use_a else None
@@ -474,10 +498,14 @@ class Batcher:
 
   def gaussians(self, gauss, i, b):
     """Sample i (anchored on view b) of a decoded dict -> render params in B's frame (gsplat's inputs)."""
-    hit = self.d.hit[b]
-    take = lambda k: gauss[k][i].permute(0, 2, 3, 1)[hit]                                         # (N, C)
-    return {"means": self.d.xyz[b] + take("offset"), "quats": take("rotation"), "scales": take("scale"),
-            "opacities": take("opacity")[:, 0], "colors": take("sh_dc")[:, None]}
+    return slot_gaussians(gauss, i, self.d.xyz[b], self.d.hit[b])
+
+
+def slot_gaussians(gauss, i, xyz, hit):
+  """Sample i of a decoded dict, anchored on B's slots (xyz (N, 3) in B's frame, hit (L, H, W)) -> render params in B's frame."""
+  take = lambda k: gauss[k][i].permute(0, 2, 3, 1)[hit]                                           # (N, C)
+  return {"means": xyz + take("offset"), "quats": take("rotation"), "scales": take("scale"),
+          "opacities": take("opacity")[:, 0], "colors": take("sh_dc")[:, None]}
 
 
 def raw_gaussians(rows, xyz):
@@ -553,3 +581,174 @@ def world_rows_to_b(data, rows, b):
   x0 = encode_grid(grid, source)
   li, yi, xi = np.nonzero(hit)
   return torch.as_tensor(x0[:, li, yi, xi].T, device=data.device)
+
+
+# ---------------------------------------------------------------------------
+# the full dataset (train_reanchor data.dataset full): many meshes, streamed
+# ---------------------------------------------------------------------------
+# Training samples are drawn by DataLoader workers (StreamPairs) and loaded from the render h5 + the grids on the fly: a random
+# training mesh, a random ordered pair A != B of its grid views, views_per_pair random loss views of the same views (no repeats;
+# A and B may be among them, as in the one-mesh mode). Only A's grid is read (B needs only its depth-peel cloud). The worker
+# sends CPU tensors (images uint8); stream_bundle turns a sample into the pair bundle Batcher.tokens takes, on the GPU, with the
+# same ops as MeshData (so mesh m streamed == MeshData(m), tests/test_reanchor.py).
+
+def mesh_split(render_h5, val_fraction=0.1, seed=42):
+  """(train_meshes, val_meshes): mesh indices of the render h5, split exactly as train_gs.py's data.mesh_split (fraction, the
+  default): gs_dataset.split_meshes_by_fraction on the render catalog -- a hash of (seed, mesh path)."""
+  from gs_dataset import render_catalog, split_meshes_by_fraction
+  train, val = split_meshes_by_fraction(render_catalog([render_h5]), val_fraction, seed)
+  return sorted(set(train.df["mesh_id"].to_list())), sorted(set(val.df["mesh_id"].to_list()))
+
+
+def mesh_paths(render_h5):
+  with h5py.File(render_h5, "r") as f:
+    return [p.decode() if isinstance(p, bytes) else str(p) for p in f["mesh_paths"][()]]
+
+
+def draw_pair(rng, meshes, n_views, views_per_pair):
+  """One training sample: (mesh uniform over `meshes`, a != b uniform over 0 .. n_views-1, views_per_pair loss views of
+  0 .. n_views-1 without repeats)."""
+  m = int(meshes[int(rng.integers(len(meshes)))])
+  a, b = (int(x) for x in rng.choice(n_views, 2, replace=False))
+  return m, a, b, [int(v) for v in rng.choice(n_views, views_per_pair, replace=False)]
+
+
+def load_pair(f, rows, grids_dir, m, a, b, views, num_layers=6):
+  """Sample (m, a, b, views) from the open render h5 f (rows: mesh_rows) -> CPU tensors: A's own-frame raw rows / anchors / hit
+  (encode_view), B's own-frame anchors / hit, the poses (OpenGL, h5) of A, B and the views, B's depth K, the views' image K and
+  uint8 RGBA images (V, H, W, 4)."""
+  ra_, rb = int(rows[m][a]), int(rows[m][b])
+  xyz_a, hit_a, x0_a, _ = encode_view(f, ra_, os.path.join(grids_dir, f"mesh{m}_view{a}.h5"), num_layers)
+  xyz_b, hit_b = view_cloud(f, rb, num_layers)
+  vr = [int(rows[m][v]) for v in views]
+  t = lambda x: torch.from_numpy(np.ascontiguousarray(x))
+  f32 = lambda x: t(np.asarray(x, np.float32))
+  return {"mesh": m, "a": a, "b": b, "views": list(views),
+          "a_x0": f32(x0_a), "a_xyz": f32(xyz_a), "a_hit": t(hit_a), "b_xyz": f32(xyz_b[hit_b]), "b_hit": t(hit_b),
+          "pose_a": f32(f["camera_pose"][ra_]), "pose_b": f32(f["camera_pose"][rb]), "K_depth_b": f32(f["depth_intrinsics"][rb]),
+          "pose_v": f32(np.stack([f["camera_pose"][r] for r in vr])), "K_v": f32(np.stack([f["image_intrinsics"][r] for r in vr])),
+          "images": t(np.stack([np.asarray(f["images"][r]) for r in vr]))}
+
+
+class StreamPairs(torch.utils.data.IterableDataset):
+  """An endless stream of training samples (draw_pair -> load_pair), for a DataLoader with batch_size None. Worker w draws with
+  default_rng([*seed, w]) (seed: [train seed, start step] -- a resumed run continues with a fresh, reproducible stream)."""
+
+  def __init__(self, render_h5, grids_dir, meshes, n_views, views_per_pair, seed, num_layers=6):
+    super().__init__()
+    self.render_h5, self.grids_dir, self.meshes = render_h5, grids_dir, [int(m) for m in meshes]
+    self.n_views, self.views_per_pair, self.num_layers = int(n_views), int(views_per_pair), num_layers
+    self.seed = [int(s) for s in np.atleast_1d(seed)]
+    self._f = self._rows = None
+
+  def load(self, m, a, b, views):
+    if self._f is None:
+      self._f = h5py.File(self.render_h5, "r")
+      self._rows = mesh_rows(self.render_h5)
+    return load_pair(self._f, self._rows, self.grids_dir, m, a, b, views, self.num_layers)
+
+  def draws(self):
+    info = torch.utils.data.get_worker_info()
+    rng = np.random.default_rng(self.seed + [info.id if info is not None else 0])
+    while True:
+      yield draw_pair(rng, self.meshes, self.n_views, self.views_per_pair)
+
+  def __iter__(self):
+    if torch.utils.data.get_worker_info() is not None:
+      torch.set_num_threads(1)
+      self._f = self._rows = None
+    for m, a, b, views in self.draws():
+      yield self.load(m, a, b, views)
+
+
+def stream_bundle(s, device, use_a=True):
+  """A load_pair sample -> the pair bundle (B's frame) with its render targets, on `device` (MeshData's ops)."""
+  t = lambda x: x.to(device, non_blocking=True)
+  c2w_b = c2w_cv(t(s["pose_b"]))
+  bd = {"b_xyz": t(s["b_xyz"]), "b_hit": t(s["b_hit"]), "fx": t(s["K_depth_b"])[0, 0]}
+  if use_a:
+    bd["a_rows"], bd["a_xyz"] = rows_to_frame(t(s["a_x0"]), t(s["a_xyz"]), c2w_cv(t(s["pose_a"])), c2w_b)
+    bd["a_hit"] = t(s["a_hit"])
+  im = t(s["images"]).float()
+  im = im / torch.tensor(255.0, device=im.device)    # a tensor divisor: true division (== numpy's; `/ 255` multiplies by 1/255)
+  alpha = im[..., 3:4]
+  bd["gt"] = (im[..., :3] * alpha).permute(0, 3, 1, 2).contiguous()
+  bd["alpha"] = alpha.permute(0, 3, 1, 2).contiguous()
+  bd["viewmats"] = torch.linalg.inv(c2w_cv(t(s["pose_v"]))) @ c2w_b
+  bd["K"] = t(s["K_v"])
+  return bd
+
+
+class MomentTasks(torch.utils.data.Dataset):
+  """One item per training mesh: sums over its `own` views' raw own-frame rows (output moments) and its `pairs`' A rows in B's
+  frame (A-input moments), plus the token counts of its own views. Item = {n, s, ss, lo, hi (own), pn, ps, pss (paired), tokens}."""
+
+  def __init__(self, render_h5, grids_dir, plan, patch=14, num_layers=6):
+    self.render_h5, self.grids_dir, self.plan, self.patch, self.num_layers = render_h5, grids_dir, plan, patch, num_layers
+    self._f = self._rows = None
+
+  def __len__(self):
+    return len(self.plan)
+
+  def __getitem__(self, i):
+    if self._f is None:
+      self._f = h5py.File(self.render_h5, "r")
+      self._rows = mesh_rows(self.render_h5)
+    torch.set_num_threads(1)
+    m, own, pairs = self.plan[i]
+    cache = {}
+
+    def view(v):
+      if v not in cache:
+        r = int(self._rows[m][v])
+        xyz, hit, x0, _ = encode_view(self._f, r, os.path.join(self.grids_dir, f"mesh{m}_view{v}.h5"), self.num_layers)
+        cache[v] = (torch.from_numpy(np.asarray(x0, np.float64)), torch.from_numpy(np.asarray(xyz, np.float64)), hit,
+                    c2w_cv(torch.from_numpy(np.asarray(self._f["camera_pose"][r], np.float64))))
+      return cache[v]
+
+    x = torch.cat([view(v)[0] for v in own])
+    tokens = []
+    for v in own:
+      hit = view(v)[2]
+      L, H, W = hit.shape
+      p = self.patch
+      tokens.append(int(hit.reshape(L, H // p, p, W // p, p).any(axis=(2, 4)).sum()))
+    pr = torch.cat([rows_to_frame(view(a)[0], view(a)[1], view(a)[3], view(b)[3])[0] for a, b in pairs])
+    return {"mesh": m, "n": len(x), "s": x.sum(0), "ss": (x * x).sum(0), "lo": x.amin(0), "hi": x.amax(0),
+            "pn": len(pr), "ps": pr.sum(0), "pss": (pr * pr).sum(0), "tokens": tokens}
+
+
+def moment_plan(meshes, n_views, own_per_mesh, pairs_per_mesh, seed):
+  """Per training mesh: own_per_mesh random views and pairs_per_mesh random ordered pairs (a != b) of 0 .. n_views-1."""
+  rng = np.random.default_rng(seed)
+  plan = []
+  for m in meshes:
+    own = sorted(int(v) for v in rng.choice(n_views, min(own_per_mesh, n_views), replace=False))
+    pairs = [tuple(int(x) for x in rng.choice(n_views, 2, replace=False)) for _ in range(pairs_per_mesh)]
+    plan.append((int(m), own, pairs))
+  return plan
+
+
+def full_moments(render_h5, grids_dir, meshes, n_views, own_per_mesh, pairs_per_mesh, seed, workers):
+  """The normalization over the training meshes: (in_mean, in_std) of A's rows in B's frame over the plan's pairs, (out_mean,
+  out_std, lo, hi) of the own-frame rows over its own views (population std, clamp_min 1e-4: MeshData's own / paired moments),
+  and the token counts per own view {mesh: [counts]}. float32 CPU tensors."""
+  ds = MomentTasks(render_h5, grids_dir, moment_plan(meshes, n_views, own_per_mesh, pairs_per_mesh, seed))
+  dl = torch.utils.data.DataLoader(ds, batch_size=None, num_workers=int(workers))
+  acc = None
+  tokens = {}
+  for it in dl:
+    tokens[int(it["mesh"])] = it["tokens"]
+    if acc is None:
+      acc = {k: it[k] for k in ("n", "s", "ss", "lo", "hi", "pn", "ps", "pss")}
+      continue
+    for k in ("n", "s", "ss", "pn", "ps", "pss"):
+      acc[k] = acc[k] + it[k]
+    acc["lo"], acc["hi"] = torch.minimum(acc["lo"], it["lo"]), torch.maximum(acc["hi"], it["hi"])
+  mean = acc["s"] / acc["n"]
+  std = (acc["ss"] / acc["n"] - mean ** 2).clamp_min(0).sqrt()
+  pmean = acc["ps"] / acc["pn"]
+  pstd = (acc["pss"] / acc["pn"] - pmean ** 2).clamp_min(0).sqrt()
+  f = lambda x: x.float()
+  return {"in_mean": f(pmean), "in_std": f(pstd).clamp_min(1e-4), "out_mean": f(mean), "out_std": f(std).clamp_min(1e-4),
+          "lo": f(acc["lo"]), "hi": f(acc["hi"]), "tokens": tokens, "n_rows": int(acc["n"]), "n_pair_rows": int(acc["pn"])}

@@ -244,14 +244,18 @@ def evaluate(model, batcher, data, pairs, views, use_a, bf16, ablate_a=False, do
 def diagnostics(gauss, batcher, data, pairs):
   """Per-step diagnostics of the prediction (valid B slots): fraction of scales at the clamp, median |offset| in B pixel footprints,
   mean opacity, fraction of near-empty (opacity < 0.004)."""
+  return bundle_diagnostics(gauss, batcher, [data.bundle(a, b, use_a=False) for a, b in pairs])
+
+
+def bundle_diagnostics(gauss, batcher, bundles):
   lo, hi = float(batcher.lo[ra.SCALE].min()), float(batcher.hi[ra.SCALE].max())
   d = {"clamp": [], "off": [], "op": [], "empty": []}
-  for i, (_, b) in enumerate(pairs):
-    hit = data.hit[b]
+  for i, bd in enumerate(bundles):
+    hit = bd["b_hit"]
     raw = gauss["raw_scale"][i].permute(0, 2, 3, 1)[hit]
     d["clamp"].append(float(((raw <= lo + 1e-6) | (raw >= hi - 1e-6)).float().mean()))
     off = gauss["offset"][i].permute(0, 2, 3, 1)[hit].norm(dim=1)
-    foot = data.xyz[b][:, 2] / data.K_depth[b][0, 0]
+    foot = bd["b_xyz"][:, 2] / bd["fx"]
     d["off"].append(float((off / foot).median()))
     op = gauss["opacity"][i].permute(0, 2, 3, 1)[hit]
     d["op"].append(float(op.mean()))
@@ -259,14 +263,44 @@ def diagnostics(gauss, batcher, data, pairs):
   return {f"diag/{k}": float(np.mean(v)) for k, v in d.items()}
 
 
+def n_cycles(cfg):
+  """The number of LR cycles: 1 without train.cycle_seconds, else max_seconds / cycle_seconds (must divide it)."""
+  cyc = cfg.train.get("cycle_seconds")
+  if cyc is None:
+    return 1
+  n = float(cfg.train.max_seconds) / float(cyc)
+  if float(cyc) <= 0 or abs(n - round(n)) > 1e-9:
+    raise SystemExit(f"train.cycle_seconds={cyc} must divide train.max_seconds={cfg.train.max_seconds}")
+  return int(round(n))
+
+
+def cycle_of(cfg, seconds):
+  """The LR cycle the training clock is in (0-based; the last cycle's index once the clock is past max_seconds)."""
+  cyc = cfg.train.get("cycle_seconds")
+  return 0 if cyc is None else min(int(seconds // float(cyc)), n_cycles(cfg) - 1)
+
+
 def lr_factor(cfg, step, seconds):
+  """LR / train.lr at a step and training clock. Without train.cycle_seconds: a linear warmup over warmup_steps steps, flat, a
+  cosine to min_lr over the last decay_fraction of max_seconds. With cycle_seconds: max_seconds cut into cycles of that length
+  (warmup-stable-decay each, decay_fraction of each cycle): the first cycle exactly as above over its own length; every later
+  one warms up linearly from min_lr over cycle_warmup_seconds of the clock, then flat, then the cosine to min_lr."""
   w = min(1.0, (step + 1) / max(1, int(cfg.train.warmup_steps)))
-  frac = seconds / float(cfg.train.max_seconds)
+  m = float(cfg.train.min_lr) / float(cfg.train.lr)
   df = float(cfg.train.decay_fraction)
-  if frac > 1 - df:
-    m = float(cfg.train.min_lr) / float(cfg.train.lr)
-    w *= m + (1 - m) * 0.5 * (1 + math.cos(math.pi * min(1.0, (frac - (1 - df)) / df)))
-  return w
+  cyc = cfg.train.get("cycle_seconds")
+  if cyc is None:
+    frac = seconds / float(cfg.train.max_seconds)
+    if frac > 1 - df:
+      w *= m + (1 - m) * 0.5 * (1 + math.cos(math.pi * min(1.0, (frac - (1 - df)) / df)))
+    return w
+  k = cycle_of(cfg, seconds)
+  frac = (seconds - k * float(cyc)) / float(cyc)
+  d = 0.5 * (1 + math.cos(math.pi * min(1.0, (frac - (1 - df)) / df))) if frac > 1 - df else 1.0
+  if k == 0:
+    return w * (m + (1 - m) * d)
+  wt = min(1.0, (seconds - k * float(cyc)) / max(1e-9, float(cfg.train.cycle_warmup_seconds)))
+  return m + (1 - m) * wt * d
 
 
 def donor_setup(cfg, nv, start_step, n_eval):
@@ -404,10 +438,320 @@ def train(cfg, data, batcher, device):
   log.info("done: %d steps, %.0f s training", step, clock)
 
 
+# ---------------------------------------------------------------------------
+# data.dataset full: the training meshes of a render h5, streamed (conf/train_reanchor_full.yaml)
+# ---------------------------------------------------------------------------
+
+T_START = time.time()
+
+
+def full_meshes(cfg):
+  """(train_meshes, val_meshes) of data.render_h5 by train_gs's mesh split; checks no eval set's other h5 shares a mesh path."""
+  sp = cfg.data.mesh_split
+  train_m, val_m = ra.mesh_split(cfg.data.render_h5, float(sp.val_fraction), int(sp.seed))
+  if cfg.data.get("train_meshes") is not None:   # a subset of the split's training meshes (local tests)
+    sub = sorted(int(m) for m in cfg.data.train_meshes)
+    if set(sub) - set(train_m):
+      raise SystemExit(f"data.train_meshes {sorted(set(sub) - set(train_m))} not in the split's training meshes")
+    train_m = sub
+  for name, s in cfg.eval.sets.items():
+    if os.path.realpath(s.render_h5) != os.path.realpath(cfg.data.render_h5):
+      check_unseen(cfg.data.render_h5, s.render_h5, name)
+  return train_m, val_m
+
+
+def check_unseen(train_h5, other_h5, name):
+  """SystemExit if the h5 `other_h5` (an eval set of meshes never trained on) shares a mesh path with the training h5."""
+  shared = set(ra.mesh_paths(train_h5)) & set(ra.mesh_paths(other_h5))
+  if shared:
+    raise SystemExit(f"eval set {name}: {len(shared)} mesh paths also in the training h5 (first {sorted(shared)[:3]})")
+
+
+def full_moments_cached(cfg, train_m, path):
+  """The training meshes' normalization (reanchor.full_moments), computed once and cached at `path` (a resumed run reuses it)."""
+  if os.path.exists(path):
+    mo = torch.load(path, weights_only=False)
+    if mo["train_meshes"] != list(train_m):
+      raise SystemExit(f"{path}: cached for other training meshes")
+    return mo
+  mc = cfg.data.moments
+  t0 = time.time()
+  mo = ra.full_moments(cfg.data.render_h5, cfg.data.grids_dir, train_m, int(cfg.data.train_views), int(mc.own_views_per_mesh),
+                       int(mc.pairs_per_mesh), int(mc.seed), int(cfg.data.workers))
+  mo["train_meshes"] = list(train_m)
+  tok = np.concatenate([np.asarray(v) for v in mo["tokens"].values()])
+  log.info("moments over %d meshes (%d own rows, %d paired rows) in %.0f s; tokens per view: mean %.0f median %.0f p95 %.0f max %.0f "
+           "(largest mesh %d)", len(train_m), mo["n_rows"], mo["n_pair_rows"], time.time() - t0, tok.mean(), np.median(tok),
+           np.percentile(tok, 95), tok.max(), max(mo["tokens"], key=lambda m: max(mo["tokens"][m])))
+  torch.save(mo, path + ".tmp")
+  os.replace(path + ".tmp", path)
+  return mo
+
+
+def eval_set_plan(cfg, name, s, train_m, val_m):
+  """Eval set `name` -> [(mesh, [(a, b)])]: fixed seeded meshes and pairs (a != b of 0 .. train_views-1), the same every eval."""
+  nv = int(cfg.data.train_views)
+  if s.meshes == "train":
+    pool = list(train_m)
+  elif s.meshes == "val":
+    pool = list(val_m)
+  elif s.meshes == "all":
+    pool = sorted(ra.mesh_rows(s.render_h5))
+  elif not isinstance(s.meshes, str):
+    pool = [int(m) for m in s.meshes]                     # an explicit list (local tests)
+    if os.path.realpath(s.render_h5) == os.path.realpath(cfg.data.render_h5) and set(pool) & set(train_m) and name != "train_heldout":
+      log.warning("eval set %s: explicit meshes include training meshes", name)
+  else:
+    raise SystemExit(f"eval set {name}: meshes must be train | val | all | a list, got {s.meshes!r}")
+  rng = np.random.default_rng([int(cfg.eval.seed), *name.encode()])
+  if s.n_meshes is not None and int(s.n_meshes) < len(pool):
+    pool = sorted(int(m) for m in rng.choice(pool, int(s.n_meshes), replace=False))
+  return [(int(m), [tuple(int(x) for x in rng.choice(nv, 2, replace=False)) for _ in range(int(s.pairs_per_mesh))]) for m in pool]
+
+
+def cpu_bundle(bd):
+  return {k: (v.cpu() if torch.is_tensor(v) else v) for k, v in bd.items()}
+
+
+def eval_sets_setup(cfg, train_m, val_m, device):
+  """{set: {"bundles": [CPU pair bundles at eval views], "ref": {ref: [[black, white]] per pair}, "pairs": [(mesh, a, b)]}}.
+  Each mesh is loaded once (MeshData of its pairs' views), its references computed (cached per set and mesh in output_dir:
+  references_<set>_mesh<M>.json) and its pairs cut down to CPU bundles, then freed."""
+  views = list(cfg.data.eval_views)
+  out = {}
+  t0 = time.time()
+  for name, s in cfg.eval.sets.items():
+    plan = eval_set_plan(cfg, name, s, train_m, val_m)
+    st = {"bundles": [], "ref": {k: [] for k in ("A_asis", "B_fit", "matched32")}, "pairs": []}
+    for m, pairs in plan:
+      gv = sorted({v for p in pairs for v in p})
+      data = ra.MeshData(s.render_h5, s.grids_dir, m, gv, device=device)
+      ref = references(data, pairs, views, os.path.join(cfg.output_dir, f"references_{name}_mesh{m}.json"))
+      for j, (a, b) in enumerate(pairs):
+        st["bundles"].append(cpu_bundle(data.bundle(a, b, True, views)))
+        st["pairs"].append((m, a, b))
+        for k in st["ref"]:
+          st["ref"][k].append(ref[k][j])
+      del data
+      torch.cuda.empty_cache()
+    out[name] = st
+    log.info("eval set %s: %d meshes, %d pairs (%s); refs %s", name, len(plan), len(st["pairs"]), s.render_h5,
+             {k: np.round(np.mean(v, 0), 3).tolist() for k, v in st["ref"].items()})
+  log.info("eval sets ready in %.0f s", time.time() - t0)
+  return out
+
+
+def to_dev(bd, device):
+  return {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v) for k, v in bd.items()}
+
+
+@torch.no_grad()
+def evaluate_bundles(model, batcher, bundles, use_a, bf16, device, ablate_a=False):
+  """Per pair (black, white) PSNR of the predicted B grid at each bundle's render targets."""
+  model.eval()
+  out = []
+  for bd in bundles:
+    bd = to_dev(bd, device)
+    if ablate_a:
+      bd["a_rows"] = batcher.in_mean.expand_as(bd["a_rows"])
+    ca, pa, cb, pb, packs = batcher.tokens([bd], model.empty, use_a)
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16):
+      rows = model(ca, pa, cb, pb, packs)
+    gauss = batcher.decode(model.readout_grid(rows, packs))
+    H, W = bd["gt"].shape[-2:]
+    rgb, alpha = ra.render(ra.slot_gaussians(gauss, 0, bd["b_xyz"], bd["b_hit"]), bd["viewmats"], bd["K"], W, H)
+    black, white = ra.psnr_bw(rgb, alpha, bd["gt"], bd["alpha"])
+    out.append((float(black.mean()), float(white.mean())))
+  model.train()
+  return np.array(out)
+
+
+def train_full(cfg, device):
+  torch.manual_seed(int(cfg.train.seed))
+  use_a = bool(cfg.model.use_a)
+  if cfg.data.identity or str(cfg.data.a_source) != "same":
+    raise SystemExit("data.dataset full: data.identity / data.a_source other_mesh are one-mesh options")
+  nc = n_cycles(cfg)
+  train_m, val_m = full_meshes(cfg)
+  log.info("mesh split (val_fraction %s, seed %s): %d train meshes, val meshes %s", cfg.data.mesh_split.val_fraction,
+           cfg.data.mesh_split.seed, len(train_m), val_m)
+  mo = full_moments_cached(cfg, train_m, os.path.join(cfg.output_dir, "moments.pt"))
+  dv = lambda x: x.to(device)
+  batcher = ra.Batcher(None, dv(mo["in_mean"]), dv(mo["in_std"]), tuple(dv(mo[k]) for k in ("out_mean", "out_std", "lo", "hi")),
+                       z_ref=float(cfg.model.z_ref), slot_scale_px=float(cfg.model.slot_scale_px), decode_clamp=str(cfg.model.decode_clamp))
+  log.info("output moments mean %s std %s; A-input mean %s std %s", mo["out_mean"].numpy().round(3), mo["out_std"].numpy().round(3),
+           mo["in_mean"].numpy().round(3), mo["in_std"].numpy().round(3))
+  sets = eval_sets_setup(cfg, train_m, val_m, device)
+  with open(os.path.join(cfg.output_dir, "eval_pairs.json"), "w") as fh:
+    json.dump({k: v["pairs"] for k, v in sets.items()}, fh)
+  model = ra.ReanchorNet(dim=int(cfg.model.dim), num_blocks=int(cfg.model.num_blocks), num_heads=cfg.model.num_heads, use_a=use_a,
+                         layer_scale_init=float(cfg.model.layer_scale_init),
+                         checkpoint_activations=bool(cfg.model.checkpoint_activations)).to(device)
+  n_params = sum(p.numel() for p in model.parameters())
+  log.info("ReanchorNet: %.1f M parameters (use_a %s)", n_params / 1e6, use_a)
+  opt = torch.optim.AdamW(model.parameters(), lr=float(cfg.train.lr), weight_decay=float(cfg.train.weight_decay))
+  dssim = DSSIMLoss(reduction="none").to(device)
+  start_step, clock, troughs = 0, 0.0, 0
+  ckpt_path = os.path.join(cfg.output_dir, "last.pt")
+  st = None
+  if os.path.exists(ckpt_path):
+    st = torch.load(ckpt_path, map_location=device, weights_only=False)
+    model.load_state_dict(st["model"]); opt.load_state_dict(st["opt"])
+    start_step, clock, troughs = st["step"], st["clock"], st.get("troughs", 0)
+    log.info("resumed %s at step %d (%.0f s training clock, %d troughs done)", ckpt_path, start_step, clock, troughs)
+    if st.get("done"):
+      log.info("the checkpoint is a finished run: nothing to do")
+      return
+  torch.manual_seed(int(cfg.train.seed) + start_step)
+  if st is not None and "torch_rng" in st:
+    torch.set_rng_state(st["torch_rng"].cpu())
+    torch.cuda.set_rng_state(st["cuda_rng"].cpu())
+  del st
+  run = init_wandb(cfg)
+  run.summary["n_params"] = n_params
+  run.summary["train_meshes"], run.summary["val_meshes"] = len(train_m), val_m
+  ds = ra.StreamPairs(cfg.data.render_h5, cfg.data.grids_dir, train_m, int(cfg.data.train_views), int(cfg.train.views_per_pair),
+                      seed=[int(cfg.train.seed), int(start_step)])
+  nw = int(cfg.data.workers)
+  loader = iter(torch.utils.data.DataLoader(ds, batch_size=None, num_workers=nw, pin_memory=True,
+                                            prefetch_factor=int(cfg.data.prefetch_factor) if nw else None, persistent_workers=nw > 0))
+  eval_file = open(os.path.join(cfg.output_dir, "eval.jsonl"), "a")
+  bf16 = bool(cfg.train.bf16)
+  max_steps = cfg.train.max_steps
+  max_wall = cfg.train.get("max_wall_seconds")
+  last_ckpt = time.time()
+  stop = {"signal": None}
+
+  def on_term(signum, frame):
+    stop["signal"] = signum
+  import signal
+  signal.signal(signal.SIGTERM, on_term)
+  signal.signal(signal.SIGUSR1, on_term)
+
+  def wall_out():
+    return stop["signal"] is not None or (max_wall is not None and time.time() - T_START > float(max_wall))
+
+  def do_eval(step, tag):
+    t0 = time.time()
+    rec = {"step": step, "clock": clock, "tag": tag, "sets": {}}
+    logd = {}
+    for name, sset in sets.items():
+      e = evaluate_bundles(model, batcher, sset["bundles"], use_a, bf16, device)
+      r = {"black": float(e[:, 0].mean()), "white": float(e[:, 1].mean()), "n": len(e),
+           "black_se": float(e[:, 0].std(ddof=1) / np.sqrt(len(e))), "white_se": float(e[:, 1].std(ddof=1) / np.sqrt(len(e))),
+           "per_pair": e.tolist()}
+      logd[f"eval/{name}/black"], logd[f"eval/{name}/white"] = r["black"], r["white"]
+      if use_a and name in list(cfg.eval.ablate_sets):
+        z = evaluate_bundles(model, batcher, sset["bundles"], use_a, bf16, device, ablate_a=True)
+        r["ablate_a_black"], r["ablate_a_white"] = float(z[:, 0].mean()), float(z[:, 1].mean())
+        logd[f"eval/{name}/ablate_a_black"], logd[f"eval/{name}/ablate_a_white"] = r["ablate_a_black"], r["ablate_a_white"]
+      for k, v in sset["ref"].items():
+        logd[f"ref/{name}/{k}_black"], logd[f"ref/{name}/{k}_white"] = np.mean(v, 0).tolist()
+      rec["sets"][name] = r
+    rec["seconds"] = time.time() - t0
+    logd["eval/seconds"] = rec["seconds"]
+    run.log(logd, step=step)
+    eval_file.write(json.dumps(rec) + "\n"); eval_file.flush()
+    log.info("eval step %d (%s, %.0f s): %s", step, tag, rec["seconds"],
+             "  ".join(f"{n} {r['black']:.3f} / {r['white']:.3f}" for n, r in rec["sets"].items()))
+
+  def save(step, done=False):
+    t0 = time.time()
+    tmp = ckpt_path + ".tmp"
+    torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "step": step, "clock": clock, "troughs": troughs, "done": done,
+                "torch_rng": torch.get_rng_state(), "cuda_rng": torch.cuda.get_rng_state(),
+                "cfg": OmegaConf.to_container(cfg, resolve=True)}, tmp)
+    os.replace(tmp, ckpt_path)
+    log.info("saved %s at step %d (%.0f s training clock) in %.0f s", ckpt_path, step, clock, time.time() - t0)
+
+  step = start_step
+  if step == 0:
+    do_eval(0, "start")
+  torch.cuda.reset_peak_memory_stats()
+  reason = "done"
+  while clock < float(cfg.train.max_seconds) and (max_steps is None or step < int(max_steps)):
+    if wall_out():
+      reason = "wall"
+      break
+    tw = time.time()
+    items = [next(loader) for _ in range(int(cfg.train.pairs_per_step))]
+    torch.cuda.synchronize()
+    t0 = time.time()
+    wait = t0 - tw
+    lrf = lr_factor(cfg, step, clock)
+    for g in opt.param_groups:
+      g["lr"] = float(cfg.train.lr) * lrf
+    bundles = [ra.stream_bundle(x, device, use_a) for x in items]
+    ca, pa, cb, pb, packs = batcher.tokens(bundles, model.empty, use_a)
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16):
+      rows = model(ca, pa, cb, pb, packs)
+    gauss = batcher.decode(model.readout_grid(rows, packs))
+    loss = torch.zeros((), device=device)
+    stats = np.zeros(3)
+    for i, bd in enumerate(bundles):
+      H, W = bd["gt"].shape[-2:]
+      rgb, alpha = ra.render(ra.slot_gaussians(gauss, i, bd["b_xyz"], bd["b_hit"]), bd["viewmats"], bd["K"], W, H)
+      li, l1, dsv, ps = photometric(dssim, cfg, rgb, alpha, bd["gt"], bd["alpha"], backgrounds(cfg, len(rgb), device))
+      loss = loss + li / len(bundles)
+      stats += [float(l1), float(dsv), float(ps)]
+    opt.zero_grad(set_to_none=True)
+    loss.backward()
+    gn = torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg.train.grad_clip))
+    opt.step()
+    torch.cuda.synchronize()
+    dt = time.time() - t0
+    k0 = cycle_of(cfg, clock)
+    clock += dt
+    step += 1
+    if step % int(cfg.train.log_every) == 0 or step < 5:
+      stats /= len(bundles)
+      d = {"train/loss": float(loss), "train/l1": stats[0], "train/dssim": stats[1], "train/psnr": stats[2], "train/lr": opt.param_groups[0]["lr"],
+           "train/grad_norm": float(gn), "train/step_seconds": dt, "train/data_wait_seconds": wait, "train/clock": clock,
+           "train/tokens_b": packs.b.T, "train/tokens_a": packs.ta, "train/max_mem_gb": torch.cuda.max_memory_allocated() / 2 ** 30,
+           "train/cycle": cycle_of(cfg, clock)}
+      if step % 50 == 0 or step < 5:
+        with torch.no_grad():
+          d.update(bundle_diagnostics({k: v.detach() for k, v in gauss.items()}, batcher, bundles))
+      run.log(d, step=step)
+    if step % 50 == 0 or step < 5 or step == start_step + 1:
+      log.info("step %d loss %.4f psnr %.2f lr %.2e gn %.3f %.3f s/step (wait %.3f) mem %.1f GB tokens A %d B %d clock %.0f", step,
+               float(loss), stats[2], opt.param_groups[0]["lr"], float(gn), dt, wait, torch.cuda.max_memory_allocated() / 2 ** 30,
+               packs.ta, packs.b.T, clock)
+    trough = nc > 1 and cycle_of(cfg, clock) > k0 and clock < float(cfg.train.max_seconds)
+    if trough:
+      troughs += 1
+      log.info("LR trough %d / %d at step %d (clock %.0f s)", troughs, nc, step, clock)
+      do_eval(step, f"trough{troughs}")
+      save(step)
+      last_ckpt = time.time()
+    elif step % int(cfg.train.eval_every) == 0:
+      do_eval(step, "regular")
+    if time.time() - last_ckpt > float(cfg.train.checkpoint_every_seconds):
+      save(step)
+      last_ckpt = time.time()
+  if reason == "done":
+    if nc > 1:
+      troughs += 1
+    do_eval(step, "final")
+    save(step, done=True)
+    run.summary["final_step"] = step
+  else:
+    save(step)
+    log.info("stopping at step %d (%.0f s training clock, %.0f s wall): %s", step, clock, time.time() - T_START,
+             f"signal {stop['signal']}" if stop["signal"] is not None else "train.max_wall_seconds")
+  run.finish()
+  log.info("%s: %d steps, %.0f s training", reason, step, clock)
+
+
 @hydra.main(version_base=None, config_path="conf", config_name="train_reanchor")
 def main(cfg):
   os.makedirs(cfg.output_dir, exist_ok=True)
   device = "cuda"
+  if cfg.data.get("dataset", "mesh") == "full":
+    if cfg.mode != "train":
+      raise SystemExit("data.dataset full supports mode train only")
+    train_full(cfg, device)
+    return
   data, batcher = setup(cfg, device)
   if cfg.mode == "roundtrip":
     roundtrip(cfg, data, batcher)
