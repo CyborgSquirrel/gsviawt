@@ -104,9 +104,34 @@ def relative(c2w_from, c2w_to):
   return T[:3, :3], T[:3, 3]
 
 
+def rows_to_frame(x0, xyz, c2w_from, c2w_to):
+  """A grid's raw x0 rows and anchors (N, 14), (N, 3) in camera `from`'s frame -> the same Gaussians in camera `to`'s frame.
+  The one A -> B transform: MeshData.a_rows_in_b (A of the same mesh) and donor_in_b (A from another mesh) both use it."""
+  R, t = relative(c2w_from, c2w_to)
+  return rotate_rows(x0, R), xyz @ R.T + t
+
+
 # ---------------------------------------------------------------------------
 # one mesh, GPU-resident
 # ---------------------------------------------------------------------------
+
+def encode_view(f, r, grid_path, num_layers=6):
+  """Render h5 row r (open h5py file f) and its grid file -> (xyz (N, 3) the hit slots' anchors in the view's own camera frame,
+  hit (L, H, W) bool, x0 (N, 14) the raw rows in the own frame (encode_grid, default encoding), the grid), numpy, rows in
+  np.nonzero(hit) order."""
+  depth = np.asarray(f["depth_peel"][r]).astype(np.float32)
+  xyz_cam, hit = dense_unproject_camera(depth, np.asarray(f["depth_intrinsics"][r], np.float32))
+  xyz_cam, hit = xyz_cam.transpose(2, 0, 1, 3), hit.transpose(2, 0, 1)                           # (L, H, W, .)
+  if hit.shape[0] != num_layers:
+    raise SystemExit(f"row {r}: {hit.shape[0]} depth-peel layers, expected {num_layers}")
+  grid = read_grid(grid_path)
+  if int(grid.attrs.get("primary_view_row", r)) != r:
+    raise SystemExit(f"{grid_path}: primary_view_row {grid.attrs.get('primary_view_row')} != render row {r}")
+  source = {"xyz_cam": torch.from_numpy(xyz_cam), "hit": torch.from_numpy(hit), "pose_gl": torch.from_numpy(
+    np.asarray(f["camera_pose"][r], np.float32)), "K_depth": torch.from_numpy(np.asarray(f["depth_intrinsics"][r], np.float32))}
+  x0 = encode_grid(grid, source)                                                                    # (14, L, H, W)
+  li, yi, xi = np.nonzero(hit)
+  return xyz_cam[li, yi, xi], hit, x0[:, li, yi, xi].T, grid
 
 class MeshData:
   """One mesh of a render h5 and its per-view grids, on the GPU. Per view v (the mesh's 0-based view number): gt (3, H, W)
@@ -137,23 +162,10 @@ class MeshData:
       self.grid_views = list(grid_views)
       self.xyz, self.hit, self.x0, self.world = {}, {}, {}, {}
       for v in self.grid_views:
-        r = int(self.rows[v])
-        depth = np.asarray(f["depth_peel"][r]).astype(np.float32)
-        xyz_cam, hit = dense_unproject_camera(depth, np.asarray(f["depth_intrinsics"][r], np.float32))
-        xyz_cam, hit = xyz_cam.transpose(2, 0, 1, 3), hit.transpose(2, 0, 1)                     # (L, H, W, .)
-        if hit.shape[0] != num_layers:
-          raise SystemExit(f"view {v}: {hit.shape[0]} depth-peel layers, expected {num_layers}")
-        path = os.path.join(grids_dir, f"mesh{mesh}_view{v}.h5")
-        grid = read_grid(path)
-        if int(grid.attrs.get("primary_view_row", r)) != r:
-          raise SystemExit(f"{path}: primary_view_row {grid.attrs.get('primary_view_row')} != render row {r}")
-        source = {"xyz_cam": torch.from_numpy(xyz_cam), "hit": torch.from_numpy(hit), "pose_gl": torch.from_numpy(
-          np.asarray(f["camera_pose"][r], np.float32)), "K_depth": torch.from_numpy(np.asarray(f["depth_intrinsics"][r], np.float32))}
-        x0 = encode_grid(grid, source)                                                              # (14, L, H, W)
-        li, yi, xi = np.nonzero(hit)
+        xyz, hit, x0, grid = encode_view(f, int(self.rows[v]), os.path.join(grids_dir, f"mesh{mesh}_view{v}.h5"), num_layers)
         self.hit[v] = torch.from_numpy(hit).to(device)
-        self.xyz[v] = t(xyz_cam[li, yi, xi])
-        self.x0[v] = t(x0[:, li, yi, xi].T)
+        self.xyz[v] = t(xyz)
+        self.x0[v] = t(x0)
         self.world[v] = {k: t(val) for k, val in grid.rows.items()}
 
   def own_moments(self):
@@ -164,8 +176,7 @@ class MeshData:
 
   def a_rows_in_b(self, a, b):
     """A's raw x0 rows and anchors (N_A, 14), (N_A, 3) in B's camera frame."""
-    R, t = relative(self.c2w[a], self.c2w[b])
-    return rotate_rows(self.x0[a], R), self.xyz[a] @ R.T + t
+    return rows_to_frame(self.x0[a], self.xyz[a], self.c2w[a], self.c2w[b])
 
   def paired_moments(self, pairs):
     """(mean, std) (14,) of A's raw rows in B's frame over the given (a, b) pairs: the A input's normalization."""
@@ -175,6 +186,86 @@ class MeshData:
   def viewmats(self, b, views):
     """(V, 4, 4) world-to-camera of `views` with "world" = B's camera frame (cameras.relative_viewmats' convention)."""
     return torch.linalg.inv(self.c2w[list(views)]) @ self.c2w[b]
+
+
+# ---------------------------------------------------------------------------
+# donor A: A from a different mesh (the "no information about the target" control, train_reanchor data.a_source other_mesh)
+# ---------------------------------------------------------------------------
+# A donor view (mesh m' != the target mesh, view v') is encoded exactly like the target's own views (encode_view: its grid's rows
+# in the donor camera's frame) and moved into B's camera frame by the same rows_to_frame as the real A, with the donor camera's
+# c2w as `from`. Since that c2w is the donor camera's pose in the WORLD (the frame its grid was fitted in) this places the donor's
+# world-frame Gaussians at their world positions relative to B's camera, i.e. exactly what the real A path does with A's grid.
+# All new100 objects are normalised into one world box and every camera sits at distance 1.9 looking at the origin (fx 492.2), so
+# the donor object is co-located with the target. The A-input normalization (the target's paired moments) is unchanged.
+
+def mesh_rows(render_h5):
+  """{mesh: its render h5 rows (sorted)} for every mesh of the h5."""
+  with h5py.File(render_h5, "r") as f:
+    mi = np.asarray(f["mesh_index"])
+  return {int(m): np.flatnonzero(mi == m) for m in np.unique(mi)}
+
+
+def donor_pool(render_h5, grids_dir, exclude, n_views):
+  """The donor meshes: every mesh of the h5 except `exclude`, each required to have the grids of views 0 .. n_views-1."""
+  rows = mesh_rows(render_h5)
+  pool = [m for m in sorted(rows) if m != int(exclude)]
+  missing = [(m, v) for m in pool for v in range(n_views) if not os.path.exists(os.path.join(grids_dir, f"mesh{m}_view{v}.h5"))]
+  if missing:
+    raise SystemExit(f"donor grids missing in {grids_dir}: {len(missing)} (first {missing[:5]})")
+  return pool
+
+
+def draw_donor(rng, pool, n_views):
+  """One donor (mesh, view): mesh uniform over the pool, view uniform over 0 .. n_views-1."""
+  return int(pool[int(rng.integers(len(pool)))]), int(rng.integers(n_views))
+
+
+def eval_donors(pool, n_views, n, seed):
+  """The fixed donors of the n eval pairs (one per pair, the same at every eval): a seeded draw_donor sequence."""
+  rng = np.random.default_rng([int(seed), 1729])
+  return [draw_donor(rng, pool, n_views) for _ in range(n)]
+
+
+class DonorViews(torch.utils.data.IterableDataset):
+  """An endless stream of random donor views, loaded on the fly (DataLoader workers, batch_size None): each item
+  {x0 (N, 14), xyz (N, 3) own-frame raw rows / anchors, hit (L, H, W) bool, pose_gl (4, 4), mesh, view}, CPU tensors. Worker w
+  draws with default_rng([*seed, w]): a fixed sequence per (seed, worker count)."""
+
+  def __init__(self, render_h5, grids_dir, pool, n_views, seed, num_layers=6):
+    super().__init__()
+    self.render_h5, self.grids_dir, self.pool, self.n_views = render_h5, grids_dir, list(pool), int(n_views)
+    self.seed, self.num_layers = [int(s) for s in np.atleast_1d(seed)], num_layers
+    self._f = self._rows = None
+
+  def load(self, m, v):
+    if self._f is None:
+      self._f = h5py.File(self.render_h5, "r")
+      self._rows = mesh_rows(self.render_h5)
+    r = int(self._rows[m][v])
+    xyz, hit, x0, _ = encode_view(self._f, r, os.path.join(self.grids_dir, f"mesh{m}_view{v}.h5"), self.num_layers)
+    return {"x0": torch.from_numpy(np.ascontiguousarray(x0, np.float32)), "xyz": torch.from_numpy(np.ascontiguousarray(xyz, np.float32)),
+            "hit": torch.from_numpy(hit), "pose_gl": torch.from_numpy(np.asarray(self._f["camera_pose"][r], np.float32)),
+            "mesh": m, "view": v}
+
+  def draws(self):
+    info = torch.utils.data.get_worker_info()
+    rng = np.random.default_rng(self.seed + [info.id if info is not None else 0])
+    while True:
+      yield draw_donor(rng, self.pool, self.n_views)
+
+  def __iter__(self):
+    if torch.utils.data.get_worker_info() is not None:
+      torch.set_num_threads(1)
+      self._f = self._rows = None                  # never a handle inherited from the parent: each worker opens its own
+    for m, v in self.draws():
+      yield self.load(m, v)
+
+
+def donor_in_b(donor, c2w_b, device):
+  """A DonorViews item -> the a_override triple (rows (N, 14) raw in B's frame, xyz (N, 3), hit (L, H, W)) on `device`."""
+  t = lambda x: x.to(device, non_blocking=True)
+  rows, xyz = rows_to_frame(t(donor["x0"]), t(donor["xyz"]), c2w_cv(t(donor["pose_gl"])), c2w_b)
+  return rows, xyz, t(donor["hit"])
 
 
 # ---------------------------------------------------------------------------

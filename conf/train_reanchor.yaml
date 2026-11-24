@@ -13,6 +13,9 @@ data:
   eval_views: [45, 46, 47, 48, 49]   # held out: never fitted, never a training target
   identity: false            # true: A = B (input A is B's own grid) in training and eval
   moment_pairs: 100          # random pairs the A input's (paired-frame) moments are computed over
+  a_source: same             # same: A = a view of the mesh | other_mesh: A = a random view of a random OTHER mesh (donor-A control)
+  donor_grids_dir: null      # other_mesh: <dir>/mesh<M>_view<V>.h5 of the donors; null: grids_dir
+  donor_workers: 4           # other_mesh: DataLoader workers loading donor views on the fly
 
 model:
   dim: 2048

@@ -2,6 +2,8 @@
 the packed cross-attention (each sample's B rows attend only to its own A rows, == a per-sample dense reference; varlen == SDPA
 under bf16 on CUDA), the joint packing (a batch == its samples run alone) and the B-only switch (no cross-attention parameters,
 output independent of A; with A the output depends on it)."""
+import os
+
 import numpy as np
 import pytest
 import torch
@@ -191,3 +193,90 @@ def test_fresh_model_readout_zero_and_branch_tokens():
   c = content.reshape(L, G * G, PS * PS, ra.SLOT_FEATS)
   assert torch.equal(keep, c[..., -1].sum(-1) > 0)
   torch.testing.assert_close((c[..., 14:17] * c[..., -1:]).sum(2)[keep], torch.zeros(int(keep.sum()), 3), atol=1e-5, rtol=0)
+
+
+# ---------------------------------------------------------------------------
+# donor A (train_reanchor data.a_source other_mesh)
+# ---------------------------------------------------------------------------
+
+NEW100_H5 = "/app/bla/new100/trellis_new100_50views_eevee_504.h5"
+GRIDS79 = "/app/bla/reanchor/grids79"
+DONOR_GRIDS = "/app/bla/new100/anchored_wd0.3/grids_sparse"
+
+
+def test_donor_draws_never_target_and_uniform():
+  pool = [m for m in range(100) if m != 79]
+  ds = ra.DonorViews("unused.h5", "unused", pool, 45, seed=[0, 0])
+  it = ds.draws()
+  d = np.array([next(it) for _ in range(30000)])
+  assert 79 not in d[:, 0] and set(d[:, 0]) == set(pool) and set(d[:, 1]) == set(range(45))
+  counts = np.bincount(d[:, 0], minlength=100)[pool]
+  assert counts.min() > 0.7 * counts.mean() and counts.max() < 1.3 * counts.mean()
+  it2 = ra.DonorViews("unused.h5", "unused", pool, 45, seed=[0, 0]).draws()
+  assert [next(it2) for _ in range(100)] == [tuple(x) for x in d[:100]]             # seeded: a fixed sequence
+
+
+def test_donor_pool_excludes_target_and_checks_grids(tmp_path):
+  import h5py
+  h5 = tmp_path / "r.h5"
+  with h5py.File(h5, "w") as f:
+    f["mesh_index"] = np.repeat([3, 79, 5], 4)
+  for m in (3, 79, 5):
+    for v in range(4):
+      (tmp_path / f"mesh{m}_view{v}.h5").touch()
+  assert ra.donor_pool(str(h5), str(tmp_path), 79, 4) == [3, 5]
+  (tmp_path / "mesh5_view2.h5").unlink()
+  with pytest.raises(SystemExit):
+    ra.donor_pool(str(h5), str(tmp_path), 79, 4)
+
+
+def test_eval_donors_deterministic():
+  pool = [m for m in range(100) if m != 79]
+  a, b = ra.eval_donors(pool, 45, 30, 0), ra.eval_donors(pool, 45, 30, 0)
+  assert a == b and len(a) == 30 and all(m != 79 and 0 <= v < 45 for m, v in a)
+  assert ra.eval_donors(pool, 45, 30, 1) != a
+
+
+def test_a_source_same_inputs_unchanged():
+  """rows_to_frame (the shared A -> B transform) == the pre-donor a_rows_in_b formula, bit for bit."""
+  rng = np.random.default_rng(5)
+  ca = torch.as_tensor(pose(rng) @ OPENGL_TO_OPENCV)
+  cb = torch.as_tensor(pose(rng) @ OPENGL_TO_OPENCV)
+  x0, xyz = torch.randn(500, 14), torch.randn(500, 3)
+  x0[:, ra.ROTATION] = torch.nn.functional.normalize(x0[:, ra.ROTATION], dim=1)
+  R, t = ra.relative(ca, cb)
+  rows, pts = ra.rows_to_frame(x0, xyz, ca, cb)
+  assert torch.equal(rows, ra.rotate_rows(x0, R)) and torch.equal(pts, xyz @ R.T + t)
+
+
+needs_new100 = pytest.mark.skipif(not (torch.cuda.is_available() and os.path.exists(NEW100_H5) and os.path.isdir(GRIDS79)),
+                                  reason="needs CUDA + the local new100 h5 and mesh 79's grids")
+
+
+@needs_new100
+def test_donor_path_with_own_mesh_reproduces_real_a():
+  data = ra.MeshData(NEW100_H5, GRIDS79, 79, [3, 17], device="cuda")
+  ds = ra.DonorViews(NEW100_H5, GRIDS79, [79], 45, seed=0)
+  for a, b in ((3, 17), (17, 3), (3, 3)):
+    rows, xyz, hit = ra.donor_in_b(ds.load(79, a), data.c2w[b], "cuda")
+    r0, x0 = data.a_rows_in_b(a, b)
+    assert torch.equal(rows, r0) and torch.equal(xyz, x0) and torch.equal(hit, data.hit[a])
+
+
+@needs_new100
+@pytest.mark.skipif(not os.path.isdir(DONOR_GRIDS), reason="needs the local new100 donor grids")
+def test_donor_in_b_frame_matches_world_render():
+  """A donor (another mesh) moved into B's frame and rendered from B-relative cameras == its world grid rendered from the same
+  cameras in the world: the donor sits at its world position relative to B."""
+  from grid_io import read_grid
+  data = ra.MeshData(NEW100_H5, GRIDS79, 79, [11], device="cuda")
+  ds = ra.DonorViews(NEW100_H5, DONOR_GRIDS, [5], 45, seed=0)
+  b, views = 11, [11, 30, 46]
+  d = ds.load(5, 20)
+  rows, xyz, _ = ra.donor_in_b(d, data.c2w[b], "cuda")
+  r1, _ = ra.render(ra.raw_gaussians(rows, xyz), data.viewmats(b, views), data.K[views], data.W, data.H)
+  world = {k: torch.as_tensor(np.asarray(v, np.float32), device="cuda") for k, v in read_grid(f"{DONOR_GRIDS}/mesh5_view20.h5").rows.items()}
+  r2, a2 = ra.render(ra.world_gaussians(world), torch.linalg.inv(data.c2w[views]), data.K[views], data.W, data.H)
+  assert float(a2.mean()) > 0.02                                                    # the donor is in view
+  psnr = -10 * torch.log10((r1.clamp(0, 1) - r2.clamp(0, 1)).pow(2).flatten(1).mean(1))
+  assert float(psnr.min()) > 50, psnr

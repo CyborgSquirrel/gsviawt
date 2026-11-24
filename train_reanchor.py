@@ -7,6 +7,10 @@ forward each, the predicted B grid rendered at `views_per_pair` random training 
 solid colour per view (render and premultiplied GT composited over it), L1 + 0.85 D-SSIM. bf16 autocast on the network, fp32
 decode / render / loss; AdamW, linear warmup, cosine decay over the last decay_fraction of max_seconds (training time).
 
+Donor-A control (data.a_source other_mesh): every training sample's A is a fresh random view (0 .. train_views-1) of a random
+OTHER mesh of the render h5 (uniform over them; reanchor.py's donor section for the frame), loaded on the fly by DataLoader
+workers; the eval pairs get fixed seeded donors (eval_donors.json) and ablate-A zeroes the donor's params at its slots.
+
 Eval (every eval_every steps and at the end): a fixed set of eval_pairs (A, B) pairs (eval_seed), the predicted B grid rendered
 at the held-out views (eval_views, never fitted) over black and over white, full-image PSNR, mean over views then pairs; the
 main model also with A's params zeroed (the mean Gaussian at A's slots: does the output follow A?). The references on the same
@@ -222,14 +226,15 @@ def forward(model, batcher, pairs, use_a, bf16, a_override=None):
 
 
 @torch.no_grad()
-def evaluate(model, batcher, data, pairs, views, use_a, bf16, ablate_a=False):
+def evaluate(model, batcher, data, pairs, views, use_a, bf16, ablate_a=False, donors=None):
+  """donors (a_source other_mesh): per pair the fixed donor A (an a_override triple in B's frame) used in place of the real A."""
   model.eval()
   out = []
-  for a, b in pairs:
-    override = None
+  for j, (a, b) in enumerate(pairs):
+    override = {0: donors[j]} if donors is not None else None
     if ablate_a:
-      rows, xyz = data.a_rows_in_b(a, b)
-      override = {0: (batcher.in_mean.expand_as(rows), xyz, data.hit[a])}   # normalized 0: the mean Gaussian at A's slots
+      rows, xyz, hit = donors[j] if donors is not None else (*data.a_rows_in_b(a, b), data.hit[a])
+      override = {0: (batcher.in_mean.expand_as(rows), xyz, hit)}   # normalized 0: the mean Gaussian at A's (the donor's) slots
     gauss, _ = forward(model, batcher, [(a, b)], use_a, bf16, override)
     out.append(render_eval(data, batcher.gaussians(gauss, 0, b), b, views, "b"))
   model.train()
@@ -264,9 +269,28 @@ def lr_factor(cfg, step, seconds):
   return w
 
 
+def donor_setup(cfg, nv, start_step, n_eval):
+  """a_source other_mesh: (an endless iterator of random donor views (DataLoader workers), the DonorViews, the eval pairs' fixed
+  donors [(mesh, view)]). Donors: data.donor_grids_dir (null: data.grids_dir), every mesh of the render h5 but data.mesh."""
+  gdir = cfg.data.donor_grids_dir or cfg.data.grids_dir
+  pool = ra.donor_pool(cfg.data.render_h5, gdir, int(cfg.data.mesh), nv)
+  ds = ra.DonorViews(cfg.data.render_h5, gdir, pool, nv, seed=[int(cfg.train.seed), int(start_step)])
+  nw = int(cfg.data.donor_workers)
+  loader = torch.utils.data.DataLoader(ds, batch_size=None, num_workers=nw, pin_memory=True, prefetch_factor=8 if nw else None,
+                                       persistent_workers=nw > 0)
+  ev = ra.eval_donors(pool, nv, n_eval, int(cfg.train.eval_seed))
+  log.info("donor A: %d donor meshes (%s .. %s) from %s, %d workers; eval donors %s", len(pool), pool[0], pool[-1], gdir, nw, ev)
+  return iter(loader), ds, ev
+
+
 def train(cfg, data, batcher, device):
   torch.manual_seed(int(cfg.train.seed))
   use_a = bool(cfg.model.use_a)
+  a_source = str(cfg.data.a_source)
+  if a_source not in ("same", "other_mesh"):
+    raise SystemExit(f"data.a_source must be same | other_mesh, got {a_source!r}")
+  if a_source == "other_mesh" and (not use_a or cfg.data.identity):
+    raise SystemExit("data.a_source other_mesh needs model.use_a true and data.identity false")
   model = ra.ReanchorNet(dim=int(cfg.model.dim), num_blocks=int(cfg.model.num_blocks), num_heads=cfg.model.num_heads, use_a=use_a,
                          layer_scale_init=float(cfg.model.layer_scale_init),
                          checkpoint_activations=bool(cfg.model.checkpoint_activations)).to(device)
@@ -290,19 +314,25 @@ def train(cfg, data, batcher, device):
     start_step, clock = st["step"], st["clock"]
     log.info("resumed %s at step %d (%.0f s)", ckpt_path, start_step, clock)
   rng = np.random.default_rng([int(cfg.train.seed), start_step])
+  donor_iter = eval_a = None
+  if a_source == "other_mesh":
+    donor_iter, donor_ds, ev = donor_setup(cfg, nv, start_step, len(pairs_eval))
+    eval_a = [ra.donor_in_b(donor_ds.load(m, v), data.c2w[b], device) for (m, v), (_, b) in zip(ev, pairs_eval)]
+    with open(os.path.join(cfg.output_dir, "eval_donors.json"), "w") as fh:
+      json.dump({"pairs": [list(p) for p in pairs_eval], "donors": [list(d) for d in ev]}, fh)
   eval_file = open(os.path.join(cfg.output_dir, "eval.jsonl"), "a")
   bf16 = bool(cfg.train.bf16)
   max_steps = cfg.train.max_steps
   last_ckpt = time.time()
 
   def do_eval(step):
-    e = evaluate(model, batcher, data, pairs_eval, views, use_a, bf16)
+    e = evaluate(model, batcher, data, pairs_eval, views, use_a, bf16, donors=eval_a)
     rec = {"step": step, "clock": clock, "black": float(e[:, 0].mean()), "white": float(e[:, 1].mean()),
            "black_se": float(e[:, 0].std(ddof=1) / np.sqrt(len(e))), "white_se": float(e[:, 1].std(ddof=1) / np.sqrt(len(e))),
            "per_pair": e.tolist()}
     logd = {"eval/black": rec["black"], "eval/white": rec["white"]}
     if use_a:
-      z = evaluate(model, batcher, data, pairs_eval, views, use_a, bf16, ablate_a=True)
+      z = evaluate(model, batcher, data, pairs_eval, views, use_a, bf16, ablate_a=True, donors=eval_a)
       rec["ablate_a_black"], rec["ablate_a_white"] = float(z[:, 0].mean()), float(z[:, 1].mean())
       logd.update({"eval/ablate_a_black": rec["ablate_a_black"], "eval/ablate_a_white": rec["ablate_a_white"]})
     for k, (bl, wh) in refm.items():
@@ -329,7 +359,10 @@ def train(cfg, data, batcher, device):
     for g in opt.param_groups:
       g["lr"] = float(cfg.train.lr) * lrf
     pairs = sample_pairs(rng, nv, int(cfg.train.pairs_per_step), bool(cfg.data.identity))
-    gauss, packs = forward(model, batcher, pairs, use_a, bf16)
+    override = None
+    if donor_iter is not None:   # a fresh random donor A per sample (the pair's a is drawn but unused: the same B / view stream as same)
+      override = {i: ra.donor_in_b(next(donor_iter), data.c2w[b], device) for i, (_, b) in enumerate(pairs)}
+    gauss, packs = forward(model, batcher, pairs, use_a, bf16, override)
     loss = torch.zeros((), device=device)
     stats = np.zeros(3)
     for i, (a, b) in enumerate(pairs):
