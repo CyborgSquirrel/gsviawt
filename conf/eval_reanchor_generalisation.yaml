@@ -1,0 +1,21 @@
+# eval_reanchor_generalisation.py: a trained one-mesh re-anchoring model (train_reanchor.py) evaluated on OTHER meshes.
+# The model's normalization (A-input paired moments, output moments / clamp range) is rebuilt exactly as in training from the
+# checkpoint's own cfg (its data.mesh and data.grids_dir: here a local copy of the trained mesh's grids), never per eval mesh.
+
+checkpoint: /mnt/hdd/gsviawt_3dgs_archive/ckpt_reanchor_m79_main_f6b7ea1/last.pt
+train_grids_dir: /app/bla/reanchor/grids79   # overrides the checkpoint cfg's data.grids_dir (the cluster path)
+render_h5: /app/bla/new100/trellis_new100_50views_eevee_504.h5
+# the other meshes' grids (same fit config as the training grids: anchored wd 0.3, random-colour background, fine-tuned)
+other_grids: /mnt/hdd/gsviawt_3dgs_archive/fit_bg_check/color/mesh{mesh}_view{view}/gaussians.grid.h5
+meshes: [1, 3, 7, 17, 25, 29, 47, 58, 77, 81]
+n_pairs: 5                   # the first n of train_reanchor's eval pairs (eval_pair_list with the checkpoint's train.eval_seed)
+bf16: true                   # autocast on the network, as in training's eval
+plot_only: false            # true: re-plot <output_dir>/generalisation.json, no eval
+output_dir: /app/bla/reanchor/generalisation
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: ${output_dir}/hydra
+  output_subdir: null
