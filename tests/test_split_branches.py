@@ -1,5 +1,6 @@
 """diffusion.split_branches: 4 branch transformers (offset + opacity, colour + opacity, scale + opacity, rotation) with joint global
-attention. The default (off) is the single trunk bit for bit (parameters, loss, gradients, sample); the packed head agrees with an
+attention, and the hybrids (mid shared | merged: input branch blocks -> a shared-weight / a merged-token middle -> output branch
+blocks), every test for each of the three. The default (off) is the single trunk bit for bit (parameters, loss, gradients, sample); the packed head agrees with an
 independent dense reference (per-branch loops, the dropped tokens masked as keys, the joint attention over the concatenated branch
 sequences), forward and gradients, and with itself on every token kept; the attention mixes the branches; the merged opacity is the
 mean of the three; the x0 loss is every branch on its own channels; the decode / sampler path; a state_dict round trip; bf16 varlen
@@ -36,7 +37,7 @@ def split_head(seed=0, device="cpu", randomize=True, **kw):
       for n, p in head.named_parameters():
         if n.endswith(("ls1", "ls2")):
           p.fill_(1.0)
-        elif n.endswith(("out_w", "out_b", "film2_w", "film2_b")):
+        elif n.endswith(("out_w", "out_b", "film2_w", "film2_b", "unmerge_w", "unmerge_b")):
           p.copy_(0.05 * torch.randn(p.shape, generator=g))
   return head
 
@@ -51,15 +52,41 @@ def inputs(b, seed=1, device="cpu"):
 
 # ---------------------------------------------------------------- the dense reference, written per branch
 
+def ref_joint_block(blk, xs, ads, keep, cos, sin, pidx):
+  """One block on the dense tokens xs (a list of (B, L, P, D_i)), ONE masked SDPA over their sequences concatenated (list order:
+  branch-major, a different order from the packed rows'); token i uses blk's parameter slice pidx(i), modulated by ads[i] ((B, L | 1,
+  6, D)). keep (B, L, P): the dropped tokens masked as keys."""
+  b, l, p, _ = xs[0].shape
+  ln = lambda x, w, bb: F.layer_norm(x, (x.shape[-1],)) * w + bb
+  key_ok = keep.reshape(b, l * p).repeat(1, len(xs))
+  qs, ks, vs, mods = [], [], [], []
+  for i, x in enumerate(xs):
+    k, D = pidx(i), x.shape[-1]
+    mod = [m[:, :, None] for m in (blk.modulation[k] + ads[i]).unbind(2)]          # (B, L | 1, 1, D) each
+    mods.append(mod)
+    h = ln(x, blk.norm1_w[k], blk.norm1_b[k]) * (1 + mod[1]) + mod[0]
+    q, kk, v = (h.reshape(b, l * p, D) @ blk.qkv_w[k]).reshape(b, l * p, 3, blk.num_heads, -1).unbind(2)
+    q, kk = ln(q, blk.q_norm_w[k], blk.q_norm_b[k]), ln(kk, blk.k_norm_w[k], blk.k_norm_b[k])
+    qs.append(apply_rope(q, cos, sin))
+    ks.append(apply_rope(kk, cos, sin))
+    vs.append(v)
+  y = _masked_sdpa(torch.cat(qs, 1), torch.cat(ks, 1), torch.cat(vs, 1), key_ok).reshape(b, len(xs), l, p, -1)
+  out = []
+  for i, x in enumerate(xs):
+    k, mod = pidx(i), mods[i]
+    x = x + blk.ls1[k] * (y[:, i] @ blk.proj_w[k] + blk.proj_b[k]) * mod[2]
+    h = ln(x, blk.norm2_w[k], blk.norm2_b[k]) * (1 + mod[4]) + mod[3]
+    out.append(x + blk.ls2[k] * ((F.gelu(h @ blk.fc1_w[k] + blk.fc1_b[k]) @ blk.fc2_w[k] + blk.fc2_b[k]) * mod[5]))
+  return out
+
+
 def ref_forward(head, feats, x_net, t, keep):
   """(merged (B, L, 14, H, W), branches (B, L, 16, H, W)) from head's parameters: per-branch dense tensors, every block's attention
-  ONE masked SDPA over the branches' sequences concatenated (branch-major: a different order from the packed rows'), the dropped
-  tokens masked as keys."""
+  one masked SDPA (ref_joint_block); the middle (mid shared | merged) written out the same way."""
   b, l, p, _ = feats.shape
   K, D = head.k, head.dim
   feats = (feats - feats.mean((1, 2, 3), keepdim=True)) / (feats.var((1, 2, 3), keepdim=True, unbiased=False) + 1e-6).sqrt()
   feats = feats * head.img_token_scale
-  ln = lambda x, w, bb: F.layer_norm(x, (x.shape[-1],)) * w + bb
   emb = F.silu(head.time_embed(gd.sinusoidal_embedding(t.reshape(-1) * 1000.0, head.t_embed_channels)))
   xs, ads, films = [], [], []
   for k, (_, chans) in enumerate(gd.SPLIT_BRANCHES):
@@ -71,27 +98,28 @@ def ref_forward(head, feats, x_net, t, keep):
     films.append(e.chunk(2, -1))
   cos, sin = head._rope_tables(GRID, feats.device)
   cos, sin = cos.repeat(l, 1), sin.repeat(l, 1)
-  key_ok = keep.reshape(b, l * p).repeat(1, K)                                     # the joint sequence's keys
-  for blk, cond in zip(head.blocks, head.cond):
-    hs, qs, ks, vs, mods = [], [], [], [], []
-    for k in range(K):
-      if cond == "frame":
-        xs[k] = xs[k] * (1 + films[k][0][None, :, None]) + films[k][1][None, :, None]
-      a = ads[k] if cond == "frame" else ads[k].mean(1, keepdim=True)
-      mod = [m[:, :, None] for m in (blk.modulation[k] + a).unbind(2)]             # (B, L | 1, 1, D) each
-      mods.append(mod)
-      h = ln(xs[k], blk.norm1_w[k], blk.norm1_b[k]) * (1 + mod[1]) + mod[0]
-      q, kk, v = (h.reshape(b, l * p, D) @ blk.qkv_w[k]).reshape(b, l * p, 3, head.num_heads, -1).unbind(2)
-      q, kk = ln(q, blk.q_norm_w[k], blk.q_norm_b[k]), ln(kk, blk.k_norm_w[k], blk.k_norm_b[k])
-      qs.append(apply_rope(q, cos, sin))
-      ks.append(apply_rope(kk, cos, sin))
-      vs.append(v)
-    y = _masked_sdpa(torch.cat(qs, 1), torch.cat(ks, 1), torch.cat(vs, 1), key_ok).reshape(b, K, l, p, D)
-    for k in range(K):
-      mod = mods[k]
-      xs[k] = xs[k] + blk.ls1[k] * (y[:, k] @ blk.proj_w[k] + blk.proj_b[k]) * mod[2]
-      h = ln(xs[k], blk.norm2_w[k], blk.norm2_b[k]) * (1 + mod[4]) + mod[3]
-      xs[k] = xs[k] + blk.ls2[k] * ((F.gelu(h @ blk.fc1_w[k] + blk.fc1_b[k]) @ blk.fc2_w[k] + blk.fc2_b[k]) * mod[5])
+
+  def middle(xs):
+    ad = head.mid_time_proj(emb).reshape(b, l, 6, head.mid_dim)
+    pick = lambda cond: ad if cond == "frame" else ad.mean(1, keepdim=True)
+    if head.mid == "shared":                                                       # the same weights (slice 0) for every branch
+      for blk, cond in zip(head.mid_blocks, head.mid_cond):
+        xs = ref_joint_block(blk, xs, [pick(cond)] * K, keep, cos, sin, lambda i: 0)
+      return xs
+    m = [head.merge(torch.cat(xs, -1))]                                            # (B, L, P, mid_dim)
+    for blk, cond in zip(head.mid_blocks, head.mid_cond):
+      m = ref_joint_block(blk, m, [pick(cond)], keep, cos, sin, lambda i: 0)
+    return [xs[k] + m[0] @ head.unmerge_w[k] + head.unmerge_b[k] for k in range(K)]
+
+  for j, (blk, cond) in enumerate(zip(head.blocks, head.cond)):
+    if j == head.n_in and head.mid != "none":
+      xs = middle(xs)
+    if cond == "frame":
+      xs = [xs[k] * (1 + films[k][0][None, :, None]) + films[k][1][None, :, None] for k in range(K)]
+    a = [ads[k] if cond == "frame" else ads[k].mean(1, keepdim=True) for k in range(K)]
+    xs = ref_joint_block(blk, xs, a, keep, cos, sin, lambda i: i)
+  if head.mid != "none" and head.n_in == len(head.blocks):
+    xs = middle(xs)
   outs = [rearrange(xs[k] @ head.out_w[k] + head.out_b[k], "b l (h w) (c py px) -> b l c (h py) (w px)", h=GRID, w=GRID, py=PS, px=PS)
           for k in range(K)]
   br = torch.cat(outs, 2)
@@ -101,6 +129,11 @@ def ref_forward(head, feats, x_net, t, keep):
       merged[:, :, c] = br[:, :, j]
   merged[:, :, 0] = br[:, :, [j for j, c in enumerate(gd.SPLIT_INDEX) if c == 0]].mean(2)
   return merged, br
+
+
+# the hybrids at test size: 2 input blocks -> 3 middle blocks -> 1 output block (positions 0 1 | 2 3 4 | 5: frame at 0 and 3)
+MIDS = {"none": {}, "shared": dict(mid="shared", in_blocks=2, mid_blocks=3, out_blocks=1),
+        "merged": dict(mid="merged", in_blocks=2, mid_blocks=3, mid_dim=128, out_blocks=1)}
 
 
 def slot_keep(keep):
@@ -113,8 +146,11 @@ def slot_keep(keep):
 
 
 def test_normalize_split_branches():
-  assert gd.normalize_split_branches(None) == {"enabled": False, "dim": 1024, "num_blocks": 9, "image_dim": 256}
-  for bad in ({"enabled": True, "dim": 100}, {"image_dim": 1024}, {"depth": 3}, {"num_blocks": 0}):
+  assert gd.normalize_split_branches(None) == {"enabled": False, "dim": 1024, "num_blocks": 9, "image_dim": 256, "mid": "none",
+                                               "in_blocks": 4, "mid_blocks": 12, "mid_dim": None, "out_blocks": 2}
+  assert gd.normalize_split_branches({"mid": "shared"})["mid_dim"] == 1024
+  for bad in ({"enabled": True, "dim": 100}, {"image_dim": 1024}, {"depth": 3}, {"num_blocks": 0}, {"mid": "both"},
+              {"mid": "shared", "mid_dim": 2048}, {"mid": "merged"}, {"mid": "merged", "mid_dim": 100}, {"mid": "shared", "mid_blocks": 0}):
     with pytest.raises(ValueError):
       gd.normalize_split_branches(bad)
   assert gd.SPLIT_INDEX == (11, 12, 13, 0, 8, 9, 10, 0, 1, 2, 3, 0, 4, 5, 6, 7)   # offset, colour, scale + opacity; rotation
@@ -160,20 +196,49 @@ def test_config_builds_the_split_head_and_rejects_other_options():
       gd.GSDiffusionModel(model_cfg(split_branches=SPLIT, **extra), stats())
 
 
+def test_mid_none_is_the_plain_split_head():
+  """mid none (with the hybrid keys given) builds the plain split head: the same parameters, the same init, the same output."""
+  torch.manual_seed(3)
+  plain = gd.SplitBranchHead(FEAT, L, patch_size=PS, dim=64, num_blocks=4, image_dim=16)
+  torch.manual_seed(3)
+  none = gd.SplitBranchHead(FEAT, L, patch_size=PS, dim=64, num_blocks=4, image_dim=16, mid="none", in_blocks=1, mid_blocks=5,
+                            mid_dim=128, out_blocks=7)
+  a, b = plain.state_dict(), none.state_dict()
+  assert list(a) == list(b) and all(torch.equal(a[k], b[k]) for k in a) and none.n_in == 4 and not none.mid_cond
+  m = gd.GSDiffusionModel(model_cfg(split_branches={**SPLIT, "mid": "none", "in_blocks": 1, "out_blocks": 1}, attention="global"),
+                          stats())
+  assert len(m.head.blocks) == 4 and m.head.mid == "none" and not hasattr(m.head, "mid_blocks")
+
+
+def test_hybrid_layouts():
+  a = split_head(**MIDS["shared"])
+  assert len(a.blocks) == 3 and len(a.mid_blocks) == 3 and a.n_in == 2 and a.mid_blocks[0].k == 1
+  assert a.cond == ["frame", "ray", "global"] and a.mid_cond == ["global", "frame", "ray"]      # positions 0 1 | 2 3 4 | 5
+  b = split_head(**MIDS["merged"])
+  assert b.mid_blocks[0].num_heads == 2 and b.merge.in_features == 4 * 64 and b.unmerge_w.shape == (4, 128, 64)
+  m = gd.GSDiffusionModel(model_cfg(split_branches={**SPLIT, **MIDS["merged"]}, attention="global"), stats())
+  assert m.head.mid == "merged" and m.head.mid_dim == 128
+
+
 def test_full_size_parameter_count():
   with torch.device("meta"):
     head = gd.SplitBranchHead(1024, 6, 14)                                          # the defaults: 1024 x 9, image 256
   n = sum(p.numel() for p in head.parameters())
   per_block_branch = sum(p.numel() for p in head.blocks[0].parameters()) / 4
   assert per_block_branch == 12_601_600 and n == 499_460_160 and len(head.blocks) == 9 and head.num_heads == 16
+  count = lambda **kw: sum(p.numel() for p in gd.SplitBranchHead(1024, 6, 14, **kw).parameters())
+  with torch.device("meta"):
+    assert count(mid="shared", in_blocks=4, mid_blocks=12, out_blocks=2) == 505_757_760                     # variant A
+    assert count(mid="merged", in_blocks=4, mid_blocks=3, mid_dim=2048, out_blocks=2) == 528_725_824        # variant B
 
 
 # ---------------------------------------------------------------- the forward
 
 
 @pytest.mark.parametrize("which", ["partial", "all"])
-def test_packed_matches_the_dense_reference(which):
-  head = split_head()
+@pytest.mark.parametrize("mid", list(MIDS))
+def test_packed_matches_the_dense_reference(which, mid):
+  head = split_head(**MIDS[mid])
   feats, x_net, t = inputs(4)
   hit = hit_masks()
   keep = gd.token_keep(hit, PS, "empty") if which == "partial" else torch.ones(4, L, P, dtype=torch.bool)
@@ -185,8 +250,9 @@ def test_packed_matches_the_dense_reference(which):
     assert torch.equal(head(feats, x_net, t), m)
 
 
-def test_packed_gradients_match_the_dense_reference():
-  head = split_head()
+@pytest.mark.parametrize("mid", list(MIDS))
+def test_packed_gradients_match_the_dense_reference(mid):
+  head = split_head(**MIDS[mid])
   feats, x_net, t = inputs(4)
   keep = gd.token_keep(hit_masks(), PS, "empty")
   s = slot_keep(keep)
@@ -203,10 +269,11 @@ def test_packed_gradients_match_the_dense_reference():
     assert rel(gp1[n], gp0[n]) < 1e-4, n
 
 
-def test_joint_attention_mixes_the_branches():
+@pytest.mark.parametrize("mid", list(MIDS))
+def test_joint_attention_mixes_the_branches(mid):
   """Perturbing only the rotation channels of the input moves the colour branch's output (and, with every token alone in its
   own sample, nothing else could carry it: the branches' only contact is the attention)."""
-  head = split_head()
+  head = split_head(**MIDS[mid])
   feats, x_net, t = inputs(2)
   pack = gd.PackIndex(gd.token_keep(hit_masks()[:2], PS, "empty"))
   x2 = x_net.clone()
@@ -216,16 +283,21 @@ def test_joint_attention_mixes_the_branches():
   s = slot_keep(gd.token_keep(hit_masks()[:2], PS, "empty"))
   for f in ("sh_dc", "offset", "scale", "opacity"):
     assert ((a[:, :, gd.X0_SLICES[f]] - b[:, :, gd.X0_SLICES[f]]) * s).abs().max() > 1e-4, f
-  # the control: without the attention's cross-branch terms (every block's attention output zeroed: ls1 = 0) the colour is untouched
+  # the control: without the attention's cross-branch terms (every block's attention output zeroed: ls1 = 0; merged: the middle's
+  # way back too) the colour is untouched
   with torch.no_grad():
-    for blk in head.blocks:
+    for blk in list(head.blocks) + list(getattr(head, "mid_blocks", [])):
       blk.ls1.zero_()
+    if mid == "merged":
+      head.unmerge_w.zero_()
+      head.unmerge_b.zero_()
     a, b = head(feats, x_net, t, pack), head(feats, x2, t, pack)
   assert torch.equal(a[:, :, gd.X0_SLICES["sh_dc"]], b[:, :, gd.X0_SLICES["sh_dc"]])
 
 
-def test_merged_opacity_is_the_mean_and_channels_in_place():
-  head = split_head()
+@pytest.mark.parametrize("mid", list(MIDS))
+def test_merged_opacity_is_the_mean_and_channels_in_place(mid):
+  head = split_head(**MIDS[mid])
   feats, x_net, t = inputs(2)
   with torch.no_grad():
     m, br = head(feats, x_net, t, branches=True)
@@ -238,8 +310,9 @@ def test_merged_opacity_is_the_mean_and_channels_in_place():
       assert torch.equal(m[:, :, c], br[:, :, j])
 
 
-def test_fresh_head_predicts_zero():
-  head = split_head(randomize=False)                                               # the zero-init readout
+@pytest.mark.parametrize("mid", list(MIDS))
+def test_fresh_head_predicts_zero(mid):
+  head = split_head(randomize=False, **MIDS[mid])                                               # the zero-init readout
   feats, x_net, t = inputs(2)
   with torch.no_grad():
     assert (head(feats, x_net, t) == 0).all()
@@ -248,17 +321,18 @@ def test_fresh_head_predicts_zero():
 # ---------------------------------------------------------------- the model: loss, decode, sampler, checkpoint
 
 
-def split_model(seed=0):
+def split_model(seed=0, mid="none"):
   torch.manual_seed(seed)
-  m = gd.GSDiffusionModel(model_cfg(split_branches=SPLIT, attention="global", token_drop="empty"), stats())
+  m = gd.GSDiffusionModel(model_cfg(split_branches={**SPLIT, **MIDS[mid]}, attention="global", token_drop="empty"), stats())
   m._feats = lambda f: f
   with torch.no_grad():
-    m.head.load_state_dict(split_head(seed).state_dict())
+    m.head.load_state_dict(split_head(seed, **MIDS[mid]).state_dict())
   return m
 
 
-def test_x0_loss_is_every_branch_on_its_own_channels():
-  m = split_model()
+@pytest.mark.parametrize("mid", list(MIDS))
+def test_x0_loss_is_every_branch_on_its_own_channels(mid):
+  m = split_model(mid=mid)
   feats, _, _ = inputs(2)
   hit = hit_masks()[:2]
   x0_raw = torch.randn(2, gd.CHANNELS, L, H, H)
@@ -286,8 +360,9 @@ def test_x0_loss_is_every_branch_on_its_own_channels():
     assert m.head.out_w.grad[k, :, 3 * ps2:].abs().sum() > 0
 
 
-def test_decode_and_sampler():
-  m = split_model()
+@pytest.mark.parametrize("mid", list(MIDS))
+def test_decode_and_sampler(mid):
+  m = split_model(mid=mid)
   feats, _, _ = inputs(2)
   hit = hit_masks()[:2]
   g = m.sample(feats, hit, seeds=[1, 2], steps=3)
@@ -300,12 +375,13 @@ def test_decode_and_sampler():
   assert torch.isfinite(probe[0.5]["err_model"]).all()
 
 
-def test_state_dict_round_trip(tmp_path):
-  m = split_model(seed=1)
+@pytest.mark.parametrize("mid", list(MIDS))
+def test_state_dict_round_trip(tmp_path, mid):
+  m = split_model(seed=1, mid=mid)
   path = tmp_path / "m.pt"
   torch.save({"state_dict": m.state_dict(), "ema": gd.EMAWeights(m.head).state_dict()}, path)
   torch.manual_seed(7)
-  fresh = gd.GSDiffusionModel(model_cfg(split_branches=SPLIT, attention="global", token_drop="empty"), stats())
+  fresh = gd.GSDiffusionModel(model_cfg(split_branches={**SPLIT, **MIDS[mid]}, attention="global", token_drop="empty"), stats())
   fresh._feats = lambda f: f
   ck = torch.load(path)
   fresh.load_state_dict(ck["state_dict"], strict=True)
@@ -319,8 +395,9 @@ def test_state_dict_round_trip(tmp_path):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA (varlen flash)")
-def test_varlen_bf16_matches_fp32():
-  head = split_head(device="cuda")
+@pytest.mark.parametrize("mid", list(MIDS))
+def test_varlen_bf16_matches_fp32(mid):
+  head = split_head(device="cuda", **MIDS[mid])
   head.checkpoint_activations = True
   feats, x_net, t = inputs(4, device="cuda")
   keep = gd.token_keep(hit_masks().cuda(), PS, "empty")

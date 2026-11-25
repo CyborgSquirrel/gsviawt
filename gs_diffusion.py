@@ -1060,20 +1060,38 @@ SPLIT_BRANCHES = (
 )
 SPLIT_INDEX = tuple(c for _, chans in SPLIT_BRANCHES for c in chans)   # (16,): the branch outputs' x0 channels, concatenated
 SPLIT_BRANCH_CHANNELS = 4
-SPLIT_DEFAULTS = dict(enabled=False, dim=1024, num_blocks=9, image_dim=256)   # diffusion.split_branches without the key: off
+SPLIT_DEFAULTS = dict(enabled=False, dim=1024, num_blocks=9, image_dim=256,   # diffusion.split_branches without the key: off
+                      mid="none", in_blocks=4, mid_blocks=12, mid_dim=None, out_blocks=2)
+SPLIT_MIDS = ("none", "shared", "merged")
 
 
 def normalize_split_branches(s):
-  """diffusion.split_branches (None or missing keys: the defaults, off) -> {"enabled", "dim", "num_blocks", "image_dim"}."""
+  """diffusion.split_branches (None or missing keys: the defaults, off) -> {"enabled", "dim", "num_blocks", "image_dim", "mid",
+  "in_blocks", "mid_blocks", "mid_dim", "out_blocks"}. mid none: num_blocks branch blocks (in / mid / out_blocks, mid_dim not
+  read); shared | merged: in_blocks branch blocks -> mid_blocks middle blocks -> out_blocks branch blocks (num_blocks not read);
+  mid_dim: the middle's width (shared: null = dim, must equal it; merged: needed)."""
   s = {**SPLIT_DEFAULTS, **dict(s or {})}
   unknown = sorted(set(s) - set(SPLIT_DEFAULTS))
   if unknown:
     raise ValueError(f"diffusion.split_branches: unknown keys {unknown}")
-  out = {"enabled": bool(s["enabled"]), "dim": int(s["dim"]), "num_blocks": int(s["num_blocks"]), "image_dim": int(s["image_dim"])}
+  out = {"enabled": bool(s["enabled"]), "dim": int(s["dim"]), "num_blocks": int(s["num_blocks"]), "image_dim": int(s["image_dim"]),
+         "mid": str(s["mid"]), "in_blocks": int(s["in_blocks"]), "mid_blocks": int(s["mid_blocks"]),
+         "mid_dim": None if s["mid_dim"] is None else int(s["mid_dim"]), "out_blocks": int(s["out_blocks"])}
   if out["dim"] % 64 or out["dim"] < 64:
     raise ValueError(f"diffusion.split_branches.dim must be a positive multiple of 64 (heads of 64), got {out['dim']}")
   if not 0 < out["image_dim"] < out["dim"] or out["num_blocks"] < 1:
     raise ValueError(f"diffusion.split_branches: needs 0 < image_dim < dim and num_blocks >= 1, got {out}")
+  if out["mid"] not in SPLIT_MIDS:
+    raise ValueError(f"diffusion.split_branches.mid must be one of {SPLIT_MIDS}, got {out['mid']!r}")
+  if out["mid"] != "none":
+    if out["mid"] == "shared":
+      out["mid_dim"] = out["dim"] if out["mid_dim"] is None else out["mid_dim"]
+      if out["mid_dim"] != out["dim"]:
+        raise ValueError(f"diffusion.split_branches.mid=shared: mid_dim must be dim ({out['dim']}), got {out['mid_dim']}")
+    if out["mid_dim"] is None or out["mid_dim"] % 64 or out["mid_dim"] < 64:
+      raise ValueError(f"diffusion.split_branches.mid={out['mid']}: mid_dim must be a positive multiple of 64, got {out['mid_dim']}")
+    if out["in_blocks"] < 0 or out["out_blocks"] < 0 or out["mid_blocks"] < 1:
+      raise ValueError(f"diffusion.split_branches: needs in_blocks, out_blocks >= 0 and mid_blocks >= 1, got {out}")
   return out
 
 
@@ -1163,8 +1181,11 @@ class SplitBranchHead(nn.Module):
   Runs on packed rows always: pack None = every token kept (the dense case), one code path."""
 
   def __init__(self, feature_dim, num_layers, patch_size=14, dim=1024, num_blocks=9, image_dim=256, mlp_ratio=4.0,
-               layer_scale_init=1e-4, t_embed_channels=256, img_token_scale=0.3, checkpoint_activations=False, cond_null="zeros"):
+               layer_scale_init=1e-4, t_embed_channels=256, img_token_scale=0.3, checkpoint_activations=False, cond_null="zeros",
+               mid="none", in_blocks=4, mid_blocks=12, mid_dim=None, out_blocks=2):
     super().__init__()
+    if mid not in SPLIT_MIDS:
+      raise ValueError(f"mid must be one of {SPLIT_MIDS}, got {mid!r}")
     if cond_null not in COND_NULLS:
       raise ValueError(f"cond_null must be one of {COND_NULLS}, got {cond_null!r}")
     if cond_null == "learned":
@@ -1187,11 +1208,31 @@ class SplitBranchHead(nn.Module):
     self.film1_w, self.film1_b = _linear_init(k, self.dim, self.dim)
     self.film2_w = nn.Parameter(torch.zeros(k, self.dim, 2 * self.dim))
     self.film2_b = nn.Parameter(torch.zeros(k, 2 * self.dim))
-    self.cond = [DiTTrunk.MODES[i % 3] for i in range(num_blocks)]   # the block's conditioning role (frame: FiLM + per-layer AdaLN)
-    self.blocks = nn.ModuleList(SplitBlock(k, self.dim, self.num_heads, mlp_ratio, layer_scale_init) for _ in range(num_blocks))
+    self.mid = mid
+    # the depth positions: [branch blocks 0 .. n_in) [middle] [branch blocks n_in ..); the conditioning role by the position in that
+    # whole sequence (frame at i % 3 == 0: per-layer AdaLN, and the per-branch FiLM before a frame-position BRANCH block)
+    n_branch = num_blocks if mid == "none" else in_blocks + out_blocks
+    self.n_in = n_branch if mid == "none" else in_blocks
+    n_mid = 0 if mid == "none" else mid_blocks
+    roles = [DiTTrunk.MODES[i % 3] for i in range(n_branch + n_mid)]
+    self.cond = roles[:self.n_in] + roles[self.n_in + n_mid:]   # the branch blocks' roles
+    self.mid_cond = roles[self.n_in:self.n_in + n_mid]
+    self.blocks = nn.ModuleList(SplitBlock(k, self.dim, self.num_heads, mlp_ratio, layer_scale_init) for _ in range(n_branch))
     self.out_w = nn.Parameter(torch.zeros(k, self.dim, self.noise_dim))
     self.out_b = nn.Parameter(torch.zeros(k, self.noise_dim))
     self._rope = {}
+    if mid != "none":   # (built last: mid none's parameters and their init are the plain split model's)
+      self.mid_dim = int(mid_dim if mid_dim is not None else self.dim)
+      if mid == "shared" and self.mid_dim != self.dim:
+        raise ValueError(f"mid=shared needs mid_dim == dim ({self.dim}), got {self.mid_dim}")
+      # one stack for every branch's tokens (K = 1 SplitBlocks: the same weights for all), its own AdaLN projection
+      self.mid_blocks = nn.ModuleList(SplitBlock(1, self.mid_dim, self.mid_dim // 64, mlp_ratio, layer_scale_init)
+                                      for _ in range(mid_blocks))
+      self.mid_time_proj = nn.Linear(self.dim, 6 * self.mid_dim)
+      if mid == "merged":   # a patch's K branch tokens -> one token, and back (residual, zero-init: the branch path intact at init)
+        self.merge = nn.Linear(k * self.dim, self.mid_dim)
+        self.unmerge_w = nn.Parameter(torch.zeros(k, self.mid_dim, self.dim))
+        self.unmerge_b = nn.Parameter(torch.zeros(k, self.dim))
 
   def _rope_tables(self, grid, device):
     key = (grid, device)
@@ -1200,12 +1241,45 @@ class SplitBranchHead(nn.Module):
       self._rope[key] = (cos.to(device), sin.to(device))
     return self._rope[key]
 
-  def adaln(self, t):
-    """t (B, L) -> (K, B, L, 6, D), fp32 (autocast off, as DiffusionHead.adaln)."""
+  def adaln(self, t, mid=False):
+    """t (B, L) -> (K, B, L, 6, D), fp32 (autocast off, as DiffusionHead.adaln). mid: also the middle's (1, B, L, 6, mid_dim)
+    (its own projection of the same shared time embedding)."""
     b, l = t.shape
     with torch.autocast(device_type=t.device.type, enabled=False):
       emb = F.silu(self.time_embed(sinusoidal_embedding(t.reshape(-1) * 1000.0, self.t_embed_channels)))   # (B L, D)
-      return _bmm(emb[None].expand(self.k, -1, -1), self.time_proj_w, self.time_proj_b).reshape(self.k, b, l, 6, self.dim)
+      ad = _bmm(emb[None].expand(self.k, -1, -1), self.time_proj_w, self.time_proj_b).reshape(self.k, b, l, 6, self.dim)
+      if not mid:
+        return ad
+      return ad, self.mid_time_proj(emb).reshape(1, b, l, 6, self.mid_dim)
+
+  def _run(self, block, *args):
+    if self.checkpoint_activations and torch.is_grad_enabled():
+      return torch.utils.checkpoint.checkpoint(block, *args, use_reentrant=False)
+    return block(*args)
+
+  def _middle(self, x, pack, cos_r, sin_r, ad_mid):
+    """The middle (mid shared | merged) on the branch rows x (K, T, D) -> (K, T, D).
+    shared: every branch's rows through the same K = 1 blocks, as ONE sequence in the joint row order (row i of branch j is row
+            K i + j: the attention segments are the branch blocks' K * cu_global), RoPE at each row's patch; no FiLM
+    merged: per kept token, its K branch tokens concatenated -> Linear(K D, mid_dim) -> the mid_dim blocks over the T merged rows
+            (cu_global) -> per branch a zero-initialized Linear(mid_dim, D) ADDED to its branch token; no FiLM"""
+    kk, t, d = x.shape
+    b, l = pack.B, pack.L
+    a_frame, a_mean = ad_mid.reshape(1, b * l, 6, self.mid_dim), ad_mid.mean(2)
+    if self.mid == "shared":
+      h = x.transpose(0, 1).reshape(1, t * kk, d)
+      cj, sj = cos_r.repeat_interleave(kk, 0), sin_r.repeat_interleave(kk, 0)
+      seg_f, seg_b = pack.frame.repeat_interleave(kk), pack.b.repeat_interleave(kk)
+      cu, mx = pack.cu_global * kk, pack.max_global * kk
+    else:
+      h = self.merge(x.transpose(0, 1).reshape(t, kk * d))[None]                            # (1, T, mid_dim)
+      cj, sj, seg_f, seg_b, cu, mx = cos_r, sin_r, pack.frame, pack.b, pack.cu_global, pack.max_global
+    for block, cond in zip(self.mid_blocks, self.mid_cond):
+      a, seg = (a_frame, seg_f) if cond == "frame" else (a_mean, seg_b)
+      h = self._run(block, h, cj, sj, a, seg, cu, mx)
+    if self.mid == "shared":
+      return h.reshape(t, kk, d).transpose(0, 1)
+    return x + _bmm(h.expand(kk, -1, -1), self.unmerge_w, self.unmerge_b).to(x.dtype)
 
   def films(self):
     """(gamma, beta), each (K, L, D): the per-branch, per-depth-layer FiLM."""
@@ -1238,19 +1312,23 @@ class SplitBranchHead(nn.Module):
     cos_r, sin_r = cos[pack.p], sin[pack.p]
     gamma, beta = self.films()
     gamma, beta = gamma[:, pack.l], beta[:, pack.l]                                          # (K, T, D)
-    ad = self.adaln(t)                                                                       # (K, B, L, 6, D)
+    if self.mid == "none":
+      ad = self.adaln(t)                                                                     # (K, B, L, 6, D)
+    else:
+      ad, ad_mid = self.adaln(t, mid=True)
     ad_frame, ad_mean = ad.reshape(self.k, b * l, 6, self.dim), ad.mean(2)
     cu, mx = pack.cu_global * self.k, pack.max_global * self.k
-    for block, cond in zip(self.blocks, self.cond):
+    for i, (block, cond) in enumerate(zip(self.blocks, self.cond)):
+      if i == self.n_in and self.mid != "none":
+        x = self._middle(x, pack, cos_r, sin_r, ad_mid)
       if cond == "frame":
         x = x * (1 + gamma) + beta
         a, seg = ad_frame, pack.frame
       else:
         a, seg = ad_mean, pack.b
-      if self.checkpoint_activations and torch.is_grad_enabled():
-        x = torch.utils.checkpoint.checkpoint(block, x, cos_r, sin_r, a, seg, cu, mx, use_reentrant=False)
-      else:
-        x = block(x, cos_r, sin_r, a, seg, cu, mx)
+      x = self._run(block, x, cos_r, sin_r, a, seg, cu, mx)
+    if self.mid != "none" and self.n_in == len(self.blocks):   # (out_blocks 0: the middle last)
+      x = self._middle(x, pack, cos_r, sin_r, ad_mid)
     y = _bmm(x, self.out_w, self.out_b)                                                      # (K, T, 4 patch^2)
     grid = int(round(p ** 0.5))
     y = pack.scatter(y.transpose(0, 1))                                                      # (B, L, P, K, 4 patch^2)
@@ -1361,7 +1439,8 @@ class GSDiffusionModel(nn.Module):
         int(cfg.model.feature_dim), self.num_layers, patch_size=self.patch_size, dim=split["dim"], num_blocks=split["num_blocks"],
         image_dim=split["image_dim"], img_token_scale=float(d.img_token_scale),
         checkpoint_activations=bool(d.get("checkpoint_activations", False)),
-        layer_scale_init=float(cfg.model.transformer.layer_scale_init), cond_null=cond_dropout["null"])
+        layer_scale_init=float(cfg.model.transformer.layer_scale_init), cond_null=cond_dropout["null"],
+        **({} if split["mid"] == "none" else {k: split[k] for k in ("mid", "in_blocks", "mid_blocks", "mid_dim", "out_blocks")}))
     else:
       self.head = DiffusionHead(
         int(cfg.model.feature_dim), self.num_layers, patch_size=self.patch_size, dim=d.get("dim"), num_blocks=int(d.num_blocks),

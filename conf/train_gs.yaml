@@ -417,12 +417,28 @@ diffusion:
   # Needs attention=global, film=frame, readout=linear, mask_attn none, colour_noise joint; diffusion.dim / num_blocks /
   # in_proj / in_proj_image_dim are not read. 1024 x 9 (16 heads; 12.60 M per branch block, 4 x 9 of them = 453.7 M): 499.5 M
   # head parameters (the 2048 x 9 split-proj-512 head: 506.2 M, 453.3 M in its blocks).
+  # Hybrids (MMDiT / FLUX style), mid: none (the above: num_blocks branch blocks) | shared | merged: in_blocks branch blocks ->
+  # mid_blocks MIDDLE blocks -> out_blocks branch blocks (num_blocks not read). The conditioning role by the position in the
+  # whole sequence (i % 3 == 0: per-layer AdaLN; the branch FiLM before a frame-position branch block; no FiLM in the middle).
+  #   shared  one stack (mid_dim = dim) for every branch's tokens: global attention over all 4 branches' tokens (4N, the same
+  #           RoPE positions; the tokens keep their branch identity in the residual stream), its own AdaLN projection
+  #           Linear(dim, 6 dim) of the shared time embedding. 4 / 12 / 2 at 1024: 505.76 M head parameters
+  #   merged  per kept token its 4 branch tokens concatenated -> Linear(4 dim, mid_dim) -> mid_blocks blocks of mid_dim (heads of
+  #           64, global attention over the N merged tokens, own AdaLN projection Linear(dim, 6 mid_dim)) -> per branch a
+  #           zero-initialized Linear(mid_dim, dim) ADDED to its branch token (the branch path intact at init). 4 / 3 / 2,
+  #           mid_dim 2048: 528.73 M (the middle's AdaLN projection alone 12.6 M)
+  # mid none: in_blocks / mid_blocks / mid_dim / out_blocks not read, the plain split model bit for bit.
   # Configs without the key: off (the single trunk, bit for bit)
   split_branches:
     enabled: false
     dim: 1024
     num_blocks: 9
     image_dim: 256               # of dim: the image features' share (the noisy values get dim - image_dim), 1/4 as split proj 512/2048
+    mid: none
+    in_blocks: 4
+    mid_blocks: 12
+    mid_dim: null                # shared: null = dim; merged: needed (e.g. 2048)
+    out_blocks: 2
   cond_dropout:
     p: 0.0                     # 0 = off: nothing is drawn, the random streams and the loss exactly as without dropout
     "null": zeros              # zeros (the features' mean after the z-score; no parameter) | learned (a learned feature_dim
