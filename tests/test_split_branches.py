@@ -1,6 +1,7 @@
 """diffusion.split_branches: 4 branch transformers (offset + opacity, colour + opacity, scale + opacity, rotation) with joint global
 attention, and the hybrids (mid shared | merged: input branch blocks -> a shared-weight / a merged-token middle -> output branch
-blocks), every test for each of the three. The default (off) is the single trunk bit for bit (parameters, loss, gradients, sample); the packed head agrees with an
+blocks), every test for each of the three; the attention patterns (attn_pattern: joint | branch | patch per block, the alt / fact presets)
+against the same dense reference, the branch blocks isolating the branches and the patch blocks the patches. The default (off) is the single trunk bit for bit (parameters, loss, gradients, sample); the packed head agrees with an
 independent dense reference (per-branch loops, the dropped tokens masked as keys, the joint attention over the concatenated branch
 sequences), forward and gradients, and with itself on every token kept; the attention mixes the branches; the merged opacity is the
 mean of the three; the x0 loss is every branch on its own channels; the decode / sampler path; a state_dict round trip; bf16 varlen
@@ -52,13 +53,18 @@ def inputs(b, seed=1, device="cpu"):
 
 # ---------------------------------------------------------------- the dense reference, written per branch
 
-def ref_joint_block(blk, xs, ads, keep, cos, sin, pidx):
+def ref_joint_block(blk, xs, ads, keep, cos, sin, pidx, kind="joint"):
   """One block on the dense tokens xs (a list of (B, L, P, D_i)), ONE masked SDPA over their sequences concatenated (list order:
   branch-major, a different order from the packed rows'); token i uses blk's parameter slice pidx(i), modulated by ads[i] ((B, L | 1,
-  6, D)). keep (B, L, P): the dropped tokens masked as keys."""
+  6, D)). keep (B, L, P): the dropped tokens masked as keys. kind branch: a key only of the query's own branch (list entry); patch:
+  only the keys at the query's own (l, p)."""
   b, l, p, _ = xs[0].shape
   ln = lambda x, w, bb: F.layer_norm(x, (x.shape[-1],)) * w + bb
   key_ok = keep.reshape(b, l * p).repeat(1, len(xs))
+  n = len(xs) * l * p
+  ent, pos = torch.arange(n) // (l * p), torch.arange(n) % (l * p)
+  allow = {"joint": torch.ones(n, n, dtype=torch.bool), "branch": ent[:, None] == ent[None, :],
+           "patch": pos[:, None] == pos[None, :]}[kind]
   qs, ks, vs, mods = [], [], [], []
   for i, x in enumerate(xs):
     k, D = pidx(i), x.shape[-1]
@@ -70,7 +76,10 @@ def ref_joint_block(blk, xs, ads, keep, cos, sin, pidx):
     qs.append(apply_rope(q, cos, sin))
     ks.append(apply_rope(kk, cos, sin))
     vs.append(v)
-  y = _masked_sdpa(torch.cat(qs, 1), torch.cat(ks, 1), torch.cat(vs, 1), key_ok).reshape(b, len(xs), l, p, -1)
+  q, k_, v = torch.cat(qs, 1), torch.cat(ks, 1), torch.cat(vs, 1)
+  m = (key_ok[:, None, None, :] & allow[None, None]) | torch.eye(n, dtype=torch.bool)[None, None]   # (_masked_sdpa's own-key rule)
+  y = F.scaled_dot_product_attention(q.transpose(1, 2), k_.transpose(1, 2), v.transpose(1, 2), attn_mask=m).transpose(1, 2)
+  y = y.reshape(b, len(xs), l, p, -1)
   out = []
   for i, x in enumerate(xs):
     k, mod = pidx(i), mods[i]
@@ -117,7 +126,7 @@ def ref_forward(head, feats, x_net, t, keep):
     if cond == "frame":
       xs = [xs[k] * (1 + films[k][0][None, :, None]) + films[k][1][None, :, None] for k in range(K)]
     a = [ads[k] if cond == "frame" else ads[k].mean(1, keepdim=True) for k in range(K)]
-    xs = ref_joint_block(blk, xs, a, keep, cos, sin, lambda i: i)
+    xs = ref_joint_block(blk, xs, a, keep, cos, sin, lambda i: i, blk.attn)
   if head.mid != "none" and head.n_in == len(head.blocks):
     xs = middle(xs)
   outs = [rearrange(xs[k] @ head.out_w[k] + head.out_b[k], "b l (h w) (c py px) -> b l c (h py) (w px)", h=GRID, w=GRID, py=PS, px=PS)
@@ -147,12 +156,19 @@ def slot_keep(keep):
 
 def test_normalize_split_branches():
   assert gd.normalize_split_branches(None) == {"enabled": False, "dim": 1024, "num_blocks": 9, "image_dim": 256, "mid": "none",
-                                               "in_blocks": 4, "mid_blocks": 12, "mid_dim": None, "out_blocks": 2}
+                                               "in_blocks": 4, "mid_blocks": 12, "mid_dim": None, "out_blocks": 2,
+                                               "attn_pattern": ["joint"] * 9}
   assert gd.normalize_split_branches({"mid": "shared"})["mid_dim"] == 1024
   for bad in ({"enabled": True, "dim": 100}, {"image_dim": 1024}, {"depth": 3}, {"num_blocks": 0}, {"mid": "both"},
-              {"mid": "shared", "mid_dim": 2048}, {"mid": "merged"}, {"mid": "merged", "mid_dim": 100}, {"mid": "shared", "mid_blocks": 0}):
+              {"mid": "shared", "mid_dim": 2048}, {"mid": "merged"}, {"mid": "merged", "mid_dim": 100}, {"mid": "shared", "mid_blocks": 0},
+              {"attn_pattern": "ray"}, {"attn_pattern": ["joint", "branch"]}, {"num_blocks": 2, "attn_pattern": ["joint", "frame"]},
+              {"mid": "shared", "attn_pattern": "alt"}):
     with pytest.raises(ValueError):
       gd.normalize_split_branches(bad)
+  j, br, pa = "joint", "branch", "patch"
+  assert gd.normalize_split_branches({"attn_pattern": "alt"})["attn_pattern"] == [j, br, br] * 3
+  assert gd.normalize_split_branches({"attn_pattern": "fact"})["attn_pattern"] == [j, br, pa] * 3
+  assert gd.normalize_split_branches({"num_blocks": 2, "attn_pattern": [pa, br]})["attn_pattern"] == [pa, br]
   assert gd.SPLIT_INDEX == (11, 12, 13, 0, 8, 9, 10, 0, 1, 2, 3, 0, 4, 5, 6, 7)   # offset, colour, scale + opacity; rotation
 
 
@@ -394,10 +410,148 @@ def test_state_dict_round_trip(tmp_path, mid):
   assert not any("branch_index" in k for k in ck["state_dict"])
 
 
+# ---------------------------------------------------------------- attention patterns (attn_pattern, mid none)
+
+# at the test size (4 blocks): alt = joint branch branch joint, fact = joint branch patch joint
+PATTERNS = {"alt": "alt", "fact": "fact", "branch": ["branch"] * 4, "patch": ["patch"] * 4}
+
+
+def test_attn_pattern_default_is_the_joint_split_head_bit_for_bit():
+  feats, x_net, t = inputs(2)
+  pack = gd.PackIndex(gd.token_keep(hit_masks()[:2], PS, "empty"))
+  heads = [split_head(), split_head(attn_pattern="joint"), split_head(attn_pattern=["joint"] * 4)]
+  sds = [h.state_dict() for h in heads]
+  assert all(list(sd) == list(sds[0]) and all(torch.equal(sd[k], sds[0][k]) for k in sd) for sd in sds)
+  with torch.no_grad():
+    outs = [h(feats, x_net, t, pack, branches=True)[1] for h in heads]
+  assert all(torch.equal(o, outs[0]) for o in outs) and heads[0].attn_pattern == ["joint"] * 4
+  # the config path: the key's default builds joint blocks, a preset the blocks' kinds, the same parameters either way
+  torch.manual_seed(0)
+  a = gd.GSDiffusionModel(model_cfg(split_branches=SPLIT, attention="global"), stats())
+  torch.manual_seed(0)
+  b = gd.GSDiffusionModel(model_cfg(split_branches={**SPLIT, "attn_pattern": "fact"}, attention="global"), stats())
+  assert [blk.attn for blk in a.head.blocks] == ["joint"] * 4
+  assert [blk.attn for blk in b.head.blocks] == ["joint", "branch", "patch", "joint"]
+  sa, sb = a.state_dict(), b.state_dict()
+  assert list(sa) == list(sb) and all(torch.equal(sa[k], sb[k]) for k in sa)
+  with pytest.raises(ValueError):
+    split_head(attn_pattern="alt", **MIDS["shared"])
+
+
+@pytest.mark.parametrize("which", ["partial", "all"])
+@pytest.mark.parametrize("pattern", list(PATTERNS))
+def test_attn_pattern_packed_matches_the_dense_reference(which, pattern):
+  head = split_head(attn_pattern=PATTERNS[pattern])
+  feats, x_net, t = inputs(4)
+  keep = gd.token_keep(hit_masks(), PS, "empty") if which == "partial" else torch.ones(4, L, P, dtype=torch.bool)
+  ref_m, ref_b = ref_forward(head, feats, x_net, t, keep)
+  m, br = head(feats, x_net, t, gd.PackIndex(keep), branches=True)
+  s = slot_keep(keep)
+  assert rel(br * s, ref_b * s) < 1e-5 and rel(m * s, ref_m * s) < 1e-5
+
+
+@pytest.mark.parametrize("pattern", list(PATTERNS))
+def test_attn_pattern_packed_gradients_match_the_dense_reference(pattern):
+  head = split_head(attn_pattern=PATTERNS[pattern])
+  feats, x_net, t = inputs(4)
+  keep = gd.token_keep(hit_masks(), PS, "empty")
+  s = slot_keep(keep)
+  w = torch.randn(4, L, 16, H, H)
+  grads = []
+  for fn in (lambda x: ref_forward(head, feats, x, t, keep)[1], lambda x: head(feats, x, t, gd.PackIndex(keep), branches=True)[1]):
+    head.zero_grad()
+    x = x_net.clone().requires_grad_(True)
+    (fn(x) * s * w).sum().backward()
+    grads.append((x.grad * s, {n: p.grad.clone() for n, p in head.named_parameters()}))
+  (gx0, gp0), (gx1, gp1) = grads
+  assert rel(gx1, gx0) < 1e-5
+  for n in gp0:
+    assert rel(gp1[n], gp0[n]) < 1e-4, n
+
+
+def _block_inputs(t_rows=None):
+  pack = gd.PackIndex(gd.token_keep(hit_masks()[:2], PS, "empty"))
+  g = torch.Generator().manual_seed(4)
+  x = torch.randn(4, pack.T, 64, generator=g)
+  ad = 0.1 * torch.randn(4, pack.B, 6, 64, generator=g)
+  cos, sin = gd.rope_cos_sin(GRID, 64)
+  cu_b = torch.cat([pack.cu_global[:-1] + j * pack.T for j in range(4)] + [pack.cu_global.new_tensor([4 * pack.T])])
+  segs = {"joint": (pack.cu_global * 4, pack.max_global * 4), "branch": (cu_b, pack.max_global), "patch": (None, None)}
+  return pack, x, ad, cos[pack.p], sin[pack.p], segs
+
+
+@pytest.mark.parametrize("attn", ["joint", "branch", "patch"])
+def test_block_isolation(attn):
+  """One SplitBlock: branch -- perturbing branch 3's rows leaves branches 0-2 bit for bit (joint: they move); patch -- perturbing one
+  row (one kept token of one branch) moves only that row's K branch tokens, every other row bit for bit."""
+  torch.manual_seed(0)
+  blk = gd.SplitBlock(4, 64, 1, attn=attn)
+  with torch.no_grad():
+    blk.ls1.fill_(1.0)
+    blk.ls2.fill_(1.0)
+  pack, x, ad, cr, sr, segs = _block_inputs()
+  run = lambda z: blk(z, cr, sr, ad, pack.b, *segs[attn])
+  x2 = x.clone()
+  x2[3] += torch.randn_like(x2[3])
+  with torch.no_grad():
+    a, b = run(x), run(x2)
+  if attn == "joint":
+    assert (a[:3] - b[:3]).abs().max() > 1e-4
+  else:
+    assert torch.equal(a[:3], b[:3]) if attn == "branch" else not torch.equal(a[:3], b[:3])
+  r = 5                                                                             # one row, branch 1
+  x3 = x.clone()
+  x3[1, r] += torch.randn(64)
+  with torch.no_grad():
+    c = run(x3)
+  moved = (c - a).abs().amax(-1) > 0                                               # (K, T)
+  if attn == "patch":
+    others = torch.ones(pack.T, dtype=torch.bool)
+    others[r] = False
+    assert moved[:, r].all() and not moved[:, others].any()
+  elif attn == "branch":   # only branch 1's rows of the same sample
+    assert not moved[[0, 2, 3]].any() and moved[1, pack.b == pack.b[r]].all() and not moved[1, pack.b != pack.b[r]].any()
+  else:
+    assert moved[:, pack.b == pack.b[r]].all()
+
+
+def test_head_branch_pattern_isolates_the_branches():
+  """attn_pattern all branch: the rotation channels' input leaves the offset / colour / scale branches' outputs bit for bit (and
+  moves the rotation's); all joint (the control): they move."""
+  feats, x_net, t = inputs(2)
+  pack = gd.PackIndex(gd.token_keep(hit_masks()[:2], PS, "empty"))
+  x2 = x_net.clone()
+  x2[:, :, gd.X0_SLICES["rotation"]] += torch.randn_like(x2[:, :, gd.X0_SLICES["rotation"]])
+  for pattern, isolated in ((["branch"] * 4, True), ("joint", False)):
+    head = split_head(attn_pattern=pattern)
+    with torch.no_grad():
+      (_, a), (_, b) = head(feats, x_net, t, pack, branches=True), head(feats, x2, t, pack, branches=True)
+    assert torch.equal(a[:, :, :12], b[:, :, :12]) == isolated and not torch.equal(a[:, :, 12:], b[:, :, 12:])
+
+
+def test_head_patch_pattern_mixes_only_within_a_patch():
+  """attn_pattern all patch: perturbing one kept patch's rotation values moves that patch's other branches and no other patch."""
+  head = split_head(attn_pattern=["patch"] * 4)
+  feats, x_net, t = inputs(2)
+  keep = gd.token_keep(hit_masks()[:2], PS, "empty")
+  pack = gd.PackIndex(keep)
+  b0, l0, p0 = (int(v) for v in keep.nonzero()[3])
+  py, px = divmod(p0, GRID)
+  x2 = x_net.clone()
+  x2[b0, l0, gd.X0_SLICES["rotation"], py * PS:(py + 1) * PS, px * PS:(px + 1) * PS] += 1.0
+  with torch.no_grad():
+    (_, a), (_, b) = head(feats, x_net, t, pack, branches=True), head(feats, x2, t, pack, branches=True)
+  d = rearrange((a - b).abs(), "b l c (h py) (w px) -> b l (h w) c (py px)", py=PS, px=PS).amax(-1)   # (B, L, P, 16)
+  assert (d[b0, l0, p0, :12] > 0).all()                                             # the other branches of the same patch moved
+  d[b0, l0, p0] = 0
+  assert (d == 0).all()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA (varlen flash)")
-@pytest.mark.parametrize("mid", list(MIDS))
+@pytest.mark.parametrize("mid", list(MIDS) + [f"pattern_{k}" for k in PATTERNS])
 def test_varlen_bf16_matches_fp32(mid):
-  head = split_head(device="cuda", **MIDS[mid])
+  kw = {"attn_pattern": PATTERNS[mid[8:]]} if mid.startswith("pattern_") else MIDS[mid]
+  head = split_head(device="cuda", **kw)
   head.checkpoint_activations = True
   feats, x_net, t = inputs(4, device="cuda")
   keep = gd.token_keep(hit_masks().cuda(), PS, "empty")

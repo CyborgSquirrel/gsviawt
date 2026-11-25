@@ -1061,13 +1061,33 @@ SPLIT_BRANCHES = (
 SPLIT_INDEX = tuple(c for _, chans in SPLIT_BRANCHES for c in chans)   # (16,): the branch outputs' x0 channels, concatenated
 SPLIT_BRANCH_CHANNELS = 4
 SPLIT_DEFAULTS = dict(enabled=False, dim=1024, num_blocks=9, image_dim=256,   # diffusion.split_branches without the key: off
-                      mid="none", in_blocks=4, mid_blocks=12, mid_dim=None, out_blocks=2)
+                      mid="none", in_blocks=4, mid_blocks=12, mid_dim=None, out_blocks=2, attn_pattern="joint")
 SPLIT_MIDS = ("none", "shared", "merged")
+# the branch blocks' attention kinds: joint = one softmax over every branch's kept tokens of the sample (K^2 N^2 pairs); branch = each
+# branch's tokens over that branch's tokens only (K N^2); patch = the K branch tokens of one kept patch over each other (K^2 per patch)
+SPLIT_ATTNS = ("joint", "branch", "patch")
+SPLIT_ATTN_PRESETS = {"joint": ("joint",), "alt": ("joint", "branch", "branch"), "fact": ("joint", "branch", "patch")}
+
+
+def split_attn_pattern(spec, n):
+  """diffusion.split_branches.attn_pattern -> the n branch blocks' attention kinds (a list): a preset name (SPLIT_ATTN_PRESETS, the
+  block at i gets the preset's i % len) or a list of n kinds (SPLIT_ATTNS); None = joint everywhere."""
+  if spec is None or isinstance(spec, str):
+    name = "joint" if spec is None else spec
+    if name not in SPLIT_ATTN_PRESETS:
+      raise ValueError(f"diffusion.split_branches.attn_pattern: a preset {sorted(SPLIT_ATTN_PRESETS)} or a list, got {spec!r}")
+    pre = SPLIT_ATTN_PRESETS[name]
+    return [pre[i % len(pre)] for i in range(n)]
+  out = [str(a) for a in spec]
+  if len(out) != n or any(a not in SPLIT_ATTNS for a in out):
+    raise ValueError(f"diffusion.split_branches.attn_pattern: needs {n} kinds of {SPLIT_ATTNS} (one per branch block), got {out}")
+  return out
 
 
 def normalize_split_branches(s):
   """diffusion.split_branches (None or missing keys: the defaults, off) -> {"enabled", "dim", "num_blocks", "image_dim", "mid",
-  "in_blocks", "mid_blocks", "mid_dim", "out_blocks"}. mid none: num_blocks branch blocks (in / mid / out_blocks, mid_dim not
+  "in_blocks", "mid_blocks", "mid_dim", "out_blocks", "attn_pattern"} (attn_pattern: the branch blocks' kinds, a list; non-joint
+  kinds only with mid none). mid none: num_blocks branch blocks (in / mid / out_blocks, mid_dim not
   read); shared | merged: in_blocks branch blocks -> mid_blocks middle blocks -> out_blocks branch blocks (num_blocks not read);
   mid_dim: the middle's width (shared: null = dim, must equal it; merged: needed)."""
   s = {**SPLIT_DEFAULTS, **dict(s or {})}
@@ -1092,6 +1112,11 @@ def normalize_split_branches(s):
       raise ValueError(f"diffusion.split_branches.mid={out['mid']}: mid_dim must be a positive multiple of 64, got {out['mid_dim']}")
     if out["in_blocks"] < 0 or out["out_blocks"] < 0 or out["mid_blocks"] < 1:
       raise ValueError(f"diffusion.split_branches: needs in_blocks, out_blocks >= 0 and mid_blocks >= 1, got {out}")
+  n_branch = out["num_blocks"] if out["mid"] == "none" else out["in_blocks"] + out["out_blocks"]
+  spec = s["attn_pattern"]
+  out["attn_pattern"] = split_attn_pattern(spec if spec is None or isinstance(spec, str) else list(spec), n_branch)
+  if out["mid"] != "none" and set(out["attn_pattern"]) - {"joint"}:
+    raise ValueError(f"diffusion.split_branches.attn_pattern: non-joint kinds only with mid none, got {out['attn_pattern']}")
   return out
 
 
@@ -1115,14 +1140,18 @@ def _ln(x, w, b, eps=1e-5):
 
 class SplitBlock(nn.Module):
   """K DiTBlocks (global attention) side by side, stacked parameters (K, ...): each branch its own AdaLN modulation, norms,
-  qkv (no bias), QK-norm, out-proj, MLP and LayerScales; the attention is ONE softmax over the union of all branches' tokens of
-  a sample (MMDiT's joint attention). Same init as DiTBlock's per branch."""
+  qkv (no bias), QK-norm, out-proj, MLP and LayerScales. attn joint: the attention is ONE softmax over the union of all branches'
+  tokens of a sample (MMDiT's joint attention); branch: each branch's tokens attend to that branch's tokens of the sample only;
+  patch: the K branch tokens of one kept patch attend to each other only (an explicit K x K softmax). Same init as DiTBlock's per
+  branch."""
 
-  def __init__(self, k, dim, num_heads, mlp_ratio=4.0, layer_scale_init=1e-4):
+  def __init__(self, k, dim, num_heads, mlp_ratio=4.0, layer_scale_init=1e-4, attn="joint"):
     super().__init__()
     if dim % num_heads or (dim // num_heads) % 4:
       raise ValueError(f"dim={dim} must split into num_heads={num_heads} heads of a multiple-of-4 size (2D RoPE)")
-    self.k, self.num_heads = k, num_heads
+    if attn not in SPLIT_ATTNS:
+      raise ValueError(f"attn must be one of {SPLIT_ATTNS}, got {attn!r}")
+    self.k, self.num_heads, self.attn = k, num_heads, attn   # (attn: no parameter, the state dict is the same for every kind)
     hd, hid = dim // num_heads, int(dim * mlp_ratio)
     self.norm1_w, self.norm1_b = nn.Parameter(torch.ones(k, dim)), nn.Parameter(torch.zeros(k, dim))
     self.qkv_w = _linear_init(k, dim, 3 * dim, bias=False)
@@ -1146,15 +1175,23 @@ class SplitBlock(nn.Module):
   def forward(self, x, cos_r, sin_r, adaln, seg, cu, max_len):
     """x (K, T, D) packed rows (PackIndex order); adaln (K, N, 6, D), seg (T,): row i of branch j is modulated by adaln[j, seg[i]];
     cu / max_len: the samples' segments of the JOINT row order (K * PackIndex.cu_global): row i of branch j is joint row K i + j,
-    so a sample's K * T_b rows are contiguous."""
+    so a sample's K * T_b rows are contiguous. attn branch: cu / max_len are the (branch, sample) segments of the BRANCH-MAJOR
+    rows (row i of branch j is row j T + i; SplitBranchHead.forward's cu_branch); patch: cu / max_len not read."""
     kk, t, d = x.shape
     mod = self.modulation[:, None] + adaln.float()                                           # (K, N, 6, D)
     row = lambda i: mod[:, :, i][:, seg]                                                     # (K, T, D)
     h = (_ln(x, self.norm1_w, self.norm1_b).float() * (1 + row(1)) + row(0)).to(x.dtype)
     q, k, v = self.qkv(h, cos_r, sin_r)
-    joint = lambda z: z.transpose(0, 1).reshape(t * kk, *z.shape[2:])                       # (K, T, ...) -> (T K, ...)
-    out = segment_attention(joint(q), joint(k), joint(v), cu, max_len)                       # (T K, heads, hd)
-    out = out.reshape(t, kk, d).transpose(0, 1)                                              # back to (K, T, D)
+    if self.attn == "joint":
+      joint = lambda z: z.transpose(0, 1).reshape(t * kk, *z.shape[2:])                     # (K, T, ...) -> (T K, ...)
+      out = segment_attention(joint(q), joint(k), joint(v), cu, max_len)                     # (T K, heads, hd)
+      out = out.reshape(t, kk, d).transpose(0, 1)                                            # back to (K, T, D)
+    elif self.attn == "branch":
+      flat = lambda z: z.reshape(kk * t, *z.shape[2:])                                       # (K, T, ...) -> (K T, ...): no copy
+      out = segment_attention(flat(q), flat(k), flat(v), cu, max_len).reshape(kk, t, d)
+    else:   # patch: K tokens per segment, every one kept (the branches share the kept tokens): no mask
+      att = torch.einsum("kthd,jthd->thkj", q, k) * (d // self.num_heads) ** -0.5
+      out = torch.einsum("thkj,jthd->kthd", att.softmax(-1).to(v.dtype), v).reshape(kk, t, d)
     x = x + (self.ls1[:, None] * _bmm(out.to(h.dtype), self.proj_w, self.proj_b) * row(2)).to(x.dtype)
     h = (_ln(x, self.norm2_w, self.norm2_b).float() * (1 + row(4)) + row(3)).to(x.dtype)
     m = _bmm(F.gelu(_bmm(h, self.fc1_w, self.fc1_b)), self.fc2_w, self.fc2_b)
@@ -1168,8 +1205,10 @@ class SplitBranchHead(nn.Module):
     input   the z-scored image features * img_token_scale -> its own Linear(F, image_dim) | its group's 4 x patch^2 noisy values ->
             its own Linear(4 patch^2, dim - image_dim), concatenated (DiffusionHead's in_proj split, the same 1/4 image share at the
             defaults), plus a learned branch embedding (dim,)
-    blocks  SplitBlock: per branch its own AdaLN modulation / norms / qkv / out-proj / MLP; ONE joint global attention per block
-            over every branch's tokens of the sample (the same kept tokens and the same 2D RoPE positions in every branch)
+    blocks  SplitBlock: per branch its own AdaLN modulation / norms / qkv / out-proj / MLP; by default ONE joint global attention
+            per block over every branch's tokens of the sample (the same kept tokens and the same 2D RoPE positions in every branch);
+            attn_pattern (mid none): per block joint | branch (own branch's tokens only) | patch (the K tokens of one patch only),
+            a preset (alt: joint branch branch, fact: joint branch patch, repeated) or a list
     time    one shared sinusoid -> MLP time_embed (as DiffusionHead's), per branch its own SiLU -> Linear(dim, 6 dim) time_proj
             (MMDiT: a shared conditioning vector, per-stream modulation); WT's rule per block position: the blocks at i % 3 == 0
             get the per-layer AdaLN and the per-layer FiLM (per branch its own layer_embed -> Linear -> GELU -> zero-init Linear),
@@ -1182,7 +1221,7 @@ class SplitBranchHead(nn.Module):
 
   def __init__(self, feature_dim, num_layers, patch_size=14, dim=1024, num_blocks=9, image_dim=256, mlp_ratio=4.0,
                layer_scale_init=1e-4, t_embed_channels=256, img_token_scale=0.3, checkpoint_activations=False, cond_null="zeros",
-               mid="none", in_blocks=4, mid_blocks=12, mid_dim=None, out_blocks=2):
+               mid="none", in_blocks=4, mid_blocks=12, mid_dim=None, out_blocks=2, attn_pattern=None):
     super().__init__()
     if mid not in SPLIT_MIDS:
       raise ValueError(f"mid must be one of {SPLIT_MIDS}, got {mid!r}")
@@ -1217,7 +1256,11 @@ class SplitBranchHead(nn.Module):
     roles = [DiTTrunk.MODES[i % 3] for i in range(n_branch + n_mid)]
     self.cond = roles[:self.n_in] + roles[self.n_in + n_mid:]   # the branch blocks' roles
     self.mid_cond = roles[self.n_in:self.n_in + n_mid]
-    self.blocks = nn.ModuleList(SplitBlock(k, self.dim, self.num_heads, mlp_ratio, layer_scale_init) for _ in range(n_branch))
+    self.attn_pattern = split_attn_pattern(attn_pattern, n_branch)
+    if mid != "none" and set(self.attn_pattern) - {"joint"}:
+      raise ValueError(f"attn_pattern: non-joint kinds only with mid none, got {self.attn_pattern}")
+    self.blocks = nn.ModuleList(SplitBlock(k, self.dim, self.num_heads, mlp_ratio, layer_scale_init, attn=a)
+                                for a in self.attn_pattern)
     self.out_w = nn.Parameter(torch.zeros(k, self.dim, self.noise_dim))
     self.out_b = nn.Parameter(torch.zeros(k, self.noise_dim))
     self._rope = {}
@@ -1318,6 +1361,11 @@ class SplitBranchHead(nn.Module):
       ad, ad_mid = self.adaln(t, mid=True)
     ad_frame, ad_mean = ad.reshape(self.k, b * l, 6, self.dim), ad.mean(2)
     cu, mx = pack.cu_global * self.k, pack.max_global * self.k
+    if "branch" in self.attn_pattern:   # the (branch, sample) segments of the branch-major rows (K T): branch j's at j T + cu_global
+      cu_b = torch.cat([pack.cu_global[:-1] + j * pack.T for j in range(self.k)] + [pack.cu_global.new_tensor([self.k * pack.T])])
+      segs = {"joint": (cu, mx), "branch": (cu_b, pack.max_global), "patch": (cu, mx)}
+    else:
+      segs = {"joint": (cu, mx), "patch": (cu, mx)}
     for i, (block, cond) in enumerate(zip(self.blocks, self.cond)):
       if i == self.n_in and self.mid != "none":
         x = self._middle(x, pack, cos_r, sin_r, ad_mid)
@@ -1326,7 +1374,7 @@ class SplitBranchHead(nn.Module):
         a, seg = ad_frame, pack.frame
       else:
         a, seg = ad_mean, pack.b
-      x = self._run(block, x, cos_r, sin_r, a, seg, cu, mx)
+      x = self._run(block, x, cos_r, sin_r, a, seg, *segs[block.attn])
     if self.mid != "none" and self.n_in == len(self.blocks):   # (out_blocks 0: the middle last)
       x = self._middle(x, pack, cos_r, sin_r, ad_mid)
     y = _bmm(x, self.out_w, self.out_b)                                                      # (K, T, 4 patch^2)
@@ -1440,6 +1488,7 @@ class GSDiffusionModel(nn.Module):
         image_dim=split["image_dim"], img_token_scale=float(d.img_token_scale),
         checkpoint_activations=bool(d.get("checkpoint_activations", False)),
         layer_scale_init=float(cfg.model.transformer.layer_scale_init), cond_null=cond_dropout["null"],
+        attn_pattern=split["attn_pattern"],
         **({} if split["mid"] == "none" else {k: split[k] for k in ("mid", "in_blocks", "mid_blocks", "mid_dim", "out_blocks")}))
     else:
       self.head = DiffusionHead(

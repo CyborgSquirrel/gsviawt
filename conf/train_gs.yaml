@@ -439,6 +439,9 @@ diffusion:
     mid_blocks: 12
     mid_dim: null                # shared: null = dim; merged: needed (e.g. 2048)
     out_blocks: 2
+    attn_pattern: joint          # the branch blocks' attention: joint (every block over all branches' tokens) | alt (joint branch
+                                 # branch, repeated) | fact (joint branch patch, repeated) | a list of joint / branch / patch per block
+                                 # (branch: own branch's tokens only; patch: a patch's K branch tokens only); non-joint: mid none only
   cond_dropout:
     p: 0.0                     # 0 = off: nothing is drawn, the random streams and the loss exactly as without dropout
     "null": zeros              # zeros (the features' mean after the z-score; no parameter) | learned (a learned feature_dim
