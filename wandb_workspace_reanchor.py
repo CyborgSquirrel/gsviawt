@@ -5,7 +5,7 @@ wandb-workspaces, like wandb_workspace.py for the diffusion runs.
   python wandb_workspace_reanchor.py save=true               # save it as a NEW view in the project and print its URL
   python wandb_workspace_reanchor.py save=true url=<view URL> # update that view in place (panels + settings; its runset is kept)
 
-Sections: for the full-dataset runs (data.dataset full) one per eval set (val, shard2, train_heldout: eval/<set>/* with its
+Sections: for the full-dataset runs (data.dataset full) first the train-vs-unseen gap (training meshes, val and shard2 in one panel), then one per eval set (val, shard2, train_heldout: eval/<set>/* with its
 references ref/<set>/*, and on val the A-ablated eval); then the one-mesh runs' panels: held-out PSNR (views 45-49, over white and over black) with the three references as lines in the same panel (A as-is,
 B's own fit = ceiling, matched copy of A's Gaussians into B's slots = floor); the same with A ablated at eval time (does the model
 read A?); the train losses; bookkeeping (lr, grad norm, step time, memory, token counts). The runset is a regex on the run name.
@@ -52,6 +52,9 @@ def workspace(cfg):
       panels += [line(f"{title}: model vs A ablated at eval, over {bg}", [f"eval/{name}/{bg}", f"eval/{name}/ablate_a_{bg}"], x)
                  for bg in ("white", "black")]
     full.append(section(f"full dataset -- {title}", panels))
+  gap = [line(f"train vs unseen meshes: held-out PSNR over {bg} (training meshes / new100 val / shard2)",
+               [f"eval/train_heldout/{bg}", f"eval/val/{bg}", f"eval/shard2/{bg}"], x) for bg in ("black", "white")]
+  full.insert(0, section("full dataset -- train vs unseen gap (same panel)", gap))
   book.append(line("data wait per step (s)", "train/data_wait_seconds", x, sm))
   book.append(line("eval seconds", "eval/seconds", x))
   book.append(line("LR cycle", "train/cycle", x))
