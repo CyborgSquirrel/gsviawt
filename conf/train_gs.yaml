@@ -406,6 +406,23 @@ diffusion:
     mode: none
     dim: 256
     hidden: 256
+  # Split branches (MMDiT-style): instead of the single trunk, 4 transformers of width dim (heads of 64) x num_blocks, one per
+  # channel group -- offset + opacity | sh_dc + opacity | scale + opacity | rotation -- each with its own input projection
+  # (image features -> image_dim, its 4 x patch^2 noisy values -> dim - image_dim, + a learned branch embedding), AdaLN
+  # modulation (a shared time MLP, per-branch 6-vector projection), per-layer FiLM, norms / qkv / out-proj / MLP and zero-init
+  # readout. Every block's attention is ONE global softmax over all 4 branches' tokens of the sample (the same kept tokens and
+  # RoPE positions in each). The rendered / sampled opacity is the mean of the 3 normalized opacity predictions (= the mean
+  # logit); the x0 loss is every branch on its own channels, each opacity on its own (the mean over the 16 predicted channels),
+  # logged parts: the merged prediction's per-field and loss/x0/merged (= a single trunk's loss/x0), loss/x0/opacity_<branch>.
+  # Needs attention=global, film=frame, readout=linear, mask_attn none, colour_noise joint; diffusion.dim / num_blocks /
+  # in_proj / in_proj_image_dim are not read. 1024 x 9 (16 heads; 12.60 M per branch block, 4 x 9 of them = 453.7 M): 499.5 M
+  # head parameters (the 2048 x 9 split-proj-512 head: 506.2 M, 453.3 M in its blocks).
+  # Configs without the key: off (the single trunk, bit for bit)
+  split_branches:
+    enabled: false
+    dim: 1024
+    num_blocks: 9
+    image_dim: 256               # of dim: the image features' share (the noisy values get dim - image_dim), 1/4 as split proj 512/2048
   cond_dropout:
     p: 0.0                     # 0 = off: nothing is drawn, the random streams and the loss exactly as without dropout
     "null": zeros              # zeros (the features' mean after the z-score; no parameter) | learned (a learned feature_dim

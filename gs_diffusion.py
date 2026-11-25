@@ -1045,6 +1045,221 @@ class DiffusionHead(nn.Module):
     return rearrange(out, "b l (h w) (c py px) -> b l c (h py) (w px)", h=grid, w=grid, py=self.patch_size, px=self.patch_size)
 
 
+# ---------------------------------------------------------------------------
+# split branches (diffusion.split_branches): one transformer per channel group, joint attention
+# ---------------------------------------------------------------------------
+
+# the branches and their x0 channels, in the order of a branch's patch values (c py px) and of its readout; three branches also
+# predict the opacity (channel 0), the rotation branch only the quaternion. Every branch has 4 channels.
+_O = X0_SLICES["opacity"].start
+SPLIT_BRANCHES = (
+  ("offset", tuple(range(X0_SLICES["offset"].start, X0_SLICES["offset"].stop)) + (_O,)),
+  ("colour", tuple(range(X0_SLICES["sh_dc"].start, X0_SLICES["sh_dc"].stop)) + (_O,)),
+  ("scale", tuple(range(X0_SLICES["scale"].start, X0_SLICES["scale"].stop)) + (_O,)),
+  ("rotation", tuple(range(X0_SLICES["rotation"].start, X0_SLICES["rotation"].stop))),
+)
+SPLIT_INDEX = tuple(c for _, chans in SPLIT_BRANCHES for c in chans)   # (16,): the branch outputs' x0 channels, concatenated
+SPLIT_BRANCH_CHANNELS = 4
+SPLIT_DEFAULTS = dict(enabled=False, dim=1024, num_blocks=9, image_dim=256)   # diffusion.split_branches without the key: off
+
+
+def normalize_split_branches(s):
+  """diffusion.split_branches (None or missing keys: the defaults, off) -> {"enabled", "dim", "num_blocks", "image_dim"}."""
+  s = {**SPLIT_DEFAULTS, **dict(s or {})}
+  unknown = sorted(set(s) - set(SPLIT_DEFAULTS))
+  if unknown:
+    raise ValueError(f"diffusion.split_branches: unknown keys {unknown}")
+  out = {"enabled": bool(s["enabled"]), "dim": int(s["dim"]), "num_blocks": int(s["num_blocks"]), "image_dim": int(s["image_dim"])}
+  if out["dim"] % 64 or out["dim"] < 64:
+    raise ValueError(f"diffusion.split_branches.dim must be a positive multiple of 64 (heads of 64), got {out['dim']}")
+  if not 0 < out["image_dim"] < out["dim"] or out["num_blocks"] < 1:
+    raise ValueError(f"diffusion.split_branches: needs 0 < image_dim < dim and num_blocks >= 1, got {out}")
+  return out
+
+
+def _linear_init(k, fan_in, fan_out, bias=True):
+  """K stacked nn.Linear(fan_in, fan_out) weights (K, fan_in, fan_out) (and biases (K, fan_out)) with nn.Linear's default init."""
+  bound = 1.0 / math.sqrt(fan_in)
+  w = nn.Parameter(torch.empty(k, fan_in, fan_out).uniform_(-bound, bound))
+  return (w, nn.Parameter(torch.empty(k, fan_out).uniform_(-bound, bound))) if bias else w
+
+
+def _bmm(x, w, b=None):
+  """x (K, T, in) @ w (K, in, out) (+ b (K, out)) -> (K, T, out): one batched matmul for all branches."""
+  return torch.bmm(x, w) if b is None else torch.baddbmm(b[:, None, :], x, w)   # (autocast casts all three)
+
+
+def _ln(x, w, b, eps=1e-5):
+  """LayerNorm over the last dim with per-branch affine w, b (K, D) (x (K, ..., D))."""
+  shape = (w.shape[0],) + (1,) * (x.dim() - 2) + (w.shape[1],)
+  return F.layer_norm(x, (x.shape[-1],), eps=eps) * w.reshape(shape) + b.reshape(shape)
+
+
+class SplitBlock(nn.Module):
+  """K DiTBlocks (global attention) side by side, stacked parameters (K, ...): each branch its own AdaLN modulation, norms,
+  qkv (no bias), QK-norm, out-proj, MLP and LayerScales; the attention is ONE softmax over the union of all branches' tokens of
+  a sample (MMDiT's joint attention). Same init as DiTBlock's per branch."""
+
+  def __init__(self, k, dim, num_heads, mlp_ratio=4.0, layer_scale_init=1e-4):
+    super().__init__()
+    if dim % num_heads or (dim // num_heads) % 4:
+      raise ValueError(f"dim={dim} must split into num_heads={num_heads} heads of a multiple-of-4 size (2D RoPE)")
+    self.k, self.num_heads = k, num_heads
+    hd, hid = dim // num_heads, int(dim * mlp_ratio)
+    self.norm1_w, self.norm1_b = nn.Parameter(torch.ones(k, dim)), nn.Parameter(torch.zeros(k, dim))
+    self.qkv_w = _linear_init(k, dim, 3 * dim, bias=False)
+    self.q_norm_w, self.q_norm_b = nn.Parameter(torch.ones(k, hd)), nn.Parameter(torch.zeros(k, hd))
+    self.k_norm_w, self.k_norm_b = nn.Parameter(torch.ones(k, hd)), nn.Parameter(torch.zeros(k, hd))
+    self.proj_w, self.proj_b = _linear_init(k, dim, dim)
+    self.ls1 = nn.Parameter(layer_scale_init * torch.ones(k, dim))
+    self.norm2_w, self.norm2_b = nn.Parameter(torch.ones(k, dim)), nn.Parameter(torch.zeros(k, dim))
+    self.fc1_w, self.fc1_b = _linear_init(k, dim, hid)
+    self.fc2_w, self.fc2_b = _linear_init(k, hid, dim)
+    self.ls2 = nn.Parameter(layer_scale_init * torch.ones(k, dim))
+    self.modulation = nn.Parameter(torch.randn(k, 6, dim) / dim ** 0.5)
+
+  def qkv(self, h, cos_r, sin_r):
+    """h (K, T, D) -> q, k, v (K, T, heads, hd): the projection, the QK-norm, RoPE at the rows' patch positions (cos_r (T, hd))."""
+    kk, t, d = h.shape
+    q, k, v = _bmm(h, self.qkv_w).reshape(kk, t, 3, self.num_heads, d // self.num_heads).unbind(2)
+    q, k = _ln(q, self.q_norm_w, self.q_norm_b), _ln(k, self.k_norm_w, self.k_norm_b)
+    return apply_rope(q, cos_r, sin_r), apply_rope(k, cos_r, sin_r), v
+
+  def forward(self, x, cos_r, sin_r, adaln, seg, cu, max_len):
+    """x (K, T, D) packed rows (PackIndex order); adaln (K, N, 6, D), seg (T,): row i of branch j is modulated by adaln[j, seg[i]];
+    cu / max_len: the samples' segments of the JOINT row order (K * PackIndex.cu_global): row i of branch j is joint row K i + j,
+    so a sample's K * T_b rows are contiguous."""
+    kk, t, d = x.shape
+    mod = self.modulation[:, None] + adaln.float()                                           # (K, N, 6, D)
+    row = lambda i: mod[:, :, i][:, seg]                                                     # (K, T, D)
+    h = (_ln(x, self.norm1_w, self.norm1_b).float() * (1 + row(1)) + row(0)).to(x.dtype)
+    q, k, v = self.qkv(h, cos_r, sin_r)
+    joint = lambda z: z.transpose(0, 1).reshape(t * kk, *z.shape[2:])                       # (K, T, ...) -> (T K, ...)
+    out = segment_attention(joint(q), joint(k), joint(v), cu, max_len)                       # (T K, heads, hd)
+    out = out.reshape(t, kk, d).transpose(0, 1)                                              # back to (K, T, D)
+    x = x + (self.ls1[:, None] * _bmm(out.to(h.dtype), self.proj_w, self.proj_b) * row(2)).to(x.dtype)
+    h = (_ln(x, self.norm2_w, self.norm2_b).float() * (1 + row(4)) + row(3)).to(x.dtype)
+    m = _bmm(F.gelu(_bmm(h, self.fc1_w, self.fc1_b)), self.fc2_w, self.fc2_b)
+    return x + (self.ls2[:, None] * m * row(5)).to(x.dtype)
+
+
+class SplitBranchHead(nn.Module):
+  """diffusion.split_branches: DiffusionHead's interface ((image features (B, L, P, F), the network's noisy x (B, L, 14, H, W), t (B, L))
+  -> x0_hat (B, L, 14, H, W)), the 14 channels split over K = 4 branches (SPLIT_BRANCHES: offset + opacity, colour + opacity,
+  scale + opacity, rotation), each its own transformer of width `dim` (heads of 64) and `num_blocks` blocks (MMDiT-style):
+    input   the z-scored image features * img_token_scale -> its own Linear(F, image_dim) | its group's 4 x patch^2 noisy values ->
+            its own Linear(4 patch^2, dim - image_dim), concatenated (DiffusionHead's in_proj split, the same 1/4 image share at the
+            defaults), plus a learned branch embedding (dim,)
+    blocks  SplitBlock: per branch its own AdaLN modulation / norms / qkv / out-proj / MLP; ONE joint global attention per block
+            over every branch's tokens of the sample (the same kept tokens and the same 2D RoPE positions in every branch)
+    time    one shared sinusoid -> MLP time_embed (as DiffusionHead's), per branch its own SiLU -> Linear(dim, 6 dim) time_proj
+            (MMDiT: a shared conditioning vector, per-stream modulation); WT's rule per block position: the blocks at i % 3 == 0
+            get the per-layer AdaLN and the per-layer FiLM (per branch its own layer_embed -> Linear -> GELU -> zero-init Linear),
+            the others the layer mean -- DiTTrunk's attention=global, film=frame pattern
+    readout per branch a zero-initialized Linear(dim, 4 patch^2) to its channels
+  The merged prediction (forward's default) puts every branch's channels in place; the opacity is the MEAN of the three branches'
+  normalized opacity predictions (normalized x0 is affine in the logit: the mean of the logits). forward(..., branches=True) also
+  returns the branch outputs (B, L, 16, H, W) in SPLIT_INDEX's channel order (each opacity on its own, for the x0 loss).
+  Runs on packed rows always: pack None = every token kept (the dense case), one code path."""
+
+  def __init__(self, feature_dim, num_layers, patch_size=14, dim=1024, num_blocks=9, image_dim=256, mlp_ratio=4.0,
+               layer_scale_init=1e-4, t_embed_channels=256, img_token_scale=0.3, checkpoint_activations=False, cond_null="zeros"):
+    super().__init__()
+    if cond_null not in COND_NULLS:
+      raise ValueError(f"cond_null must be one of {COND_NULLS}, got {cond_null!r}")
+    if cond_null == "learned":
+      self.null_cond = nn.Parameter(torch.zeros(feature_dim))
+    k = len(SPLIT_BRANCHES)
+    self.k, self.dim, self.num_heads = k, int(dim), int(dim) // 64
+    self.patch_size, self.channels, self.img_token_scale, self.t_embed_channels = patch_size, CHANNELS, img_token_scale, t_embed_channels
+    self.checkpoint_activations = checkpoint_activations
+    self.noise_dim = SPLIT_BRANCH_CHANNELS * patch_size ** 2
+    assert _O == 0 and sorted(set(SPLIT_INDEX)) == list(range(CHANNELS))
+    self._branch_index = list(SPLIT_INDEX)
+    self._opacity_at = tuple(j for j, c in enumerate(SPLIT_INDEX) if c == _O)                  # its 3 places among the 16
+    self._rest_at = tuple(SPLIT_INDEX.index(c) for c in range(1, CHANNELS))                    # channels 1..13's places
+    self.in_image_w, self.in_image_b = _linear_init(k, feature_dim, image_dim)
+    self.in_noise_w, self.in_noise_b = _linear_init(k, self.noise_dim, self.dim - image_dim)
+    self.branch_embed = nn.Parameter(0.02 * torch.randn(k, self.dim))
+    self.time_embed = nn.Sequential(nn.Linear(t_embed_channels, self.dim), nn.SiLU(), nn.Linear(self.dim, self.dim))
+    self.time_proj_w, self.time_proj_b = _linear_init(k, self.dim, 6 * self.dim)
+    self.layer_embed = nn.Parameter(torch.randn(k, num_layers, self.dim))   # (nn.Embedding's N(0, 1) init)
+    self.film1_w, self.film1_b = _linear_init(k, self.dim, self.dim)
+    self.film2_w = nn.Parameter(torch.zeros(k, self.dim, 2 * self.dim))
+    self.film2_b = nn.Parameter(torch.zeros(k, 2 * self.dim))
+    self.cond = [DiTTrunk.MODES[i % 3] for i in range(num_blocks)]   # the block's conditioning role (frame: FiLM + per-layer AdaLN)
+    self.blocks = nn.ModuleList(SplitBlock(k, self.dim, self.num_heads, mlp_ratio, layer_scale_init) for _ in range(num_blocks))
+    self.out_w = nn.Parameter(torch.zeros(k, self.dim, self.noise_dim))
+    self.out_b = nn.Parameter(torch.zeros(k, self.noise_dim))
+    self._rope = {}
+
+  def _rope_tables(self, grid, device):
+    key = (grid, device)
+    if key not in self._rope:
+      cos, sin = rope_cos_sin(grid, self.dim // self.num_heads)
+      self._rope[key] = (cos.to(device), sin.to(device))
+    return self._rope[key]
+
+  def adaln(self, t):
+    """t (B, L) -> (K, B, L, 6, D), fp32 (autocast off, as DiffusionHead.adaln)."""
+    b, l = t.shape
+    with torch.autocast(device_type=t.device.type, enabled=False):
+      emb = F.silu(self.time_embed(sinusoidal_embedding(t.reshape(-1) * 1000.0, self.t_embed_channels)))   # (B L, D)
+      return _bmm(emb[None].expand(self.k, -1, -1), self.time_proj_w, self.time_proj_b).reshape(self.k, b, l, 6, self.dim)
+
+  def films(self):
+    """(gamma, beta), each (K, L, D): the per-branch, per-depth-layer FiLM."""
+    e = _bmm(F.gelu(_bmm(self.layer_embed, self.film1_w, self.film1_b)), self.film2_w, self.film2_b)
+    return e.chunk(2, dim=-1)
+
+  def forward(self, feats, x_net, t, pack=None, uncond=None, hit=None, branches=False):
+    """DiffusionHead.forward's arguments (hit: unused, accepted for the call's shape). branches: also return the branch outputs
+    (B, L, 16, H, W) (SPLIT_INDEX's channels)."""
+    if t.dim() != 2:
+      raise ValueError(f"SplitBranchHead: t must be (B, L) (colour_noise joint), got {tuple(t.shape)}")
+    b, l, p, _ = feats.shape
+    feats = (feats - feats.mean((1, 2, 3), keepdim=True)) / (feats.var((1, 2, 3), keepdim=True, unbiased=False) + 1e-6).sqrt()
+    if uncond is not None:
+      null = self.null_cond.to(feats.dtype) if hasattr(self, "null_cond") else feats.new_zeros(())
+      feats = torch.where(uncond.to(feats.device).bool()[:, None, None, None], null, feats * self.img_token_scale)
+    else:
+      feats = feats * self.img_token_scale
+    if pack is None or pack.T == 0:   # every token (nothing kept: the dense graph, a loss of 0 with zero gradients)
+      pack = PackIndex(torch.ones(b, l, p, dtype=torch.bool, device=feats.device))
+    # each branch's own channels' patch values: (K, B, L, P, 4 py px) -> the kept rows (K, T, 4 patch^2)
+    xb = x_net[:, :, self._branch_index].reshape(b, l, self.k, SPLIT_BRANCH_CHANNELS, *x_net.shape[-2:])
+    patches = rearrange(xb, "b l k c (h py) (w px) -> b l (h w) k (c py px)", py=self.patch_size, px=self.patch_size)
+    rows_f, rows_x = pack.gather(feats), pack.gather(patches).transpose(0, 1)                # (T, F), (K, T, 4 patch^2)
+    img = _bmm(rows_f[None].expand(self.k, -1, -1), self.in_image_w, self.in_image_b)
+    noise = _bmm(rows_x.to(rows_f.dtype), self.in_noise_w, self.in_noise_b)
+    x = torch.cat([img, noise], dim=-1) + self.branch_embed[:, None].to(img.dtype)          # (K, T, D)
+
+    cos, sin = self._rope_tables(int(round(p ** 0.5)), x.device)
+    cos_r, sin_r = cos[pack.p], sin[pack.p]
+    gamma, beta = self.films()
+    gamma, beta = gamma[:, pack.l], beta[:, pack.l]                                          # (K, T, D)
+    ad = self.adaln(t)                                                                       # (K, B, L, 6, D)
+    ad_frame, ad_mean = ad.reshape(self.k, b * l, 6, self.dim), ad.mean(2)
+    cu, mx = pack.cu_global * self.k, pack.max_global * self.k
+    for block, cond in zip(self.blocks, self.cond):
+      if cond == "frame":
+        x = x * (1 + gamma) + beta
+        a, seg = ad_frame, pack.frame
+      else:
+        a, seg = ad_mean, pack.b
+      if self.checkpoint_activations and torch.is_grad_enabled():
+        x = torch.utils.checkpoint.checkpoint(block, x, cos_r, sin_r, a, seg, cu, mx, use_reentrant=False)
+      else:
+        x = block(x, cos_r, sin_r, a, seg, cu, mx)
+    y = _bmm(x, self.out_w, self.out_b)                                                      # (K, T, 4 patch^2)
+    grid = int(round(p ** 0.5))
+    y = pack.scatter(y.transpose(0, 1))                                                      # (B, L, P, K, 4 patch^2)
+    y = rearrange(y, "b l (h w) k (c py px) -> b l (k c) (h py) (w px)", h=grid, w=grid, py=self.patch_size, px=self.patch_size)
+    # the merged 14 channels: the opacity the mean of its three predictions, every other channel its one branch's
+    merged = torch.cat([y[:, :, list(self._opacity_at)].mean(2, keepdim=True), y[:, :, list(self._rest_at)]], dim=2)
+    return (merged, y) if branches else merged
+
+
 COLOUR_SCHEDULE_KINDS = ("first", "power", "lead")
 COLOUR_SCHEDULE_DEFAULT = {"kind": "power", "gamma": 1.0}   # t_c = t_g: colour and geometry together
 
@@ -1110,6 +1325,7 @@ class GSDiffusionModel(nn.Module):
   colour_noise = {"mode": "joint", "draw": "cond_uniform"}   # diffusion.colour_noise, normalized (set in __init__)
   colour_separate = False        # colour_noise mode separate (set in __init__)
   mask_attn = "none"             # diffusion.mask_attn.mode (set in __init__): not none = the head is given the hit mask
+  split_branches = False         # diffusion.split_branches.enabled (set in __init__): the head is a SplitBranchHead
 
   def __init__(self, cfg, stats):
     super().__init__()
@@ -1129,15 +1345,33 @@ class GSDiffusionModel(nn.Module):
     mask_attn = normalize_mask_attn(d.get("mask_attn"))   # (configs without the key: none, as before)
     self.mask_attn = mask_attn["mode"]
     self.backbone = hydra.utils.instantiate(cfg.model.backbone)
-    self.head = DiffusionHead(
-      int(cfg.model.feature_dim), self.num_layers, patch_size=self.patch_size, dim=d.get("dim"), num_blocks=int(d.num_blocks),
-      img_token_scale=float(d.img_token_scale), checkpoint_activations=bool(d.get("checkpoint_activations", False)),
-      layer_scale_init=float(cfg.model.transformer.layer_scale_init), cond_null=cond_dropout["null"],
-      readout=str(d.get("readout", "linear")),   # (configs without the key, older runs: the linear output projection)
-      in_proj=str(d.get("in_proj", "shared")), in_proj_image_dim=d.get("in_proj_image_dim"),   # (without the keys: one shared projection)
-      attention=str(d.get("attention", "frame_ray_global")),   # (configs without the key: the frame/ray/global pattern)
-      film=str(d.get("film", "frame")),   # (configs without the key: the FiLM at the frame positions only)
-      colour_separate=self.colour_separate, mask_attn=mask_attn)
+    split = normalize_split_branches(d.get("split_branches"))   # (configs without the key: off, the single trunk)
+    self.split_branches = split["enabled"]
+    if self.split_branches:
+      bad = {k: v for k, v in (("attention", str(d.get("attention", "frame_ray_global"))), ("film", str(d.get("film", "frame"))),
+                               ("readout", str(d.get("readout", "linear"))), ("mask_attn.mode", self.mask_attn),
+                               ("colour_noise.mode", self.colour_noise["mode"]))
+             if v != {"attention": "global", "film": "frame", "readout": "linear", "mask_attn.mode": "none",
+                      "colour_noise.mode": "joint"}[k]}
+      if bad:
+        raise SystemExit(f"diffusion.split_branches: only with attention=global, film=frame, readout=linear, mask_attn none, "
+                         f"colour_noise joint; got {bad}")
+      # (diffusion.dim / num_blocks / in_proj / in_proj_image_dim are the single trunk's: not read)
+      self.head = SplitBranchHead(
+        int(cfg.model.feature_dim), self.num_layers, patch_size=self.patch_size, dim=split["dim"], num_blocks=split["num_blocks"],
+        image_dim=split["image_dim"], img_token_scale=float(d.img_token_scale),
+        checkpoint_activations=bool(d.get("checkpoint_activations", False)),
+        layer_scale_init=float(cfg.model.transformer.layer_scale_init), cond_null=cond_dropout["null"])
+    else:
+      self.head = DiffusionHead(
+        int(cfg.model.feature_dim), self.num_layers, patch_size=self.patch_size, dim=d.get("dim"), num_blocks=int(d.num_blocks),
+        img_token_scale=float(d.img_token_scale), checkpoint_activations=bool(d.get("checkpoint_activations", False)),
+        layer_scale_init=float(cfg.model.transformer.layer_scale_init), cond_null=cond_dropout["null"],
+        readout=str(d.get("readout", "linear")),   # (configs without the key, older runs: the linear output projection)
+        in_proj=str(d.get("in_proj", "shared")), in_proj_image_dim=d.get("in_proj_image_dim"),   # (without the keys: one shared projection)
+        attention=str(d.get("attention", "frame_ray_global")),   # (configs without the key: the frame/ray/global pattern)
+        film=str(d.get("film", "frame")),   # (configs without the key: the FiLM at the frame positions only)
+        colour_separate=self.colour_separate, mask_attn=mask_attn)
     mean, std, lo, hi = stats
     self.register_buffer("x0_mean", mean.clone().float())
     self.register_buffer("x0_std", std.clone().float())
@@ -1329,12 +1563,26 @@ class GSDiffusionModel(nn.Module):
       uncond = drop
     else:
       uncond = self._uncond(condition, b, x0.device)
-    x0_hat = self._head(feats, x_net, t_head, self.pack(hit), uncond, hit=hit)
-    err = (x0_hat.float() - x0).square()                                            # (B, L, C, H, W)
     valid = a.sum().clamp_min(1)
-    loss = (err * a).sum() / (valid * CHANNELS)
+    if self.split_branches:   # every branch on its own channels (each opacity on its own): the mean over the 16 predicted channels
+      x0_hat, x0_br = self.head(feats, x_net, t_head, self.pack(hit), uncond=uncond, branches=True)
+      err_br = (x0_br.float() - x0[:, :, list(SPLIT_INDEX)]).square()                 # (B, L, 16, H, W)
+      loss = (err_br * a).sum() / (valid * len(SPLIT_INDEX))
+      err = (x0_hat.float() - x0).square()                                            # the merged prediction's: the parts below
+    else:
+      x0_hat = self._head(feats, x_net, t_head, self.pack(hit), uncond, hit=hit)
+      err = (x0_hat.float() - x0).square()                                            # (B, L, C, H, W)
+      loss = (err * a).sum() / (valid * CHANNELS)
     with torch.no_grad():
       parts, counts = {}, {}
+      if self.split_branches:   # the merged prediction's x0 loss (what a single trunk's loss/x0 is) and each branch's opacity
+        parts["merged"] = ((err * a).sum() / (valid * CHANNELS)).detach()
+        counts["merged"] = valid
+        for j, c in enumerate(SPLIT_INDEX):
+          if c == X0_SLICES["opacity"].start:
+            name = f"opacity_{SPLIT_BRANCHES[j // SPLIT_BRANCH_CHANNELS][0]}"
+            parts[name] = ((err_br[:, :, j] * a[:, :, 0]).sum() / valid).detach()
+            counts[name] = valid
       if drop is not None:
         parts["cond_drop"] = drop
         for name, sel in (("cond_kept", ~drop), ("cond_dropped", drop)):
