@@ -11,6 +11,12 @@ Donor-A control (data.a_source other_mesh): every training sample's A is a fresh
 OTHER mesh of the render h5 (uniform over them; reanchor.py's donor section for the frame), loaded on the fly by DataLoader
 workers; the eval pairs get fixed seeded donors (eval_donors.json) and ablate-A zeroes the donor's params at its slots.
 
+Colour augmentation (data.colour_aug.enabled; both modes, training only, default off): per training sample one random transform
+colour' = colour[p] * g (p uniform over the 6 channel permutations, g ~ U[gain]^3) on A's RGB colours (before the A-input
+normalization; the donor's with a_source other_mesh) and on that sample's premultiplied GT targets (before the random background,
+which stays untransformed); the target composite is then clamped to [0, 1] like the render's (reanchor.py's colour section).
+Drawn from its own Generator ([train.seed, start step, 0xC0A6]): the background / pair streams are those of the run without it.
+
 Eval (every eval_every steps and at the end): a fixed set of eval_pairs (A, B) pairs (eval_seed), the predicted B grid rendered
 at the held-out views (eval_views, never fitted) over black and over white, full-image PSNR, mean over views then pairs; the
 main model also with A's params zeroed (the mean Gaussian at A's slots: does the output follow A?). The references on the same
@@ -88,10 +94,13 @@ def ref_means(ref):
   return {k: np.mean(ref[k], 0).tolist() for k in ("A_asis", "B_fit", "matched32")}
 
 
-def photometric(dssim, cfg, rgb, alpha, gt, gt_alpha, bg):
-  """L1 + D-SSIM (loss weights) of a render (V, 3, H, W) over per-view backgrounds bg (V, 3, 1, 1) against the GT over them."""
+def photometric(dssim, cfg, rgb, alpha, gt, gt_alpha, bg, clamp_target=False):
+  """L1 + D-SSIM (loss weights) of a render (V, 3, H, W) over per-view backgrounds bg (V, 3, 1, 1) against the GT over them.
+  clamp_target (colour augmentation: gains > 1 can lift the GT above 1): the target composite clamped to [0, 1] like the render's."""
   pred = (rgb + (1 - alpha) * bg).clamp(0, 1)
   target = gt + (1 - gt_alpha) * bg
+  if clamp_target:
+    target = target.clamp(0, 1)
   l1 = (pred - target).abs().mean()
   ds = dssim(pred, target).mean()
   with torch.no_grad():
@@ -105,6 +114,18 @@ def backgrounds(cfg, n, device):
   if cfg.loss.background == "black":
     return torch.zeros(n, 3, 1, 1, device=device)
   raise SystemExit(f"loss.background must be random | black, got {cfg.loss.background!r}")
+
+
+def colour_aug_rng(cfg, start_step):
+  """data.colour_aug -> (its numpy Generator, gain, permute), or None when disabled / absent (nothing drawn: the run is unchanged)."""
+  ca = cfg.data.get("colour_aug")
+  if ca is None or not bool(ca.enabled):
+    return None
+  gain = [float(x) for x in ca.gain]
+  if not (len(gain) == 2 and 0 < gain[0] <= gain[1]):
+    raise SystemExit(f"data.colour_aug.gain must be [lo, hi] with 0 < lo <= hi, got {gain}")
+  log.info("colour augmentation: per training sample channel permutation %s, gains U%s", bool(ca.permute), gain)
+  return np.random.default_rng([int(cfg.train.seed), int(start_step), 0xC0A6]), gain, bool(ca.permute)
 
 
 def setup(cfg, device):
@@ -348,6 +369,7 @@ def train(cfg, data, batcher, device):
     start_step, clock = st["step"], st["clock"]
     log.info("resumed %s at step %d (%.0f s)", ckpt_path, start_step, clock)
   rng = np.random.default_rng([int(cfg.train.seed), start_step])
+  caug = colour_aug_rng(cfg, start_step)
   donor_iter = eval_a = None
   if a_source == "other_mesh":
     donor_iter, donor_ds, ev = donor_setup(cfg, nv, start_step, len(pairs_eval))
@@ -396,13 +418,21 @@ def train(cfg, data, batcher, device):
     override = None
     if donor_iter is not None:   # a fresh random donor A per sample (the pair's a is drawn but unused: the same B / view stream as same)
       override = {i: ra.donor_in_b(next(donor_iter), data.c2w[b], device) for i, (_, b) in enumerate(pairs)}
+    augs = None
+    if caug is not None:         # one transform per sample: its A (real or donor) and its loss views' targets
+      augs = [ra.draw_colour_aug(caug[0], caug[1], caug[2]) for _ in pairs]
+      if use_a:
+        src = override or {i: (*data.a_rows_in_b(a, b), data.hit[a]) for i, (a, b) in enumerate(pairs)}
+        override = {i: (ra.colour_aug_rows(src[i][0], *augs[i]), src[i][1], src[i][2]) for i in range(len(pairs))}
     gauss, packs = forward(model, batcher, pairs, use_a, bf16, override)
     loss = torch.zeros((), device=device)
     stats = np.zeros(3)
     for i, (a, b) in enumerate(pairs):
       vs = rng.choice(nv, int(cfg.train.views_per_pair), replace=False).tolist()
       rgb, alpha = ra.render(batcher.gaussians(gauss, i, b), data.viewmats(b, vs), data.K[vs], data.W, data.H)
-      li, l1, ds, ps = photometric(dssim, cfg, rgb, alpha, data.gt[vs], data.alpha[vs], backgrounds(cfg, len(vs), device))
+      gt = data.gt[vs] if augs is None else ra.colour_aug_images(data.gt[vs], *augs[i])
+      li, l1, ds, ps = photometric(dssim, cfg, rgb, alpha, gt, data.alpha[vs], backgrounds(cfg, len(vs), device),
+                                   clamp_target=augs is not None)
       loss = loss + li / len(pairs)
       stats += [float(l1), float(ds), float(ps)]
     opt.zero_grad(set_to_none=True)
@@ -610,6 +640,7 @@ def train_full(cfg, device):
   run = init_wandb(cfg)
   run.summary["n_params"] = n_params
   run.summary["train_meshes"], run.summary["val_meshes"] = len(train_m), val_m
+  caug = colour_aug_rng(cfg, start_step)
   ds = ra.StreamPairs(cfg.data.render_h5, cfg.data.grids_dir, train_m, int(cfg.data.train_views), int(cfg.train.views_per_pair),
                       seed=[int(cfg.train.seed), int(start_step)])
   nw = int(cfg.data.workers)
@@ -682,6 +713,12 @@ def train_full(cfg, device):
     for g in opt.param_groups:
       g["lr"] = float(cfg.train.lr) * lrf
     bundles = [ra.stream_bundle(x, device, use_a) for x in items]
+    if caug is not None:         # one transform per sample: its A and its loss views' targets (eval bundles never)
+      for bd in bundles:
+        p, g = ra.draw_colour_aug(caug[0], caug[1], caug[2])
+        if use_a:
+          bd["a_rows"] = ra.colour_aug_rows(bd["a_rows"], p, g)
+        bd["gt"] = ra.colour_aug_images(bd["gt"], p, g)
     ca, pa, cb, pb, packs = batcher.tokens(bundles, model.empty, use_a)
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16):
       rows = model(ca, pa, cb, pb, packs)
@@ -691,7 +728,8 @@ def train_full(cfg, device):
     for i, bd in enumerate(bundles):
       H, W = bd["gt"].shape[-2:]
       rgb, alpha = ra.render(ra.slot_gaussians(gauss, i, bd["b_xyz"], bd["b_hit"]), bd["viewmats"], bd["K"], W, H)
-      li, l1, dsv, ps = photometric(dssim, cfg, rgb, alpha, bd["gt"], bd["alpha"], backgrounds(cfg, len(rgb), device))
+      li, l1, dsv, ps = photometric(dssim, cfg, rgb, alpha, bd["gt"], bd["alpha"], backgrounds(cfg, len(rgb), device),
+                                    clamp_target=caug is not None)
       loss = loss + li / len(bundles)
       stats += [float(l1), float(dsv), float(ps)]
     opt.zero_grad(set_to_none=True)

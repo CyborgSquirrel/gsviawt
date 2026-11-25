@@ -17,6 +17,10 @@ data:
   a_source: same             # same: A = a view of the mesh | other_mesh: A = a random view of a random OTHER mesh (donor-A control)
   donor_grids_dir: null      # other_mesh: <dir>/mesh<M>_view<V>.h5 of the donors; null: grids_dir
   donor_workers: 4           # other_mesh: DataLoader workers loading donor views on the fly
+  colour_aug:                # training only: per sample colour' = colour[p] * g on A's RGB colours and the GT targets alike
+    enabled: false           # false: nothing drawn, the run is unchanged
+    gain: [0.5, 1.5]         # per-channel gains g ~ U[gain]^3
+    permute: true            # p uniform over the 6 channel permutations (false: identity)
 
 model:
   dim: 2048

@@ -531,6 +531,41 @@ def render(p, viewmats, Ks, W, H):
   return rgb.permute(0, 3, 1, 2), alpha.permute(0, 3, 1, 2)
 
 
+# ---------------------------------------------------------------------------
+# colour augmentation (train_reanchor data.colour_aug): one random colour transform per training sample, colour' = colour[p] * g
+# (p a channel permutation, g per-channel gains > 0), applied alike to A's colours (in RGB: sh_dc = (rgb - 0.5) / SH_C0 is decoded,
+# transformed, re-encoded; before the A-input normalization) and to the sample's premultiplied GT targets (before the background).
+# Exact: gsplat's per-Gaussian SH0 colour is max(SH_C0 sh + 0.5, 0) (no upper clamp), max(x g, 0) = max(x, 0) g for g > 0, and the
+# premultiplied render is linear in the per-Gaussian colours -> render(A transformed) == transform(render(A)) to float precision
+# (tests/test_reanchor_colour_aug.py). The loss's composite clamp to [0, 1] (photometric) is the only >1 clamp; with the
+# augmentation on the target composite is clamped the same way, so the transformed A still explains the transformed targets.
+# ---------------------------------------------------------------------------
+
+def draw_colour_aug(rng, gain=(0.5, 1.5), permute=True):
+  """One transform from a numpy Generator: (p (3,) int permutation (uniform over the 6; identity with permute false),
+  g (3,) float gains U[gain])."""
+  p = rng.permutation(3) if permute else np.arange(3)
+  g = rng.uniform(float(gain[0]), float(gain[1]), 3)
+  return p, g
+
+
+def colour_aug_rows(rows, p, g):
+  """Raw x0 rows (N, 14) -> the same rows with their RGB colour (SH_C0 sh_dc + 0.5) transformed to rgb[:, p] * g, re-encoded."""
+  pt = torch.as_tensor(np.asarray(p), dtype=torch.long, device=rows.device)
+  gt = torch.as_tensor(np.asarray(g), dtype=rows.dtype, device=rows.device)
+  rgb = rows[:, SH_DC] * SH_C0 + 0.5
+  out = rows.clone()
+  out[:, SH_DC] = (rgb[:, pt] * gt - 0.5) / SH_C0
+  return out
+
+
+def colour_aug_images(img, p, g):
+  """Premultiplied RGB images (V, 3, H, W) -> img[:, p] * g (per channel)."""
+  pt = torch.as_tensor(np.asarray(p), dtype=torch.long, device=img.device)
+  gt = torch.as_tensor(np.asarray(g), dtype=img.dtype, device=img.device)
+  return img[:, pt] * gt[None, :, None, None]
+
+
 def psnr_bw(rgb, alpha, gt, gt_alpha):
   """Per-view full-image PSNR over black and over white: (V,), (V,). rgb / gt premultiplied over black."""
   mse = lambda x, y: (x - y).pow(2).flatten(1).mean(1)
