@@ -32,7 +32,7 @@ extra_sets: more eval sets from other render files (extra_dataset: e.g. unseen m
 skip_methods (and extra_sets.<name>.skip_methods): leave out fit / onestep (e.g. a set without grids has no fit).
 kid (kid.enabled): the sets (val_sets; null: val_views_sval, val_views_strain and the extra sets) become one volume per mesh with
 kid.views_per_mesh fixed target views (kid_selection: a function of kid.seed, set and mesh only); the noise base is kid.noise_seed
-(null: seed) instead of seed; besides the usual outputs every <out>/[cs_<name>/][steps<N>/] gets kid_features.npz: the DINOv2 features
+(null: +noise_seed or seed) instead of seed; besides the usual outputs every <out>/[cs_<name>/][steps<N>/] gets kid_features.npz: the DINOv2 features
 (kid_features.py) of the sample (k = 0) and of the GT at every target view, scored by kid_compare.py.
 Not in conf/eval_diffusion.yaml (so a default eval's summary.json config stays as it was; give them with a +):
   +volume_indices={<set>:[<dataset index>, ...], ...}   score only these sets, each with exactly these volumes instead of
@@ -40,7 +40,9 @@ Not in conf/eval_diffusion.yaml (so a default eval's summary.json config stays a
                        and volume only)
   +save_gaussians=true  per scored volume <out>/[cs_<name>/][steps<N>/]gaussians/<set>_<volume>.npz (save_gaussians): the fit's
                        and the sample's (k = 0) Gaussians as rendered, for rendering elsewhere (e.g. turntables) with the eval's
-                       own samples, whatever sampler options made them"""
+                       own samples, whatever sampler options made them
+  +noise_seed=<k>       the samplers' noise base instead of seed (sample_noise_seed): other noise draws for the same volumes and
+                       target views (those stay on seed); kid.noise_seed, when set, takes precedence; summary.json records it"""
 import contextlib as ctl
 import csv
 import json
@@ -205,6 +207,20 @@ def extra_dataset(name, spec, like, encoding, patch_size, out_dir):
   return ds
 
 
+def sample_noise_seed(cfg, kid=None):
+  """The base of the samplers' noise seeds: cfg.seed, or the optional top-level +noise_seed (other noise, same volumes and
+  target views, which stay on cfg.seed); with the KID on, kid.noise_seed takes precedence."""
+  if kid is not None and kid.get("noise_seed") is not None:
+    return int(kid.noise_seed)
+  return int(cfg.seed if cfg.get("noise_seed") is None else cfg.noise_seed)
+
+
+def sample_seeds(noise_seed, source_view, K):
+  """The K sampler seeds of a volume: a function of the noise base and the volume's source view."""
+  base = 1_000_003 * (noise_seed + 1) + int(source_view) * 101
+  return [base + k for k in range(K)]
+
+
 def scored_volumes(cfg, sets, datasets):
   """{set: [dataset index, ...]} of the volumes to score, in set order: volume_subset (max_volumes) of each of `sets`, or with
   cfg.volume_indices exactly the listed sets and indices."""
@@ -319,7 +335,7 @@ def main(cfg):
   for name in [*sets, *set_skip]:
     if not set(cfg.get("skip_methods") or []) | set_skip.get(name, set()) <= {"fit", "onestep"}:
       raise SystemExit("skip_methods: fit and / or onestep only")
-  noise_seed = int(cfg.seed)
+  noise_seed = sample_noise_seed(cfg)
   if kid_on:   # the KID's volumes: one per mesh with fixed target views (kid_selection), features of the sample and the GT
     for name in sets:
       inner = getattr(datasets[name], "inner", datasets[name])
@@ -329,7 +345,7 @@ def main(cfg):
       if counts != [int(kid.views_per_mesh)]:
         print(f"WARNING kid {name}: not {int(kid.views_per_mesh)} target views for every mesh (the set's pool is smaller)", flush=True)
       datasets[name] = fixed_targets_dataset(datasets[name], sel)
-    noise_seed = int(cfg.seed if kid.get("noise_seed") is None else kid.noise_seed)
+    noise_seed = sample_noise_seed(cfg, kid)
     gt_cache = kid_features.GTCache(kid.get("gt_cache"))
     kid_model = kid_features.load_dinov2(kid.get("dinov2_repo"), device)
   kid_rows = {s: [] for s in outs}
@@ -370,8 +386,7 @@ def main(cfg):
               project = gd.format_projection(model.x0_mean, model.x0_std, hit, item["source"]["xyz_cam"][..., 2].to(device),
                                              float(item["source"]["K_depth"][0, 0]), **enc,
                                              quat=str(cfg.get("project_quat", "unit")))
-            base = 1_000_003 * (noise_seed + 1) + int(item["source_view"]) * 101
-            seeds = [base + k for k in range(K)]
+            seeds = sample_seeds(noise_seed, int(item["source_view"]), K)
             M = lambda r: metrics(r[0], gt_pm, dssim, lpips, r[1], gt_alpha, r[2], gt_depth)
             if "x0_raw" not in batch and ("fit" not in skip or cfg.get("lock_layers") or cfg.get("inject_fields")):
               raise SystemExit(f"{set_name}: no grids (grids_dir null): 'fit', lock_layers and inject_fields need them (skip_methods: [fit])")

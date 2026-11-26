@@ -102,3 +102,17 @@ def test_save_load_gaussians_roundtrip(tmp_path):
     for k in ev.GAUSSIAN_KEYS:
       assert str(loaded[m][k].dtype) == "float32"
       assert torch.equal(torch.from_numpy(loaded[m][k]), flat[k].float())   # exactly what render() rasterizes
+
+
+def test_noise_seed_override():
+  from omegaconf import OmegaConf
+  base = OmegaConf.create({"max_volumes": 60, "seed": 0})
+  over = OmegaConf.create({"max_volumes": 60, "seed": 0, "noise_seed": 1})
+  assert ev.sample_noise_seed(base) == 0 and ev.sample_noise_seed(over) == 1
+  assert ev.sample_seeds(ev.sample_noise_seed(base), 5, 3) == [1_000_003 + 505 + k for k in range(3)]   # default: as before
+  assert ev.sample_seeds(ev.sample_noise_seed(over), 5, 3) != ev.sample_seeds(ev.sample_noise_seed(base), 5, 3)
+  datasets = {"val_meshes": [None] * 450, "val_views_sval": [None] * 30}
+  assert ev.scored_volumes(over, list(datasets), datasets) == ev.scored_volumes(base, list(datasets), datasets)   # same volumes
+  kid_null, kid_set = OmegaConf.create({"noise_seed": None}), OmegaConf.create({"noise_seed": 7})
+  assert ev.sample_noise_seed(base, kid_null) == 0 and ev.sample_noise_seed(over, kid_null) == 1
+  assert ev.sample_noise_seed(over, kid_set) == 7 == ev.sample_noise_seed(base, kid_set)              # kid.noise_seed wins
