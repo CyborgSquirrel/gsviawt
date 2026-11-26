@@ -29,6 +29,8 @@ lock_layers: null         # oracle: a list of depth layers (e.g. [0]) held at th
 layer_stages: null        # staged sampling: groups of depth layers denoised one after the other with `steps` steps each, e.g.
                           # [[0],[1,2,3,4,5]] (the surface first, then the rest; earlier groups held finished at t = 0, later ones at
                           # noise t = 1). The methods stay the same (sample = the staged sample); total model calls = steps x groups
+hidden_shift: null        # Modality Forcing's sampling schedule (GSDiffusionModel.sample): layer 0 (visible) on the plain grid, layers
+                          # 1.. on t_h = alpha t / (1 + (alpha - 1) t), e.g. 32 (MF's default; > 1: occluded layers stay noisier); null: lockstep
 colour_schedule: null     # diffusion.colour_noise separate runs only: the sampler's colour schedule, e.g. 'colour_schedule={kind:first,f:0.25}'
                           # (colour 1 -> 0 linearly over the first fraction f of the steps; f: 1/N = finished after step 1, the
                           # one-step anchor) | '{kind:power,gamma:2}' (t_c = t_g ** gamma); null: power gamma 1 (t_c = t_g)

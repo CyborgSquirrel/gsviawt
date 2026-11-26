@@ -359,6 +359,7 @@ def main(cfg):
               else:
                 g = model.sample(image.expand(K, *image.shape[1:]), hit.expand(K, *hit.shape[1:]), seeds=seeds, steps=steps,
                                  project=project, floor=floor, inject=inject, t_min=float(cfg.get("sampler_t_min", 0.0)), lock=lock,
+                                 hidden_shift=cfg.get("hidden_shift"),
                                  **({"colour_schedule": schedule_of[cs_name]} if schedule_of[cs_name] is not None else {}))
               samples = [render(model, batch, {k: v[j:j + 1] for k, v in g.items()}, views, device) for j in range(K)]
               per = dict(once)

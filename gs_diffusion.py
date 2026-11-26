@@ -1786,7 +1786,7 @@ class GSDiffusionModel(nn.Module):
 
   @torch.no_grad()
   def sample(self, image, hit, seeds=None, steps=None, project=None, floor=None, guidance=None, inject=None, t_min=0.0,
-             lock=None, colour_schedule=None):
+             lock=None, colour_schedule=None, hidden_shift=None):
     """20 Euler steps of the flow from pure noise -> the Gaussian dict. The noise of volume i is a function of seeds[i] (default:
     eval_seed + i): reproducible. Invalid slots stay at the noise. project: applied to every step's x0 prediction before it is used
     (e.g. format_projection; the last step's x0 prediction is the output).
@@ -1809,7 +1809,13 @@ class GSDiffusionModel(nn.Module):
     channels follow their own grid t_c (colour_schedule_ts) and the rest t_g = linspace(1, 0); each group takes the exact Euler step
     with its own dt (x - dt (x - x0_hat) / t), the model given (t_g, t_c) per layer. Once t_c is 0 the colour is fixed (its last
     step landed on that step's x0 prediction) and the model is given t_c = 0. Locked layers: both 0; inject: each channel at its own
-    group's t; the guidance interval is checked on t_g."""
+    group's t; the guidance interval is checked on t_g.
+    hidden_shift (alpha, None: lockstep): Modality Forcing's sampling schedule (arXiv 2606.13676, t_depth = f_alpha(t_rgb)) with
+    the visible layer 0 as the leading stream: layer 0 follows t = linspace(1, 0) and layers 1.. follow the SD3 shift of it,
+    t_h = alpha t / (1 + (alpha - 1) t) (alpha > 1: the occluded layers stay noisier, MF's default alpha 32); each layer takes the exact
+    Euler step with its own dt, the model given the per-layer t; the guidance interval is checked on layer 0's t."""
+    if hidden_shift is not None and (colour_schedule is not None or self.colour_separate):
+      raise ValueError("hidden_shift: not with colour_schedule / a colour_noise separate model")
     if colour_schedule is not None and not self.colour_separate:
       raise ValueError("colour_schedule: only for a diffusion.colour_noise.mode=separate model")
     if self.colour_separate:
@@ -1828,6 +1834,10 @@ class GSDiffusionModel(nn.Module):
     a = hit[:, :, None].to(eps.dtype)
     x = eps
     ts = torch.linspace(1.0, 0.0, steps + 1, device=image.device)
+    ts_l = ts[:, None].repeat(1, l)   # (steps + 1, L): every layer's t at every step
+    if hidden_shift is not None:
+      al = float(hidden_shift)
+      ts_l[:, 1:] = (al * ts / (1 + (al - 1) * ts))[:, None]
     pack = self.pack(hit)   # the same tokens at every step
     if inject is not None:
       inj_x0, fields = inject
@@ -1846,9 +1856,10 @@ class GSDiffusionModel(nn.Module):
       x = torch.where(free[None, :, None, None, None], x, lock_x0.to(x.dtype).expand_as(x))
     for i in range(steps):
       t = ts[i]
-      t_l = t.expand(b, l) if lock is None else torch.where(free[None], t, torch.zeros_like(t)).expand(b, l)
+      t_l = ts_l[i][None].expand(b, l) if lock is None else torch.where(free[None], ts_l[i][None], torch.zeros_like(t)).expand(b, l)
+      t5 = ts_l[i][None, :, None, None, None]   # per layer, for the state updates
       if inject is not None and inj_x0 is not None:
-        x = torch.where(on, (1 - t) * inj_x0 + t * eps, x)
+        x = torch.where(on, (1 - t5) * inj_x0 + t5 * eps, x)
       x_net = self._net_input(a * x + (1 - a) * eps, a)
       lo, hi = guidance["interval"]
       if guidance["scale"] != 1.0 and lo <= float(t) <= hi:
@@ -1859,7 +1870,8 @@ class GSDiffusionModel(nn.Module):
         x0_hat = project(x0_hat)
       if inject is not None and inj_x0 is None:   # "onestep": the first (t = 1) prediction is the injected x0 from now on
         inj_x0 = x0_hat.detach().clone()
-      x_next = x - (t - ts[i + 1]) * (x - x0_hat) / (t.clamp(min=t_min) if t_min > 0 else t)
+      dt = t5 - ts_l[i + 1][None, :, None, None, None]
+      x_next = x - dt * (x - x0_hat) / (t5.clamp(min=t_min) if t_min > 0 else t5)
       x = x_next if lock is None else torch.where(free[None, :, None, None, None], x_next, x)
     return self.decode(x, floor)
 
