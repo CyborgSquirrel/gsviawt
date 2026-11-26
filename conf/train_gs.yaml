@@ -486,7 +486,8 @@ diffusion:
     standard: {mu: 0.0, sigma: 1.0}                         # layers 1.. (logit-normal)
     plateau: {mu: 0.0, sigma: 1.0, mirror: false}           # layer 0: logit-normal up to its mode t* = 0.5, then flat towards t = 1
     phase: 1                   # 1: an independent t per layer (layer 0 plateaued, the rest standard); 2: one t per volume shared by
-                               # all its layers (as in the sampler), from the 50/50 mixture of the two. The validations' seeded
+                               # all its layers (as in the sampler), from the 50/50 mixture of the two; 3: hidden-synced, layer 0
+                               # its own t, one t shared by the occluded layers 1.. (as the hidden_shift sampler). The validations' seeded
                                # timesteps (loss/x0, the gated loss/photom) follow it
     uniform: false             # true: every t uniform on [0, 1] instead of the two densities above (per layer in phase 1, shared in
                                # phase 2): as much training near clean input (low t) as anywhere; the logit-normal(0, 1) puts ~1.4%

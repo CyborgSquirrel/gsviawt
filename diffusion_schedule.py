@@ -10,6 +10,8 @@ Two base densities over t in (0, 1), t = 1 pure noise:
 Two phases:
   1  every layer draws its own t: layer 0 from the plateaued logit-normal, layers 1.. from the logit-normal;
   2  one t per sample shared by all layers, from the equal-weight mixture of the two densities.
+  3  hidden-synced: layer 0 (the visible surface) its own t, ONE t shared by all occluded layers 1.. (layer 0 plateaued, the shared
+     one standard; uniform: both uniform) -- the per-layer pattern the Modality-Forcing sampler (hidden_shift) visits.
 `LayerAwareSchedule.sample(batch_size, phase)` returns (B, L) timesteps in either phase.
 `uniform=True` replaces both densities by the uniform one on [0, 1] (per layer in phase 1, one shared t in phase 2): as much
 training at low t (nearly clean input) as anywhere else, where the logit-normal(0, 1) puts ~1.4% of its mass below t = 0.1.
@@ -133,22 +135,28 @@ class LayerAwareSchedule:
 
   def sample(self, batch_size, phase, generator=None, device=None):
     """(B, L) float32 timesteps. phase 1: independent per layer (layer 0 plateaued, the rest standard);
-    phase 2: one t per sample, from the 50/50 mixture, repeated over the layers."""
+    phase 2: one t per sample, from the 50/50 mixture, repeated over the layers; phase 3: layer 0 its own t, one t shared by layers 1.."""
     kw = dict(generator=generator, device=device)
     if self.fixed_t is not None:
-      if phase not in (1, 2):
-        raise ValueError(f"phase must be 1 or 2, got {phase!r}")
+      if phase not in (1, 2, 3):
+        raise ValueError(f"phase must be 1, 2 or 3, got {phase!r}")
       return torch.full((batch_size, self.num_layers), self.fixed_t, dtype=torch.float32, device=device)
     if self.uniform:
-      if phase not in (1, 2):
-        raise ValueError(f"phase must be 1 or 2, got {phase!r}")
-      n = self.num_layers if phase == 1 else 1
+      if phase not in (1, 2, 3):
+        raise ValueError(f"phase must be 1, 2 or 3, got {phase!r}")
+      n = {1: self.num_layers, 2: 1, 3: 2}[phase]
       t = T_MIN + (1 - 2 * T_MIN) * torch.rand((batch_size, n), generator=generator, device=device, dtype=torch.float64)
+      if phase == 3:   # [layer 0, the occluded layers' shared t]
+        return torch.cat([t[:, :1], t[:, 1:].expand(-1, self.num_layers - 1)], dim=1).float().contiguous()
       return t.expand(-1, self.num_layers).float().contiguous()
     if phase == 1:
       t0 = sample_plateau_logit_normal((batch_size, 1), **self.plateau, **kw)
       rest = sample_logit_normal((batch_size, self.num_layers - 1), **self.standard, **kw)
       return torch.cat([t0, rest], dim=1).float()
+    if phase == 3:
+      t0 = sample_plateau_logit_normal((batch_size, 1), **self.plateau, **kw)
+      hid = sample_logit_normal((batch_size, 1), **self.standard, **kw)
+      return torch.cat([t0, hid.expand(-1, self.num_layers - 1)], dim=1).float().contiguous()
     if phase == 2:
       pick = torch.rand((batch_size, 1), generator=generator, device=device, dtype=torch.float64) < 0.5
       t = torch.where(
@@ -157,4 +165,4 @@ class LayerAwareSchedule:
         sample_plateau_logit_normal((batch_size, 1), **self.plateau, **kw),
       )
       return t.expand(-1, self.num_layers).float().contiguous()
-    raise ValueError(f"phase must be 1 or 2, got {phase!r}")
+    raise ValueError(f"phase must be 1, 2 or 3, got {phase!r}")

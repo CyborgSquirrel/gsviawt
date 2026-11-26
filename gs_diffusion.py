@@ -1523,8 +1523,8 @@ class GSDiffusionModel(nn.Module):
                                        uniform=bool(d.schedule.get("uniform", False)),   # (configs without the key: logit-normal)
                                        fixed_t=fixed_t)
     self.phase = int(d.schedule.get("phase", 1))
-    if self.phase not in (1, 2):
-      raise SystemExit(f"diffusion.schedule.phase must be 1 or 2, got {self.phase}")
+    if self.phase not in (1, 2, 3):
+      raise SystemExit(f"diffusion.schedule.phase must be 1, 2 or 3, got {self.phase}")
     if self.colour_separate and (fixed_t is not None or self.phase != 1):
       raise SystemExit("diffusion.colour_noise.mode=separate draws its own per-layer (t_g, t_c) (diffusion_schedule.sample_colour_geo): "
                        f"needs schedule.phase=1 and no schedule.fixed_t, got phase={self.phase}, fixed_t={fixed_t}")
