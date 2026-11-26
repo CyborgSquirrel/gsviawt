@@ -33,7 +33,14 @@ skip_methods (and extra_sets.<name>.skip_methods): leave out fit / onestep (e.g.
 kid (kid.enabled): the sets (val_sets; null: val_views_sval, val_views_strain and the extra sets) become one volume per mesh with
 kid.views_per_mesh fixed target views (kid_selection: a function of kid.seed, set and mesh only); the noise base is kid.noise_seed
 (null: seed) instead of seed; besides the usual outputs every <out>/[cs_<name>/][steps<N>/] gets kid_features.npz: the DINOv2 features
-(kid_features.py) of the sample (k = 0) and of the GT at every target view, scored by kid_compare.py."""
+(kid_features.py) of the sample (k = 0) and of the GT at every target view, scored by kid_compare.py.
+Not in conf/eval_diffusion.yaml (so a default eval's summary.json config stays as it was; give them with a +):
+  +volume_indices={<set>:[<dataset index>, ...], ...}   score only these sets, each with exactly these volumes instead of
+                       max_volumes' subset (the per-volume numbers are the same: target views and noise are functions of seed, set
+                       and volume only)
+  +save_gaussians=true  per scored volume <out>/[cs_<name>/][steps<N>/]gaussians/<set>_<volume>.npz (save_gaussians): the fit's
+                       and the sample's (k = 0) Gaussians as rendered, for rendering elsewhere (e.g. turntables) with the eval's
+                       own samples, whatever sampler options made them"""
 import contextlib as ctl
 import csv
 import json
@@ -198,6 +205,46 @@ def extra_dataset(name, spec, like, encoding, patch_size, out_dir):
   return ds
 
 
+def scored_volumes(cfg, sets, datasets):
+  """{set: [dataset index, ...]} of the volumes to score, in set order: volume_subset (max_volumes) of each of `sets`, or with
+  cfg.volume_indices exactly the listed sets and indices."""
+  chosen = cfg.get("volume_indices")
+  if chosen is None:
+    return {s: volume_subset(len(datasets[s]), cfg.max_volumes, cfg.seed, s) for s in sets}
+  unknown = sorted(set(chosen) - set(sets))
+  if unknown:
+    raise SystemExit(f"volume_indices: sets {unknown} are not among the eval's sets {sets}")
+  out = {}
+  for s in sets:
+    if s in chosen:
+      idx = [int(i) for i in chosen[s]]
+      if any(not 0 <= i < len(datasets[s]) for i in idx):
+        raise SystemExit(f"volume_indices.{s}: {idx} out of range (the set has {len(datasets[s])} volumes)")
+      out[s] = idx
+  return out
+
+
+GAUSSIAN_KEYS = ("means", "quats", "scales", "opacities", "colors")
+
+
+def save_gaussians(path, gaussians, batch, device, sh_degree):
+  """path (.npz): per method of `gaussians` ({method: Gaussian dict, batch dim 1}) <method>_{means, quats, scales, opacities,
+  colors}, float32, exactly what render() rasterizes (flatten_gaussians), and sh_degree. load_gaussians reads it back."""
+  os.makedirs(os.path.dirname(path), exist_ok=True)
+  out = {"sh_degree": np.int64(sh_degree)}
+  for method, g in gaussians.items():
+    flat = next(train_gs.flatten_gaussians(1, g, batch["source"]["xyz_cam"].to(device), batch["source"]["hit"].to(device)))
+    out.update({f"{method}_{k}": flat[k].float().cpu().numpy() for k in GAUSSIAN_KEYS})
+  np.savez(path, **out)
+
+
+def load_gaussians(path):
+  """save_gaussians' file -> ({method: {means, quats, scales, opacities, colors} (numpy float32)}, sh_degree)."""
+  with np.load(path) as f:
+    methods = sorted({k[:-len("_means")] for k in f.files if k.endswith("_means")})
+    return {m: {k: f[f"{m}_{k}"] for k in GAUSSIAN_KEYS} for m in methods}, int(f["sh_degree"])
+
+
 def load_checkpoint(module, path):
   ckpt = torch.load(path, map_location="cpu", weights_only=False)
   missing, unexpected = module.load_state_dict(ckpt["state_dict"], strict=False)
@@ -286,6 +333,8 @@ def main(cfg):
     gt_cache = kid_features.GTCache(kid.get("gt_cache"))
     kid_model = kid_features.load_dinov2(kid.get("dinov2_repo"), device)
   kid_rows = {s: [] for s in outs}
+  chosen = scored_volumes(cfg, sets, datasets)
+  save_g = bool(cfg.get("save_gaussians", False))
 
   rows, view_rows = {s: [] for s in outs}, {s: [] for s in outs}
   for ckpt_path in cfg.checkpoints:
@@ -296,10 +345,9 @@ def main(cfg):
         continue
       ctx = module.ema.applied(model) if weights == "ema" else ctl.nullcontext()
       with ctx, torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        for set_name in sets:
+        for set_name, idx in chosen.items():
           ds = datasets[set_name]
           skip = set(cfg.get("skip_methods") or []) | set_skip.get(set_name, set())
-          idx = volume_subset(len(ds), cfg.max_volumes, cfg.seed, set_name)
           n = len(idx)
           for k, i in enumerate(idx):
             random.seed(f"{cfg.seed}/{set_name}/{i}")       # the dataset draws the target views from the global `random`
@@ -327,9 +375,10 @@ def main(cfg):
             M = lambda r: metrics(r[0], gt_pm, dssim, lpips, r[1], gt_alpha, r[2], gt_depth)
             if "x0_raw" not in batch and ("fit" not in skip or cfg.get("lock_layers") or cfg.get("inject_fields")):
               raise SystemExit(f"{set_name}: no grids (grids_dir null): 'fit', lock_layers and inject_fields need them (skip_methods: [fit])")
-            once = {}
+            once, fit_g = {}, None
             if "fit" not in skip:
-              once["fit"] = M(render(model, batch, model.decode(model.normalize(batch["x0_raw"].to(device).float()), floor), views, device))
+              fit_g = model.decode(model.normalize(batch["x0_raw"].to(device).float()), floor)
+              once["fit"] = M(render(model, batch, fit_g, views, device))
             if "onestep" not in skip:
               once["onestep"] = M(render(model, batch, model.sample(image, hit, seeds=seeds[:1], steps=1, project=project, floor=floor),
                                          views, device))
@@ -362,6 +411,10 @@ def main(cfg):
                                  hidden_shift=cfg.get("hidden_shift"),
                                  **({"colour_schedule": schedule_of[cs_name]} if schedule_of[cs_name] is not None else {}))
               samples = [render(model, batch, {k: v[j:j + 1] for k, v in g.items()}, views, device) for j in range(K)]
+              if save_g:
+                save_gaussians(os.path.join(outs[out_key], "gaussians", f"{set_name}_{i}.npz"),
+                               {**({"fit": fit_g} if fit_g is not None else {}), "sample": {k: v[:1] for k, v in g.items()}},
+                               batch, device, model.max_sh_degree)
               per = dict(once)
               ks = [M(r) for r in samples]
               per["sample"] = ks[0]

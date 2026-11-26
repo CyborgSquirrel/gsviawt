@@ -66,3 +66,39 @@ def test_view_angles():
   batch = {"views": {"viewmat": torch.stack([viewmat(0), viewmat(30), viewmat(90), viewmat(180)])[None]}}
   ang = ev.view_angles(batch, [1, 2, 3])
   assert torch.allclose(ang, torch.tensor([30.0, 90.0, 180.0]), atol=1e-3)
+
+
+def test_scored_volumes_default_and_chosen():
+  from omegaconf import OmegaConf
+  datasets = {"val_meshes": [None] * 450, "val_views_sval": [None] * 30}
+  sets = list(datasets)
+  cfg = OmegaConf.create({"max_volumes": 60, "seed": 0})
+  out = ev.scored_volumes(cfg, sets, datasets)                                # default: max_volumes' subset of every set
+  assert out == {s: ev.volume_subset(len(datasets[s]), 60, 0, s) for s in sets} and list(out) == sets
+  cfg = OmegaConf.create({"max_volumes": 60, "seed": 0, "volume_indices": {"val_views_sval": [7, 3], "val_meshes": [94]}})
+  assert ev.scored_volumes(cfg, sets, datasets) == {"val_meshes": [94], "val_views_sval": [7, 3]}   # set order, listed indices
+  for bad in ({"val_train": [0]}, {"val_views_sval": [30]}):
+    with pytest.raises(SystemExit):
+      ev.scored_volumes(OmegaConf.create({"max_volumes": 60, "seed": 0, "volume_indices": bad}), sets, datasets)
+
+
+def test_save_load_gaussians_roundtrip(tmp_path):
+  import train_gs
+  g = torch.Generator().manual_seed(0)
+  L, H, W = 2, 4, 5
+  hit = torch.rand(1, L, H, W, generator=g) > 0.4
+  batch = {"source": {"xyz_cam": torch.randn(1, L, H, W, 3, generator=g), "hit": hit}}
+  gauss = lambda: {"opacity": torch.rand(1, L, 1, H, W, generator=g), "scale": torch.rand(1, L, 3, H, W, generator=g),
+                   "rotation": torch.randn(1, L, 4, H, W, generator=g), "sh_dc": torch.rand(1, L, 3, H, W, generator=g),
+                   "offset": torch.randn(1, L, 3, H, W, generator=g)}
+  gs = {"fit": gauss(), "sample": gauss()}
+  path = str(tmp_path / "gaussians" / "val_meshes_3.npz")
+  ev.save_gaussians(path, gs, batch, torch.device("cpu"), 0)
+  loaded, sh = ev.load_gaussians(path)
+  assert sh == 0 and sorted(loaded) == ["fit", "sample"]
+  for m, gm in gs.items():
+    flat = next(train_gs.flatten_gaussians(1, gm, batch["source"]["xyz_cam"], hit))
+    assert len(loaded[m]["means"]) == int(hit.sum())
+    for k in ev.GAUSSIAN_KEYS:
+      assert str(loaded[m][k].dtype) == "float32"
+      assert torch.equal(torch.from_numpy(loaded[m][k]), flat[k].float())   # exactly what render() rasterizes
