@@ -77,6 +77,13 @@ log = logging.getLogger(__name__)
 # model
 # ---------------------------------------------------------------------------
 
+def premultiplied(views, idx):
+  """The GT colour of views idx premultiplied by its alpha (B, V, 3, H, W), i.e. over black like a gsplat render. The render h5
+  stores STRAIGHT alpha (rgb is the surface colour even where alpha ~ 0), so the raw views["rgb"] is NOT comparable with a render;
+  views["rgb"][:, 0] stays straight as the encoder's input image."""
+  return views["rgb"][:, idx] * views["alpha"][:, idx]
+
+
 def image_quality(pred_rgb, gt_rgb, gt_alpha):
   """Per view (B, V), in fp32 and without a graph: psnr, fg_psnr (over the target silhouette, gt_alpha > 0.5; 100 dB for a view
   without one) and bg_l1 (the L1 outside it) -- eval_diffusion.metrics' definitions. pred_rgb / gt_rgb (B, V, 3, H, W), gt_alpha
@@ -791,7 +798,7 @@ class GSLightningModule(pl.LightningModule):
     rvi = ([0] if "source" in cfg.loss.photom["for"] else []) + (list(range(1, V)) if "target" in cfg.loss.photom["for"] else [])
     pred = model_forward(self.model, batch, need_render=True, render_view_idx=rvi, gauss=gauss, device=device)
     pred_rgb = pred["rgb"]                                                              # (B, RV, 3, H, W)
-    gt_rgb = batch["views"]["rgb"][:, rvi].to(device)
+    gt_rgb = premultiplied(batch["views"], rvi).to(device)
     per = {}
     if cfg.loss.photom.l1_weight > 0:
       per["l1"] = (pred_rgb - gt_rgb).abs().flatten(1).mean(1)                          # (B,)
@@ -1017,14 +1024,12 @@ class GSLightningModule(pl.LightningModule):
     out = {}
 
     # photometric losses
-    gt_rgb = batch["views"]["rgb"][:, render_view_idx]
+    gt_rgb = premultiplied(batch["views"], render_view_idx)
     gt_alpha = batch["views"]["alpha"][:, render_view_idx]
     if bg_colors is not None:
-      # gt_rgb is rendered (render_objaverse.py) premultiplied over BLACK,
-      # i.e. gt_rgb == true_fg_color*alpha already -- recompositing onto a
-      # different background is just += bg*(1-alpha), no un-premultiply
-      # needed. Same bg_colors the pred render above used, so pred/gt are
-      # compared on a matching background.
+      # gt_rgb is premultiplied now (like the render), so recompositing onto a
+      # different background is just += bg*(1-alpha). Same bg_colors the pred
+      # render above used, so pred/gt are compared on a matching background.
       gt_rgb = gt_rgb + bg_colors[:, None, :, None, None] * (1.0 - gt_alpha)
 
     def _splatter_metric(metric_name, metric_full):

@@ -3,7 +3,8 @@
 Every checkpoint x weights (raw / EMA) is scored on the run's validation volumes with FIXED target views and noise (functions of
 seed, set and volume, so every run and checkpoint sees the same ones) and with metrics computed here, in fp32 with autocast off --
 the same numbers whatever code version trained the run. Per target view, of renders premultiplied over black against the
-dataset images:
+dataset images premultiplied by their alpha (the h5 stores straight alpha; until gt-premult the straight colour was used, which
+capped a perfect render near 30.5 dB psnr and made edge pixels count as errors):
   l1, dssim (module.DSSIMLoss), psnr, loss = l1 + 0.85 dssim   the whole frame (dominated by the black background)
   fg_l1, fg_psnr       over the TARGET's silhouette (alpha > 0.5) only -- a fixed region per view, so spreading coverage
                        (haze) cannot dilute the error (a union with the render's silhouette would reward it)
@@ -307,6 +308,7 @@ def main(cfg):
             views = list(range(1, batch["views"]["rgb"].shape[1]))   # the target views (index 0 is the source)
             gt = batch["views"]["rgb"][0, views].to(device)
             gt_alpha = batch["views"]["alpha"][0, views].to(device)
+            gt_pm = gt * gt_alpha   # the h5 stores STRAIGHT alpha; the metrics compare against the premultiplied GT, like the render
             with h5py.File(getattr(ds, "inner", ds).source_h5, "r") as f:   # the target views' first depth-peel layer (z-depth, NaN = no hit)
               gt_depth = torch.from_numpy(np.stack([f["depth_peel"][int(r)][..., 0] for r in item["target_views"]]))
             gt_depth = gt_depth.float().to(device)[:, None]
@@ -322,7 +324,7 @@ def main(cfg):
                                              quat=str(cfg.get("project_quat", "unit")))
             base = 1_000_003 * (noise_seed + 1) + int(item["source_view"]) * 101
             seeds = [base + k for k in range(K)]
-            M = lambda r: metrics(r[0], gt, dssim, lpips, r[1], gt_alpha, r[2], gt_depth)
+            M = lambda r: metrics(r[0], gt_pm, dssim, lpips, r[1], gt_alpha, r[2], gt_depth)
             if "x0_raw" not in batch and ("fit" not in skip or cfg.get("lock_layers") or cfg.get("inject_fields")):
               raise SystemExit(f"{set_name}: no grids (grids_dir null): 'fit', lock_layers and inject_fields need them (skip_methods: [fit])")
             once = {}
@@ -367,7 +369,7 @@ def main(cfg):
                                                   device)
                 for v, tv in enumerate(item["target_views"]):
                   kid_rows[out_key].append({**key, "view": int(tv), "gen": gen_feats[v], "gt": gt_feats[v]})
-              per[f"mean{K}"] = metrics(torch.stack([r[0] for r in samples]).mean(0), gt, dssim, lpips,
+              per[f"mean{K}"] = metrics(torch.stack([r[0] for r in samples]).mean(0), gt_pm, dssim, lpips,
                                         torch.stack([r[1] for r in samples]).mean(0), gt_alpha)
               best = int(np.argmin([float(m["loss"].mean()) for m in ks]))
               per[f"best{K}"] = ks[best]
