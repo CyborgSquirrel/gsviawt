@@ -10,7 +10,7 @@
 # Regression mode with held-out views 45-49 (= the default val_fraction split of a 50-view mesh, train views 0-44), so
 # every mesh gets _anchored/mesh<M>/regression.json (held-out PSNR over black). Extra args = Hydra overrides for every
 # fit (e.g. loss.background=color; save_dense=true for the old dense run dirs as well). Resumable: resubmit the same array
-# (a root holding old dense-only fits is refused, not refit). After the array: scripts/finalize_anchored_cluster.sbatch (counts).
+# (a root holding old dense-only fits is refused, never refit; with save_dense=true their sparse grids are made from them). After the array: scripts/finalize_anchored_cluster.sbatch (counts).
 #   sbatch --array=0-9%4 --time=02:00:00 --export=ALL,CODE=$HOME/gsviawt_<sha>,H5=<h5>,OUT=<root> \
 #     $HOME/gsviawt_<sha>/scripts/fit_anchored_cluster.sbatch loss.background=color
 set -u

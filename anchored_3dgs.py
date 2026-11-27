@@ -441,24 +441,49 @@ def _dense_done(root, name):
 
 
 def view_done(root, name, save_dense=False):
-  """A view is done when its sparse grid is in <root>/grids_sparse/ (and, with save_dense, its dense grid is in the run dir or
-  grids/ too). A sparse file that is not an anchored fit's is an error. A view with only a dense grid (a root fitted before the
-  fitter wrote sparse grids) is an error without save_dense rather than a silent refit: convert that root with
-  finalize_fit_dataset.py + convert_grids_sparse.py, or resume it with save_dense=true."""
+  """A view is done when its sparse grid is in <root>/grids_sparse/. A sparse file that is not an anchored fit's is an error.
+  A view with a dense grid (run dir or grids/) but no sparse one -- a root fitted with the old dense-only output, or a save_dense
+  run stopped between its two writes -- is never refit: with save_dense its sparse grid is made from that dense grid here
+  (sparse_from_dense), without it is an error (convert that root with finalize_fit_dataset.py + convert_grids_sparse.py, or
+  resume it with save_dense=true). A view with only its sparse grid counts as done also with save_dense (no refit just to
+  write its dense grid)."""
   sp = sparse_path(root, name)
-  sparse = os.path.exists(sp)
-  if sparse:
-    with h5py.File(sp, "r") as f:
-      if "config_json" not in f.attrs or "anchored" not in json.loads(f.attrs["config_json"]):
-        raise SystemExit(f"{sp} holds a grid that is not an anchored fit's -- use a separate output_dir")
-  dense = _dense_done(root, name)
-  if save_dense:
-    return sparse and dense
-  if dense and not sparse:
-    raise SystemExit(f"{root}: {name} has a dense grid but no {SPARSE_DIR}/{name}.h5 (a root fitted with the old dense-only "
-                     "output): finalize + convert it (finalize_fit_dataset.py, convert_grids_sparse.py), or rerun with "
-                     "save_dense=true, instead of refitting it")
-  return sparse
+  if not os.path.exists(sp) and _dense_done(root, name):
+    if not save_dense:
+      raise SystemExit(f"{root}: {name} has a dense grid but no {SPARSE_DIR}/{name}.h5 (a root fitted with the old dense-only "
+                       "output): finalize + convert it (finalize_fit_dataset.py, convert_grids_sparse.py), or rerun with "
+                       "save_dense=true (which converts it), instead of refitting it")
+    sparse_from_dense(root, name)
+  if not os.path.exists(sp):
+    return False
+  with h5py.File(sp, "r") as f:
+    if "config_json" not in f.attrs or "anchored" not in json.loads(f.attrs["config_json"]):
+      raise SystemExit(f"{sp} holds a grid that is not an anchored fit's -- use a separate output_dir")
+  return True
+
+
+def _to_sparse(mem, root, name):
+  """An in-memory dense grid file (its fit metadata attrs) -> stamped as finalize_fit_dataset.py does -> <root>/grids_sparse/<name>.h5
+  (grid_io.convert_file: <name>.h5.tmp, verified, fsynced, renamed). The dense file on disk, if any, is never touched."""
+  from finalize_fit_dataset import stamp_attrs
+  min_free = 2 << 30
+  os.makedirs(os.path.join(root, SPARSE_DIR), exist_ok=True)
+  if shutil.disk_usage(root).free < min_free:
+    raise RuntimeError(f"{root}: less than {min_free >> 30} GB free on the output disk")
+  with h5py.File(mem, "r+") as g:
+    g.attrs.update(stamp_attrs(name, dict(g.attrs)))
+  grid_io.convert_file(mem, sparse_path(root, name), fsync=True)
+
+
+def sparse_from_dense(root, name):
+  """<root>/grids_sparse/<name>.h5 from the view's existing dense grid (run dir, else grids/; read into memory, the file is left
+  as it is): the file the old finalize + convert path makes from it (stamp_attrs gives the same attrs again on a finalized one)."""
+  run = os.path.join(root, name, "gaussians.grid.h5")
+  src = run if os.path.exists(run) else os.path.join(root, "grids", name + ".h5")
+  with open(src, "rb") as f:
+    mem = io.BytesIO(f.read())
+  log.info("%s: sparse grid made from the existing dense grid %s", name, src)
+  _to_sparse(mem, root, name)
 
 
 def _dense_grid(target, params_np, view, meta, config, scene_extent, final_loss, name):
@@ -483,13 +508,8 @@ def write_view(root, name, params_np, view, meta, config, scene_extent, final_lo
   save_dense: also <root>/<name>/gaussians.grid.h5, the old dense grid-only run dir (unstamped; finalize_fit_dataset.py collects
   it into grids/, written into <root>/.tmp_<name> and renamed into place); its sparse copy is already in grids_sparse/, so no
   convert_grids_sparse.py run is needed (or possible: finalize's stamping makes the dense file newer than its sparse copy)."""
-  from finalize_fit_dataset import stamp_attrs
   if not all(np.isfinite(v).all() for v in params_np.values()):
     raise RuntimeError(f"{name}: non-finite parameters")
-  min_free = 2 << 30
-  os.makedirs(os.path.join(root, SPARSE_DIR), exist_ok=True)
-  if shutil.disk_usage(root).free < min_free:
-    raise RuntimeError(f"{root}: less than {min_free >> 30} GB free on the output disk")
   if save_dense and not _dense_done(root, name):
     tmp = os.path.join(root, ".tmp_" + name)
     if os.path.exists(tmp):
@@ -501,14 +521,9 @@ def write_view(root, name, params_np, view, meta, config, scene_extent, final_lo
     if os.path.exists(final):   # an older, grid-less dir (view_done was false): replaced
       shutil.rmtree(final)
     os.replace(tmp, final)
-  sp = sparse_path(root, name)
-  if os.path.exists(sp):   # (save_dense resuming a view whose sparse grid was written before its dense one)
-    return
   mem = io.BytesIO()
   _dense_grid(mem, params_np, view, meta, config, scene_extent, final_loss, name)
-  with h5py.File(mem, "r+") as g:
-    g.attrs.update(stamp_attrs(name, dict(g.attrs)))
-  grid_io.convert_file(mem, sp, fsync=True)
+  _to_sparse(mem, root, name)
 
 
 def verify_written(d):

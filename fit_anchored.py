@@ -14,8 +14,9 @@ Stages, each skipped when its result is already there (rerun the same command to
   finetune  -> <output_dir>/grids_sparse/mesh<M>_view<V>.h5 (always from the combined fit's parameters)
 The grids are written finalized, in grid_io.py's sparse layout (the file finalize_fit_dataset.py + convert_grids_sparse.py made
 from the old dense output, bit for bit); no dense grid is written unless save_dense=true (then also the old dense run dir
-<root>/mesh<M>_view<V>/gaussians.grid.h5, for finalize_fit_dataset.py). A view counts as done when its sparse grid is there
-(+ its dense one with save_dense); see anchored_3dgs.view_done for roots fitted with the old dense-only output.
+<root>/mesh<M>_view<V>/gaussians.grid.h5, for finalize_fit_dataset.py). A view counts as done when its sparse grid is there; a
+view with only a dense grid (old dense-only roots) is never refit: an error by default, converted with save_dense=true (see
+anchored_3dgs.view_done).
 Stage timings accumulate in <output_dir>/_anchored/mesh<M>/timing.json; regression mode writes regression.json there.
 """
 

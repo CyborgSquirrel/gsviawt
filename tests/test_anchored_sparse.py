@@ -87,18 +87,29 @@ def test_same_file_as_old_dense_path(tmp_path):
 
 
 def test_view_done_old_dense_root(tmp_path):
-  """A root with a dense grid but no sparse one: an error by default (no silent refit), not done with save_dense."""
+  """A root with a dense grid but no sparse one is never refit: an error by default; with save_dense the sparse grid is made from
+  the existing dense one (the old convert's file, byte for byte), in the run dir or finalized into grids/. A view with only its
+  sparse grid is done also with save_dense."""
   name = "mesh3_view2"
   write(tmp_path, name, save_dense=True)
-  os.remove(tmp_path / "grids_sparse" / (name + ".h5"))
+  ref = tmp_path / "ref.h5"
+  os.replace(tmp_path / "grids_sparse" / (name + ".h5"), ref)
   with pytest.raises(SystemExit, match="dense grid but no"):
     an.view_done(str(tmp_path), name)
-  assert not an.view_done(str(tmp_path), name, save_dense=True)
-  write(tmp_path, name, save_dense=True)   # resume: the dense grid is kept, the sparse one written
-  assert an.view_done(str(tmp_path), name, save_dense=True) and an.view_done(str(tmp_path), name)
-  # sparse only (default run), then resumed with save_dense: the dense grid is missing, so not done
+  dense = tmp_path / name / "gaussians.grid.h5"
+  before = dense.read_bytes()
+  assert an.view_done(str(tmp_path), name, save_dense=True)   # converted from the run-dir dense grid
+  assert filecmp.cmp(tmp_path / "grids_sparse" / (name + ".h5"), ref, shallow=False)
+  assert dense.read_bytes() == before                         # the dense grid is left as it is
+  # finalized (stamped, moved to grids/) and then the sparse grid lost: the same file again
+  assert ffd.finalize_one(str(tmp_path), name, False, "dense") is None
+  os.remove(tmp_path / "grids_sparse" / (name + ".h5"))
+  assert an.view_done(str(tmp_path), name, save_dense=True)
+  assert filecmp.cmp(tmp_path / "grids_sparse" / (name + ".h5"), ref, shallow=False)
+  assert an.view_done(str(tmp_path), name)
+  # sparse only (a default run), resumed with save_dense: done, not refit for its dense grid
   write(tmp_path, "mesh3_view4")
-  assert not an.view_done(str(tmp_path), "mesh3_view4", save_dense=True)
+  assert an.view_done(str(tmp_path), "mesh3_view4", save_dense=True)
 
 
 def test_view_done_rejects_foreign_sparse(tmp_path):
