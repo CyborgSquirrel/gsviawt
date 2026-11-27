@@ -7,10 +7,13 @@ defaults:
 
 hdf5_path: ???          # render_objaverse.py h5 with depth_peel (+ depth_peel_normals for the spacing levels)
 mesh_index: ???         # the mesh: its rows are the h5 rows with this mesh_index, local view v = its v-th row
-output_dir: ???         # <output_dir>/mesh<M>_view<V>/ per training view (fit_3dgs layered format, finalize_fit_dataset.py
-                        # root); per-mesh state (anchors, combined fit, timings) in <output_dir>/_anchored/mesh<M>/
+output_dir: ???         # <output_dir>/grids_sparse/mesh<M>_view<V>.h5 per training view: finalized sparse grids (grid_io.py),
+                        # train with diffusion.grids_dir=<output_dir>/grids_sparse -- no finalize / convert step;
+                        # per-mesh state (anchors, combined fit, timings, regression.json) in <output_dir>/_anchored/mesh<M>/
 shared_output_dir: null # also write each training view's subset straight from the combined fit (no fine-tune) here, same
-                        # format; null = don't
+                        # format (<shared_output_dir>/grids_sparse/); null = don't
+save_dense: false       # true: ALSO write the old dense grid <root>/mesh<M>_view<V>/gaussians.grid.h5 (~1.6x the bytes; for
+                        # finalize_fit_dataset.py -> grids/). false: sparse only, no dense grid file is ever written
 # the last round(val_fraction x n) views of the mesh are excluded entirely (not merged, no camera, no grid)
 val_fraction: 0.1
 seed: 0
@@ -44,6 +47,10 @@ lr:
 
 loss:
   lambda_dssim: 0.2
+  background: black     # training-loss background: black (render over black vs premultiplied GT) | noise (both composited over
+                        # a fresh per-pixel uniform RGB noise image every step, combined fit and fine-tune; seeded from seed)
+                        # | color (the same, over one fresh uniform random solid RGB colour per step).
+                        # Evaluation (regression mode's held-out PSNR) is always over black
 
 # regression mode: these local views are held out instead of the val_fraction split, and every written view's held-out PSNR
 # (mean over these views, full image, like fit_3dgs's val/PSNR) is reported for the shared and the fine-tuned grids

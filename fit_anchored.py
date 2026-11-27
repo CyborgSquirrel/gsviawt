@@ -3,15 +3,20 @@
 jointly (combined fit), then cut out and fine-tune every training view's grid. Config: conf/fit_anchored.yaml.
 
     python fit_anchored.py hdf5_path=/app/bla/new90/trellis_new90_50views_eevee_504.h5 mesh_index=3 \\
-        output_dir=/app/bla/new90/anchored shared_output_dir=/app/bla/new90/anchored_shared
+        output_dir=/app/bla/new90/anchored
+    -> train with diffusion.grids_dir=/app/bla/new90/anchored/grids_sparse (no finalize / convert step)
 
 Stages, each skipped when its result is already there (rerun the same command to resume):
   merge     -> <output_dir>/_anchored/mesh<M>/anchors.npz (slot -> anchor labels, per-slot levels, anchor stats, the config
                fingerprint it was built with; a mismatch with the current config is an error, not a silent reuse)
   combined  -> <output_dir>/_anchored/mesh<M>/combined.npz + combined.done
-  shared    -> <shared_output_dir>/mesh<M>_view<V>/ (shared_output_dir set)
-  finetune  -> <output_dir>/mesh<M>_view<V>/ (always from the combined fit's parameters)
-A view counts as done when its gaussians.grid.h5 is in the run dir, or finalize_fit_dataset.py already moved it to grids/.
+  shared    -> <shared_output_dir>/grids_sparse/mesh<M>_view<V>.h5 (shared_output_dir set; default off)
+  finetune  -> <output_dir>/grids_sparse/mesh<M>_view<V>.h5 (always from the combined fit's parameters)
+The grids are written finalized, in grid_io.py's sparse layout (the file finalize_fit_dataset.py + convert_grids_sparse.py made
+from the old dense output, bit for bit); no dense grid is written unless save_dense=true (then also the old dense run dir
+<root>/mesh<M>_view<V>/gaussians.grid.h5, for finalize_fit_dataset.py). A view counts as done when its sparse grid is there; a
+view with only a dense grid (old dense-only roots) is never refit: an error by default, converted with save_dense=true (see
+anchored_3dgs.view_done).
 Stage timings accumulate in <output_dir>/_anchored/mesh<M>/timing.json; regression mode writes regression.json there.
 """
 
@@ -63,11 +68,12 @@ def main(cfg: DictConfig) -> None:
   out = str(cfg.output_dir)
   shared = None if cfg.shared_output_dir is None else str(cfg.shared_output_dir)
   regression = cfg.regression.held_views is not None
+  save_dense = bool(cfg.save_dense)
   rows = an.mesh_rows(hdf5_path, M)
   train, held = an.split_views(len(rows), cfg.val_fraction, cfg.regression.held_views)
   name = {v: f"mesh{M}_view{v}" for v in train}
-  todo_ft = [v for v in train if not an.view_done(out, name[v])]
-  todo_sh = [v for v in train if not an.view_done(shared, name[v])] if shared else []
+  todo_ft = [v for v in train if not an.view_done(out, name[v], save_dense)]
+  todo_sh = [v for v in train if not an.view_done(shared, name[v], save_dense)] if shared else []
   log.info("mesh %d: %d views, %d train, excluded %s; to do: %d fine-tuned, %d shared grids",
            M, len(rows), len(train), held, len(todo_ft), len(todo_sh))
   if not todo_ft and not todo_sh:
@@ -142,6 +148,8 @@ def main(cfg: DictConfig) -> None:
   # everything else the combined fit depends on (a saved fit is only reused when this matches exactly)
   combined_setup = {k: OmegaConf.to_container(cfg, resolve=True)[k]
                     for k in ("levels", "init_opacity", "seed", "combined", "lr", "loss")}
+  if an.check_background(cfg) == "black":   # the default: states saved before loss.background existed stay resumable
+    combined_setup["loss"].pop("background", None)
   if os.path.exists(done_path):
     z = np.load(combined_path)
     _check(combined_path, {"labels_sha1": str(z["labels_sha1"]), "n_anchors": int(z["n_anchors"]), **json.loads(str(z["setup"]))},
@@ -154,7 +162,7 @@ def main(cfg: DictConfig) -> None:
     torch.manual_seed(int(cfg.seed))
     params = {k: v.requires_grad_(True) for k, v in an.init_params(anchors, int(cfg.levels), float(cfg.init_opacity), dev).items()}
     photo, combined_loss = an.fit_combined(params, anchors_t, cams, cfg, scene_extent, np.random.default_rng(int(cfg.seed)),
-                                           _log_step("combined"))
+                                           _log_step("combined"), gen=an.noise_generator(dev, int(cfg.seed)))
     params = {k: v.detach() for k, v in params.items()}
     an.save_npz_atomic(combined_path, labels_sha1=digest, n_anchors=n_anchor, setup=json.dumps(combined_setup),
                        photom=photo, loss=combined_loss,
@@ -182,7 +190,8 @@ def main(cfg: DictConfig) -> None:
       if regression:
         reg.setdefault("shared", {})[str(v)] = an.heldout_psnr(an.flat_render_params(flat), held_cams)
       config = _view_config(cfg, hdf5_path, rows, train, held, v, "shared", cfg.combined.steps, _extra(j))
-      an.write_view(shared, name[v], an.flat_numpy(flat), views[j], meta, config, scene_extent, float(combined_loss[-1]))
+      an.write_view(shared, name[v], an.flat_numpy(flat), views[j], meta, config, scene_extent, float(combined_loss[-1]),
+                    save_dense)
     _timed("shared", t0)
 
   # --- per-view fine-tunes, each from the combined fit
@@ -193,12 +202,13 @@ def main(cfg: DictConfig) -> None:
     if regression:   # the subset straight from the combined fit, also without shared_output_dir
       reg.setdefault("shared", {})[str(v)] = an.heldout_psnr(an.flat_render_params(flat), held_cams)
     rng = np.random.default_rng([int(cfg.seed), M, v])
-    photo, loss = an.finetune(flat, cams, cfg, scene_extent, rng, _log_step("finetune", {"finetune/view": v}))
+    photo, loss = an.finetune(flat, cams, cfg, scene_extent, rng, _log_step("finetune", {"finetune/view": v}),
+                              gen=an.noise_generator(dev, [int(cfg.seed), M, v]))
     if regression:
       reg.setdefault("finetuned", {})[str(v)] = an.heldout_psnr(an.flat_render_params(flat), held_cams)
     config = _view_config(cfg, hdf5_path, rows, train, held, v, "finetune",
                           int(cfg.combined.steps) + int(cfg.finetune.steps), _extra(j))
-    an.write_view(out, name[v], an.flat_numpy(flat), views[j], meta, config, scene_extent, float(loss[-1]))
+    an.write_view(out, name[v], an.flat_numpy(flat), views[j], meta, config, scene_extent, float(loss[-1]), save_dense)
     log.info("mesh %d view %d fine-tuned (%d/%d): loss %.5f%s", M, v, n_done + 1, len(todo_ft), float(loss[-1]),
              f", held-out PSNR {reg['finetuned'][str(v)]:.3f}" if regression else "")
   if todo_ft:
@@ -213,7 +223,7 @@ def main(cfg: DictConfig) -> None:
              reg_path)
   if wandb_run is not None:
     wandb_run.finish()
-  log.info("mesh %d done -> %s", M, out)
+  log.info("mesh %d done -> %s", M, os.path.join(out, an.SPARSE_DIR))
 
 
 if __name__ == "__main__":

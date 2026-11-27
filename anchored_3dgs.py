@@ -9,19 +9,23 @@ Per mesh (the rows of a render_objaverse.py h5 with one `mesh_index`):
   - combined fit (fit_combined): per-anchor offset (free 3D, from the anchor = its slots' mean), quaternion, SH0 colour, and
     `levels` density levels of log-scale + opacity logit; a view renders its subset at, per anchor, the level of its own spacing
     relative to the anchor's mean spacing (view_levels). Each step: a random training view's subset, rendered into an independent
-    random training camera, 0.8 L1 + 0.2 D-SSIM over the subset; dense Adam over all anchors, AdamW with decoupled weight decay
-    lr.offset_weight_decay for the offsets (pulls them back toward the anchor; an L2 loss term barely acts under Adam's
+    random training camera, 0.8 L1 + 0.2 D-SSIM over the subset (loss.background black: render over black vs premultiplied GT;
+    noise: both over a fresh uniform-noise image every step, also in the fine-tune; color: over one fresh random solid colour);
+    dense Adam over all anchors, AdamW with decoupled weight decay lr.offset_weight_decay for the offsets (pulls them back toward the anchor; an L2 loss term barely acts under Adam's
     per-parameter scaling); the offset lr decays exponentially offset_lr_start -> offset_lr_end (x base) over the run.
   - per-view fine-tune (finetune): the view's subset at its levels, flattened to one Gaussian per slot, from the combined fit's
     parameters (never from another view's fine-tune: anchors are shared), fresh optimizer, a few hundred steps with the cameras of
     all training views.
-  - outputs (write_view): <root>/mesh<M>_view<V>/gaussians.grid.h5 only (fit metadata in its attributes), written by
-    fit_3dgs.py's own grid writer, so finalize_fit_dataset.py and gs_diffusion.encode_grid take it unchanged.
+  - outputs (write_view): <root>/grids_sparse/mesh<M>_view<V>.h5, the finalized grid in grid_io.py's sparse layout (the dense
+    grid of fit_3dgs.py's own grid writer, built in memory, stamped as finalize_fit_dataset.py does and converted as
+    convert_grids_sparse.py does: the same file, bit for bit); training reads it with diffusion.grids_dir=<root>/grids_sparse.
+    No dense grid on disk unless save_dense (then also the old <root>/mesh<M>_view<V>/gaussians.grid.h5, for finalize).
 
 The Hydra entry point (stages, resume, config) is fit_anchored.py; this module is the per-stage library.
 """
 
 import hashlib
+import io
 import json
 import logging
 import os
@@ -32,6 +36,7 @@ import numpy as np
 import torch
 from scipy.spatial import cKDTree
 
+import grid_io
 from cameras import unproject_depth_peel
 from fit_3dgs import render, save_output_layered
 from module import DSSIMLoss, OPENGL_TO_OPENCV, SH_C0
@@ -79,8 +84,8 @@ def scene_extent_of(poses):
 
 def load_view(f, row):
   """One h5 row's slots + camera. Slots in unproject_depth_peel order: points (N,3) world, u/v/layer (depth-peel pixel / layer),
-  foot (N,), the front image pixel's RGB (N,3) in [0,1] (not premultiplied), spacing (N,). Also the premultiplied GT image and
-  the camera (OpenCV world-to-camera viewmat, image K) and the raw depth peel (for the grid's layer_valid check)."""
+  foot (N,), the front image pixel's RGB (N,3) in [0,1] (not premultiplied), spacing (N,). Also the premultiplied GT image, its
+  alpha (H,W,1) and the camera (OpenCV world-to-camera viewmat, image K) and the raw depth peel (for the grid's layer_valid check)."""
   depth = np.asarray(f["depth_peel"][row])                        # (H,W,L) f32
   Kd = np.asarray(f["depth_intrinsics"][row])
   pose = np.asarray(f["camera_pose"][row]).astype(np.float32)
@@ -106,7 +111,7 @@ def load_view(f, row):
   rgb, alpha = (img[..., :3], img[..., 3:4]) if img.shape[-1] == 4 else (img, np.ones_like(img[..., :1]))
   return {
     "row": int(row), "points": pts, "u": u, "v": v, "layer": layer, "foot": foot, "color": color, "spacing": spacing,
-    "gt": np.ascontiguousarray(rgb * alpha), "viewmat": np.linalg.inv(pose @ OPENGL_TO_OPENCV).astype(np.float32),
+    "gt": np.ascontiguousarray(rgb * alpha), "alpha": np.ascontiguousarray(alpha), "viewmat": np.linalg.inv(pose @ OPENGL_TO_OPENCV).astype(np.float32),
     "K": np.asarray(f["image_intrinsics"][row]).astype(np.float32), "pose": pose, "valid": depth > 0,
   }
 
@@ -265,10 +270,11 @@ def flat_numpy(flat):
 
 
 class Cameras:
-  """The GPU-resident targets of a set of views: premultiplied GT (V,H,W,3), viewmats, image Ks."""
+  """The GPU-resident targets of a set of views: premultiplied GT (V,H,W,3), its alpha (V,H,W,1), viewmats, image Ks."""
 
   def __init__(self, views, device):
     self.gt = torch.tensor(np.stack([w["gt"] for w in views]), device=device)
+    self.alpha = torch.tensor(np.stack([w["alpha"] for w in views]), device=device)
     self.viewmat = torch.tensor(np.stack([w["viewmat"] for w in views]), device=device)
     self.K = torch.tensor(np.stack([w["K"] for w in views]), device=device)
     self.H, self.W = self.gt.shape[1:3]
@@ -279,6 +285,40 @@ class Cameras:
   def render(self, p, i):
     rgb, _, _ = render(p, 0, self.viewmat[[i]], self.K[[i]], self.W, self.H)
     return rgb
+
+  def render_rgba(self, p, i):
+    """(rgb (1,H,W,3) over black, alpha (1,H,W,1))"""
+    rgb, alpha, _ = render(p, 0, self.viewmat[[i]], self.K[[i]], self.W, self.H)
+    return rgb, alpha
+
+
+BACKGROUNDS = ("black", "noise", "color")
+
+
+def check_background(cfg):
+  bg = str(cfg.loss.get("background", "black"))
+  if bg not in BACKGROUNDS:
+    raise SystemExit(f"loss.background must be one of {BACKGROUNDS}, got {bg!r}")
+  return bg
+
+
+def step_target(cams, p, cam, background, gen):
+  """(render, GT) for one training step. black: the render over black vs the premultiplied GT (unchanged). noise: both composited
+  over the same fresh per-pixel uniform RGB noise image bg ~ U[0,1]^(H,W,3) drawn from `gen`. color: both composited over one
+  fresh solid colour bg ~ U[0,1]^3 drawn from `gen`."""
+  if background == "black":
+    return cams.render(p, cam), cams.gt[cam]
+  rgb, alpha = cams.render_rgba(p, cam)
+  shape = (cams.H, cams.W, 3) if background == "noise" else (3,)
+  bg = torch.rand(*shape, device=cams.gt.device, generator=gen)
+  return rgb + (1 - alpha) * bg, cams.gt[cam] + (1 - cams.alpha[cam]) * bg
+
+
+def noise_generator(device, seed):
+  """The torch generator of the noise backgrounds (separate from the numpy camera rng); seed: an int or a SeedSequence entropy
+  list."""
+  s = int(np.random.SeedSequence(seed).generate_state(1, np.uint64)[0] >> 1)
+  return torch.Generator(device=device).manual_seed(s)
 
 
 def photometric(dssim, rgb, gt, lambda_dssim):
@@ -310,10 +350,12 @@ def make_adam(params, lrs, offset_wd):
 # optimization
 # ---------------------------------------------------------------------------
 
-def fit_combined(params, anchors_t, cams, cfg, scene_extent, rng, log_step=None):
+def fit_combined(params, anchors_t, cams, cfg, scene_extent, rng, log_step=None, gen=None):
   """The combined fit, in place on `params` (per-anchor, requires_grad). anchors_t: {"pos": (A,3), "labels": [per-view slot ->
   anchor (N_v,)], "levels": [per-view (N_v,)]} on the device, views indexed like cams. Each step: subset view and camera drawn
-  independently from the training views. Returns (photometric, total) per-step losses (numpy)."""
+  independently from the training views; gen: the noise-background generator (loss.background noise). Returns (photometric,
+  total) per-step losses (numpy)."""
+  background = check_background(cfg)
   steps = int(cfg.combined.steps)
   lrs = {k: float(cfg.lr[k]) for k in PARAM_KEYS}
   lrs["offset"] *= scene_extent
@@ -325,8 +367,8 @@ def fit_combined(params, anchors_t, cams, cfg, scene_extent, rng, log_step=None)
     sv = int(rng.choice(views))
     cam = int(rng.choice(views))
     idx, lev = anchors_t["labels"][sv], anchors_t["levels"][sv]
-    rgb = cams.render(gather(params, anchors_t["pos"], idx, lev), cam)
-    photo = photometric(dssim, rgb, cams.gt[cam], float(cfg.loss.lambda_dssim))
+    rgb, gt = step_target(cams, gather(params, anchors_t["pos"], idx, lev), cam, background, gen)
+    photo = photometric(dssim, rgb, gt, float(cfg.loss.lambda_dssim))
     opt["offset"].param_groups[0]["lr"] = lrs["offset"] * exp_factor(
       it, steps, float(cfg.combined.offset_lr_start), float(cfg.combined.offset_lr_end))
     loss = photo
@@ -341,10 +383,11 @@ def fit_combined(params, anchors_t, cams, cfg, scene_extent, rng, log_step=None)
   return torch.stack(photo_log).cpu().numpy(), torch.stack(loss_log).cpu().numpy()
 
 
-def finetune(flat, cams, cfg, scene_extent, rng, log_step=None):
+def finetune(flat, cams, cfg, scene_extent, rng, log_step=None, gen=None):
   """Per-view fine-tune of a flattened subset (view_params; offset/scales/quats/opacities/sh0 trained, means_original frozen),
   in place, fresh Adam; cameras drawn from all training views; offset lr exponential pos_lr_start -> pos_lr_end (x the combined
-  base). Returns (photometric, total) per-step losses (numpy)."""
+  base); gen: the noise-background generator (loss.background noise). Returns (photometric, total) per-step losses (numpy)."""
+  background = check_background(cfg)
   steps = int(cfg.finetune.steps)
   params = {k: flat[k].requires_grad_(True) for k in PARAM_KEYS}
   lrs = {k: float(cfg.lr[k]) for k in PARAM_KEYS}
@@ -355,8 +398,8 @@ def finetune(flat, cams, cfg, scene_extent, rng, log_step=None):
   photo_log, loss_log = [], []   # detached GPU scalars, copied to the host once at the end (no per-step sync)
   for it in range(1, steps + 1):
     cam = int(rng.choice(views))
-    rgb = cams.render(flat_render_params(flat), cam)
-    photo = photometric(dssim, rgb, cams.gt[cam], float(cfg.loss.lambda_dssim))
+    rgb, gt = step_target(cams, flat_render_params(flat), cam, background, gen)
+    photo = photometric(dssim, rgb, gt, float(cfg.loss.lambda_dssim))
     opt["offset"].param_groups[0]["lr"] = lrs["offset"] * exp_factor(
       it, steps, float(cfg.finetune.pos_lr_start), float(cfg.finetune.pos_lr_end))
     loss = photo
@@ -377,8 +420,15 @@ def finetune(flat, cams, cfg, scene_extent, rng, log_step=None):
 # outputs
 # ---------------------------------------------------------------------------
 
-def view_done(root, name):
-  """A view's grid already exists: in the run dir, or collected by finalize_fit_dataset.py into grids/. A run-dir fit
+SPARSE_DIR = "grids_sparse"   # <root>/grids_sparse/<name>.h5: the finalized sparse grids (train with diffusion.grids_dir=<that>)
+
+
+def sparse_path(root, name):
+  return os.path.join(root, SPARSE_DIR, name + ".h5")
+
+
+def _dense_done(root, name):
+  """A view's dense grid already exists: in the run dir, or collected by finalize_fit_dataset.py into grids/. A run-dir fit
   that is not an anchored one (e.g. a fit_3dgs.py fit in the same root) is an error, not a finished view."""
   run = os.path.join(root, name)
   if os.path.exists(os.path.join(run, "gaussians.grid.h5")):
@@ -390,32 +440,90 @@ def view_done(root, name):
   return os.path.exists(os.path.join(root, "grids", name + ".h5"))
 
 
-def write_view(root, name, params_np, view, meta, config, scene_extent, final_loss):
-  """<root>/<name>/gaussians.grid.h5 only (save_output_layered; layer_valid == the view's depth_peel > 0, checked), with the
-  fit's metadata in its attributes (config_json = `config`, final_loss, num_gaussians, num_gaussians_seeded, scene_extent) --
-  the grid-only form finalize_fit_dataset.py collects; no flat gaussians.h5 / .ply copies. Written into <root>/.tmp_<name> (a
-  name finalize_fit_dataset.py skips) and renamed into place."""
-  if not all(np.isfinite(v).all() for v in params_np.values()):
-    raise RuntimeError(f"{name}: non-finite parameters")
-  tmp = os.path.join(root, ".tmp_" + name)
-  if os.path.exists(tmp):
-    shutil.rmtree(tmp)
-  os.makedirs(tmp)
+def view_done(root, name, save_dense=False):
+  """A view is done when its sparse grid is in <root>/grids_sparse/. A sparse file that is not an anchored fit's is an error.
+  A view with a dense grid (run dir or grids/) but no sparse one -- a root fitted with the old dense-only output, or a save_dense
+  run stopped between its two writes -- is never refit: with save_dense its sparse grid is made from that dense grid here
+  (sparse_from_dense), without it is an error (convert that root with finalize_fit_dataset.py + convert_grids_sparse.py, or
+  resume it with save_dense=true). A view with only its sparse grid counts as done also with save_dense (no refit just to
+  write its dense grid)."""
+  sp = sparse_path(root, name)
+  if not os.path.exists(sp) and _dense_done(root, name):
+    if not save_dense:
+      raise SystemExit(f"{root}: {name} has a dense grid but no {SPARSE_DIR}/{name}.h5 (a root fitted with the old dense-only "
+                       "output): finalize + convert it (finalize_fit_dataset.py, convert_grids_sparse.py), or rerun with "
+                       "save_dense=true (which converts it), instead of refitting it")
+    sparse_from_dense(root, name)
+  if not os.path.exists(sp):
+    return False
+  with h5py.File(sp, "r") as f:
+    if "config_json" not in f.attrs or "anchored" not in json.loads(f.attrs["config_json"]):
+      raise SystemExit(f"{sp} holds a grid that is not an anchored fit's -- use a separate output_dir")
+  return True
+
+
+def _to_sparse(mem, root, name):
+  """An in-memory dense grid file (its fit metadata attrs) -> stamped as finalize_fit_dataset.py does -> <root>/grids_sparse/<name>.h5
+  (grid_io.convert_file: <name>.h5.tmp, verified, fsynced, renamed). The dense file on disk, if any, is never touched."""
+  from finalize_fit_dataset import stamp_attrs
+  min_free = 2 << 30
+  os.makedirs(os.path.join(root, SPARSE_DIR), exist_ok=True)
+  if shutil.disk_usage(root).free < min_free:
+    raise RuntimeError(f"{root}: less than {min_free >> 30} GB free on the output disk")
+  with h5py.File(mem, "r+") as g:
+    g.attrs.update(stamp_attrs(name, dict(g.attrs)))
+  grid_io.convert_file(mem, sparse_path(root, name), fsync=True)
+
+
+def sparse_from_dense(root, name):
+  """<root>/grids_sparse/<name>.h5 from the view's existing dense grid (run dir, else grids/; read into memory, the file is left
+  as it is): the file the old finalize + convert path makes from it (stamp_attrs gives the same attrs again on a finalized one)."""
+  run = os.path.join(root, name, "gaussians.grid.h5")
+  src = run if os.path.exists(run) else os.path.join(root, "grids", name + ".h5")
+  with open(src, "rb") as f:
+    mem = io.BytesIO(f.read())
+  log.info("%s: sparse grid made from the existing dense grid %s", name, src)
+  _to_sparse(mem, root, name)
+
+
+def _dense_grid(target, params_np, view, meta, config, scene_extent, final_loss, name):
+  """The fit's dense grid (save_output_layered; layer_valid == the view's depth_peel > 0, checked) with its metadata attrs
+  (config_json = `config`, final_loss, num_gaussians, num_gaussians_seeded, scene_extent), into target (a path or a file object)."""
   grid_meta = {"u": view["u"], "v": view["v"], "layer": view["layer"], "H": view["valid"].shape[0],
                "W": view["valid"].shape[1], "L": view["valid"].shape[2], **meta}
-  grid_path = os.path.join(tmp, "gaussians.grid.h5")
-  save_output_layered(grid_path, params_np, grid_meta)
-  with h5py.File(grid_path, "r+") as g:
+  save_output_layered(target, params_np, grid_meta)
+  with h5py.File(target, "r+") as g:
     if not np.array_equal(np.asarray(g["layer_valid"]), view["valid"]):
       raise RuntimeError(f"{name}: layer_valid != depth_peel > 0")
     n = len(params_np["means"])
     g.attrs.update({"config_json": json.dumps(config), "final_loss": float(final_loss), "num_gaussians": n,
                     "num_gaussians_seeded": n, "scene_extent": float(scene_extent)})
-  verify_written(tmp)
-  final = os.path.join(root, name)
-  if os.path.exists(final):   # an older, grid-less dir (view_done was false): replaced
-    shutil.rmtree(final)
-  os.replace(tmp, final)
+
+
+def write_view(root, name, params_np, view, meta, config, scene_extent, final_loss, save_dense=False):
+  """<root>/grids_sparse/<name>.h5: the view's grid finalized, in grid_io.py's sparse layout -- exactly the file the old path
+  (dense gaussians.grid.h5 -> finalize_fit_dataset.py -> convert_grids_sparse.py) gives: the dense grid is built in memory only
+  (never on disk), stamped with finalize_fit_dataset.stamp_attrs, converted and verified by grid_io.convert_file (written to
+  <name>.h5.tmp, which build_grid_index's *.h5 glob skips, fsynced, renamed into place).
+  save_dense: also <root>/<name>/gaussians.grid.h5, the old dense grid-only run dir (unstamped; finalize_fit_dataset.py collects
+  it into grids/, written into <root>/.tmp_<name> and renamed into place); its sparse copy is already in grids_sparse/, so no
+  convert_grids_sparse.py run is needed (or possible: finalize's stamping makes the dense file newer than its sparse copy)."""
+  if not all(np.isfinite(v).all() for v in params_np.values()):
+    raise RuntimeError(f"{name}: non-finite parameters")
+  if save_dense and not _dense_done(root, name):
+    tmp = os.path.join(root, ".tmp_" + name)
+    if os.path.exists(tmp):
+      shutil.rmtree(tmp)
+    os.makedirs(tmp)
+    _dense_grid(os.path.join(tmp, "gaussians.grid.h5"), params_np, view, meta, config, scene_extent, final_loss, name)
+    verify_written(tmp)
+    final = os.path.join(root, name)
+    if os.path.exists(final):   # an older, grid-less dir (view_done was false): replaced
+      shutil.rmtree(final)
+    os.replace(tmp, final)
+  mem = io.BytesIO()
+  _dense_grid(mem, params_np, view, meta, config, scene_extent, final_loss, name)
+  _to_sparse(mem, root, name)
 
 
 def verify_written(d):

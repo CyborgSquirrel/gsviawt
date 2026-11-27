@@ -237,9 +237,12 @@ def verify_sparse(dense_path, sparse_path):
   return None
 
 
-def convert_file(dense_path, sparse_path):
+def convert_file(dense_path, sparse_path, fsync=False):
   """dense_path's grid as a sparse file at sparse_path: written to sparse_path + ".tmp", verified (verify_sparse), then renamed.
-  Raises (and removes the temp file) when the copy is not exact. The dense file is left alone."""
+  Raises (and removes the temp file) when the copy is not exact. The dense file is left alone. dense_path may also be an open
+  binary file object (e.g. an in-memory io.BytesIO dense file: fit_anchored.py's, which never writes a dense file to disk).
+  fsync: fsync the temp file before the rename (a delayed write error, e.g. a full disk, then raises instead of leaving a
+  truncated file in place)."""
   tmp = sparse_path + ".tmp"
   try:
     with h5py.File(dense_path, "r") as f:
@@ -249,6 +252,12 @@ def convert_file(dense_path, sparse_path):
     msg = verify_sparse(dense_path, tmp)
     if msg:
       raise RuntimeError(f"{dense_path}: the sparse copy is not exact: {msg}")
+    if fsync:
+      fd = os.open(tmp, os.O_RDONLY)
+      try:
+        os.fsync(fd)
+      finally:
+        os.close(fd)
     os.replace(tmp, sparse_path)
   finally:
     if os.path.exists(tmp):
