@@ -16,13 +16,16 @@ Per mesh (the rows of a render_objaverse.py h5 with one `mesh_index`):
   - per-view fine-tune (finetune): the view's subset at its levels, flattened to one Gaussian per slot, from the combined fit's
     parameters (never from another view's fine-tune: anchors are shared), fresh optimizer, a few hundred steps with the cameras of
     all training views.
-  - outputs (write_view): <root>/mesh<M>_view<V>/gaussians.grid.h5 only (fit metadata in its attributes), written by
-    fit_3dgs.py's own grid writer, so finalize_fit_dataset.py and gs_diffusion.encode_grid take it unchanged.
+  - outputs (write_view): <root>/grids_sparse/mesh<M>_view<V>.h5, the finalized grid in grid_io.py's sparse layout (the dense
+    grid of fit_3dgs.py's own grid writer, built in memory, stamped as finalize_fit_dataset.py does and converted as
+    convert_grids_sparse.py does: the same file, bit for bit); training reads it with diffusion.grids_dir=<root>/grids_sparse.
+    No dense grid on disk unless save_dense (then also the old <root>/mesh<M>_view<V>/gaussians.grid.h5, for finalize).
 
 The Hydra entry point (stages, resume, config) is fit_anchored.py; this module is the per-stage library.
 """
 
 import hashlib
+import io
 import json
 import logging
 import os
@@ -33,6 +36,7 @@ import numpy as np
 import torch
 from scipy.spatial import cKDTree
 
+import grid_io
 from cameras import unproject_depth_peel
 from fit_3dgs import render, save_output_layered
 from module import DSSIMLoss, OPENGL_TO_OPENCV, SH_C0
@@ -416,8 +420,15 @@ def finetune(flat, cams, cfg, scene_extent, rng, log_step=None, gen=None):
 # outputs
 # ---------------------------------------------------------------------------
 
-def view_done(root, name):
-  """A view's grid already exists: in the run dir, or collected by finalize_fit_dataset.py into grids/. A run-dir fit
+SPARSE_DIR = "grids_sparse"   # <root>/grids_sparse/<name>.h5: the finalized sparse grids (train with diffusion.grids_dir=<that>)
+
+
+def sparse_path(root, name):
+  return os.path.join(root, SPARSE_DIR, name + ".h5")
+
+
+def _dense_done(root, name):
+  """A view's dense grid already exists: in the run dir, or collected by finalize_fit_dataset.py into grids/. A run-dir fit
   that is not an anchored one (e.g. a fit_3dgs.py fit in the same root) is an error, not a finished view."""
   run = os.path.join(root, name)
   if os.path.exists(os.path.join(run, "gaussians.grid.h5")):
@@ -429,32 +440,75 @@ def view_done(root, name):
   return os.path.exists(os.path.join(root, "grids", name + ".h5"))
 
 
-def write_view(root, name, params_np, view, meta, config, scene_extent, final_loss):
-  """<root>/<name>/gaussians.grid.h5 only (save_output_layered; layer_valid == the view's depth_peel > 0, checked), with the
-  fit's metadata in its attributes (config_json = `config`, final_loss, num_gaussians, num_gaussians_seeded, scene_extent) --
-  the grid-only form finalize_fit_dataset.py collects; no flat gaussians.h5 / .ply copies. Written into <root>/.tmp_<name> (a
-  name finalize_fit_dataset.py skips) and renamed into place."""
-  if not all(np.isfinite(v).all() for v in params_np.values()):
-    raise RuntimeError(f"{name}: non-finite parameters")
-  tmp = os.path.join(root, ".tmp_" + name)
-  if os.path.exists(tmp):
-    shutil.rmtree(tmp)
-  os.makedirs(tmp)
+def view_done(root, name, save_dense=False):
+  """A view is done when its sparse grid is in <root>/grids_sparse/ (and, with save_dense, its dense grid is in the run dir or
+  grids/ too). A sparse file that is not an anchored fit's is an error. A view with only a dense grid (a root fitted before the
+  fitter wrote sparse grids) is an error without save_dense rather than a silent refit: convert that root with
+  finalize_fit_dataset.py + convert_grids_sparse.py, or resume it with save_dense=true."""
+  sp = sparse_path(root, name)
+  sparse = os.path.exists(sp)
+  if sparse:
+    with h5py.File(sp, "r") as f:
+      if "config_json" not in f.attrs or "anchored" not in json.loads(f.attrs["config_json"]):
+        raise SystemExit(f"{sp} holds a grid that is not an anchored fit's -- use a separate output_dir")
+  dense = _dense_done(root, name)
+  if save_dense:
+    return sparse and dense
+  if dense and not sparse:
+    raise SystemExit(f"{root}: {name} has a dense grid but no {SPARSE_DIR}/{name}.h5 (a root fitted with the old dense-only "
+                     "output): finalize + convert it (finalize_fit_dataset.py, convert_grids_sparse.py), or rerun with "
+                     "save_dense=true, instead of refitting it")
+  return sparse
+
+
+def _dense_grid(target, params_np, view, meta, config, scene_extent, final_loss, name):
+  """The fit's dense grid (save_output_layered; layer_valid == the view's depth_peel > 0, checked) with its metadata attrs
+  (config_json = `config`, final_loss, num_gaussians, num_gaussians_seeded, scene_extent), into target (a path or a file object)."""
   grid_meta = {"u": view["u"], "v": view["v"], "layer": view["layer"], "H": view["valid"].shape[0],
                "W": view["valid"].shape[1], "L": view["valid"].shape[2], **meta}
-  grid_path = os.path.join(tmp, "gaussians.grid.h5")
-  save_output_layered(grid_path, params_np, grid_meta)
-  with h5py.File(grid_path, "r+") as g:
+  save_output_layered(target, params_np, grid_meta)
+  with h5py.File(target, "r+") as g:
     if not np.array_equal(np.asarray(g["layer_valid"]), view["valid"]):
       raise RuntimeError(f"{name}: layer_valid != depth_peel > 0")
     n = len(params_np["means"])
     g.attrs.update({"config_json": json.dumps(config), "final_loss": float(final_loss), "num_gaussians": n,
                     "num_gaussians_seeded": n, "scene_extent": float(scene_extent)})
-  verify_written(tmp)
-  final = os.path.join(root, name)
-  if os.path.exists(final):   # an older, grid-less dir (view_done was false): replaced
-    shutil.rmtree(final)
-  os.replace(tmp, final)
+
+
+def write_view(root, name, params_np, view, meta, config, scene_extent, final_loss, save_dense=False):
+  """<root>/grids_sparse/<name>.h5: the view's grid finalized, in grid_io.py's sparse layout -- exactly the file the old path
+  (dense gaussians.grid.h5 -> finalize_fit_dataset.py -> convert_grids_sparse.py) gives: the dense grid is built in memory only
+  (never on disk), stamped with finalize_fit_dataset.stamp_attrs, converted and verified by grid_io.convert_file (written to
+  <name>.h5.tmp, which build_grid_index's *.h5 glob skips, fsynced, renamed into place).
+  save_dense: also <root>/<name>/gaussians.grid.h5, the old dense grid-only run dir (unstamped; finalize_fit_dataset.py collects
+  it into grids/, written into <root>/.tmp_<name> and renamed into place); its sparse copy is already in grids_sparse/, so no
+  convert_grids_sparse.py run is needed (or possible: finalize's stamping makes the dense file newer than its sparse copy)."""
+  from finalize_fit_dataset import stamp_attrs
+  if not all(np.isfinite(v).all() for v in params_np.values()):
+    raise RuntimeError(f"{name}: non-finite parameters")
+  min_free = 2 << 30
+  os.makedirs(os.path.join(root, SPARSE_DIR), exist_ok=True)
+  if shutil.disk_usage(root).free < min_free:
+    raise RuntimeError(f"{root}: less than {min_free >> 30} GB free on the output disk")
+  if save_dense and not _dense_done(root, name):
+    tmp = os.path.join(root, ".tmp_" + name)
+    if os.path.exists(tmp):
+      shutil.rmtree(tmp)
+    os.makedirs(tmp)
+    _dense_grid(os.path.join(tmp, "gaussians.grid.h5"), params_np, view, meta, config, scene_extent, final_loss, name)
+    verify_written(tmp)
+    final = os.path.join(root, name)
+    if os.path.exists(final):   # an older, grid-less dir (view_done was false): replaced
+      shutil.rmtree(final)
+    os.replace(tmp, final)
+  sp = sparse_path(root, name)
+  if os.path.exists(sp):   # (save_dense resuming a view whose sparse grid was written before its dense one)
+    return
+  mem = io.BytesIO()
+  _dense_grid(mem, params_np, view, meta, config, scene_extent, final_loss, name)
+  with h5py.File(mem, "r+") as g:
+    g.attrs.update(stamp_attrs(name, dict(g.attrs)))
+  grid_io.convert_file(mem, sp, fsync=True)
 
 
 def verify_written(d):

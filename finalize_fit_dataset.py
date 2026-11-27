@@ -14,6 +14,10 @@ grid_format=sparse writes grids/<name>.h5 in grid_io.py's sparse layout instead 
 kept: it goes to extra/<name>/gaussians.grid.h5 with the rest of the run). Default dense, as before.
 
     python finalize_fit_dataset.py root=/scratch/vc16/t26rb00/fit_dataset
+
+fit_anchored.py no longer needs this step: it writes its grids finalized and sparse itself (<output_dir>/grids_sparse/, with the
+attrs of stamp_attrs below), and no run dirs unless save_dense=true -- on such a root this finds nothing to do. It still finalizes
+roots of dense fits (old fit_anchored.py roots, fit_3dgs.py, save_dense=true run dirs) as before.
 """
 
 import json
@@ -33,6 +37,32 @@ NEEDED = ("gaussians.grid.h5", "gaussians.h5", "gaussians.ply")
 
 
 GRID_FORMATS = ("dense", "sparse")
+
+
+def stamp_attrs(name, attrs):
+  """The attrs finalize stamps onto a fit's grid file: the fit's own (attrs: its config_json, final_loss, num_gaussians) plus what
+  gs_diffusion / gs_dataset read (source_h5, primary_view_row, ...). Also used by fit_anchored.py, which writes its grids
+  finalized (sparse) itself, so the two paths give the same file."""
+  cfg = json.loads(attrs["config_json"])
+  mesh, view = (int(x) for x in name[len("mesh"):].split("_view"))
+  return {
+    "source_h5": cfg["hdf5_path"],
+    "mesh_number": mesh,
+    "primary_view_in_mesh": view,
+    "primary_view_row": int(cfg["data"]["primary_view"]),
+    "supervision_views_rows": json.dumps(cfg["data"]["secondary_views"]),   # the fit's other training views
+    "num_supervision_views": len(cfg["data"]["secondary_views"]) + 1,       # + the primary
+    "iters": int(cfg["iters"]),
+    "sh_degree": int(cfg["sh_degree"]),
+    # how the layered offsets were pulled toward their slot: AdamW weight decay (current) or, in fits made
+    # before it replaced it, an L2 loss weight
+    **({"means_weight_decay": float(cfg["lr"]["means_weight_decay"])} if "means_weight_decay" in cfg.get("lr", {})
+       else {"mean_offset_reg_weight": float(cfg["mean_offset_reg_weight"])}),
+    "means_optimized": True,   # layered: means = the depth-peel seed + a trained offset
+    "final_loss": float(attrs["final_loss"]),
+    "num_gaussians": int(attrs["num_gaussians"]),
+    "config_json": attrs["config_json"],
+  }
 
 
 def finalize_one(root, name, overwrite, grid_format="dense"):
@@ -58,26 +88,8 @@ def finalize_one(root, name, overwrite, grid_format="dense"):
     cfg = json.loads(attrs["config_json"])
     if cfg.get("gaussian_layout") != "layered":
       return f"not a layered fit (gaussian_layout={cfg.get('gaussian_layout')!r})"
-    mesh, view = (int(x) for x in name[len("mesh"):].split("_view"))
     with h5py.File(grid, "r+") as g:   # also fails (BlockingIOError) while a fit still writes it
-      g.attrs.update({
-        "source_h5": cfg["hdf5_path"],
-        "mesh_number": mesh,
-        "primary_view_in_mesh": view,
-        "primary_view_row": int(cfg["data"]["primary_view"]),
-        "supervision_views_rows": json.dumps(cfg["data"]["secondary_views"]),   # the fit's other training views
-        "num_supervision_views": len(cfg["data"]["secondary_views"]) + 1,       # + the primary
-        "iters": int(cfg["iters"]),
-        "sh_degree": int(cfg["sh_degree"]),
-        # how the layered offsets were pulled toward their slot: AdamW weight decay (current) or, in fits made
-        # before it replaced it, an L2 loss weight
-        **({"means_weight_decay": float(cfg["lr"]["means_weight_decay"])} if "means_weight_decay" in cfg.get("lr", {})
-           else {"mean_offset_reg_weight": float(cfg["mean_offset_reg_weight"])}),
-        "means_optimized": True,   # layered: means = the depth-peel seed + a trained offset
-        "final_loss": float(attrs["final_loss"]),
-        "num_gaussians": int(attrs["num_gaussians"]),
-        "config_json": attrs["config_json"],
-      })
+      g.attrs.update(stamp_attrs(name, attrs))
   except (OSError, KeyError, ValueError) as e:
     return f"{type(e).__name__}: {e}"
   os.makedirs(os.path.dirname(target), exist_ok=True)

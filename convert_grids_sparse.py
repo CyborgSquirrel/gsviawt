@@ -11,6 +11,9 @@ Stale entries are left behind (they would be recomputed anyway).
 
     python convert_grids_sparse.py grids_dir=/scratch/vc16/t26rb00/new100/anchored/grids workers=8
     -> /scratch/vc16/t26rb00/new100/anchored/grids_sparse   (then train with diffusion.grids_dir=<that>)
+
+For existing dense grids only: fit_anchored.py now writes <output_dir>/grids_sparse/ itself (the same files this makes from its
+old dense output), so its new roots need no conversion.
 """
 
 import glob
