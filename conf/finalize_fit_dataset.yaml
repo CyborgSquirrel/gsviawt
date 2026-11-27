@@ -6,6 +6,7 @@ defaults:
 
 root: ???            # the directory holding the fit run dirs mesh<M>_view<V>/
 overwrite: false     # replace an existing grids/<name>.h5
+grid_format: dense   # dense | sparse (grid_io.py; the fit's dense grid is kept in extra/<name>/)
 
 hydra:
   job:

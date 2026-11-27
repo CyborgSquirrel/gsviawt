@@ -13,6 +13,16 @@ log = logging.getLogger(__name__)
 _MISSING = object()
 
 
+def register_eval_resolver():
+  """Register OmegaConf's `eval` resolver, once: conf/*.yaml use it for fields that are a small expression over another
+  field (e.g. "${eval:'${iters} // 50'}"). Called at import by module.py and gs_diffusion.py, so importing either is
+  enough to resolve a train_gs / fit_3dgs config; a second call is a no-op (registering twice would raise). omegaconf is
+  imported here, not at the top: util.py also runs inside Blender (render_objaverse.py)."""
+  from omegaconf import OmegaConf
+  if not OmegaConf.has_resolver("eval"):
+    OmegaConf.register_new_resolver("eval", eval)
+
+
 def intrinsics_name(f, kind="depth", default=_MISSING):
   """Name of the intrinsics dataset to read from a render_objaverse h5.
 

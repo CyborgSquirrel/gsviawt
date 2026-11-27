@@ -1,7 +1,7 @@
 """Diffusion mode of train_gs.py: a diffusion model over the fitted layered 3DGS grids (World Tracing's recipe).
 
 The data are fit_3dgs.py `gaussian_layout=layered` fits, one finalized grid .h5 per source view (see
-bla/finalize_fit_dataset.py: `mesh<M>_view<V>.h5`, (H, W, 6, .) arrays, NaN where a slot has no Gaussian). Gaussian POSITIONS come
+finalize_fit_dataset.py: `mesh<M>_view<V>.h5`, (H, W, 6, .) arrays, NaN where a slot has no Gaussian). Gaussian POSITIONS come
 from the source view's point cloud (the depth peel, as everywhere in train_gs.py); the model generates, per slot, 14 channels
 (CHANNELS), normalized per channel (x0):
     opacity (1)   logit, clamped to +-7
@@ -22,7 +22,6 @@ of 64 for the heads).
 
 import contextlib
 import glob
-import json
 import logging
 import math
 import os
@@ -40,15 +39,19 @@ from einops import rearrange
 from torch.utils.data import Dataset
 
 from diffusion_schedule import LayerAwareSchedule
+# the x0 layout, SH_C0 and quat_forms live in gaussians.py (re-exported here: gs_diffusion.CHANNELS, gs_diffusion.SCALE, ...)
+from gaussians import SH_C0, X0_CHANNELS, X0_DIMS, X0_FIELDS, X0_SLICES, quat_forms  # noqa: F401
 from gs_dataset import OPENGL_TO_OPENCV, rotate_quats_wxyz
 from gs_decoder import AttentionBlock, apply_rope, rope_cos_sin
-from module import SH_C0
+from grid_io import Grid, grid_shape, load_grid, read_grid  # noqa: F401  (load_grid: the dense dict, for the callers that want it)
+from util import register_eval_resolver
 
 log = logging.getLogger(__name__)
 
-FIELDS = ("opacity", "scale", "rotation", "sh_dc", "offset")
-DIMS = (1, 3, 4, 3, 3)
-CHANNELS = sum(DIMS)   # 14
+# the run configs' ${eval:...} fields (module.py registered it when this module still imported it, for SH_C0)
+register_eval_resolver()
+
+FIELDS, DIMS, CHANNELS = X0_FIELDS, X0_DIMS, X0_CHANNELS   # 14 channels
 OPACITY_LOGIT_CLAMP = 7.0
 T_MIN_CLAMP = 0.05     # WT's: the x0 -> velocity conversion divides by max(t, T_MIN_CLAMP)
 
@@ -56,15 +59,6 @@ T_MIN_CLAMP = 0.05     # WT's: the x0 -> velocity conversion divides by max(t, T
 # ---------------------------------------------------------------------------
 # grids <-> x0 channels
 # ---------------------------------------------------------------------------
-
-def load_grid(path):
-  """A finalized grid file -> ({name: array (H, W, L, .)}, attrs)."""
-  with h5py.File(path, "r") as f:
-    grid = {k: np.asarray(f[k]) for k in (
-      "gaussian_means", "gaussian_scales", "gaussian_quats", "gaussian_opacities", "gaussian_colors", "layer_valid")}
-    attrs = {k: (v.item() if hasattr(v, "item") else v) for k, v in f.attrs.items() if k != "config_json"}
-  return grid, attrs
-
 
 def permute_scale_axes(scale, quat, order):
   """(N, 3) scales, (N, 4) wxyz quaternions, (N, 3) axis orders -> the same Gaussians with their axes in that order: the scales
@@ -111,13 +105,6 @@ def normalize_encoding(encoding):
   return e
 
 
-def quat_forms(q):
-  """(N, 4) wxyz -> (N, 4 forms, 4): q times 1, i, j, k -- the same Gaussian with two of its axes flipped (a 180 degree turn about
-  one of its own axes). The 4 forms are exactly the rotations that leave an ellipsoid (with fixed axis order) unchanged."""
-  w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-  return np.stack([q, np.stack([-x, w, z, -y], 1), np.stack([-y, -z, w, x], 1), np.stack([-z, y, -x, w], 1)], 1)
-
-
 def set_rot_form(q, rot_form, rng=None):
   """(N, 4) wxyz -> the same Gaussians' quaternions in the requested form, w >= 0. canonical: the form with the largest |w| (the
   one closest to no rotation in this frame); random: a uniformly random form per Gaussian; keep: q unchanged."""
@@ -133,6 +120,8 @@ def set_rot_form(q, rot_form, rng=None):
 def encode_grid(grid, source, scale_order=None, scale_floor_px=None, rot_form="keep", rng=None, scale_sort=None,
                 scale_floor_mode="max"):
   """The grid's Gaussians as raw (un-normalized) x0 channels, (CHANNELS, L, H, W) float32, zero at the slots without a Gaussian.
+  `grid`: a grid_io.Grid (read_grid: a sparse file's rows, used as they are) or load_grid's dense dict (gathered into one first: the
+  same rows, so the same x0 bit for bit).
   `source`: the dataset item's "source" dict (xyz_cam (L, H, W, 3) with NaN where there is no hit, hit (L, H, W), pose_gl (4, 4),
   K_depth (3, 3)).
   scale_floor_px: every scale axis is raised to at least this fraction of the pixel footprint at the Gaussian's depth in the source
@@ -152,7 +141,9 @@ def encode_grid(grid, source, scale_order=None, scale_floor_px=None, rot_form="k
   scale_order, rot_form = e["scale_order"], e["rot_form"]
   if "random" in (scale_order, rot_form) and rng is None:
     rng = np.random.default_rng()
-  valid = grid["layer_valid"].transpose(2, 0, 1)                      # (L, H, W)
+  if not isinstance(grid, Grid):
+    grid = Grid.from_dense(grid)
+  valid = grid.valid                                                 # (L, H, W)
   hit = source["hit"].numpy()
   mismatch = int((valid != hit).sum())
   if mismatch:   # one slot is enough: a Gaussian without a point (NaN offset) would poison the loss
@@ -163,8 +154,8 @@ def encode_grid(grid, source, scale_order=None, scale_floor_px=None, rot_form="k
   w2c = np.linalg.inv(c2w)
   # the math on the valid slots only (~6% of them), as (N, .) rows in [valid]'s order, scattered into the zeros once; every op is
   # elementwise per slot (or per row), so the values are the dense version's bit for bit, and the rng draws the same (N, .) shapes
-  li, yi, xi = np.nonzero(valid)
-  take = lambda k: grid[k][yi, xi, li]                                # the grid's (H, W, L, .) arrays -> (N, .)
+  li, yi, xi = grid.idx                                              # np.nonzero(valid)
+  take = lambda k: grid.rows[k]                                      # (N, .)
   means = take("gaussian_means")                                     # world frame
   # world -> source camera; a single row doubled: numpy's matmul takes BLAS gemv for one row, gemm (the dense version's, (W, 3)
   # per (layer, row)) for more, and the two can differ in the last bit
@@ -200,7 +191,7 @@ def encode_grid(grid, source, scale_order=None, scale_floor_px=None, rot_form="k
   return x0                                                          # (CHANNELS, L, H, W)
 
 
-SCALE, ROTATION, OFFSET = (slice(o, o + d) for o, d in zip(np.cumsum((0,) + DIMS)[[1, 2, 4]], DIMS[1:2] + DIMS[2:3] + DIMS[4:5]))
+SCALE, ROTATION, OFFSET = X0_SLICES["scale"], X0_SLICES["rotation"], X0_SLICES["offset"]
 _SCALE_IDX = torch.arange(SCALE.start, SCALE.stop)
 
 
@@ -305,8 +296,7 @@ def format_projection(mean, std, hit, anchor_z, fx, scale_sort=False, scale_floo
     raise NotImplementedError("format_projection: quat=keep with rot_form canonical")
   if scale_order is not None:
     scale_sort = scale_order == "sorted"
-  o = np.cumsum((0,) + DIMS)
-  sc, ro = slice(int(o[1]), int(o[2])), slice(int(o[2]), int(o[3]))   # the scale and rotation channels
+  sc, ro = SCALE, ROTATION   # the scale and rotation channels
 
   def project(x0):
     x = x0.clone()
@@ -326,14 +316,13 @@ def format_projection(mean, std, hit, anchor_z, fx, scale_sort=False, scale_floo
     else:
       q = torch.where(q[:, :1] < 0, -q, q)
     if rot_form == "canonical":   # q times 1, i, j, k: the same Gaussian; keep the one with the largest |w|
-      w, x_, y, z = q.unbind(-1)
-      forms = torch.stack([q, torch.stack([-x_, w, z, -y], 1), torch.stack([-y, -z, w, x_], 1), torch.stack([-z, y, -x_, w], 1)], 1)
+      forms = quat_forms(q)
       q = forms[torch.arange(len(q), device=q.device), forms[:, :, 0].abs().argmax(1)]
       q = torch.where(q[:, :1] < 0, -q, q)
     if quat == "keep":   # as predicted, but where the axes were reordered: the permuted rotation at the predicted length
       q = torch.where(moved[:, None], q * q_raw.norm(dim=1, keepdim=True), q_raw)
     if scale_floor_px is not None:
-      z = anchor_z.expand(*v.shape)[v].float() + raw[:, :, int(o[4]) + 2].permute(0, 1, 2, 3)[v].float()   # the mean's depth, as encode_grid
+      z = anchor_z.expand(*v.shape)[v].float() + raw[:, :, OFFSET.start + 2].permute(0, 1, 2, 3)[v].float()   # the mean's depth, as encode_grid
       floor = torch.log(float(scale_floor_px) * z.clamp_min(1e-3) / float(fx))   # (a wild predicted offset must not make it NaN)
       s = torch.maximum(s, floor[:, None])
     out = raw.permute(0, 1, 3, 4, 2).clone()                          # (B, L, H, W, C)
@@ -404,8 +393,7 @@ def build_grid_index(grids_dir, source_h5=None):
 def check_grids(grid_index, image_size, patch_size, num_layers):
   """The grids' (H, W, L) must be the model's grid: image_size square (a multiple of the patch size, so the patches tile it) and
   num_layers layers. (data.depth_size must stay null: grids are at the depth peel's own resolution.)"""
-  with h5py.File(next(iter(grid_index.values())), "r") as f:
-    h, w, l = f["layer_valid"].shape
+  h, w, l = grid_shape(next(iter(grid_index.values())))
   if (h, w) != (image_size, image_size) or h % patch_size or l != num_layers:
     raise SystemExit(
       f"the grids are {h}x{w} with {l} layers, but the model wants {image_size}x{image_size} (a multiple of the patch size "
@@ -459,7 +447,7 @@ class GridTargetDataset(Dataset):
         random.setstate(state)
     else:
       item = self.inner[idx]
-    grid, _ = load_grid(self.grid_index[item["source_view"]])
+    grid = read_grid(self.grid_index[item["source_view"]])
     # half precision in transit (dense (14, 6, 504, 504) is 85 MB in float32): the log-scales (|x| < 17), logits, colours and offsets
     # lose < 2% of the channel's std; the model upcasts it
     rng = np.random.default_rng(int(item["source_view"])) if self.seeded else None
@@ -493,7 +481,7 @@ def _grid_moments(dataset, i, path, cache_dir):
     if (z["stamp"] == stamp).all():
       return z["s"], z["s2"], int(z["n"]), z["lo"], z["hi"]
   item = dataset.inner[i]
-  grid, _ = load_grid(path)
+  grid = read_grid(path)
   x = torch.from_numpy(encode_grid(grid, item["source"], rng=np.random.default_rng(int(item["source_view"])), **dataset.encoding))[:, item["source"]["hit"]].double()   # (CHANNELS, valid slots), full precision
   if x.shape[1]:
     moments = (x.sum(1).numpy(), x.square().sum(1).numpy(), x.shape[1], x.amin(1).numpy(), x.amax(1).numpy())
@@ -540,6 +528,126 @@ def compute_stats(dataset, grid_index, cache_dir=None):
 # ---------------------------------------------------------------------------
 # network
 # ---------------------------------------------------------------------------
+
+TOKEN_DROPS = ("none", "empty", "empty_except_layer0")
+COND_NULLS = ("zeros", "learned")
+GUIDANCE_DEFAULTS = dict(scale=1.0, interval=(0.0, 1.0), fields=None)   # diffusion.cfg: what a config without the key means
+
+
+def normalize_cond_dropout(cd):
+  """diffusion.cond_dropout (None or missing keys: off) -> {"p": float in [0, 1], "null": zeros | learned}."""
+  cd = {"p": 0.0, "null": "zeros", **dict(cd or {})}
+  unknown = sorted(set(cd) - {"p", "null"})
+  if unknown:
+    raise ValueError(f"diffusion.cond_dropout: unknown keys {unknown}")
+  p = float(cd["p"])
+  if not 0.0 <= p <= 1.0:
+    raise ValueError(f"diffusion.cond_dropout.p must be in [0, 1], got {p}")
+  if cd["null"] not in COND_NULLS:
+    raise ValueError(f"diffusion.cond_dropout.null must be one of {COND_NULLS}, got {cd['null']!r}")
+  return {"p": p, "null": str(cd["null"])}
+
+
+def normalize_guidance(g):
+  """diffusion.cfg (classifier-free guidance at sampling; None or missing keys: the defaults, off) -> {"scale": float,
+  "interval": (lo, hi), "fields": tuple of FIELDS names or None (all)}."""
+  g = {**GUIDANCE_DEFAULTS, **{k: v for k, v in dict(g or {}).items()}}
+  unknown = sorted(set(g) - set(GUIDANCE_DEFAULTS))
+  if unknown:
+    raise ValueError(f"diffusion.cfg: unknown keys {unknown}")
+  lo, hi = (float(v) for v in g["interval"])
+  if lo > hi:
+    raise ValueError(f"diffusion.cfg.interval must be [lo, hi] with lo <= hi, got {[lo, hi]}")
+  fields = None
+  if g["fields"] is not None:
+    fields = tuple(str(f) for f in g["fields"])
+    bad = sorted(set(fields) - set(FIELDS))
+    if bad or not fields:
+      raise ValueError(f"diffusion.cfg.fields must be a non-empty subset of {FIELDS} (or null: all), got {list(fields)}")
+  return {"scale": float(g["scale"]), "interval": (lo, hi), "fields": fields}
+
+
+def warn_guidance_without_dropout(guidance, cond_dropout_p):
+  """Guidance (scale != 1) on a run trained without condition dropout: its unconditional branch was never trained."""
+  if guidance["scale"] != 1.0 and float(cond_dropout_p) == 0.0:
+    msg = (f"diffusion.cfg.scale={guidance['scale']:g} on a run trained with diffusion.cond_dropout.p=0: the unconditional "
+           "branch (null image condition) was never trained, so it (and the guided mix) is not meaningful")
+    log.warning(msg)
+    warnings.warn(msg)
+
+
+def token_keep(hit, patch_size, token_drop):
+  """The tokens the trunk runs on (diffusion.token_drop), (B, L, P) bool in the tokens' (b, l, (h w)) order, or None (none: all, the
+  dense path). A token is one layer's patch; it is empty when none of its patch_size^2 slots is valid (hit). empty: every empty
+  token dropped; empty_except_layer0: the empty tokens of layers 1.. dropped, all of layer 0 kept (its empty patches are the
+  background: image features only)."""
+  if token_drop not in TOKEN_DROPS:
+    raise ValueError(f"token_drop must be one of {TOKEN_DROPS}, got {token_drop!r}")
+  if token_drop == "none":
+    return None
+  b, l, h, w = hit.shape
+  keep = hit.bool().reshape(b, l, h // patch_size, patch_size, w // patch_size, patch_size).any(5).any(3).reshape(b, l, -1)
+  if token_drop == "empty_except_layer0":
+    keep[:, 0] = True
+  return keep
+
+
+class PackIndex:
+  """Index tables for running the trunk on the kept tokens of a (B, L, P) keep mask only, as packed (T, D) rows in (b, l, p) order:
+  a frame segment (one (sample, layer)) and a global segment (one sample) are contiguous runs of rows (cu_frame / cu_global, the
+  zero-length ones left out); the ray block's columns (one (sample, patch) with >= 1 kept layer) are a (C, L) table of row
+  indices, -1 where that layer's token is dropped."""
+
+  def __init__(self, keep):
+    B, L, P = keep.shape
+    dev = keep.device
+    self.B, self.L, self.P = B, L, P
+    self.flat = keep.reshape(-1).nonzero().squeeze(1)                 # (T,) the kept tokens' flat (b, l, p) indices
+    self.T = len(self.flat)
+    self.b = self.flat // (L * P)
+    self.l = (self.flat // P) % L
+    self.p = self.flat % P
+    self.frame = self.b * L + self.l                                  # (T,) the row's (sample, layer)
+    self.cu_frame, self.max_frame = self._cu(self.frame, B * L)
+    self.cu_global, self.max_global = self._cu(self.b, B)
+    table = torch.full((B * P, L), -1, dtype=torch.long, device=dev)  # (sample, patch) x layer -> row
+    col = self.b * P + self.p
+    table[col, self.l] = torch.arange(self.T, device=dev)
+    used = (table >= 0).any(1)
+    self.ray_table = table[used]                                      # (C, L)
+    self.ray_valid = self.ray_table >= 0
+    self.ray_col = (used.cumsum(0) - 1)[col]                          # (T,) the row's place in the table: (ray_col, l)
+
+  @staticmethod
+  def _cu(seg, n):
+    counts = torch.bincount(seg, minlength=n)
+    counts = counts[counts > 0]                                       # the rows are sorted by segment
+    cu = torch.zeros(len(counts) + 1, dtype=torch.int32, device=seg.device)
+    cu[1:] = counts.cumsum(0)
+    return cu, int(counts.max()) if len(counts) else 0
+
+  def gather(self, x):
+    """(B, L, P, ...) -> the kept rows (T, ...)."""
+    return x.reshape(self.B * self.L * self.P, *x.shape[3:])[self.flat]
+
+  def scatter(self, rows):
+    """(T, ...) rows -> (B, L, P, ...), zeros at the dropped tokens."""
+    out = rows.new_zeros(self.B * self.L * self.P, *rows.shape[1:]).index_copy(0, self.flat, rows)
+    return out.reshape(self.B, self.L, self.P, *rows.shape[1:])
+
+
+def segment_attention(q, k, v, cu, max_len):
+  """q, k, v (T, H, hd) -> (T, H, hd): softmax attention within the segments cu (int32 cumulative lengths). Under CUDA autocast
+  (bf16 / fp16) torch's varlen flash kernel, at the autocast dtype (as SDPA's dense path under autocast); otherwise (fp32, CPU)
+  SDPA per segment."""
+  if q.is_cuda and torch.is_autocast_enabled("cuda") and torch.get_autocast_dtype("cuda") in (torch.bfloat16, torch.float16):
+    from torch.nn.attention.varlen import varlen_attn
+    dt = torch.get_autocast_dtype("cuda")
+    return varlen_attn(q.to(dt).contiguous(), k.to(dt).contiguous(), v.to(dt).contiguous(), cu, cu, max_len, max_len)
+  bounds = cu.tolist()
+  return torch.cat([F.scaled_dot_product_attention(q[a:e].transpose(0, 1), k[a:e].transpose(0, 1), v[a:e].transpose(0, 1))
+                    .transpose(0, 1) for a, e in zip(bounds[:-1], bounds[1:])])
+
 
 def sinusoidal_embedding(t, dim=256, theta=10_000.0):
   """WT's (Wan 2.1's) timestep embedding: [cos, sin] of t * theta^(-k / (dim / 2)); t: (N,) -> (N, dim) float32."""
@@ -594,6 +702,34 @@ class DiTBlock(AttentionBlock):
     h = (self.norm2(x).float() * (1 + scale_m) + shift_m).to(x.dtype)
     return x + (self.ls2 * self.mlp(h) * gate_m).to(x.dtype)
 
+  def _mix_packed(self, h, pack, cos_r, sin_r):
+    """_mix on packed rows h (T, D): the frame / global blocks attend within the rows' segments (RoPE at each row's own patch
+    position), the ray block over each column's kept layers (the explicit softmax, the dropped layers' keys masked)."""
+    t, d = h.shape
+    hd = d // self.num_heads
+    q, k, v = self.qkv(h).reshape(t, 3, self.num_heads, hd).unbind(1)                      # (T, heads, hd)
+    q, k = self.q_norm(q), self.k_norm(k)
+    if self.mode == "ray":
+      idx = pack.ray_table.clamp_min(0)                                                     # (C, L)
+      att = torch.einsum("cshd,cthd->chst", q[idx], k[idx]) * hd ** -0.5
+      att = att.masked_fill(~pack.ray_valid[:, None, None, :], float("-inf"))
+      out = torch.einsum("chst,cthd->cshd", att.softmax(-1).to(v.dtype), v[idx])[pack.ray_col, pack.l]   # back to rows
+    else:
+      q, k = apply_rope(q, cos_r, sin_r), apply_rope(k, cos_r, sin_r)
+      cu, mx = (pack.cu_frame, pack.max_frame) if self.mode == "frame" else (pack.cu_global, pack.max_global)
+      out = segment_attention(q, k, v, cu, mx)
+    return self.proj(out.reshape(t, d))
+
+  def forward_packed(self, x, pack, cos_r, sin_r, adaln, seg):
+    """forward on the packed rows x (T, D) of a PackIndex. adaln (N, 6, D) and seg (T,): row i is modulated by adaln[seg[i]] (the
+    frame blocks: N = B * L, one per (sample, layer); ray / global: N = B, the layers' mean)."""
+    mod = self.modulation + adaln.float()                                                    # (N, 6, D)
+    row = lambda i: mod[:, i][seg]                                                           # (T, D), gathered when used
+    h = (self.norm1(x).float() * (1 + row(1)) + row(0)).to(x.dtype)
+    x = x + (self.ls1 * self._mix_packed(h, pack, cos_r, sin_r) * row(2)).to(x.dtype)
+    h = (self.norm2(x).float() * (1 + row(4)) + row(3)).to(x.dtype)
+    return x + (self.ls2 * self.mlp(h) * row(5)).to(x.dtype)
+
 
 class DiTTrunk(nn.Module):
   """gs_decoder.TransformerTrunk with AdaLN blocks: frame -> ray -> global, the per-layer FiLM before every frame block, and WT's
@@ -637,6 +773,28 @@ class DiTTrunk(nn.Module):
         x = block(x, cos, sin, a)
     return x
 
+  def forward_packed(self, x, adaln, pack):
+    """forward on the kept tokens of `pack` only: x (T, D) packed rows, adaln (B, L, 6, D) -> (T, D). What forward computes for
+    them when the dropped tokens are left out of every block (as keys too): the same weights, FiLM, RoPE and AdaLN per token."""
+    b, num_layers = adaln.shape[:2]
+    cos, sin = self._rope_tables(int(round(pack.P ** 0.5)), x.device)
+    cos_r, sin_r = cos[pack.p], sin[pack.p]                           # RoPE at each row's own patch position
+    gamma, beta = self.film(self.layer_embed(torch.arange(num_layers, device=x.device))).chunk(2, dim=-1)   # (L, D)
+    gamma, beta = gamma[pack.l], beta[pack.l]
+    adaln_frame = adaln.reshape(b * num_layers, *adaln.shape[2:])
+    adaln_mean = adaln.mean(1)                                        # (B, 6, D)
+    for block in self.blocks:
+      if block.mode == "frame":
+        x = x * (1 + gamma) + beta
+        a, seg = adaln_frame, pack.frame
+      else:
+        a, seg = adaln_mean, pack.b
+      if self.checkpoint_activations and torch.is_grad_enabled():
+        x = torch.utils.checkpoint.checkpoint(block.forward_packed, x, pack, cos_r, sin_r, a, seg, use_reentrant=False)
+      else:
+        x = block.forward_packed(x, pack, cos_r, sin_r, a, seg)
+    return x
+
 
 class DiffusionHead(nn.Module):
   """(image features (B, L, P, D), the network's noisy x (B, L, C, H, W), t (B, L)) -> x0_hat (B, L, C, H, W).
@@ -644,8 +802,14 @@ class DiffusionHead(nn.Module):
   set below that width (diffusion.dim): then a learned Linear maps the token to dim (DiT's patch embedding), a smaller trunk."""
 
   def __init__(self, feature_dim, num_layers, channels=CHANNELS, patch_size=14, dim=None, num_blocks=3, mlp_ratio=4.0,
-               layer_scale_init=1e-4, t_embed_channels=256, img_token_scale=0.3, checkpoint_activations=False):
+               layer_scale_init=1e-4, t_embed_channels=256, img_token_scale=0.3, checkpoint_activations=False, cond_null="zeros"):
+    """cond_null (diffusion.cond_dropout.null): what a dropped sample's image tokens become -- zeros (the z-scored features' mean;
+    no parameter) | learned (a learned (feature_dim,) vector, zero-initialized: the parameter `null_cond` exists only then)."""
     super().__init__()
+    if cond_null not in COND_NULLS:
+      raise ValueError(f"cond_null must be one of {COND_NULLS}, got {cond_null!r}")
+    if cond_null == "learned":
+      self.null_cond = nn.Parameter(torch.zeros(feature_dim))
     self.patch_size, self.channels, self.img_token_scale, self.t_embed_channels = patch_size, channels, img_token_scale, t_embed_channels
     self.noise_dim = channels * patch_size ** 2
     in_dim = feature_dim + self.noise_dim
@@ -668,16 +832,31 @@ class DiffusionHead(nn.Module):
       emb = self.time_embed(sinusoidal_embedding(t.reshape(-1) * 1000.0, self.t_embed_channels))
       return self.time_proj(emb).reshape(b, l, 6, self.dim)
 
-  def forward(self, feats, x_net, t):
+  def forward(self, feats, x_net, t, pack=None, uncond=None):
+    """pack: a PackIndex (diffusion.token_drop): the trunk and the output projection run on its kept tokens only, and the
+    prediction is 0 at the dropped ones (fully empty patches: nothing reads them). None: every token (the dense path).
+    uncond: (B,) bool, the samples whose image condition is replaced by the null (diffusion.cond_dropout): every token of the sample
+    (all layers, all patches) gets the null instead of its z-scored, img_token_scale-scaled features; None: no sample (the call
+    exactly as before)."""
     b, l, p, _ = feats.shape
     feats = (feats - feats.mean((1, 2, 3), keepdim=True)) / (feats.var((1, 2, 3), keepdim=True, unbiased=False) + 1e-6).sqrt()
+    if uncond is not None:   # after the per-sample z-score and the scale (a null before them would be renormalized), before packing
+      null = self.null_cond.to(feats.dtype) if hasattr(self, "null_cond") else feats.new_zeros(())
+      feats = torch.where(uncond.to(feats.device).bool()[:, None, None, None], null, feats * self.img_token_scale)
     patches = rearrange(x_net, "b l c (h py) (w px) -> b l (h w) (c py px)", py=self.patch_size, px=self.patch_size)
-    tokens = torch.cat([feats * self.img_token_scale, patches.to(feats.dtype)], dim=-1)
+    if pack is not None and pack.T == 0:   # nothing kept (no valid slot in the batch): no output is read, the dense path keeps the
+      pack = None                          # graph (a loss of 0 with zero gradients) without an empty attention
+    if pack is not None:   # the feature z-scoring above stays over all tokens; everything after it is per token
+      feats, patches = pack.gather(feats), pack.gather(patches)
+    tokens = torch.cat([feats if uncond is not None else feats * self.img_token_scale, patches.to(feats.dtype)], dim=-1)
     if self.in_proj is not None:
       tokens = self.in_proj(tokens)
     elif self.pad:
       tokens = F.pad(tokens, (0, self.pad))
-    out = self.out(self.trunk(tokens, self.adaln(t)))
+    if pack is None:
+      out = self.out(self.trunk(tokens, self.adaln(t)))
+    else:
+      out = pack.scatter(self.out(self.trunk.forward_packed(tokens, self.adaln(t), pack)))
     grid = int(round(p ** 0.5))
     return rearrange(out, "b l (h w) (c py px) -> b l c (h py) (w px)", h=grid, w=grid, py=self.patch_size, px=self.patch_size)
 
@@ -690,6 +869,9 @@ class GSDiffusionModel(nn.Module):
   phase = 1   # diffusion.schedule.phase (set in __init__)
   decode_clamp = "channel"   # diffusion.decode_clamp (set in __init__)
   floor_add_px = None        # diffusion.scale_encoding.scale_floor_px with scale_floor_mode add (set in __init__): the decode adds it
+  token_drop = "none"        # diffusion.token_drop (set in __init__)
+  cond_dropout_p = 0.0       # diffusion.cond_dropout.p (set in __init__): 0 = never dropped, nothing drawn
+  guidance = GUIDANCE_DEFAULTS   # diffusion.cfg, normalized (set in __init__): scale 1 = conditional only, one forward per step
 
   def __init__(self, cfg, stats):
     super().__init__()
@@ -699,11 +881,16 @@ class GSDiffusionModel(nn.Module):
       raise SystemExit("diffusion mode needs an image backbone: model/backbone=moge_mix")
     self.num_layers = int(cfg.data.num_layers)
     self.patch_size = int(cfg.model.patch_size)
+    # (configs without the keys, older runs: no dropout, no guidance)
+    cond_dropout = normalize_cond_dropout(d.get("cond_dropout"))
+    self.cond_dropout_p = cond_dropout["p"]
+    self.guidance = normalize_guidance(d.get("cfg"))
+    warn_guidance_without_dropout(self.guidance, self.cond_dropout_p)
     self.backbone = hydra.utils.instantiate(cfg.model.backbone)
     self.head = DiffusionHead(
       int(cfg.model.feature_dim), self.num_layers, patch_size=self.patch_size, dim=d.get("dim"), num_blocks=int(d.num_blocks),
       img_token_scale=float(d.img_token_scale), checkpoint_activations=bool(d.get("checkpoint_activations", False)),
-      layer_scale_init=float(cfg.model.transformer.layer_scale_init))
+      layer_scale_init=float(cfg.model.transformer.layer_scale_init), cond_null=cond_dropout["null"])
     mean, std, lo, hi = stats
     self.register_buffer("x0_mean", mean.clone().float())
     self.register_buffer("x0_std", std.clone().float())
@@ -730,6 +917,61 @@ class GSDiffusionModel(nn.Module):
       raise SystemExit(f"diffusion.schedule.phase must be 1 or 2, got {self.phase}")
     self.steps = int(d.steps)
     self.eval_seed = int(d.eval_seed)
+    self.token_drop = str(d.get("token_drop", "none"))   # (configs without the key: every token, as before)
+    if self.token_drop not in TOKEN_DROPS:
+      raise SystemExit(f"diffusion.token_drop must be one of {TOKEN_DROPS}, got {self.token_drop!r}")
+
+  def pack(self, hit):
+    """The PackIndex of diffusion.token_drop for this hit mask (B, L, H, W), or None (token_drop none: the dense trunk)."""
+    if self.token_drop == "none":
+      return None
+    return PackIndex(token_keep(hit, self.patch_size, self.token_drop))
+
+  def _head(self, feats, x_net, t, pack, uncond=None):
+    """self.head, with the pack only when there is one (token_drop none: the head's call exactly as before), and the null-condition
+    mask uncond (B,) only when there is one."""
+    if uncond is not None:
+      return self.head(feats, x_net, t, pack, uncond=uncond)
+    return self.head(feats, x_net, t) if pack is None else self.head(feats, x_net, t, pack)
+
+  @staticmethod
+  def _uncond(condition, b, device):
+    """condition (True: every sample conditioned | False: none | a (B,) bool tensor, True = that sample keeps its image) -> the
+    head's uncond mask (B,) bool, or None (every sample conditioned: the head's call as before)."""
+    if condition is True:
+      return None
+    if condition is False:
+      return torch.ones(b, dtype=torch.bool, device=device)
+    condition = torch.as_tensor(condition, device=device)
+    if condition.shape != (b,) or condition.dtype != torch.bool:
+      raise ValueError(f"condition must be True, False or a ({b},) bool tensor, got {condition.dtype} {tuple(condition.shape)}")
+    return ~condition
+
+  def predict_x0(self, image, hit, x_net, t, condition=True, feats=None):
+    """The head's x0 prediction (B, L, C, H, W, normalized) for the network input x_net (B, L, C, H, W: the noisy grid, invalid
+    slots already noise, as training_loss / sample build it) at timesteps t (B, L), with diffusion.token_drop's packing from hit.
+    condition: True (conditional) | False (unconditional: every sample's image tokens the null) | a (B,) bool tensor (True = that
+    sample conditioned). feats: the backbone's features of image, if already computed (then image is not read)."""
+    feats = self._feats(image) if feats is None else feats
+    a = hit[:, :, None].to(x_net.dtype)
+    return self._head(feats, self._net_input(x_net, a), t, self.pack(hit), self._uncond(condition, x_net.shape[0], x_net.device))
+
+  def _guided_x0(self, feats, x_net, t, pack, guidance):
+    """The guided x0 prediction (float) of one sampler step inside the guidance interval: x0_u + scale * (x0_c - x0_u), on
+    guidance["fields"] only (the other channels: the conditional prediction). Scale 0 on all fields: the unconditional forward
+    alone."""
+    s, fields = guidance["scale"], guidance["fields"]
+    x_u = self._head(feats, x_net, t, pack, torch.ones(x_net.shape[0], dtype=torch.bool, device=x_net.device)).float()
+    if s == 0.0 and fields is None:
+      return x_u
+    x_c = self._head(feats, x_net, t, pack).float()
+    out = x_u + s * (x_c - x_u)
+    if fields is not None:
+      on = torch.zeros(CHANNELS, dtype=torch.bool, device=out.device)
+      for f in fields:
+        on[X0_SLICES[f]] = True
+      out = torch.where(on[None, None, :, None, None], out, x_c)
+    return out
 
   def inputs(self, batch, device):
     """(image, hit mask, per-volume seeds, floor context): the noise of a sample is a function of its volume (see eval_noise)."""
@@ -771,12 +1013,18 @@ class GSDiffusionModel(nn.Module):
       return x_net
     return (1 - a).expand_as(x_net).to(x_net.dtype)
 
-  def training_loss(self, image, hit, x0_raw, seeds=None, return_pred=False, t=None):
+  def training_loss(self, image, hit, x0_raw, seeds=None, return_pred=False, t=None, condition=None):
     """The masked x0 loss. Returns (loss, parts, counts): parts = per-field and per-t-bucket detached means, counts the number of valid
     slots each is a mean over (a bucket can be empty: it is not a mean then, and must not be logged). seeds: per-volume seeds
     for the timesteps and the noise (validation); None: the global random stream. return_pred: also the prediction x0_hat
     (B, L, C, H, W, normalized, with its graph) and the timesteps t (B, L), for the rendering loss (diffusion.photom). t: these
-    timesteps (B, L) instead of the schedule's (the noise is still the seeds')."""
+    timesteps (B, L) instead of the schedule's (the noise is still the seeds').
+    condition: None = the training's condition dropout (diffusion.cond_dropout): on the global random stream only (seeds None) with
+    p > 0, each sample's image condition is replaced by the null with probability p (one draw of (B,) uniforms on x0's device, after
+    the timesteps and the noise; with p = 0 nothing is drawn); seeded calls (validations) are conditional. True | False | a (B,)
+    bool tensor (True = that sample conditioned): that, explicitly (e.g. the unconditional branch's validation loss). When a
+    dropout was drawn, parts also holds "cond_drop" (the (B,) bool mask; not a mean: the caller pops it) and the x0 loss over
+    the conditioned / dropped samples' valid slots as "cond_kept" / "cond_dropped" (counts: their slots)."""
     feats = self._feats(image)
     x0 = self.normalize(x0_raw)
     b, l = x0.shape[:2]
@@ -792,15 +1040,28 @@ class GSDiffusionModel(nn.Module):
     t5 = t[:, :, None, None, None]
     a = hit[:, :, None].to(x0.dtype)                                                 # (B, L, 1, H, W): the validity mask
     x_net = self._net_input(a * ((1 - t5) * x0 + t5 * eps) + (1 - a) * eps, a)     # WT Eq. 7: invalid slots see the max noise
-    x0_hat = self.head(feats, x_net, t)
+    drop = None
+    if condition is None:
+      if seeds is None and self.cond_dropout_p > 0:   # (p = 0: no draw, the random streams as without dropout)
+        drop = torch.rand(b, device=x0.device) < self.cond_dropout_p                 # (B,) True = the null condition
+      uncond = drop
+    else:
+      uncond = self._uncond(condition, b, x0.device)
+    x0_hat = self._head(feats, x_net, t, self.pack(hit), uncond)
     err = (x0_hat.float() - x0).square()                                            # (B, L, C, H, W)
     valid = a.sum().clamp_min(1)
     loss = (err * a).sum() / (valid * CHANNELS)
     with torch.no_grad():
       parts, counts = {}, {}
-      for name, sl in zip(FIELDS, np.cumsum((0,) + DIMS)[:-1].tolist()):
-        dim = DIMS[FIELDS.index(name)]
-        parts[name] = ((err[:, :, sl:sl + dim] * a).sum() / (valid * dim)).detach()
+      if drop is not None:
+        parts["cond_drop"] = drop
+        for name, sel in (("cond_kept", ~drop), ("cond_dropped", drop)):
+          m = a * sel[:, None, None, None, None].to(a.dtype)
+          counts[name] = m.sum()
+          parts[name] = ((err * m).sum() / (counts[name].clamp_min(1) * CHANNELS)).detach()
+      for name, sl in X0_SLICES.items():
+        dim = sl.stop - sl.start
+        parts[name] = ((err[:, :, sl] * a).sum() / (valid * dim)).detach()
         counts[name] = valid
       for lo, hi in ((0.0, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 1.01)):
         in_bucket = a * ((t5 >= lo) & (t5 < hi)).to(a.dtype)
@@ -812,10 +1073,72 @@ class GSDiffusionModel(nn.Module):
     return loss, parts, counts
 
   @torch.no_grad()
-  def sample(self, image, hit, seeds=None, steps=None, project=None, floor=None):
+  def xt_probe(self, image, hit, x0_raw, seeds, ts, gain_delta=0.01):
+    """The x_t reliance probe (diffusion.probe): does the x0 prediction use the noisy input, or only the image? Per volume and per
+    shared timestep t in ts (every layer at t, as in the sampler), from x_t = (1 - t) x0 + t eps with the volume's own seeded noise
+    (eval_noise: the validation loss's; invalid slots at the noise, through _net_input, as the model always sees them):
+      err_model  the masked x0 error of the model's prediction (the head call of training_loss / sample, packing included), per
+                 valid slot and channel, in normalized units
+      err_copy   the same error of c(t) x_t, c = (1 - t) / ((1 - t)^2 + t^2): the best linear estimate of unit-variance data from
+                 x_t alone (its error is t^2 / ((1 - t)^2 + t^2) on such data)
+      gain       <x0_hat(x_t + delta) - x0_hat(x_t), delta> / |delta|^2 over the valid slots, delta = gain_delta z (z a seeded
+                 standard normal on the valid slots, its own stream: not eps's): the prediction's response to its input (1 / (1 - t)
+                 for "unshrink x_t", 0 for a prediction that ignores it); its two forwards in fp32 (autocast off), so a small delta
+                 is not lost to bf16
+    Returns {t: {"err_model", "err_copy", "gain", "valid"}}, each (B,) float32 on the device (valid: the volume's valid slots; a
+    volume without any has NaN values). The volumes run one at a time (bounded memory, and each volume's values do not depend on
+    the batch it came in); nothing draws from a global random stream."""
+    device = image.device
+    b, l = hit.shape[:2]
+    x0_all = self.normalize(x0_raw.to(device).float())                               # (B, L, C, H, W)
+    out = {float(t): {k: torch.full((b,), float("nan"), device=device) for k in ("err_model", "err_copy", "gain", "valid")}
+           for t in ts}
+    fp32 = torch.autocast(device_type=device.type, enabled=False)
+    for i in range(b):
+      x0, h = x0_all[i:i + 1], hit[i:i + 1]
+      feats = self._feats(image[i:i + 1])
+      pack = self.pack(h)
+      _, eps = self.eval_noise([seeds[i]], x0.shape, device)
+      a = h[:, :, None].to(x0.dtype)                                                 # (1, L, 1, H, W)
+      n = a.sum() * CHANNELS
+      for t in ts:
+        out[float(t)]["valid"][i] = a.sum()
+      if n == 0:
+        continue
+      for t in ts:
+        t = float(t)
+        res = out[t]
+        # the deterministic control (schedule.fixed_t) has no other timestep (as training_loss); its input has no x_t anyway
+        t_in = torch.full((1, l), float(self.schedule.fixed_t) if self.schedule.fixed_t is not None else t, device=device)
+        x_t = (1 - t) * x0 + t * eps
+        head = lambda x, f=feats: self._head(f, self._net_input(a * x + (1 - a) * eps, a), t_in, pack).float()
+        masked_mse = lambda pred: ((pred - x0).square() * a).sum() / n
+        res["err_model"][i] = masked_mse(head(x_t))
+        res["err_copy"][i] = masked_mse((1 - t) / ((1 - t) ** 2 + t ** 2) * x_t)
+        gen = torch.Generator(device=device).manual_seed(
+          int(np.random.SeedSequence([int(seeds[i]), round(t * 1e6), 0x7874]).generate_state(1)[0]))   # 0x7874: "xt"
+        delta = gain_delta * torch.randn(x0.shape, device=device, generator=gen) * a
+        with fp32:
+          f32 = feats.float()
+          base = head(x_t.float(), f32)
+          moved = head(x_t.float() + delta, f32)
+        res["gain"][i] = ((moved - base) * delta).sum() / delta.square().sum()
+    return out
+
+  @torch.no_grad()
+  def sample(self, image, hit, seeds=None, steps=None, project=None, floor=None, guidance=None):
     """20 Euler steps of the flow from pure noise -> the Gaussian dict. The noise of volume i is a function of seeds[i] (default:
     eval_seed + i): reproducible. Invalid slots stay at the noise. project: applied to every step's x0 prediction before it is used
-    (e.g. format_projection; the last step's x0 prediction is the output)."""
+    (e.g. format_projection; the last step's x0 prediction is the output).
+    guidance: classifier-free guidance (diffusion.cfg's keys; None: the model's, self.guidance). scale 1: the conditional
+    prediction only (one forward per step, as without guidance); otherwise, at the steps whose t is in interval (inclusive):
+    x0_u + scale * (x0_c - x0_u) on the raw (normalized) predictions of fields (null: all), before project and the decode's clamp
+    (scale 0 on all fields: the unconditional prediction, one forward); outside the interval: the conditional prediction."""
+    if guidance is None:
+      guidance = self.guidance
+    else:
+      guidance = normalize_guidance(guidance)
+      warn_guidance_without_dropout(guidance, self.cond_dropout_p)
     steps = steps or self.steps
     feats = self._feats(image)
     b, l = hit.shape[:2]
@@ -824,9 +1147,15 @@ class GSDiffusionModel(nn.Module):
     a = hit[:, :, None].to(eps.dtype)
     x = eps
     ts = torch.linspace(1.0, 0.0, steps + 1, device=image.device)
+    pack = self.pack(hit)   # the same tokens at every step
     for i in range(steps):
       t = ts[i]
-      x0_hat = self.head(feats, self._net_input(a * x + (1 - a) * eps, a), t.expand(b, l)).float()
+      x_net = self._net_input(a * x + (1 - a) * eps, a)
+      lo, hi = guidance["interval"]
+      if guidance["scale"] != 1.0 and lo <= float(t) <= hi:
+        x0_hat = self._guided_x0(feats, x_net, t.expand(b, l), pack, guidance)
+      else:
+        x0_hat = self._head(feats, x_net, t.expand(b, l), pack).float()
       if project is not None:
         x0_hat = project(x0_hat)
       x = x - (t - ts[i + 1]) * (x - x0_hat) / t.clamp(min=T_MIN_CLAMP)

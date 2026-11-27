@@ -1,0 +1,16 @@
+# Config for convert_grids_sparse.py -- see its docstring.
+defaults:
+  - _self_
+  - override hydra/job_logging: none      # the script logs through logging.basicConfig; no <job>.log in the working directory
+  - override hydra/hydra_logging: none
+
+grids_dir: ???       # a directory of dense finalized grids (<root>/grids)
+out_dir: null        # where the sparse copies go; null: <grids_dir>_sparse. Never grids_dir itself
+workers: 1           # parallel conversion processes
+
+hydra:
+  job:
+    chdir: false
+  output_subdir: null
+  run:
+    dir: .

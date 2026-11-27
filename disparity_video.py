@@ -34,7 +34,7 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 from omegaconf import DictConfig  # noqa: E402
 
-# orbit_video pulls in fit_gsplat (CUDA toolchain for gsplat's JIT) on import.
+# orbit_video pulls in module.py (lightning, wandb) on import.
 from orbit_video import (  # noqa: E402
   orbit_poses, render_frames, write_frames_dir, write_mp4,
 )

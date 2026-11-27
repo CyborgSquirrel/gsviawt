@@ -77,6 +77,20 @@ data:
   # (model.rgb_patch).
   input: features           # features | image | features_image (both: model.rgb_patch)
   image_size: 504           # side of the image fed to the backbone (input: image), a multiple of 14
+  # Restrict the volumes (source views) trained and validated on with a Python/polars expression over the render catalogue: it
+  # is evaluated with `df` (the catalogue dataframe: mesh_id, view_idx, path, ...; plus a row-index column it must keep) and `pl`
+  # (polars) in scope and returns some of df's rows, e.g. one volume for an overfitting run:
+  #   data.catalog_transform='df.filter(pl.col("mesh_id") == 13).filter(pl.col("view_idx") == 12)'
+  # The splits (mesh_split / view_split), the supervision-view pools and the x0 normalization stats are the full catalogue's, as
+  # without it: only the training set's and each validation set's volumes are cut down to the kept rows (an emptied validation
+  # set is dropped; no training volume left is an error). null = all.
+  catalog_transform: null
+  # Add a validation set "val_train" of the training volumes themselves (after catalog_transform; targets from the training views'
+  # pool, seeded like the other sets): how well the run fits what it trains on.
+  val_train: false
+  # An epoch is this many passes over the training volumes (each access draws its own target views, t and noise), e.g. so a
+  # one-volume run fills a batch and has epochs of many steps. 1 = one pass.
+  repeat: 1
 
 model:
   patch_size: 14            # WT's patch size; head output grid = sqrt(P) * patch_size per side
@@ -114,7 +128,7 @@ model:
     layer_scale_init: 1.0e-4  # small -> the trunk starts close to the identity
     checkpoint_activations: false   # recompute the blocks in backward (less memory, same numerics)
   max_sh_degree: 0           # 0 = plain RGB, 1 = DC + 1 SH band (9 extra channels).
-                              # Default 0 for now: fit_gsplat.py's ground truth is flat
+                              # Default 0 for now: fit_gsplat.py's (deleted) ground truth is flat
                               # RGB with no SH>0 at all, so direct_color_weight only ever
                               # supervises sh_dc -- with sh_degree=1, sh_rest gets zero
                               # gradient AND (if color_reg_weight=0, e.g. isolated
@@ -340,6 +354,30 @@ diffusion:
   num_blocks: 3
   img_token_scale: 0.3         # WT's: the normalized image features are scaled before they are concatenated
   checkpoint_activations: true
+  # which tokens (one layer's patch) the trunk runs on: none (all, dense) | empty (only those with >= 1 valid slot: the trunk,
+  # including its attention keys, never sees a fully empty patch; packed rows + varlen flash attention, ~8% of the tokens) |
+  # empty_except_layer0 (as empty, but all of layer 0 kept: the background patches' image features). The predictions at dropped
+  # tokens are never read (the loss, the render and the sampler use valid slots only). No parameters: checkpoints load either way.
+  # Default empty (Nov 6): at equal steps it matches dense (runs 1032/1040 vs 1030) at ~4.8x faster steps; run configs without the
+  # key (older runs) keep every token, as they were trained
+  token_drop: empty
+  # Condition (image) dropout in training: per SAMPLE, with probability p, the image tokens of every layer and patch become the null
+  # condition instead of the z-scored features (after the z-score and img_token_scale). Applies to the x0 loss and the rendering
+  # loss alike (one forward); the validations stay conditional. Logs train/cond_dropped (the realized fraction) and the x0 /
+  # rendering losses over the kept / dropped samples (train/loss/x0/cond_kept|cond_dropped, train/loss/photom_cond|photom_uncond).
+  # Configs without the key: off. A run trained with p = 0 has no meaningful unconditional branch (diffusion.cfg below).
+  cond_dropout:
+    p: 0.0                     # 0 = off: nothing is drawn, the random streams and the loss exactly as without dropout
+    "null": zeros              # zeros (the features' mean after the z-score; no parameter) | learned (a learned feature_dim
+                               # vector, zero-initialized: the parameter head.null_cond exists only then)
+  # Classifier-free guidance when sampling (the validations' samples, previews / orbits, eval_diffusion.py's `guidance` override):
+  # x0 = x0_uncond + scale * (x0_cond - x0_uncond) on the raw (normalized) x0 prediction, before the format projection and the
+  # decode clamp. Configs without the key: off.
+  cfg:
+    scale: 1.0                 # 1: the conditional prediction only (one forward per step, as without guidance); 0: the unconditional
+                               # prediction only (a probe); otherwise two forwards per guided step
+    interval: [0.0, 1.0]       # guide only the sampler steps with lo <= t <= hi (t = 1: pure noise; the others conditional)
+    fields: null               # null: every channel; or a subset of [opacity, scale, rotation, sh_dc, offset] (the rest conditional)
   steps: 20                    # Euler steps when sampling
   eval_seed: 0                 # the noise of the samples, and of the validation loss
   # the decode of a prediction (the training rendering loss, the samples) clamps into the training grids' range: channel = every
@@ -350,6 +388,24 @@ diffusion:
   # the validation's index and the set: paired across runs and resumes), logged as
   # <set>/<name>/loss/photom_t<t> (t = 1: the 1-step sample, from pure noise). Empty / null: off
   val_t: [0.25, 0.5, 0.75, 1.0]
+  # The x_t reliance probe (GSDiffusionModel.xt_probe): does the x0 prediction use its noisy input x_t, or has it collapsed into an
+  # image -> 3DGS lookup? Every validation (small / big, raw / ema, Lightning's own; every set) takes the first `volumes` volumes of
+  # each set in its own seeded order and, at each shared t of `ts` (every layer at t), noises them with their seeded noise
+  # (eval_seed: the validation loss's) and logs <set>/<name>/probe/t<t>/:
+  #   err_model  the masked x0 error of the prediction (normalized units, per valid slot and channel)
+  #   err_copy   the error of c(t) x_t, c = (1-t) / ((1-t)^2 + t^2): what x_t alone gives (t^2 / ((1-t)^2 + t^2) for unit-variance data)
+  #   ratio      err_model / err_copy (of the means over the volumes): <~ 1 at low t when the model uses x_t; >> 1 when it ignores it
+  #   gain       the prediction's response to a small seeded perturbation of x_t (of size gain_delta, two fp32 forwards):
+  #              -> 1 / (1-t) ~ 1 at low t when it uses x_t, -> 0 at t = 1; ~ 0 at every t for an image-only lookup
+  # and probe/n_volumes. Logging only: no rendering, no change to any other logged number, the training or its random streams.
+  # Cost per probed volume: 1 backbone pass + 3 head forwards per t (2 of them in fp32). A run config without the key (a saved
+  # config of a run from before it, e.g. loaded by eval_diffusion.py): off. A resume composed from this file (ckpt_path=...) gets it
+  # on: it only adds probe/ keys (diffusion.probe.enabled=false to keep an old run's logs exactly as they were)
+  probe:
+    enabled: true
+    ts: [1.0, 0.5, 0.2, 0.1, 0.02]
+    volumes: 8                 # per set and validation (fewer when the validation scores fewer)
+    gain_delta: 0.01
   schedule:
     standard: {mu: 0.0, sigma: 1.0}                         # layers 1.. (logit-normal)
     plateau: {mu: 0.0, sigma: 1.0, mirror: false}           # layer 0: logit-normal up to its mode t* = 0.5, then flat towards t = 1

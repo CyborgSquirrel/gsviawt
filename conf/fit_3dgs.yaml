@@ -1,6 +1,6 @@
 # Config for fit_3dgs.py -- faithful 3D Gaussian Splatting optimization on a
 # COLMAP scene (same format/folders as our gaussian-splatting/ reproduction:
-# data/tandt/truck etc), Hydra + Lightning-shaped like fit_gsplat.py. See
+# data/tandt/truck etc), Hydra + Lightning-shaped like train_gs.py. See
 # fit_3dgs.py's module docstring for what "faithful" covers here.
 
 defaults:
@@ -62,7 +62,7 @@ background: none                      # none | white | random
 
 # set: free xyz, real growing/shrinking densification (what fit_3dgs.py has
 # always done). layered: one Gaussian per depth-peel hit in the primary
-# train view (like fit_gsplat.py), Gaussian COUNT fixed for the whole run
+# train view (module.init_gaussians), Gaussian COUNT fixed for the whole run
 # (densify/prune below forced off regardless of their own settings) -- only
 # valid with hdf5_path set to an h5 that actually has depth_peel. See
 # init_gaussians_layered/save_output_layered in fit_3dgs.py.
@@ -131,7 +131,7 @@ wandb:
   name: ${output_dirname}
 
 # Same wandb train/val [GT | render | |diff|] panel + orbit turntable
-# fit_gsplat.py/train_gs.py log -- module.{Panel,Orbit}Callback, shared, see
+# train_gs.py logs -- module.{Panel,Orbit}Callback, shared, see
 # their own docstrings. Cadence in STEPS (not epochs): one epoch here is one
 # pass over the (small, ~100-300 image) train split, so step cadence is the
 # only one worth using -- an every_n_epochs=1 panel would fire many times a

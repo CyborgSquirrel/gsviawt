@@ -2,7 +2,7 @@
 # model (camera orbiting the object). See orbit_video.py's module docstring.
 
 # --- input ---
-# A 3DGS model: either a fit_gsplat .h5 (gaussian_* grids + layer_valid) or a
+# A 3DGS model: either a layered-grid .h5 (gaussian_* grids + layer_valid) or a
 # standard INRIA-format 3DGS .ply. Format is picked from the extension.
 model_path: ???           # required -- pass model_path=/app/bla/....h5
 
@@ -72,7 +72,7 @@ crf: 18                  # x264 quality (lower = better/bigger; 18 ~ visually lo
 device: cuda             # cuda | cpu
 seed: 0
 
-# --- dataset-name overrides (fit_gsplat .h5) ---
+# --- dataset-name overrides (layered-grid .h5) ---
 datasets:
   means: gaussian_means
   scales: gaussian_scales

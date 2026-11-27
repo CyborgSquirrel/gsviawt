@@ -12,8 +12,12 @@ anchored to the source view's own depth-peel point cloud (see gs_dataset.py's
 dense_unproject_camera); with model.predict_mean_offset the head also
 predicts a residual offset on top of that anchor (see flatten_gaussians).
 
-For now this is overfitting only: data.item picks ONE row of the features h5
-(gs_dataset.WTFeatureDataset) and the model trains on it alone.
+data.item picks the rows of the features h5 the datasets hold (one row, a
+list of rows, or null for all of them; gs_dataset.WTFeatureDataset), split
+into train/val by data.mesh_split / data.view_split. With model/backbone set
+(data.input=image) the head's input is the source image instead of cached
+features, and with diffusion.enabled the model is gs_diffusion.py's
+diffusion model over fitted layered 3DGS grids.
 
 Training objective (Flash3D's cross-view photometric setup): decode the
 source view's Gaussians, render them into the source view itself
@@ -32,8 +36,8 @@ Usage:
     docker exec -w /app gsviawt-app-gpu-1 /home/user/venv/bin/python train_gs.py \\
         ckpt_path=/app/outputs/3dgs-model-2026-09-01_12-00-00/final.ckpt
 
-gsplat JIT-compiles CUDA kernels on first import; see _setup_cuda_toolchain
-(copied from fit_gsplat.py, which needs the same env setup).
+gsplat JIT-compiles CUDA kernels on first import; the CUDA toolchain
+it needs is set up at the image level (see Dockerfile).
 """
 
 import contextlib as ctl
@@ -54,14 +58,13 @@ import torch.nn as nn
 import torch.utils.checkpoint
 from einops import pack, rearrange
 from omegaconf import DictConfig, OmegaConf, open_dict
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader
 
 import wandb
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
-from gs_dataset import (OPENGL_TO_OPENCV, H5Catalog, WTFeatureDataset,  # noqa: E402
-                        _EmptyDataset, render_catalog, rotate_quats_wxyz,
-                        sample_matching_sources)
+from gs_dataset import (OPENGL_TO_OPENCV, WTFeatureDataset, _EmptyDataset,  # noqa: E402
+                        render_catalog, rotate_quats_wxyz, sample_matching_sources)
 from gs_decoder import PatchGaussianHead  # noqa: E402
 import gs_diffusion  # noqa: E402
 from module import (DSSIMLoss, Events, ProgressWandbLogger, SameDirCheckpointIO, TrainClock, _completed_steps,  # noqa: E402
@@ -99,6 +102,39 @@ def x0_encoding(cfg):
 def diffusion_enabled(cfg):
   """cfg.diffusion.enabled; configs without the block (older ones) are not diffusion runs."""
   return bool(OmegaConf.select(cfg, "diffusion.enabled", default=False))
+
+
+def probe_config(cfg):
+  """cfg.diffusion.probe (the x_t reliance probe of the validations, GSDiffusionModel.xt_probe) when it is enabled, else None. A
+  config without the key (a run from before the probe) has it off: its validations, logged keys and cost stay as they were."""
+  p = OmegaConf.select(cfg, "diffusion.probe", default=None)
+  return p if p is not None and bool(p.get("enabled", False)) else None
+
+
+CATALOG_ROW = "__catalog_row"   # the row-index column catalog_transform's expression must keep
+
+
+def catalog_transform_keys(df, expr):
+  """The (mesh_id, view_idx) keys of the catalogue rows data.catalog_transform keeps: `expr` is a Python expression evaluated with
+  `df` (the catalogue dataframe, plus a row-index column CATALOG_ROW) and `pl` (polars) in scope, which must return a DataFrame of
+  some of df's rows (still carrying CATALOG_ROW), e.g. 'df.filter(pl.col("mesh_id") == 13).filter(pl.col("view_idx") == 12)'."""
+  indexed = df.with_row_index(CATALOG_ROW)
+  try:
+    out = eval(expr, {"df": indexed, "pl": polars})
+  except Exception as e:
+    raise SystemExit(f"data.catalog_transform {expr!r} failed: {type(e).__name__}: {e}") from e
+  if isinstance(out, polars.LazyFrame):
+    out = out.collect()
+  if not isinstance(out, polars.DataFrame):
+    raise SystemExit(f"data.catalog_transform {expr!r} must return a polars DataFrame, got {type(out).__name__}")
+  if CATALOG_ROW not in out.columns:
+    raise SystemExit(f"data.catalog_transform {expr!r}: the result lost the {CATALOG_ROW!r} column (filter df's rows, don't "
+                     "select columns away)")
+  kept = sorted(set(out[CATALOG_ROW].to_list()))
+  if kept and not 0 <= kept[0] <= kept[-1] < len(df):
+    raise SystemExit(f"data.catalog_transform {expr!r}: {CATALOG_ROW} values out of range")
+  sub = df[kept]
+  return set(zip(sub["mesh_id"].to_list(), sub["view_idx"].to_list()))
 
 
 def check_val_targets(ds, name, cfg):
@@ -212,7 +248,6 @@ def model_forward(
   model,
   batch,
   *,
-  need_flat_gauss: bool=False,
   need_render: bool=False,
   render_view_idx = None,
   bg_colors = None,
@@ -233,14 +268,6 @@ def model_forward(
   # render 3DGS if necessary
   if need_render:
     rvi = render_view_idx
-
-    # TODO: overrides
-    # gauss_render = gauss_pred
-    # gt = item.get("ground_truth")
-    # if gt is not None:
-    #   gauss_render = apply_ground_truth_overrides(gauss, gt, hit, predict_params, device)
-    # src = item["source"]
-    # hit = src["hit"].to(device)
 
     pred_rgb = []
     pred_alpha = []
@@ -343,11 +370,11 @@ def flatten_gaussians(b, gauss, xyz_cam, hit):
     scale_flat    = rearrange(gauss["scale"]   [idx], "l c h w -> (l h w) c")
     rotation_flat = rearrange(gauss["rotation"][idx], "l c h w -> (l h w) c")
     colors_flat   = rearrange(gauss["sh_dc"]   [idx], "l c h w -> (l h w) 1 c")
-    if "sh_rest" in gauss:
-      colors_flat = pack(
+    if "sh_rest" in gauss:   # max_sh_degree > 0: (N, 1 + K, 3), the DC band first
+      colors_flat, _ = pack(
         [
-          colors_flat[idx],
-          rearrange(gauss["sh_rest"], "l (k c) h w -> (l h w) k c", c=3)
+          colors_flat,
+          rearrange(gauss["sh_rest"][idx], "l (k c) h w -> (l h w) k c", c=3)
         ],
         "n * c",
       )
@@ -378,6 +405,9 @@ class GSDataModule(pl.LightningDataModule):
     val_views_strain: volumes with a train-view source, as many per mesh as it has val views (see
                       gs_dataset.sample_matching_sources); targets from the val views
     val_views_sval:   volumes with a val-view source, targets from the val views
+    val_train:        (data.val_train) the training volumes themselves, targets from the train views
+  data.catalog_transform (a polars expression, see catalog_transform_keys) then cuts the training set and every validation
+  set down to the volumes of the catalogue rows it keeps; the splits, pools and x0 stats stay the full catalogue's.
   Every validation set is complete (the empty ones are dropped); how much of it a validation scores is
   that validation's own choice (module.EventValidation volumes; trainer.limit_val_batches for Lightning's own
   ones, which a run with an at_end validation doesn't have): the val dataloaders shuffle, so each validation scores a fresh random sample. The datasets are in
@@ -462,6 +492,27 @@ class GSDataModule(pl.LightningDataModule):
     if len(val_views):
       sets["val_views_strain"] = (val_views, rows_in(sample_matching_sources(train_views, val_views, seed=cfg.seed)))
       sets["val_views_sval"] = (val_views, rows_in(val_views))
+    # data.catalog_transform: the splits, the supervision-view pools and the x0 stats (below) are the full catalogue's; the
+    # transform only picks which of their volumes (source views) are trained / validated on
+    stats_rows = train_rows
+    transform = d.get("catalog_transform")
+    if transform is not None:
+      keys = catalog_transform_keys(catalog.df, str(transform))
+      key_of = dict(zip(rows.tolist(), volume_keys))
+      kept = lambda rs: [r for r in rs if key_of[r] in keys]
+      before = {"train": len(train_rows), **{n: len(r) for n, (_, r) in sets.items()}}
+      train_rows = kept(train_rows)
+      sets = {n: (v, kept(r)) for n, (v, r) in sets.items()}
+      after = {"train": len(train_rows), **{n: len(r) for n, (_, r) in sets.items()}}
+      log.info("data.catalog_transform %r keeps %d of %d catalogue rows; volumes kept (of): %s", transform, len(keys),
+               len(catalog), {n: f"{after[n]} ({before[n]})" for n in before})
+      if not train_rows:
+        raise SystemExit(
+          f"data.catalog_transform {transform!r} leaves no training volume (kept per set: {after}): its rows are not training "
+          "source views -- e.g. a held-out mesh of data.mesh_split or a held-out view of data.view_split, or no volume of the data")
+    repeat = d.get("repeat", 1)
+    if isinstance(repeat, bool) or not isinstance(repeat, int) or repeat < 1:
+      raise SystemExit(f"data.repeat must be a whole number >= 1, got {repeat!r}")
     train_pool = train_views
     if grid_index is not None and cfg.diffusion.get("train_targets", "grid") == "all":
       # diffusion.train_targets=all: the training volumes' supervision views are ALL renders of their mesh except the held-out
@@ -473,6 +524,9 @@ class GSDataModule(pl.LightningDataModule):
         if m in train_mesh_ids and (m, v) not in held_out])
     elif cfg.diffusion.get("train_targets", "grid") not in ("grid", "all"):
       raise SystemExit(f"diffusion.train_targets must be grid or all, got {cfg.diffusion.train_targets!r}")
+    if d.get("val_train", False):
+      # val_train: the training volumes themselves (after data.catalog_transform), targets from the training views' pool
+      sets["val_train"] = (train_pool, train_rows)
     self.train_ds = WTFeatureDataset(features_h5, train_pool, rows=train_rows, **kwargs)
     self.val_datasets = {
       name: WTFeatureDataset(features_h5, v, rows=r, **kwargs) for name, (v, r) in sets.items() if len(r)}
@@ -484,9 +538,12 @@ class GSDataModule(pl.LightningDataModule):
       self.val_datasets = {n: gs_diffusion.GridTargetDataset(ds, grid_index, enc, seeded=True) for n, ds in self.val_datasets.items()}
       for name, ds in self.val_datasets.items():
         check_val_targets(ds, name, cfg)
-      # normalization of the x0 channels: the valid slots of the TRAIN grids (moments cached per grid, next to the grids)
+      # normalization of the x0 channels: the valid slots of the TRAIN grids (moments cached per grid, next to the grids) -- all of
+      # them, also under data.catalog_transform, so a run on a few volumes sees them normalized like a run on all
+      stats_ds = self.train_ds if stats_rows == train_rows else gs_diffusion.GridTargetDataset(
+        WTFeatureDataset(features_h5, train_pool, rows=stats_rows, **kwargs), grid_index, enc)
       self.diffusion_stats = gs_diffusion.compute_stats(
-        self.train_ds, grid_index, os.path.join(cfg.diffusion.grids_dir, ".x0_moments"))
+        stats_ds, grid_index, os.path.join(cfg.diffusion.grids_dir, ".x0_moments"))
     log.info(
       "volumes: %d train, validation sets %s", len(self.train_ds),
       {n: len(ds) for n, ds in self.val_datasets.items()})
@@ -494,8 +551,11 @@ class GSDataModule(pl.LightningDataModule):
       self.val_datasets = {"val": _EmptyDataset()}
 
   def train_dataloader(self):
+    # data.repeat: an epoch is that many passes over the training volumes (each access draws its own targets, t and noise);
+    # self.train_ds itself (the previews' "train" stage) is not repeated
+    repeat = int(self.cfg.data.get("repeat", 1))
     return DataLoader(
-      self.train_ds,
+      self.train_ds if repeat == 1 else ConcatDataset([self.train_ds] * repeat),
       shuffle=True,
       collate_fn=collate_with_batch_size,
       **OmegaConf.to_container(self.cfg.loader, resolve=True),
@@ -688,21 +748,31 @@ class GSLightningModule(pl.LightningModule):
     seconds = self.clock.seconds() if self.clock is not None else 0.0
     return seconds >= float(p.start_seconds)
 
-  def _diffusion_photom(self, stage, batch, x0_hat, t, log=None):
+  def _diffusion_photom(self, stage, batch, x0_hat, t, log=None, cond_drop=None):
     """The photometric loss of the diffusion model's x0 prediction (at the timesteps t), rendered: per volume, only the volumes
     whose timestep, reduced over the layers by diffusion.photom.t_reduce (max: the noisiest layer, mean, layer0), is in
     diffusion.photom.t_range count (a mean over them; zero when there is none). Logs <prefix>/photom[_l1|_dssim] (over the
     volumes that count) and photom_frac (the fraction of volumes that count); the validations log it the same way, so
     train/loss/photom and <set>/<name>/loss/photom are one quantity. log: called instead of _log_metric (the train step holds
-    its logs until the step is accepted). Returns the loss (with its graph)."""
+    its logs until the step is accepted). Returns the loss (with its graph). cond_drop: the (B,) mask of the samples trained with
+    the null image condition (diffusion.cond_dropout): the same renders' loss is also logged over the conditioned / dropped
+    volumes that count, as <prefix>/photom_cond[_<term>] / photom_uncond[_<term>] (the loss itself is unchanged)."""
     log = log or self._log_metric
     lo, hi = self.cfg.diffusion.photom.t_range
     reduce = self.cfg.diffusion.photom.t_reduce
     tv = {"max": lambda: t.amax(dim=1), "mean": lambda: t.mean(dim=1), "layer0": lambda: t[:, 0]}[reduce]()   # (B,)
     keep = ((tv >= float(lo)) & (tv <= float(hi))).float()
     log(stage, "loss/photom_frac", keep.mean(), batch["batch_size"])
-    return self._render_photom(stage, batch, self.model.decode(x0_hat, self.model.floor_context(batch, self.device)), keep,
-                               "loss/photom", log)
+    gauss = self.model.decode(x0_hat, self.model.floor_context(batch, self.device))
+    if cond_drop is None:
+      return self._render_photom(stage, batch, gauss, keep, "loss/photom", log)
+    if keep.sum() == 0:
+      return torch.zeros((), device=self.device)
+    per = self._photom_per_volume(batch, gauss)
+    dropped = cond_drop.to(keep.device, keep.dtype)
+    self._log_photom(stage, per, keep * (1 - dropped), "loss/photom_cond", log)
+    self._log_photom(stage, per, keep * dropped, "loss/photom_uncond", log)
+    return self._log_photom(stage, per, keep, "loss/photom", log)
 
   def _render_photom(self, stage, batch, gauss, keep, key, log=None):
     """loss.photom (L1 + D-SSIM on the views of loss.photom.for, against the dataset's rendered images) of the Gaussian dict gauss,
@@ -756,12 +826,14 @@ class GSLightningModule(pl.LightningModule):
     average is skipped (no optimizer step), as in WT's recipe, and so is a non-finite one (gs_diffusion.SpikeSkip)."""
     B = batch["batch_size"]
     loss, parts, counts, x0_hat, t = self._diffusion_losses(batch)
+    # diffusion.cond_dropout (p > 0 only): the (B,) mask of the samples whose image condition was the null this step
+    cond_drop = parts.pop("cond_drop", None)
     x0_loss = loss.detach()
     loss = float(self.cfg.diffusion.get("x0_weight", 1.0)) * loss   # 0: the x0 loss is only logged (diffusion.photom alone trains)
     held = []   # the rendering loss's logs: like train/loss and the x0 loss's, accepted steps only
     if self._photom_active():
       loss = loss + float(self.cfg.diffusion.photom.weight) * self._diffusion_photom(
-        "train", batch, x0_hat, t, log=lambda *a: held.append(a))
+        "train", batch, x0_hat, t, log=lambda *a: held.append(a), **({"cond_drop": cond_drop} if cond_drop is not None else {}))
     value = float(loss.detach())
     skipped = self.spike_skip.check(value)
     self._log_metric("train", "skipped", float(skipped), B)
@@ -776,6 +848,8 @@ class GSLightningModule(pl.LightningModule):
     self._log_metric("train", "loss", loss.detach(), B)
     self._log_metric("train", "loss/x0", x0_loss, B)   # like train/loss and its parts: accepted steps only
     self._log_parts("train", "loss/x0", parts, counts)   # the validations' keys: <set>/<name>/loss/x0/<part>
+    if cond_drop is not None:
+      self._log_metric("train", "cond_dropped", cond_drop.float().mean(), B)   # the realized fraction of null-condition samples
     for a in held:
       self._log_metric(*a)
     return loss
@@ -791,6 +865,45 @@ class GSLightningModule(pl.LightningModule):
       self._diffusion_photom(stage, batch, x0_hat, t)   # the training's own rendering term, gated the same way
     if self.cfg.diffusion.get("val_t"):
       self._diffusion_val_t(stage, batch)
+    if probe_config(self.cfg) is not None:
+      self._diffusion_probe(stage, batch)
+
+  @torch.no_grad()
+  def _diffusion_probe(self, stage, batch):
+    """diffusion.probe: GSDiffusionModel.xt_probe on the validation set's first diffusion.probe.volumes volumes in the validation's
+    own (seeded) order -- the first batches it scores, so no other draw and no other volume -- collected per set, logged once per
+    validation by on_validation_epoch_end. Not in Lightning's sanity check (its logs are thrown away)."""
+    p = probe_config(self.cfg)
+    if p is None or self.trainer.sanity_checking:
+      return
+    probe = self.__dict__.setdefault("_probe", {})
+    rows = probe.setdefault(stage, [])
+    k = min(int(p.volumes) - sum(int(r["n"]) for r in rows), int(batch["batch_size"]))
+    if k <= 0:
+      return
+    image, hit, seeds, _ = self.model.inputs(batch, self.device)
+    vals = self.model.xt_probe(image[:k], hit[:k], batch["x0_raw"][:k], seeds[:k], [float(t) for t in p.ts], float(p.gain_delta))
+    rows.append({"n": k, "vals": vals})
+
+  def _log_probe(self):
+    """Logs every set's collected probe values (_diffusion_probe) as <set>/<name>/probe/t<t>/{err_model, err_copy, ratio, gain}:
+    err_model, err_copy, gain the means over the probed volumes (those with a valid slot), ratio = mean err_model / mean err_copy;
+    and <set>/<name>/probe/n_volumes, how many volumes they are a mean over."""
+    probe, self._probe = self.__dict__.get("_probe") or {}, {}
+    for stage, rows in probe.items():
+      count = None
+      for t in rows[0]["vals"]:
+        v = {k: torch.cat([r["vals"][t][k] for r in rows]) for k in ("err_model", "err_copy", "gain", "valid")}
+        ok = v["valid"] > 0
+        count = int(ok.sum())
+        if not count:
+          continue
+        m = {k: float(v[k][ok].mean()) for k in ("err_model", "err_copy", "gain")}
+        m["ratio"] = m["err_model"] / m["err_copy"] if m["err_copy"] > 0 else float("nan")
+        for k, value in m.items():
+          self._log_metric(stage, f"probe/t{t:g}/{k}", value, count)
+      if count is not None:
+        self._log_metric(stage, "probe/n_volumes", float(count), 1)
 
   def on_validation_end(self):
     dm = getattr(self.trainer, "datamodule", None)
@@ -803,6 +916,11 @@ class GSLightningModule(pl.LightningModule):
     # a fresh bag per validation set at every validation (each splits its volumes evenly over diffusion.val_t), shuffled by an RNG
     # of this validation and set
     self._val_t_bags, self._val_t_rngs = {}, {}
+    self._probe = {}   # diffusion.probe: this validation's values per set (_diffusion_probe)
+
+  def on_validation_epoch_end(self):
+    if self.__dict__.get("_probe"):
+      self._log_probe()
 
   def _pop_val_t(self, stage):
     """The next timestep of the validation set's bag of diffusion.val_t (refilled, shuffled, when empty). The shuffles of a
@@ -891,7 +1009,6 @@ class GSLightningModule(pl.LightningModule):
       device=device,
     )
     pred_rgb = model_pred["rgb"]
-    pred_alpha = model_pred["alpha"]
 
     # loss
     loss = torch.zeros((), device=device)
@@ -985,23 +1102,8 @@ class GSLightningModule(pl.LightningModule):
       loss = loss + cfg.loss.mean_offset_reg_weight * mean_offset_reg
       _log("loss/mean_offset_reg", mean_offset_reg.detach())
 
-    # TODO: skim through this code, fix it up
-    # if need_direct:
-    #   raise NotImplementedError()
-    # if need_direct:
-    #   direct_total, direct_parts = compute_direct_loss(gauss, gt, hit, cfg.loss, device)
-    #   loss = loss + direct_total
-    #   for k, v in direct_parts.items():
-    #     metrics[f"direct_{k}"] = v.detach()
-
     _log("loss", loss.detach())
     out["loss"] = loss
-
-    # TODO: Are any of these metrics actually needed?
-    # metrics["mean_opacity"] = flat["opacities"].mean().detach() if flat["opacities"].numel() else torch.zeros((), device=device)
-    # metrics["mean_scale"] = flat["scales"].mean().detach() if flat["scales"].numel() else torch.zeros((), device=device)
-    # metrics["frac_kept"] = torch.tensor(
-    #   flat["means"].shape[0] / max(1, item["source"]["hit"].numel()), device=device)
 
     return out
 
@@ -1082,8 +1184,8 @@ class GSLightningModule(pl.LightningModule):
       **({"gauss_layers": gauss_layers} if gauss_layers is not None else {}),
       # scene_scale: the source camera's own real distance from the world
       # origin -- module.OrbitCallback's orbit radius (matches
-      # fit_gsplat.py's own scene_scale: norm of a capture camera's own
-      # world position).
+      # the deleted fit_gsplat.py's scene_scale: norm of a capture camera's
+      # own world position).
       "scene_scale": float(np.linalg.norm(pose_gl_np[:3, 3])) or 1.0,
       "views": {
         "viewmat": torch.from_numpy(world_viewmat.astype(np.float32)).to(device),

@@ -35,6 +35,8 @@ import h5py
 import numpy as np
 import trimesh
 
+# unproject_depth_peel lives in cameras.py (`from debug_pointcloud import unproject_depth_peel` still works)
+from cameras import unproject_depth_peel
 from util import intrinsics_name
 
 DEFAULT_DATASETS = {
@@ -61,56 +63,6 @@ def detect_format(f, datasets):
         f"Cannot auto-detect format: depth dataset present={has_depth}, "
         f"points dataset present={has_points} (need exactly one); pass "
         "-f/--format explicitly")
-
-
-def unproject_depth_peel(depth_peel, intrinsics, pose, space, pixel_offset=0.5):
-  """depth_peel: (H, W, L) float32, NaN marks no hit (older renders used
-    -1.0; the `depth_peel > 0` test below rejects both).
-  intrinsics: (3, 3) pinhole K matrix (pixel row 0 = top, standard
-    computer-vision convention: u right, v down, cx/cy in pixel units).
-  pose: (4, 4) camera-to-world matrix (Blender camera-local axes: +X
-    right, +Y up, -Z forward -- glTF/OpenGL convention, not OpenCV).
-  space: "camera" to return points_cv as-is (OpenCV convention: X right,
-    Y down, Z forward -- the frame World Tracing itself predicts in, see
-    wt_infer_layers.py), or "world" to additionally flip into Blender's
-    camera-local axes and apply `pose`.
-
-  Returns (points, u, v, layer_idx), each length N (one entry per hit),
-  where points is (N, 3) in the requested space.
-  """
-  height, width, max_layers = depth_peel.shape
-  v_idx, u_idx, l_idx = np.meshgrid(
-    np.arange(height), np.arange(width), np.arange(max_layers), indexing="ij")
-
-  hit = depth_peel > 0  # NaN and -1.0 both fail this
-  u = u_idx[hit].astype(np.float32)
-  v = v_idx[hit].astype(np.float32)
-  layer_idx = l_idx[hit]
-  depth = depth_peel[hit]
-
-  # K^-1 maps homogeneous pixel coords to a ray in OpenCV-style camera space
-  # (X right, Y down, Z forward) at unit depth; scale by depth to place the
-  # point. Pixel (u, v)'s sample sits at its centre (u + 0.5, v + 0.5): the
-  # renderer casts each pixel's ray through the centre (cx = W/2), and gsplat
-  # rasterizes at pixel centres too (cross-view check: bla/_pixel_convention_test.py).
-  # pixel_offset=0.0 reproduces World Tracing's own integer-index convention
-  # (wt/inference.py), for comparisons against its point maps.
-  pixels_h = np.stack([u + pixel_offset, v + pixel_offset, np.ones_like(u)], axis=1)
-  rays_cv = pixels_h @ np.linalg.inv(intrinsics).T
-  points_cv = rays_cv * depth[:, None]
-
-  match space:
-    case "camera":
-      points = points_cv
-    case "world":
-      # Flip Y/Z into Blender's actual camera-local axes (X right, Y up,
-      # Z backward) before applying `pose`.
-      local = np.concatenate([points_cv * [1, -1, -1], np.ones_like(depth[:, None])], axis=1)
-      points = (local @ pose.T)[:, :3]
-    case _:
-      raise ValueError(f"Unknown space: {space!r}")
-
-  return points, u.astype(np.int64), v.astype(np.int64), layer_idx
 
 
 def colors_by_depth(z, lo=None, hi=None):
