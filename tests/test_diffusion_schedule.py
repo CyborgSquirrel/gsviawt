@@ -44,7 +44,7 @@ def test_layer_aware_schedule():
   t2 = s.sample(1000, phase=2, generator=g)
   assert (t2 == t2[:, :1]).all()                                     # phase 2: one t per sample
   with pytest.raises(ValueError):
-    s.sample(2, phase=3)
+    s.sample(2, phase=4)
   s2 = LayerAwareSchedule(6, standard=dict(mu=0.3), plateau=dict(sigma=0.9))   # overrides merge with the defaults
   assert s2.standard == dict(mu=0.3, sigma=1.0) and s2.plateau == dict(mu=0.0, sigma=0.9, mirror=False)
   d = s.densities(T)
