@@ -64,24 +64,29 @@ source_max_meshes: null
 # one mesh with all its views) from the queue file queue_path; the rows keep the mesh's global index in
 # the queue's mesh list. A job is marked done only after its rows are committed to output_path. The
 # whole config comes from the queue (render_queue.py stores it there); a worker is started with just
-# queue_path, queue_worker and its own output_path.
+# queue_path, queue_worker and output_path = the launcher's parts directory (one file per mesh,
+# render_merge.part_path, written as a temp file and renamed).
 queue_path: null
 queue_worker: null       # this worker's id in the queue (null = the process id)
 queue_max_meshes: 25     # a worker exits after claiming this many meshes (null = until none is ready)
 
 # Launcher (render_queue.py, run with the same overrides as render_objaverse.py): mesh_strategy gives
 # the meshes and output_path is the merged file. It enqueues them (largest file first) into
-# queue_dir/queue.db, keeps queue_workers Blender processes running (part files under queue_dir/parts,
-# logs under queue_dir/logs), merges when the queue is drained and enqueues meshes that are in no good
-# part again, for up to queue_max_rounds rounds. A job claimed queue_max_attempts times without
-# finishing is failed for good; a worker holding one job for over queue_claim_timeout seconds is killed.
+# queue_dir/queue.db, keeps queue_workers Blender processes running (one part file per mesh under
+# queue_dir/parts, logs under queue_dir/logs), merges when the queue is drained and enqueues meshes that
+# are in no good part again, for up to queue_max_rounds rounds. A job claimed queue_max_attempts times
+# without finishing is failed for good (claims a restarted launcher finds don't count: those workers were
+# killed with the run); a worker holding one job for over queue_claim_timeout seconds is killed.
 queue_dir: null
 queue_workers: 3
 queue_max_attempts: 3
 queue_max_rounds: 3
+queue_retry_failed: 0       # a mesh whose render raised is retried this many times (in later rounds) before it is failed
 queue_claim_timeout: 1800   # seconds (null = never)
 queue_blender: /opt/blender/blender
 queue_env: {}               # extra environment variables for the Blender processes
+queue_tmpdir: null          # the Blender processes' TMPDIR / TEMP / TMP, emptied on launcher start (null = inherited, e.g.
+                            # the container's /tmp; killed workers leave their temp dirs behind)
 
 # --- Objaverse blender_script.py conventions ---
 # Recenter the object on the origin and scale so its longest bbox axis == 1

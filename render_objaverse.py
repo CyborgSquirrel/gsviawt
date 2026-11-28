@@ -636,7 +636,8 @@ def run(cfg):
   import hydra
   import h5py
   from omegaconf import OmegaConf
-  from util import TransactionalWriter, size_chunks
+  from render_merge import part_path
+  from util import TransactionalWriter, fsync_path, size_chunks
 
   logging.basicConfig(level=logging.INFO)
 
@@ -702,34 +703,43 @@ def run(cfg):
       mesh_views = lambda mi: _source_views(src, mi)
     logger.info("RGB %dx%d, depth-peel %dx%d", W, H, DW, DH)
 
-    os.makedirs(os.path.dirname(cfg.output_path) or ".", exist_ok=True)
-    img_kw = dict(compression="gzip", compression_opts=4)
-    depth_kw = dict(compression="gzip", compression_opts=4)
-
-    tmp = stack.enter_context(TemporaryDirectory())
-    hf = stack.enter_context(h5py.File(cfg.output_path, "w"))
-    hf.attrs["config_json"] = json.dumps(OmegaConf.to_container(cfg, resolve=True))
-    hf.create_dataset("mesh_paths", data=meshes, dtype=h5py.string_dtype("utf-8"))
-
     # when re-rendering depth only, the RGB images are copied from the source
     render_rgb = cfg.render and (src is None or cfg.source_rerender_rgb)
-    writer = TransactionalWriter(hf)
-    if render_rgb:
-      writer.init("images", dataset_kwargs=img_kw)
-    writer.init("camera_pose")
-    # two intrinsics datasets, both always written (identical when the RGB and
-    # depth-peel resolutions match) so consumers never have to guess which K a
-    # dataset goes with.
-    writer.init("depth_intrinsics")  # matches depth_peel
-    if cfg.render:
-      writer.init("image_intrinsics")  # matches images
-    writer.init("depth_peel", dataset_kwargs=depth_kw)
-    if cfg.depth_peel_rgb:
-      writer.init("depth_peel_rgb", dataset_kwargs=depth_kw)  # pixel- and layer-aligned with depth_peel
-    if cfg.depth_peel_normals:
-      writer.init("depth_peel_normals", dataset_kwargs=depth_kw)  # likewise
-    writer.init("mesh_index", chunks=size_chunks)
-    writer.init("depth_scale")
+    tmp = stack.enter_context(TemporaryDirectory())
+
+    def open_output(path):
+      """The output file at `path` (created) and a TransactionalWriter with every dataset of this run registered."""
+      img_kw = dict(compression="gzip", compression_opts=4)
+      depth_kw = dict(compression="gzip", compression_opts=4)
+      hf = h5py.File(path, "w")
+      hf.attrs["config_json"] = json.dumps(OmegaConf.to_container(cfg, resolve=True))
+      hf.create_dataset("mesh_paths", data=meshes, dtype=h5py.string_dtype("utf-8"))
+      writer = TransactionalWriter(hf)
+      if render_rgb:
+        writer.init("images", dataset_kwargs=img_kw)
+      writer.init("camera_pose")
+      # two intrinsics datasets, both always written (identical when the RGB and
+      # depth-peel resolutions match) so consumers never have to guess which K a
+      # dataset goes with.
+      writer.init("depth_intrinsics")  # matches depth_peel
+      if cfg.render:
+        writer.init("image_intrinsics")  # matches images
+      writer.init("depth_peel", dataset_kwargs=depth_kw)
+      if cfg.depth_peel_rgb:
+        writer.init("depth_peel_rgb", dataset_kwargs=depth_kw)  # pixel- and layer-aligned with depth_peel
+      if cfg.depth_peel_normals:
+        writer.init("depth_peel_normals", dataset_kwargs=depth_kw)  # likewise
+      writer.init("mesh_index", chunks=size_chunks)
+      writer.init("depth_scale")
+      return hf, writer
+
+    if queue is None:
+      os.makedirs(os.path.dirname(cfg.output_path) or ".", exist_ok=True)
+      hf, writer = open_output(cfg.output_path)
+      stack.enter_context(hf)
+    else:
+      # queue mode: output_path is the launcher's parts directory, one file per mesh (part_path)
+      os.makedirs(cfg.output_path, exist_ok=True)
 
     failed = []
     for mi, job in _mesh_jobs(meshes, queue, worker, cfg.queue_max_meshes):
@@ -737,19 +747,40 @@ def run(cfg):
       views = list(mesh_views(mi))
       if not views:
         continue  # re-render: mesh has no rows in the source (it failed there)
+      part = None
+      if queue is not None:
+        part = part_path(cfg.output_path, mi)
+        if os.path.exists(part):   # rendered by a worker that died before marking the job done
+          logger.info("mesh %d: %s exists already", mi, part)
+          queue.done(job, worker)
+          continue
+        part_tmp = f"{part}.{worker}.tmp"
+        hf, writer = open_output(part_tmp)
+      rendered = False
       try:
         with writer.transaction():
           _render_mesh(cfg, scene, mi, mesh_path, views, W, H, DW, DH, Lmax, tmp, writer)
+          rendered = True
       except Exception as e:
-        if src is not None:
-          raise  # skipping would misalign rows with the copied images
+        if rendered or src is not None:
+          # the commit failed (e.g. a full disk): the file can't be trusted -- stop the worker, so its claim goes back to
+          # the queue as a crash instead of the next meshes failing on the write marker; re-render: skipping would
+          # misalign rows with the copied images
+          raise
         logger.exception("mesh %d (%s) failed -- skipping", mi, mesh_path)
         failed.append(mi)
         if job is not None:
+          hf.close()
+          os.remove(part_tmp)
           queue.fail(job, worker, repr(e))
       else:
         if job is not None:
-          queue.done(job, worker)   # only after the rows are committed to the file
+          # one file per mesh: written under a temp name, fsynced and renamed, so a kill loses at most this mesh
+          hf.close()
+          fsync_path(part_tmp)
+          os.replace(part_tmp, part)
+          fsync_path(os.path.dirname(part), directory=True)
+          queue.done(job, worker)   # only after the mesh's file is in place
 
     if src is not None:
       if "images" in src and not render_rgb:
@@ -757,7 +788,8 @@ def run(cfg):
       if "failed_mesh_indices" in src.attrs:
         hf.attrs["failed_mesh_indices"] = src.attrs["failed_mesh_indices"]
     if failed:
-      hf.attrs["failed_mesh_indices"] = json.dumps(failed)
+      if queue is None:
+        hf.attrs["failed_mesh_indices"] = json.dumps(failed)   # queue mode: the queue holds them
       logger.warning("%d/%d meshes failed: %s", len(failed), len(meshes), failed)
 
   logger.info("wrote %s", cfg.output_path)

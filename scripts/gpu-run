@@ -1,0 +1,92 @@
+#!/bin/bash
+# gpu-run: run a command inside the GPU container so that killing THIS (host-side) process also kills the command.
+#
+#   gpu-run [-c CONTAINER] [-w WORKDIR] [-g GRACE_S] [-e NAME]... [--] CMD [ARGS...]
+#   e.g. srun -p high --gres=gpu:1 scripts/gpu-run -w /app python train_gs.py ...
+#
+# Why: killing a host-side `docker exec` client does NOT kill the process it started in the container (the GPU stays busy),
+# and processes started by docker exec are outside the Slurm job's cgroup, so Slurm can't kill them either. gpu-run starts CMD
+# inside the container as the leader of its own process group (docker exec makes it one; everything it starts inherits the
+# group unless it daemonizes itself), records the group id in the container (/tmp/gpu-run/<id>.pgid), and on SIGTERM / SIGINT /
+# SIGHUP -- Slurm's preemption signal -- sends TERM to the whole group in the container, waits up to GRACE_S (default 8 s, keep
+# it below the partition's GraceTime), then KILL, and waits until the group is gone. Exit status: CMD's, or 143 after a signal.
+#
+# Options (or environment): -c CONTAINER ($GPU_RUN_CONTAINER, default gsviawt-app-gpu-1), -w WORKDIR in the container
+# ($GPU_RUN_WORKDIR, default /app), -g GRACE_S ($GPU_RUN_GRACE), -e NAME: pass the host's environment variable NAME into the
+# container (repeatable; SLURM_JOB_ID, SLURM_RESTART_COUNT and CUDA_VISIBLE_DEVICES are always passed when set).
+set -u
+CTR=${GPU_RUN_CONTAINER:-gsviawt-app-gpu-1}
+WD=${GPU_RUN_WORKDIR:-/app}
+GRACE=${GPU_RUN_GRACE:-8}
+ENVS=()
+for v in SLURM_JOB_ID SLURM_RESTART_COUNT CUDA_VISIBLE_DEVICES; do
+  [ -n "${!v:-}" ] && ENVS+=(-e "$v")
+done
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -c) CTR=$2; shift 2 ;;
+    -w) WD=$2; shift 2 ;;
+    -g) GRACE=$2; shift 2 ;;
+    -e) ENVS+=(-e "$2"); shift 2 ;;
+    --) shift; break ;;
+    -*) echo "gpu-run: unknown option $1" >&2; exit 2 ;;
+    *) break ;;
+  esac
+done
+[ $# -gt 0 ] || { echo "usage: gpu-run [-c CONTAINER] [-w WORKDIR] [-g GRACE_S] [-e NAME]... [--] CMD [ARGS...]" >&2; exit 2; }
+
+ID="$(hostname -s)-$$-$(date +%s%N)"
+PIDFILE=/tmp/gpu-run/$ID.pgid
+log() { echo "gpu-run[$$]: $*" >&2; }
+
+# in the container: sh is the process group leader docker exec made; it records its pid (= the pgid) and becomes CMD
+docker exec -w "$WD" ${ENVS[@]+"${ENVS[@]}"} "$CTR" \
+  sh -c 'mkdir -p /tmp/gpu-run && echo $$ > "$0" && exec "$@"' "$PIDFILE" "$@" &
+CLIENT=$!
+
+group_alive() { docker exec "$CTR" kill -0 -- "-$1" 2>/dev/null; }
+
+stop_group() {
+  local sig=$1 pgid="" i
+  for i in $(seq 1 20); do   # a signal right after the start: the pidfile may not be written yet
+    pgid=$(docker exec "$CTR" cat "$PIDFILE" 2>/dev/null) && [ -n "$pgid" ] && break
+    kill -0 "$CLIENT" 2>/dev/null || break
+    sleep 0.25
+  done
+  if [ -z "$pgid" ]; then
+    log "got $sig before the command started: nothing to stop in the container"
+    kill -KILL "$CLIENT" 2>/dev/null
+    return
+  fi
+  log "got $sig: TERM to process group $pgid in $CTR"
+  docker exec "$CTR" kill -TERM -- "-$pgid" 2>/dev/null
+  for i in $(seq 1 $((GRACE * 4))); do
+    group_alive "$pgid" || break
+    sleep 0.25
+  done
+  if group_alive "$pgid"; then
+    log "process group $pgid still alive after ${GRACE}s: KILL"
+    docker exec "$CTR" kill -KILL -- "-$pgid" 2>/dev/null
+    for i in $(seq 1 20); do
+      group_alive "$pgid" || break
+      sleep 0.25
+    done
+  fi
+  group_alive "$pgid" && log "WARNING: process group $pgid is still alive" || log "process group $pgid is gone"
+}
+
+on_signal() {
+  trap '' TERM INT HUP
+  stop_group "$1"
+  wait "$CLIENT" 2>/dev/null
+  docker exec "$CTR" rm -f "$PIDFILE" 2>/dev/null
+  exit 143
+}
+trap 'on_signal TERM' TERM
+trap 'on_signal INT' INT
+trap 'on_signal HUP' HUP
+
+wait "$CLIENT"
+rc=$?
+docker exec "$CTR" rm -f "$PIDFILE" 2>/dev/null
+exit $rc

@@ -1,0 +1,80 @@
+# Config for build_dataset.py -- the continuous 3DGS dataset builder (see its docstring). The renderer's config
+# (objaverse.yaml, as render_queue.py takes it) is mounted under `render`, the fitter's (fit_anchored.yaml) under `fit`, so
+# every option is available and named as in the standalone scripts, e.g.
+#   python build_dataset.py render.width=504 render.view_strategy.num_views=50 fit.loss.background=color
+# (a config group of the renderer is chosen with its package: view_strategy@render.view_strategy=turntable). The builder sets
+# per shard: render.output_path / queue_dir / queue_tmpdir / mesh_strategy / queue_retry_failed and fit.hdf5_path /
+# mesh_index / mesh_indices / output_dir / packed -- setting those here has no effect. The defaults below are today's dataset
+# (shard2 / shard3: bla/shard2/overnight_fit_then_shard3.sh; fit as scripts/fit_anchored_cluster.sbatch + loss.background=color).
+defaults:
+  - objaverse@render
+  - fit_anchored@fit
+  - override view_strategy@render.view_strategy: random-views
+  - override mesh_strategy@render.mesh_strategy: list
+  - _self_
+
+mode: build             # build (the builder) | download (the downloader on its own) | status (progress summary, read-only)
+
+csv: /mnt/hdd/objaverse/trellis-500k/ObjaverseXL_sketchfab.csv   # TRELLIS-500K's Sketchfab part, walked in row order
+# meshes skipped (their GLB stem = uid): the existing new10 + new90, shard2, shard3 (300 meshes; they count towards the target)
+skip_meshes:
+  - /app/bla/trellis_new10_meshes.txt
+  - /app/bla/new90/trellis_new90_meshes.txt
+  - /app/bla/shard2/trellis_shard2_meshes.txt
+  - /app/bla/shard3/trellis_shard3_meshes.txt
+target_meshes: 10000    # incl. the skip lists' meshes: target_meshes - |skip-list uids| new meshes are built
+shard_size: 100         # rendered (= fitted) meshes per shard; the last shard is smaller if the target needs fewer
+out_root: /mnt/hdd/gsviawt_dataset
+first_shard: 4          # shard numbers continue after the existing shard1v2 / shard2v2 / shard3
+download_ahead: 1.25    # the downloader keeps the GLBs of the next download_ahead x shard_size CSV rows beyond the rendered ones
+retries: 1              # extra tries of a download that fails for good-looking reasons (404 / sha256 mismatch) and of a render
+                        # that raises (render.queue_retry_failed), before the mesh goes to bad_meshes.csv
+local_glbs:             # GLBs already on disk, taken (sha256-checked; hard link or copy into out_root/glbs) instead of downloading
+  - /mnt/hdd/objaverse/hf-objaverse-v1/glbs
+  - /home/user/.objaverse/hf-objaverse-v1/glbs
+objaverse_dir: /home/user/.objaverse   # objaverse's cache of its uid -> path index (object-paths.json.gz)
+download_timeout: 120   # seconds per HTTP request
+download_poll: 30       # seconds between the downloader's passes when there is nothing to fetch
+lock_wait: 60           # seconds the builder waits for out_root/.builder.lock (an old builder still dying) before giving up
+
+render:
+  view_strategy:
+    num_views: 50
+    seed: 0
+    rng_mode: per_mesh
+    only_northern_hemisphere: false
+    maxz: 2.2
+    minz: -2.2
+  device: cpu
+  width: 504
+  height: 504
+  depth_width: 504
+  depth_height: 504
+  max_peel_layers: 6
+  depth_peel_rgb: true
+  depth_peel_normals: true
+  normalize_object: true
+  camera_distance: 1.9
+  camera_lens: 50.0
+  camera_sensor_width: 51.2
+  render_engine: BLENDER_EEVEE_NEXT
+  cycles_samples: 64
+  film_transparent: true
+  lighting: objaverse
+  camera_depth_target: null
+  queue_workers: 4
+
+fit:
+  hdf5_path: null
+  loss:
+    background: color
+  regression:
+    held_views: [45, 46, 47, 48, 49]
+  save_dense: false
+
+hydra:
+  job:
+    chdir: false
+  output_subdir: null
+  run:
+    dir: .

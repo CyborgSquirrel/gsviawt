@@ -129,6 +129,15 @@ class LazyDataset:
     self.idx += 1
 
 
+def fsync_path(path, directory=False):
+  """fsync a file (or, with directory, a directory: makes a rename in it durable)."""
+  fd = os.open(path, os.O_RDONLY | (os.O_DIRECTORY if directory else 0))
+  try:
+    os.fsync(fd)
+  finally:
+    os.close(fd)
+
+
 def txn_lock_path(h5_path):
   """The marker TransactionalWriter keeps next to an h5 file while it writes a transaction."""
   return f"{h5_path}.txn"

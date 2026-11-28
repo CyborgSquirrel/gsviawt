@@ -5,6 +5,7 @@
     job = q.claim("worker-7")       # {"id": ..., "payload": {...}} or None when nothing is ready
     q.done(job, "worker-7")         # or q.fail(job, "worker-7", "why")
     q.requeue_stale({"worker-3"})   # claimed by any other worker -> ready again
+    q.requeue_stale((), refund=True)  # on a restart: every claim is stale, and none of them counts as an attempt
     q.counts()                      # {"ready": .., "claimed": .., "done": .., "failed": ..}
 
 A claim is one atomic UPDATE ... RETURNING, so two processes never get the same job. Nothing is
@@ -12,8 +13,9 @@ resumed implicitly: a job claimed by a worker that died stays "claimed" (with it
 time) until requeue_stale() is called with the workers that are still alive. done()/fail() only
 take effect for the worker that holds the claim, so a worker that was presumed dead can't undo a
 requeue. Every claim counts as an attempt; fail_exhausted() retires jobs that keep killing their
-workers. A job is whatever JSON payload the caller wants; `meta` holds shared JSON values (e.g. the
-full mesh list the jobs index into).
+workers -- except claims a restarted launcher finds stale (requeue_stale(..., refund=True)): their worker was killed
+together with the launcher (a preemption), not by the job. retry_failed() gives failed jobs another try. A job is
+whatever JSON payload the caller wants; `meta` holds shared JSON values (e.g. the full mesh list the jobs index into).
 """
 
 import json
@@ -83,13 +85,23 @@ class JobQueue:
     """Mark a job as failed for good (no retry); same return value as done()."""
     return self._finish("failed", job, worker, str(error))
 
-  def requeue_stale(self, alive_workers):
-    """Claimed by a worker not in alive_workers -> ready again. Returns the number of jobs requeued."""
+  def requeue_stale(self, alive_workers, refund=False):
+    """Claimed by a worker not in alive_workers -> ready again. Returns the number of jobs requeued.
+    refund: the claim doesn't count as an attempt (attempts - 1): for the claims a restarted launcher finds, whose
+    workers died with the previous launcher (a kill / preemption of the whole run, not a crash caused by the job)."""
     alive = [str(w) for w in alive_workers]
     cond = f" AND worker NOT IN ({','.join('?' * len(alive))})" if alive else ""
+    dec = ", attempts = MAX(attempts - 1, 0)" if refund else ""
     cur = self.db.execute(
-      "UPDATE jobs SET status = 'ready', worker = NULL, claimed_at = NULL WHERE status = 'claimed'" + cond, alive)
+      f"UPDATE jobs SET status = 'ready', worker = NULL, claimed_at = NULL{dec} WHERE status = 'claimed'" + cond, alive)
     return cur.rowcount
+
+  def retry_failed(self, max_attempts):
+    """Failed jobs claimed fewer than max_attempts times -> ready again (keeping their attempts). Returns their
+    (id, payload)s."""
+    return [(i, json.loads(p)) for i, p in self.db.execute(
+      "UPDATE jobs SET status = 'ready', worker = NULL, claimed_at = NULL, error = NULL"
+      " WHERE status = 'failed' AND attempts < ? RETURNING id, payload", (max_attempts,)).fetchall()]
 
   def fail_exhausted(self, max_attempts):
     """Ready jobs that were already claimed max_attempts times (each claim that wasn't finished was

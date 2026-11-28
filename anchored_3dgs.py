@@ -547,12 +547,20 @@ def verify_written(d):
 
 def save_npz_atomic(path, **arrays):
   tmp = path + ".tmp.npz"
-  np.savez(tmp, **arrays)
-  os.replace(tmp, path)
+  try:
+    np.savez(tmp, **arrays)
+    os.replace(tmp, path)
+  finally:
+    if os.path.exists(tmp):   # a failed write (e.g. a full disk) leaves no partial temp behind
+      os.remove(tmp)
 
 
 def write_json_atomic(path, obj):
   tmp = path + ".tmp"
-  with open(tmp, "w") as f:
-    json.dump(obj, f, indent=1)
-  os.replace(tmp, path)
+  try:
+    with open(tmp, "w") as f:
+      json.dump(obj, f, indent=1)
+    os.replace(tmp, path)
+  finally:
+    if os.path.exists(tmp):
+      os.remove(tmp)

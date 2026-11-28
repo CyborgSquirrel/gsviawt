@@ -1,15 +1,22 @@
 # Config for fit_anchored.py -- anchored layered 3DGS for one mesh of a render_objaverse.py h5 (see anchored_3dgs.py's
-# docstring for the pipeline). One run = one mesh; rerunning the same command resumes (finished stages / views are skipped).
+# docstring for the pipeline). One run = one mesh (mesh_index), or the meshes of a shard one after another (mesh_indices);
+# rerunning the same command resumes (finished stages / views / DONE meshes are skipped).
+# Also composed into build_dataset.yaml as its `fit` key (fit_anchored@fit): hence the absolute (/hydra/..., _global_) overrides.
 defaults:
   - _self_
-  - override hydra/job_logging: none      # the script logs through logging.basicConfig
-  - override hydra/hydra_logging: none
+  - override /hydra/job_logging@_global_.hydra.job_logging: none      # the script logs through logging.basicConfig
+  - override /hydra/hydra_logging@_global_.hydra.hydra_logging: none
 
 hdf5_path: ???          # render_objaverse.py h5 with depth_peel (+ depth_peel_normals for the spacing levels)
-mesh_index: ???         # the mesh: its rows are the h5 rows with this mesh_index, local view v = its v-th row
+mesh_index: null        # one mesh: its rows are the h5 rows with this mesh_index, local view v = its v-th row
+mesh_indices: null      # shard mode instead (exactly one of the two): a list of mesh indices, or all (every mesh with rows),
+                        # fitted in this process one after another; a fit error stops the run (no mesh is skipped)
+packed: null            # shard mode: once every listed mesh is DONE, pack their grids into this file (e.g. <shard>/grids.h5;
+                        # grid_io.pack_dir) and delete the per-view grid files + anchors.npz / combined.npz (regression.json,
+                        # timing.json, DONE stay); null = keep the per-view files, no packing
 output_dir: ???         # <output_dir>/grids_sparse/mesh<M>_view<V>.h5 per training view: finalized sparse grids (grid_io.py),
                         # train with diffusion.grids_dir=<output_dir>/grids_sparse -- no finalize / convert step;
-                        # per-mesh state (anchors, combined fit, timings, regression.json) in <output_dir>/_anchored/mesh<M>/
+                        # per-mesh state (anchors, combined fit, timings, regression.json, DONE) in <output_dir>/_anchored/mesh<M>/
 shared_output_dir: null # also write each training view's subset straight from the combined fit (no fine-tune) here, same
                         # format (<shared_output_dir>/grids_sparse/); null = don't
 save_dense: false       # true: ALSO write the old dense grid <root>/mesh<M>_view<V>/gaussians.grid.h5 (~1.6x the bytes; for
