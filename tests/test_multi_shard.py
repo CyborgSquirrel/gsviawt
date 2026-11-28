@@ -67,7 +67,9 @@ def make_grids(out_dir, grids_dir, shard_h5, n_meshes):
 
 @pytest.fixture(scope="module")
 def data(data_dir):
-  return fixture_data(data_dir)
+  d = fixture_data(data_dir)
+  yield d
+  shutil.rmtree(d["tmp"], ignore_errors=True)
 
 
 def fixture_data(data_dir):
@@ -354,7 +356,9 @@ def test_eval_diffusion_loads_a_multi_shard_run(data):
 if __name__ == "__main__" and sys.argv[1:] == ["golden"]:
   data_path = _root()
   os.makedirs(os.path.dirname(GOLDEN), exist_ok=True)
-  digests = golden_digests(fixture_data(data_path))
+  d = fixture_data(data_path)
+  digests = golden_digests(d)
+  shutil.rmtree(d["tmp"], ignore_errors=True)
   with open(GOLDEN, "w") as f:
     json.dump(digests, f, indent=1, sort_keys=True)
   print("wrote", GOLDEN, {k: {s: len(v["volumes"]) for s, v in d.items() if s != "stats"} for k, d in digests.items()})
