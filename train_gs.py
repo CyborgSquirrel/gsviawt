@@ -606,9 +606,9 @@ class GSDataModule(pl.LightningDataModule):
       # whole corpus's, each grid's moments cached in its own shard's grids dir (moments are sums: the totals are exact)
       stats_ds = self.train_ds if stats_rows == train_rows else gs_diffusion.GridTargetDataset(
         WTFeatureDataset(features_h5, train_pool, rows=stats_rows, **kwargs), grid_index, enc)
-      cache = (os.path.join(cfg.diffusion.grids_dir, ".x0_moments") if self.shards is None
-               else lambda path: os.path.join(os.path.dirname(path), ".x0_moments"))
-      self.diffusion_stats = gs_diffusion.compute_stats(stats_ds, grid_index, cache)
+      # (moments_cache_dir: <grids dir>/.x0_moments for grid files -- for diffusion.grids_dir the same dir as always --, <the packed
+      # file's dir>/.x0_moments/<its name>/ for a packed file's grids)
+      self.diffusion_stats = gs_diffusion.compute_stats(stats_ds, grid_index, gs_diffusion.moments_cache_dir)
       self.split = write_split(os.path.join(cfg.output_dir, "split.json"), cfg, catalog, train_meshes, val_meshes, train_views,
                                val_views, self.shards, {"train": len(self.train_ds), **{n: len(v) for n, v in self.val_datasets.items()}})
     log.info(

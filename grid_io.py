@@ -13,13 +13,36 @@ sparse (v2, attrs layout="sparse", layout_version=2): the same Gaussians as rows
 
 read_grid(path) -> Grid (the valid rows + their indices; never densifies a sparse file); load_grid(path) -> the dense dict
 (dense()) and attrs, for the callers that want (H, W, L, .) arrays; grid_shape(path); convert_file(dense, sparse).
+
+packed (one HDF5 file per shard, pack_grids.py; root attrs layout="packed", layout_version=PACKED_VERSION): a directory of sparse
+files as ONE file, never modified once written (temp name -> verify -> fsync -> rename; pack_dir):
+  /grids/<primary_view_row>/   one group per grid: exactly the sparse file's datasets (the five fields H5Ocopy'd: their compressed
+                               bytes, dtype, shape, one chunk, gzip 4 + shuffle and attrs as they are) and its root attrs (all of
+                               them, layout="sparse" included, so the group reads as the file did); two storage-only changes, the
+                               values bit for bit the same: layer_valid_lhw is ONE chunk (L, H, W) (same gzip 4), layer_offsets is
+                               COMPACT (in the object header). Written grid by grid with HDF5's default file-space settings, so each
+                               grid's data is one contiguous byte range (a 56-byte contiguous layer_offsets / the per-layer mask chunks
+                               would go to HDF5's shared small-data blocks, < 2 KB, and interleave the grids: grid_extents checks it)
+  /rows (n,) int64             the grids' primary_view_row, ascending (the index: no group is opened to build it)
+  /names (n,) str              the source file names (mesh<M>_view<V>.h5)
+  root attrs                   layout, layout_version, n_grids, source_h5 and grid_shape (the grids' own, the same for all),
+                               packed_from (the source directory)
+A grid of a packed file is a GridRef(path, group); read_grid / load_grid / grid_shape take either a path or a GridRef. The packed
+files are opened lazily, read-only, once per process (packed_file: os.register_at_fork closes them before a fork, so a DataLoader
+worker opens its own and never inherits a handle).
 """
 
 import dataclasses
+import contextlib
+import glob
+import logging
 import os
+import typing
 
 import h5py
 import numpy as np
+
+log = logging.getLogger(__name__)
 
 FIELDS = (("gaussian_means", 3), ("gaussian_scales", 3), ("gaussian_quats", 4), ("gaussian_opacities", 1),
           ("gaussian_colors", 3))
@@ -76,7 +99,7 @@ def is_sparse(f):
   if layout is None:
     return False
   if layout != "sparse" or int(f.attrs.get("layout_version", -1)) != LAYOUT_VERSION:
-    raise ValueError(f"{f.filename}: unknown grid layout {layout!r} version {f.attrs.get('layout_version')!r}")
+    raise ValueError(f"{_where(f)}: unknown grid layout {layout!r} version {f.attrs.get('layout_version')!r}")
   return True
 
 
@@ -87,30 +110,130 @@ def _attrs(f):
 
 
 def _read_sparse(f):
+  """A sparse file or a packed file's grid group -> Grid."""
   valid = f["layer_valid_lhw"][()]
   idx = np.nonzero(valid)
   rows = {k: f[k][()] for k in FIELD_NAMES}
   n = len(idx[0])
   offsets = f["layer_offsets"][()]
   if offsets[-1] != n or any(len(r) != n for r in rows.values()):
-    raise ValueError(f"{f.filename}: {n} valid slots but layer_offsets ends at {offsets[-1]} and the fields hold "
+    raise ValueError(f"{_where(f)}: {n} valid slots but layer_offsets ends at {offsets[-1]} and the fields hold "
                      f"{ {k: len(r) for k, r in rows.items()} } rows")
   return Grid(valid, idx, rows, _attrs(f))
 
 
-def read_grid(path):
-  """A finalized grid file of either layout -> Grid. A sparse file is read as rows (no dense arrays); a dense file is read whole
-  and gathered (as encode_grid always did)."""
+def _where(obj):
+  """A file's name, a group's file:group (for messages)."""
+  return obj.file.filename if obj.name == "/" else f"{obj.file.filename}:{obj.name}"
+
+
+# ---------------------------------------------------------------------------------------------------------------- packed files
+
+PACKED_LAYOUT = "packed"
+PACKED_VERSION = 1
+PACKED_ROOT_ATTRS = ("layout", "layout_version", "n_grids", "source_h5", "grid_shape", "packed_from")
+
+
+class GridRef(typing.NamedTuple):
+  """One grid of a packed file: (the file, its group "grids/<row>"). build_grid_index's value for a packed file (a plain path for a
+  per-file grid)."""
+  path: str
+  group: str
+
+  @property
+  def row(self):
+    return int(self.group.rsplit("/", 1)[1])
+
+  def __str__(self):
+    return f"{self.path}:{self.group}"
+
+
+def group_name(row):
+  return f"grids/{int(row)}"
+
+
+_files = {}          # path -> the open packed file of this process (packed_file)
+_files_pid = [None]  # the process _files belongs to
+
+
+def close_packed_files():
+  """Closes this process's packed-file handles (they are reopened on the next read)."""
+  for f in list(_files.values()):
+    try:
+      f.close()
+    except Exception:   # (an already closed / invalid id)
+      pass
+  _files.clear()
+
+
+# no handle is ever inherited by a forked process (a DataLoader worker): the parent closes its own before the fork, the child
+# starts from an empty table (and would drop a stale one: _files_pid)
+os.register_at_fork(before=close_packed_files, after_in_child=_files.clear)
+
+
+def packed_file(path):
+  """The packed file at path, opened read-only once per process (lazily: in a DataLoader worker, by the worker). File locking as
+  the environment says (HDF5_USE_FILE_LOCKING=FALSE works)."""
+  if _files_pid[0] != os.getpid():
+    _files.clear()
+    _files_pid[0] = os.getpid()
+  f = _files.get(path)
+  if f is None or not f.id.valid:
+    f = _files[path] = h5py.File(path, "r")
+  return f
+
+
+def is_packed(path):
+  """path is a packed grids file (an HDF5 file with root attr layout="packed"); False for a directory or anything else."""
+  if not os.path.isfile(path):
+    return False
+  try:
+    with h5py.File(path, "r") as f:
+      return f.attrs.get("layout") == PACKED_LAYOUT
+  except OSError:
+    return False
+
+
+def read_packed_index(path):
+  """A packed file -> ({primary_view_row: GridRef}, source_h5 (the grids' own attribute), grid_shape (H, W, L)): from its /rows and
+  root attrs only (no group is opened)."""
   with h5py.File(path, "r") as f:
+    if f.attrs.get("layout") != PACKED_LAYOUT:
+      raise ValueError(f"{path}: not a packed grids file (layout {f.attrs.get('layout')!r})")
+    if int(f.attrs["layout_version"]) != PACKED_VERSION:
+      raise ValueError(f"{path}: unknown packed layout version {f.attrs['layout_version']!r}")
+    rows = f["rows"][()]
+    n = int(f.attrs["n_grids"])
+    if len(rows) != n or len(f["grids"]) != n:
+      raise ValueError(f"{path}: {n} grids in its attrs, {len(rows)} rows, {len(f['grids'])} groups")
+    path = os.path.abspath(path)
+    return ({int(r): GridRef(path, group_name(r)) for r in rows}, str(f.attrs["source_h5"]),
+            tuple(int(v) for v in f.attrs["grid_shape"]))
+
+
+@contextlib.contextmanager
+def _open(src):
+  """A grid file path or a GridRef -> the h5py object holding the grid (a file, or the packed file's group; that file stays open)."""
+  if isinstance(src, GridRef):
+    yield packed_file(src.path)[src.group]
+  else:
+    with h5py.File(src, "r") as f:
+      yield f
+
+
+def read_grid(path):
+  """A finalized grid file of either layout, or a packed file's grid (a GridRef) -> Grid. A sparse file is read as rows (no dense
+  arrays); a dense file is read whole and gathered (as encode_grid always did)."""
+  with _open(path) as f:
     if is_sparse(f):
       return _read_sparse(f)
     return Grid.from_dense({k: np.asarray(f[k]) for k in DENSE_DATASETS}, _attrs(f))
 
 
 def load_grid(path):
-  """A finalized grid file of either layout -> ({name: array (H, W, L, .)}, attrs): for a dense file exactly what it holds, for a
-  sparse one the same (NaN at the invalid slots, the dense file's attrs)."""
-  with h5py.File(path, "r") as f:
+  """A finalized grid file of either layout (or a GridRef) -> ({name: array (H, W, L, .)}, attrs): for a dense file exactly what it
+  holds, for a sparse one the same (NaN at the invalid slots, the dense file's attrs)."""
+  with _open(path) as f:
     if is_sparse(f):
       g = _read_sparse(f)
       return g.dense(), g.attrs
@@ -118,8 +241,8 @@ def load_grid(path):
 
 
 def grid_shape(path):
-  """(H, W, L) of a grid file of either layout, from its metadata only."""
-  with h5py.File(path, "r") as f:
+  """(H, W, L) of a grid file of either layout (or a GridRef), from its metadata only."""
+  with _open(path) as f:
     return tuple(int(v) for v in f.attrs["grid_shape"]) if is_sparse(f) else tuple(f["layer_valid"].shape)
 
 
@@ -262,3 +385,191 @@ def convert_file(dense_path, sparse_path, fsync=False):
   finally:
     if os.path.exists(tmp):
       os.remove(tmp)
+
+
+# ---------------------------------------------------------------------------------------------------------------- packing
+
+DATASET_PROPS = ("dtype", "shape", "compression", "compression_opts", "shuffle", "fletcher32", "scaleoffset")
+
+
+def write_packed_grid(group, src):
+  """src (an open sparse grid file) into group (empty, of the packed file being written): its root attrs (with their HDF5 types),
+  the five fields and any other dataset copied as they are (H5Ocopy: compressed chunks, filters, attrs), layer_valid_lhw as one
+  chunk (L, H, W) with its own filters, layer_offsets COMPACT (no small raw-data allocation: see the module docstring)."""
+  if not is_sparse(src):
+    raise ValueError(f"{_where(src)}: not a sparse grid file (convert_grids_sparse.py it first)")
+  _copy_attrs(src, group)
+  for k in src:
+    if k in ("layer_valid_lhw", "layer_offsets"):
+      continue
+    src.copy(src[k], group, name=k)
+  m = src["layer_valid_lhw"]
+  d = group.create_dataset("layer_valid_lhw", data=m[()], chunks=m.shape, compression=m.compression,
+                           compression_opts=m.compression_opts, shuffle=m.shuffle)
+  _copy_attrs(m, d)
+  o = src["layer_offsets"]
+  dcpl = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
+  dcpl.set_layout(h5py.h5d.COMPACT)
+  d = group.create_dataset("layer_offsets", data=o[()], dcpl=dcpl)
+  _copy_attrs(o, d)
+
+
+def verify_packed_grid(src, group):
+  """None if group (a packed file's grid) holds exactly src's grid (an open sparse file), else what differs: the attrs (names, HDF5
+  types, values), the dataset names, per dataset dtype / shape / filters / attrs and its decoded values bit for bit; every dataset
+  one chunk (or none: an empty field)."""
+  msg = _same_attrs(src, group)
+  if msg:
+    return msg
+  if set(src) != set(group):
+    return f"datasets differ: {sorted(set(src) ^ set(group))}"
+  for k in src:
+    a, b = src[k], group[k]
+    if not isinstance(a, h5py.Dataset) or not isinstance(b, h5py.Dataset):
+      return f"{k}: not a dataset"
+    for p in DATASET_PROPS:
+      if getattr(a, p) != getattr(b, p):
+        return f"{k}: {p} differs ({getattr(a, p)!r} vs {getattr(b, p)!r})"
+    if b.chunks not in (None, b.shape):
+      return f"{k}: {b.chunks} chunks, not one"
+    if not _same(a[()], b[()]):
+      return f"{k}: values differ"
+    msg = _same_attrs(a, b)
+    if msg:
+      return f"{k}: {msg}"
+  return None
+
+
+def verify_packed(grids_dir, packed, names=None):
+  """packed against the sparse files of grids_dir it was made from: the index (/rows, /names, root attrs), then every grid
+  (verify_packed_grid). -> list of problems ([] = every grid bit-identical). names: the files expected (default: all *.h5)."""
+  names = sorted(names if names is not None else (os.path.basename(p) for p in glob.glob(os.path.join(grids_dir, "*.h5"))))
+  problems = []
+  with h5py.File(packed, "r") as f:
+    rows = f["rows"][()]
+    fnames = f["names"].asstr()[()]
+    if int(f.attrs["n_grids"]) != len(names) or sorted(fnames) != names or len(f["grids"]) != len(names):
+      return [f"the packed file holds {int(f.attrs['n_grids'])} grids / {len(f['grids'])} groups ({len(fnames)} names), "
+              f"{grids_dir} {len(names)} files"]
+    if not (np.diff(rows) > 0).all():
+      problems.append("/rows not strictly ascending")
+    for row, name in zip(rows.tolist(), fnames.tolist()):
+      with h5py.File(os.path.join(grids_dir, name), "r") as s:
+        if int(s.attrs["primary_view_row"]) != row:
+          problems.append(f"{name}: primary_view_row {int(s.attrs['primary_view_row'])} but packed as row {row}")
+          continue
+        if str(s.attrs["source_h5"]) != str(f.attrs["source_h5"]):
+          problems.append(f"{name}: source_h5 differs from the packed file's")
+        msg = verify_packed_grid(s, f[group_name(row)])
+        if msg:
+          problems.append(f"{name} (row {row}): {msg}")
+  return problems
+
+
+def _extents(d):
+  """[(byte offset, size)] of a dataset's raw data in the file (none: compact or empty)."""
+  if d.chunks:
+    return [(c.byte_offset, c.size) for c in (d.id.get_chunk_info(i) for i in range(d.id.get_num_chunks()))]
+  off = d.id.get_offset()
+  return [(off, d.id.get_storage_size())] if off is not None and d.id.get_storage_size() else []
+
+
+def grid_extents(packed):
+  """{row: (first byte, end byte, bytes of data)} of every grid's raw data (its datasets' chunks / contiguous storage) in packed,
+  and the rows whose byte range overlaps another grid's (a grid is one contiguous byte range when it overlaps none)."""
+  out = {}
+  with h5py.File(packed, "r") as f:
+    for row in f["rows"][()].tolist():
+      g = f[group_name(row)]
+      ex = [e for k in g for e in _extents(g[k])]
+      if ex:
+        out[row] = (min(o for o, _ in ex), max(o + n for o, n in ex), sum(n for _, n in ex))
+  spans = sorted((lo, hi, r) for r, (lo, hi, _) in out.items())
+  overlapping = set()
+  end, end_row = -1, None
+  for lo, hi, r in spans:
+    if lo < end:
+      overlapping |= {r, end_row}
+    if hi > end:
+      end, end_row = hi, r
+  return out, sorted(overlapping)
+
+
+def _fsync(path, directory=False):
+  fd = os.open(path, os.O_RDONLY | (os.O_DIRECTORY if directory else 0))
+  try:
+    os.fsync(fd)
+  finally:
+    os.close(fd)
+
+
+def pack_dir(grids_dir, out, progress=None):
+  """The sparse grid files of grids_dir (*.h5) as one packed file at out: written grid by grid (ascending primary_view_row) to
+  out + ".tmp", closed, verified against every source file (verify_packed), fsynced, then moved to out (os.link: never over an
+  existing file) and the temp removed. Raises if out exists (a packed file is never modified or replaced: delete it by hand), if
+  grids_dir holds a leftover *.tmp (a fit still writing), if a file is not sparse, if the files disagree on source_h5 / grid_shape
+  or share a row, or if the verification finds any difference (the temp is removed then). A temp left by a killed earlier run is
+  removed first. -> {n_grids, bytes, source_bytes, overlapping (rows whose bytes are not one contiguous range), seconds}.
+  progress: called with (grids written, total)."""
+  import time
+  t0 = time.perf_counter()
+  grids_dir, out = os.path.abspath(grids_dir), os.path.abspath(out)
+  if not os.path.isdir(grids_dir):
+    raise ValueError(f"{grids_dir}: not a directory")
+  if os.path.exists(out):
+    raise FileExistsError(f"{out} exists: a packed file is never overwritten (delete it by hand to pack again)")
+  if os.path.realpath(os.path.dirname(out)) == os.path.realpath(grids_dir):
+    raise ValueError(f"{out}: inside the grids dir it packs (its *.h5 would be taken for a grid)")
+  leftovers = sorted(glob.glob(os.path.join(grids_dir, "*.tmp")))
+  if leftovers:
+    raise ValueError(f"{grids_dir}: {len(leftovers)} *.tmp files (a writer still running or killed?), e.g. {leftovers[0]}")
+  names = sorted(os.path.basename(p) for p in glob.glob(os.path.join(grids_dir, "*.h5")))
+  if not names:
+    raise ValueError(f"no *.h5 in {grids_dir}")
+  rows, sources, shapes = {}, set(), set()
+  for n in names:
+    with h5py.File(os.path.join(grids_dir, n), "r") as f:
+      if not is_sparse(f):
+        raise ValueError(f"{n}: not a sparse grid file (convert_grids_sparse.py the dir first)")
+      r = int(f.attrs["primary_view_row"])
+      if r in rows:
+        raise ValueError(f"{n} and {rows[r]}: both row {r}")
+      rows[r] = n
+      sources.add(str(f.attrs["source_h5"]))
+      shapes.add(tuple(int(v) for v in f.attrs["grid_shape"]))
+  if len(sources) != 1 or len(shapes) != 1:
+    raise ValueError(f"{grids_dir}: the grids disagree on source_h5 {sorted(sources)} / grid_shape {sorted(shapes)}")
+  order = sorted(rows)
+  tmp = out + ".tmp"
+  if os.path.exists(tmp):
+    log.info("removing %s (left by an interrupted run)", tmp)
+    os.remove(tmp)
+  try:
+    with h5py.File(tmp, "x") as f:
+      f.attrs["layout"] = PACKED_LAYOUT
+      f.attrs["layout_version"] = PACKED_VERSION
+      f.attrs["n_grids"] = np.int64(len(order))
+      f.attrs["source_h5"] = sources.pop()
+      f.attrs["grid_shape"] = np.array(shapes.pop(), np.int64)
+      f.attrs["packed_from"] = grids_dir
+      f.create_dataset("rows", data=np.array(order, np.int64))
+      f.create_dataset("names", data=np.array([rows[r] for r in order], dtype=object), dtype=h5py.string_dtype())
+      grids = f.create_group("grids")
+      for i, r in enumerate(order, 1):
+        with h5py.File(os.path.join(grids_dir, rows[r]), "r") as s:
+          write_packed_grid(grids.create_group(str(r)), s)
+        if progress:
+          progress(i, len(order))
+    problems = verify_packed(grids_dir, tmp, names)
+    if problems:
+      raise RuntimeError(f"{tmp}: {len(problems)} grids are not exact copies, e.g. {problems[:3]}")
+    _, overlapping = grid_extents(tmp)
+    _fsync(tmp)
+    os.link(tmp, out)   # (fails if out appeared meanwhile: never replaced)
+    os.remove(tmp)
+    _fsync(os.path.dirname(out), directory=True)
+  finally:
+    if os.path.exists(tmp):
+      os.remove(tmp)
+  return dict(n_grids=len(order), bytes=os.path.getsize(out), overlapping=overlapping,
+              source_bytes=sum(os.path.getsize(os.path.join(grids_dir, n)) for n in names), seconds=time.perf_counter() - t0)

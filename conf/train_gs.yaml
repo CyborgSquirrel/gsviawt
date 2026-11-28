@@ -364,7 +364,9 @@ trainer:
 # (AdamW, weight decay 0.01, gradient clipping 1.0) is `optim` / trainer.gradient_clip_val below; keep the repo's own LR schedule.
 diffusion:
   enabled: false
-  grids_dir: null              # the finalized grids: <grids_dir>/mesh<M>_view<V>.h5
+  grids_dir: null              # the finalized grids: a dir <grids_dir>/mesh<M>_view<V>.h5, or a packed file (pack_grids.py,
+                               # e.g. <shard>/anchored_wd0.3_rbg/grids.h5); anywhere a grids_dir is taken (data.shards,
+                               # extra sets, eval_diffusion) either works
   source_h5: null              # the render file the grids were fit from; null: the grids' own `source_h5` attribute, which is a path on
                                # the machine that fit them -- set this to run elsewhere
   # also needed: data.input=image, data.item=null (the default 0 trains on ONE listed grid), data.depth_size=null (the grids are at the

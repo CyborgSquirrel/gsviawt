@@ -9,6 +9,8 @@
 # (gs_diffusion.build_grid_index: one source h5). Exit 1 when anything is off. (Roots fitted with save_dense=true also hold the
 # dense run dirs: finalize_fit_dataset.py collects those into grids/ if wanted; never convert_grids_sparse.py them into
 # grids_sparse/, it is there already.)
+# Once a shard's grids are complete: pack them into one file (pack_grids.py grids_dir=OUT/grids_sparse out=OUT/grids.h5; the
+# grids_sparse files stay as they are).
 #   sbatch --dependency=afterany:<array> --export=ALL,CODE=$HOME/gsviawt_<sha>,OUT=<root> .../finalize_anchored_cluster.sbatch
 set -u
 source ~/env.sh

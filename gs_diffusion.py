@@ -46,6 +46,7 @@ from gaussians import SH_C0, X0_CHANNELS, X0_DIMS, X0_FIELDS, X0_SLICES, quat_fo
 import gs_dataset
 from gs_dataset import OPENGL_TO_OPENCV, rotate_quats_wxyz
 from gs_decoder import AttentionBlock, apply_rope, rope_cos_sin
+import grid_io
 from grid_io import Grid, grid_shape, load_grid, read_grid  # noqa: F401  (load_grid: the dense dict, for the callers that want it)
 from util import register_eval_resolver
 
@@ -380,11 +381,21 @@ def decode_x0(x0, mean, std, lo=None, hi=None, clamp="channel", floor=None):
 # ---------------------------------------------------------------------------
 
 def build_grid_index(grids_dir, source_h5=None):
-  """{row of the render h5 of the grid's source view: path}, and the render h5 the grids were fit from (the grids' own attribute,
-  a path on the machine that fit them; source_h5 overrides it, for another machine)."""
+  """{row of the render h5 of the grid's source view: the grid}, and the render h5 the grids were fit from (the grids' own attribute,
+  a path on the machine that fit them; source_h5 overrides it, for another machine). grids_dir: a directory of grid files (the
+  values: their paths) or a packed file (grid_io, pack_grids.py; the values: grid_io.GridRef, the index read from the file
+  alone) -- whichever the path points at."""
+  if os.path.isfile(grids_dir):
+    index, source, _ = grid_io.read_packed_index(grids_dir)
+    if not index:
+      raise SystemExit(f"no grids in the packed file {grids_dir!r}")
+    return index, source_h5 or source
   index, sources = {}, set()
   for path in sorted(glob.glob(os.path.join(grids_dir, "*.h5"))):
     with h5py.File(path, "r") as f:
+      if f.attrs.get("layout") == grid_io.PACKED_LAYOUT:
+        raise SystemExit(f"{path}: a packed grids file inside the grids dir {grids_dir!r}: give it as the grids path itself, "
+                         "or move it out")
       index[int(f.attrs["primary_view_row"])] = path
       sources.add(str(f.attrs["source_h5"]))
   if not index:
@@ -543,17 +554,39 @@ def encoding_tag(encoding):
   return "_".join(parts)
 
 
+MOMENTS_DIR = ".x0_moments"
+
+
+def moments_cache_dir(grid):
+  """The x0 moments cache of a grid (a build_grid_index value): <its grids dir>/.x0_moments for a grid file (the cache of every run
+  so far), <the packed file's dir>/.x0_moments for a packed file's grid (its entries in a subdirectory named after the file:
+  _moments_entry)."""
+  return os.path.join(os.path.dirname(grid.path if isinstance(grid, grid_io.GridRef) else grid), MOMENTS_DIR)
+
+
+def _moments_entry(grid, cache_dir):
+  """(cache file of the grid under cache_dir (None: no cache), stamp): a grid file's <name>.npz, stamped with the file's (size,
+  mtime); a packed file's grid <packed name>/row<R>.npz, stamped with the packed file's (size, mtime) (the file is never modified
+  in place: a repacked file has another mtime, so every entry of the old one is stale)."""
+  packed = isinstance(grid, grid_io.GridRef)
+  st = os.stat(grid.path if packed else grid)
+  stamp = np.array([st.st_size, st.st_mtime_ns], np.int64)
+  if not cache_dir:
+    return None, stamp
+  name = os.path.join(os.path.basename(grid.path), f"row{grid.row}.npz") if packed else os.path.basename(grid) + ".npz"
+  return os.path.join(cache_dir, name), stamp
+
+
 def _grid_moments(dataset, i, path, cache_dir):
-  """(sum, sum of squares, count, min, max) of the x0 channels over the valid slots of volume i; cached per grid file (size + mtime)
-  and per encoding (dataset.encoding: its own subdirectory of cache_dir). cache_dir may be a function of the grid's path (data.shards:
-  each grid's own grids dir)."""
+  """(sum, sum of squares, count, min, max) of the x0 channels over the valid slots of volume i; cached per grid (a grid file:
+  its size + mtime; a packed file's grid: the packed file's, _moments_entry) and per encoding (dataset.encoding: its own
+  subdirectory of cache_dir). cache_dir may be a function of the grid (moments_cache_dir: each grid's own grids dir / packed file's
+  dir)."""
   if callable(cache_dir):
     cache_dir = cache_dir(path)
   if cache_dir and encoding_tag(dataset.encoding):
     cache_dir = os.path.join(cache_dir, encoding_tag(dataset.encoding))
-  st = os.stat(path)
-  stamp = np.array([st.st_size, st.st_mtime_ns], np.int64)
-  cache = os.path.join(cache_dir, os.path.basename(path) + ".npz") if cache_dir else None
+  cache, stamp = _moments_entry(path, cache_dir)
   if cache and os.path.exists(cache):
     try:   # (a file another run is replacing right now is complete either way: the writer below is atomic; an unreadable one is
       with np.load(cache) as z:   #  recomputed)
@@ -570,7 +603,7 @@ def _grid_moments(dataset, i, path, cache_dir):
     moments = (np.zeros(CHANNELS), np.zeros(CHANNELS), 0, np.full(CHANNELS, np.inf), np.full(CHANNELS, -np.inf))
   if cache:
     try:
-      os.makedirs(cache_dir, exist_ok=True)
+      os.makedirs(os.path.dirname(cache), exist_ok=True)
       # atomic: written to a temporary name of this process, then renamed over the cache (runs started together on a fresh grids
       # dir compute the same files at the same time; a reader never sees a partial one)
       tmp = f"{cache}.{os.getpid()}.tmp.npz"

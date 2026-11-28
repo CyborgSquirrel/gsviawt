@@ -1,0 +1,16 @@
+# Config for pack_grids.py -- see its docstring.
+defaults:
+  - _self_
+  - override hydra/job_logging: none      # the script logs through logging.basicConfig; no <job>.log in the working directory
+  - override hydra/hydra_logging: none
+
+grids_dir: ???       # a directory of sparse grid files (mesh<M>_view<V>.h5), e.g. <root>/grids_sparse; only read
+out: ???             # the packed file to write, e.g. <root>/grids.h5 (not inside grids_dir); refused when it exists
+verify_only: false   # true: only verify an existing `out` against grids_dir (exit 1 on any difference)
+
+hydra:
+  job:
+    chdir: false
+  output_subdir: null
+  run:
+    dir: .
