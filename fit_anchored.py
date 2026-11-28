@@ -320,6 +320,9 @@ def fit_shard(cfg: DictConfig) -> None:
     not_done = [M for M in meshes if not mesh_done(out, M)]
     if not_done:
       raise SystemExit(f"{packed} exists but meshes {not_done[:20]} are not DONE (a different mesh list?)")
+    tmp = packed + ".tmp"
+    if os.path.exists(tmp) and os.path.samefile(packed, tmp):   # killed between pack_dir's link and the temp's removal
+      os.remove(tmp)
     n = _cleanup(out, meshes)
     log.info("%s: packed already, %d meshes DONE%s", packed, len(meshes), f" (removed {n} leftover grid files)" if n else "")
     return

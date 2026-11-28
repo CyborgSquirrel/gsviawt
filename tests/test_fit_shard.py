@@ -154,6 +154,7 @@ def test_kill_in_pack_or_cleanup(render_h5, tmp_path, monkeypatch):
   with pytest.raises(Killed):
     fit_anchored.fit_shard(cfg)   # packed, killed before the per-view files were deleted
   assert (tmp_path / "grids.h5").exists() and len(os.listdir(tmp_path / an.SPARSE_DIR)) == 12
+  os.link(tmp_path / "grids.h5", str(tmp_path / "grids.h5") + ".tmp")   # as a kill between pack_dir's link and unlink leaves it
   monkeypatch.setattr(fit_anchored, "_cleanup", real_cleanup)
   fit_anchored.fit_shard(cfg)
   assert not (tmp_path / an.SPARSE_DIR).exists() and not os.path.exists(str(tmp_path / "grids.h5") + ".tmp")
