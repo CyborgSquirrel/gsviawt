@@ -638,6 +638,81 @@ def render_catalog(h5_paths) -> H5Catalog:
   return H5Catalog(h5_paths, RENDER_DATASETS, _render_columns)
 
 
+def render_corpus(h5_paths, out_dir):
+  """Several render files (render_objaverse.py schema; meshes distinct across them) as ONE render file, so everything keyed on a
+  file's (row, mesh_index) -- the splits, the grid index, the listing, the seeds, eval_diffusion, the KID's GT cache -- works on the
+  corpus unchanged: <out_dir>/corpus_<hash>.h5, an HDF5 virtual file. File k's rows are rows row_offset_k .. + n_k (offsets = the
+  earlier files' row counts, in order), its meshes mesh_offset_k + mesh_index (`mesh_index` and `mesh_paths` are real, small
+  datasets; every per-row dataset is a virtual concatenation of the files' own, nothing copied). The hash is of the files' paths,
+  sizes and mtimes, in order: another composition is another file name (the KID's GT cache keys on name + size). Checked here:
+  same datasets / shapes / dtypes in every file, no mesh name in two files, and the first and last row of every dataset of every
+  file read through the corpus equal to the file's own (a virtual dataset silently reads fill values for a missing source file).
+  -> (corpus path, [{"source_h5", "row_offset", "rows", "mesh_offset", "meshes"}, ...] per file)."""
+  paths = [os.path.abspath(str(p)) for p in h5_paths]
+  if len(set(paths)) != len(paths):
+    raise SystemExit(f"render_corpus: a render file twice: {paths}")
+  shards, names, schema = [], {}, None
+  for k, p in enumerate(paths):
+    with h5py.File(p, "r") as f:
+      n = f["mesh_index"].shape[0]
+      sch = {name: (ds.shape[1:], ds.dtype) for name, ds in f.items() if name != "mesh_paths"}
+      bad = sorted(name for name, ds in f.items() if name != "mesh_paths" and ds.shape[0] != n)
+      if bad:
+        raise SystemExit(f"render_corpus: {p}: datasets {bad} are not per row ({n} rows)")
+      if schema is not None and sch != schema:
+        raise SystemExit(f"render_corpus: {p}'s datasets differ from {paths[0]}'s: {sch} vs {schema}")
+      schema = sch
+      mesh_paths = f["mesh_paths"].asstr()[()].tolist()
+    for name in mesh_paths:
+      if name in names:
+        raise SystemExit(f"render_corpus: mesh {name!r} is in {paths[names[name]]} and {p}: the meshes of the shards must be distinct")
+      names[name] = k
+    off = shards[-1]["row_offset"] + shards[-1]["rows"] if shards else 0
+    moff = shards[-1]["mesh_offset"] + shards[-1]["meshes"] if shards else 0
+    shards.append({"source_h5": p, "row_offset": off, "rows": n, "mesh_offset": moff, "meshes": len(mesh_paths)})
+  stamp = [(p, os.stat(p).st_size, os.stat(p).st_mtime_ns) for p in paths]
+  tag = hashlib.sha256(json.dumps(stamp).encode()).hexdigest()[:12]
+  os.makedirs(out_dir, exist_ok=True)
+  out = os.path.join(out_dir, f"corpus_{tag}.h5")
+  tmp = f"{out}.{os.getpid()}.tmp"
+  total = shards[-1]["row_offset"] + shards[-1]["rows"]
+  with h5py.File(tmp, "w") as o:
+    mesh_index, mesh_paths = [], []
+    for s in shards:
+      with h5py.File(s["source_h5"], "r") as f:
+        mesh_index.append(f["mesh_index"][:].astype(np.int64) + s["mesh_offset"])
+        mesh_paths += f["mesh_paths"].asstr()[()].tolist()
+    o.create_dataset("mesh_index", data=np.concatenate(mesh_index))
+    o.create_dataset("mesh_paths", data=np.array(mesh_paths, dtype=object), dtype=h5py.string_dtype())
+    for name, (shape, dtype) in schema.items():
+      if name == "mesh_index":
+        continue
+      layout = h5py.VirtualLayout(shape=(total, *shape), dtype=dtype)
+      for s in shards:
+        layout[s["row_offset"]:s["row_offset"] + s["rows"]] = h5py.VirtualSource(s["source_h5"], name, shape=(s["rows"], *shape))
+      o.create_virtual_dataset(name, layout)
+    attrs = []
+    for p in paths:
+      with h5py.File(p, "r") as f:
+        attrs.append(dict(f.attrs))
+    for key, v in attrs[0].items():   # the attributes every file shares (config_json differs per render job: usually none)
+      if all(key in a and np.array_equal(a[key], v) for a in attrs[1:]):
+        o.attrs[key] = v
+    o.attrs["corpus_shards"] = json.dumps(shards)
+  with h5py.File(tmp, "r") as o:
+    for s in shards:
+      with h5py.File(s["source_h5"], "r") as f:
+        for name in schema:
+          for r in sorted({0, s["rows"] - 1}):
+            want = f[name][r] + (s["mesh_offset"] if name == "mesh_index" else 0)
+            if not np.array_equal(o[name][s["row_offset"] + r], want, equal_nan=np.asarray(want).dtype.kind == "f"):
+              raise SystemExit(f"render_corpus: {out}: row {r} of {s['source_h5']}'s {name!r} reads differently through the corpus")
+  os.replace(tmp, out)
+  log.info("render corpus %s: %d rows, %d meshes from %s", out, total, len(names),
+           [(s["source_h5"], s["rows"], s["meshes"]) for s in shards])
+  return out, shards
+
+
 def _mesh_names(catalog: H5Catalog):
   return sorted(catalog.df["mesh_name"].unique().to_list())
 

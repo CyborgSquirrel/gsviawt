@@ -32,6 +32,7 @@ import zipfile
 import h5py
 import hydra
 import numpy as np
+import polars as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -42,6 +43,7 @@ from torch.utils.data import Dataset
 from diffusion_schedule import LayerAwareSchedule, normalize_colour_noise, sample_colour_geo
 # the x0 layout, SH_C0 and quat_forms live in gaussians.py (re-exported here: gs_diffusion.CHANNELS, gs_diffusion.SCALE, ...)
 from gaussians import SH_C0, X0_CHANNELS, X0_DIMS, X0_FIELDS, X0_SLICES, quat_forms  # noqa: F401
+import gs_dataset
 from gs_dataset import OPENGL_TO_OPENCV, rotate_quats_wxyz
 from gs_decoder import AttentionBlock, apply_rope, rope_cos_sin
 from grid_io import Grid, grid_shape, load_grid, read_grid  # noqa: F401  (load_grid: the dense dict, for the callers that want it)
@@ -392,6 +394,64 @@ def build_grid_index(grids_dir, source_h5=None):
   return index, source_h5 or sources.pop()
 
 
+def build_shard_index(shards, out_dir):
+  """data.shards ([{source_h5, grids_dir}, ...]) -> (grid index {corpus row: grid path}, the corpus render file
+  (gs_dataset.render_corpus, in out_dir), its per-shard rows (render_corpus' list, + each shard's grids_dir)). Each shard's grids
+  are indexed as build_grid_index does (source_h5 null: the grids' own attribute), at its rows' offset in the corpus."""
+  per, sources = [], []
+  for k, s in enumerate(shards):
+    if s.get("grids_dir") is None:
+      raise SystemExit(f"data.shards[{k}]: grids_dir is required")
+    index, src = build_grid_index(str(s.grids_dir), None if s.get("source_h5") is None else str(s.source_h5))
+    per.append(index)
+    sources.append(src)
+  corpus, info = gs_dataset.render_corpus(sources, out_dir)
+  grid_index = {}
+  for index, s, spec in zip(per, info, shards):
+    s["grids_dir"] = str(spec.grids_dir)
+    bad = sorted(r for r in index if not 0 <= r < s["rows"])
+    if bad:
+      raise SystemExit(f"{spec.grids_dir}: grids of rows {bad[:5]} outside {s['source_h5']} ({s['rows']} rows)")
+    grid_index.update({s["row_offset"] + r: p for r, p in index.items()})
+  return grid_index, corpus, info
+
+
+def extra_dataset(name, spec, like, encoding, patch_size, out_dir):
+  """An extra eval set (extra_sets.<name>) from another render file: max_meshes of its meshes (a random subset by (spec.seed, name);
+  null: all), as sources their views with view number < max_source_view_num (null: all), targets drawn from all of the mesh's
+  other views (the run's data.num_views per volume; kid: kid_selection). The grids of spec.grids_dir give the 'fit' and the
+  oracles; grids_dir null: none (the set has to skip 'fit'). The x0 normalization stays the run's (its training grids). `like`:
+  one of the run's datasets, for the item settings (layers, sizes, num_views). The listing goes to
+  <out_dir>/listing_<name>.h5. (eval_diffusion's extra_sets; train_gs.py's data.extra_val_sets.)"""
+  inner_like = getattr(like, "inner", like)
+  source_h5 = str(spec.source_h5)
+  cat = gs_dataset.render_catalog(source_h5)
+  meshes = sorted(cat.df["mesh_id"].unique().to_list())
+  if spec.get("max_meshes") is not None and int(spec.max_meshes) < len(meshes):
+    rng = np.random.default_rng([int(spec.get("seed", 0)), *map(ord, name)])
+    meshes = sorted(rng.choice(meshes, int(spec.max_meshes), replace=False).tolist())
+  cat = cat.filter(pl.col("mesh_id").is_in(meshes))
+  src = cat if spec.get("max_source_view_num") is None else cat.filter(pl.col("view_num") < int(spec.max_source_view_num))
+  rows = sorted(src.df["view_idx"].to_list())
+  grid_index = None
+  if spec.get("grids_dir") is not None:
+    grid_index, _ = build_grid_index(str(spec.grids_dir), source_h5)
+    check_grids(grid_index, int(inner_like.image_size), int(patch_size), int(inner_like.num_layers))
+    missing = sorted(set(rows) - set(grid_index))
+    if missing:
+      raise SystemExit(f"extra set {name}: source views (rows) {missing[:5]}... have no grid in {spec.grids_dir!r} (max_source_view_num)")
+  listing = make_listing({r: None for r in rows}, source_h5, os.path.join(out_dir, f"listing_{name}.h5"))
+  ds = gs_dataset.WTFeatureDataset(
+    listing, cat, num_layers=inner_like.num_layers, num_views=inner_like.num_views,
+    allow_source_as_target=inner_like.allow_source_as_target, depth_size=inner_like.depth_size, image_size=inner_like.image_size,
+    read_features=inner_like.read_features)
+  if grid_index is None:
+    return ds
+  ds = GridTargetDataset(ds, grid_index, encoding, seeded=True)
+  ds.seed_targets = False
+  return ds
+
+
 def check_grids(grid_index, image_size, patch_size, num_layers):
   """The grids' (H, W, L) must be the model's grid: image_size square (a multiple of the patch size, so the patches tile it) and
   num_layers layers. (data.depth_size must stay null: grids are at the depth peel's own resolution.)"""
@@ -485,7 +545,10 @@ def encoding_tag(encoding):
 
 def _grid_moments(dataset, i, path, cache_dir):
   """(sum, sum of squares, count, min, max) of the x0 channels over the valid slots of volume i; cached per grid file (size + mtime)
-  and per encoding (dataset.encoding: its own subdirectory of cache_dir)."""
+  and per encoding (dataset.encoding: its own subdirectory of cache_dir). cache_dir may be a function of the grid's path (data.shards:
+  each grid's own grids dir)."""
+  if callable(cache_dir):
+    cache_dir = cache_dir(path)
   if cache_dir and encoding_tag(dataset.encoding):
     cache_dir = os.path.join(cache_dir, encoding_tag(dataset.encoding))
   st = os.stat(path)

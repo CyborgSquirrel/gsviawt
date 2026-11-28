@@ -42,6 +42,7 @@ it needs is set up at the image level (see Dockerfile).
 
 import contextlib as ctl
 import functools as ft
+import json
 import logging
 import math
 import os
@@ -400,6 +401,38 @@ def flatten_gaussians(b, gauss, xyz_cam, hit):
 # training loop
 # ---------------------------------------------------------------------------
 
+def write_split(path, cfg, catalog, train_meshes, val_meshes, train_views, val_views, shards, sizes):
+  """The run's actual split, by mesh name, to `path` (<output_dir>/split.json, written at set-up): the held-out meshes
+  (data.mesh_split), every training mesh's held-out and training view numbers (data.view_split; the views with a grid), each mesh's
+  shard and id in the (corpus) render file, the shards (data.shards; one entry for a single render file) and the sets' volume
+  counts. Returns the dict."""
+  src = str(catalog.df["path"][0]) if len(catalog) else None
+  shards = shards or [{"source_h5": src, "grids_dir": cfg.diffusion.get("grids_dir"), "row_offset": 0}]
+  offsets = [int(s["row_offset"]) for s in shards]
+  meshes = {}
+  for key, cat in (("train_views", train_views), ("val_views", val_views), ("views", val_meshes)):
+    for name, mid, row, num in cat.df.select(["mesh_name", "mesh_id", "view_idx", "view_num"]).iter_rows():
+      m = meshes.setdefault(name, {"shard": int(np.searchsorted(offsets, int(row), side="right") - 1), "mesh_id": int(mid),
+                                   "held_out": cat is val_meshes})
+      m.setdefault(key, []).append(int(num))
+  for m in meshes.values():
+    for k in ("train_views", "val_views", "views"):
+      if k in m:
+        m[k] = sorted(m[k])
+  out = {"seed": int(cfg.seed), "mesh_split": OmegaConf.to_container(cfg.data.mesh_split, resolve=True),
+         "view_split": OmegaConf.to_container(cfg.data.view_split, resolve=True), "shards": shards, "volumes": sizes,
+         "held_out_meshes": sorted(n for n, m in meshes.items() if m["held_out"]),
+         "held_out_views": {n: m["val_views"] for n, m in sorted(meshes.items()) if m.get("val_views")},
+         "meshes": dict(sorted(meshes.items()))}
+  tmp = f"{path}.{os.getpid()}.tmp"
+  with open(tmp, "w") as f:
+    json.dump(out, f, indent=1)
+  os.replace(tmp, path)
+  log.info("split: %d meshes (%d held out), %d with held-out views -> %s", len(meshes), len(out["held_out_meshes"]),
+           len(out["held_out_views"]), path)
+  return out
+
+
 class GSDataModule(pl.LightningDataModule):
   """Train/val over cached feature volumes (data.item: one row, a list of rows, or null for all of them),
   split with master's two stages on the render catalog the volumes' source views are rows of:
@@ -413,6 +446,9 @@ class GSDataModule(pl.LightningDataModule):
                       gs_dataset.sample_matching_sources); targets from the val views
     val_views_sval:   volumes with a val-view source, targets from the val views
     val_train:        (data.val_train) the training volumes themselves, targets from the train views
+    <extra set>:      (data.extra_val_sets) volumes of other render files (gs_diffusion.extra_dataset), after the sets above
+  data.shards: several render files + grids as one corpus (gs_dataset.render_corpus), split as one (by mesh name); the split is
+  written to <output_dir>/split.json (write_split).
   data.catalog_transform (a polars expression, see catalog_transform_keys) then cuts the training set and every validation
   set down to the volumes of the catalogue rows it keeps; the splits, pools and x0 stats stay the full catalogue's.
   Every validation set is complete (the empty ones are dropped); how much of it a validation scores is
@@ -426,6 +462,8 @@ class GSDataModule(pl.LightningDataModule):
     self.cfg = cfg
     self.train_ds = None
     self.val_datasets = None
+    self.shards = None   # data.shards: the corpus's per-shard rows (gs_diffusion.build_shard_index)
+    self.split = None    # the split as written to <output_dir>/split.json (write_split)
     self.validation = "lightning"
     self.lightning_runs = 0   # Lightning's own validations so far (kept in checkpoints: state_dict)
 
@@ -454,9 +492,17 @@ class GSDataModule(pl.LightningDataModule):
         log.warning("data.item=%s: the diffusion run trains on that one listed grid only (data.item=null: all of them)", d.item)
       if d.depth_size not in (None, d.image_size):
         raise SystemExit("diffusion mode needs data.depth_size=null (or the grids' own size): the grids are at the depth peel's own resolution")
-      grid_index, grids_source = gs_diffusion.build_grid_index(cfg.diffusion.grids_dir, cfg.diffusion.get("source_h5"))
-      gs_diffusion.check_grids(grid_index, int(d.image_size), int(cfg.model.patch_size), int(d.num_layers))
       os.makedirs(cfg.output_dir, exist_ok=True)   # the module makes it too, but later
+      if d.get("shards"):
+        # data.shards: several render files + their grids as one corpus (gs_dataset.render_corpus: one virtual render file in
+        # output_dir, shard k's rows / meshes at its offsets), so everything below runs as for one render file
+        if cfg.diffusion.get("grids_dir") is not None or cfg.diffusion.get("source_h5") is not None:
+          raise SystemExit("data.shards replaces diffusion.grids_dir / diffusion.source_h5: set those to null")
+        grid_index, grids_source, self.shards = gs_diffusion.build_shard_index(d.shards, cfg.output_dir)
+      else:
+        grid_index, grids_source = gs_diffusion.build_grid_index(cfg.diffusion.grids_dir, cfg.diffusion.get("source_h5"))
+        self.shards = None
+      gs_diffusion.check_grids(grid_index, int(d.image_size), int(cfg.model.patch_size), int(d.num_layers))
       features_h5 = gs_diffusion.make_listing(grid_index, grids_source, os.path.join(cfg.output_dir, "listing.h5"))
     with h5py.File(features_h5, "r") as f:
       source_h5 = str(f.attrs.get("source_h5", f.attrs["input"]))
@@ -543,14 +589,28 @@ class GSDataModule(pl.LightningDataModule):
       self.train_ds = gs_diffusion.GridTargetDataset(
         self.train_ds, grid_index, enc, augment=OmegaConf.to_container(augment) if augment is not None else None)
       self.val_datasets = {n: gs_diffusion.GridTargetDataset(ds, grid_index, enc, seeded=True) for n, ds in self.val_datasets.items()}
+      for name, spec in (d.get("extra_val_sets") or {}).items():
+        # data.extra_val_sets: validation sets from other render files (eval_diffusion's extra_sets, the same builder), seeded like
+        # the sets above (paired across runs and validations); their x0 normalization is the run's (below)
+        if name in self.val_datasets or name in ("train", "val"):
+          raise SystemExit(f"data.extra_val_sets.{name}: the run has a set of that name")
+        if spec.get("grids_dir") is None:
+          raise SystemExit(f"data.extra_val_sets.{name}: grids_dir is required (the validation losses need the fitted grids)")
+        ds = gs_diffusion.extra_dataset(name, spec, self.train_ds, enc, cfg.model.patch_size, cfg.output_dir)
+        ds.seed_targets = True
+        self.val_datasets[name] = ds
       for name, ds in self.val_datasets.items():
         check_val_targets(ds, name, cfg)
       # normalization of the x0 channels: the valid slots of the TRAIN grids (moments cached per grid, next to the grids) -- all of
-      # them, also under data.catalog_transform, so a run on a few volumes sees them normalized like a run on all
+      # them, also under data.catalog_transform, so a run on a few volumes sees them normalized like a run on all; data.shards: the
+      # whole corpus's, each grid's moments cached in its own shard's grids dir (moments are sums: the totals are exact)
       stats_ds = self.train_ds if stats_rows == train_rows else gs_diffusion.GridTargetDataset(
         WTFeatureDataset(features_h5, train_pool, rows=stats_rows, **kwargs), grid_index, enc)
-      self.diffusion_stats = gs_diffusion.compute_stats(
-        stats_ds, grid_index, os.path.join(cfg.diffusion.grids_dir, ".x0_moments"))
+      cache = (os.path.join(cfg.diffusion.grids_dir, ".x0_moments") if self.shards is None
+               else lambda path: os.path.join(os.path.dirname(path), ".x0_moments"))
+      self.diffusion_stats = gs_diffusion.compute_stats(stats_ds, grid_index, cache)
+      self.split = write_split(os.path.join(cfg.output_dir, "split.json"), cfg, catalog, train_meshes, val_meshes, train_views,
+                               val_views, self.shards, {"train": len(self.train_ds), **{n: len(v) for n, v in self.val_datasets.items()}})
     log.info(
       "volumes: %d train, validation sets %s", len(self.train_ds),
       {n: len(ds) for n, ds in self.val_datasets.items()})

@@ -29,6 +29,8 @@ Writes <out>/views.csv (one row per checkpoint, weights, set, volume, method, ta
 over the volume's target views) and <out>/summary.json (mean and standard error over volumes per checkpoint, weights, set, method;
 volumes, not views, are the unit). mean<K> has no depth (an average of renders has no single depth).
 extra_sets: more eval sets from other render files (extra_dataset: e.g. unseen meshes), the x0 normalization still the run's.
+A data.shards run (train_gs.py: several render files as one corpus) is rebuilt as it trained (its corpus file goes to <out>); the
+run's data.extra_val_sets (training-time validation sets) are dropped here: give them as extra_sets.
 skip_methods (and extra_sets.<name>.skip_methods): leave out fit / onestep (e.g. a set without grids has no fit).
 kid (kid.enabled): the sets (val_sets; null: val_views_sval, val_views_strain and the extra sets) become one volume per mesh with
 kid.views_per_mesh fixed target views (kid_selection: a function of kid.seed, set and mesh only); the noise base is kid.noise_seed
@@ -171,40 +173,7 @@ def fixed_targets_dataset(ds, selection):
   return out
 
 
-def extra_dataset(name, spec, like, encoding, patch_size, out_dir):
-  """An extra eval set (extra_sets.<name>) from another render file: max_meshes of its meshes (a random subset by (spec.seed, name);
-  null: all), as sources their views with view number < max_source_view_num (null: all), targets drawn from all of the mesh's
-  other views (the run's data.num_views per volume; kid: kid_selection). The grids of spec.grids_dir give the 'fit' and the
-  oracles; grids_dir null: none (the set has to skip 'fit'). The x0 normalization stays the run's (its training grids). `like`:
-  one of the run's validation datasets, for the item settings (layers, sizes, num_views). The listing goes to
-  <out_dir>/listing_<name>.h5."""
-  inner_like = getattr(like, "inner", like)
-  source_h5 = str(spec.source_h5)
-  cat = gs_dataset.render_catalog(source_h5)
-  meshes = sorted(cat.df["mesh_id"].unique().to_list())
-  if spec.get("max_meshes") is not None and int(spec.max_meshes) < len(meshes):
-    rng = np.random.default_rng([int(spec.get("seed", 0)), *map(ord, name)])
-    meshes = sorted(rng.choice(meshes, int(spec.max_meshes), replace=False).tolist())
-  cat = cat.filter(pl.col("mesh_id").is_in(meshes))
-  src = cat if spec.get("max_source_view_num") is None else cat.filter(pl.col("view_num") < int(spec.max_source_view_num))
-  rows = sorted(src.df["view_idx"].to_list())
-  grid_index = None
-  if spec.get("grids_dir") is not None:
-    grid_index, _ = gd.build_grid_index(str(spec.grids_dir), source_h5)
-    gd.check_grids(grid_index, int(inner_like.image_size), int(patch_size), int(inner_like.num_layers))
-    missing = sorted(set(rows) - set(grid_index))
-    if missing:
-      raise SystemExit(f"extra set {name}: source views (rows) {missing[:5]}... have no grid in {spec.grids_dir!r} (max_source_view_num)")
-  listing = gd.make_listing({r: None for r in rows}, source_h5, os.path.join(out_dir, f"listing_{name}.h5"))
-  ds = gs_dataset.WTFeatureDataset(
-    listing, cat, num_layers=inner_like.num_layers, num_views=inner_like.num_views,
-    allow_source_as_target=inner_like.allow_source_as_target, depth_size=inner_like.depth_size, image_size=inner_like.image_size,
-    read_features=inner_like.read_features)
-  if grid_index is None:
-    return ds
-  ds = gd.GridTargetDataset(ds, grid_index, encoding, seeded=True)
-  ds.seed_targets = False
-  return ds
+extra_dataset = gd.extra_dataset   # (moved to gs_diffusion: train_gs.py's data.extra_val_sets builds its sets with it too)
 
 
 def sample_noise_seed(cfg, kid=None):
@@ -272,14 +241,18 @@ def load_checkpoint(module, path):
   return has_ema
 
 
-@hydra.main(version_base=None, config_path="conf", config_name="eval_diffusion")
-def main(cfg):
-  device = torch.device("cuda")
+def load_run_config(cfg):
+  """The run's .hydra config (cfg.run_config), set up for the eval: output_dir = cfg.out, no loader workers, the eval's overrides
+  (grids_dir / source_h5 / val_train / guidance), the run's data.extra_val_sets dropped."""
   run = OmegaConf.load(cfg.run_config)
   os.makedirs(cfg.out, exist_ok=True)
   with open_dict(run):
     run.output_dir = cfg.out                      # listing.h5 goes here, not into the run's own directory
     run.loader.num_workers = 0
+    if run.data.get("shards") and (cfg.grids_dir is not None or cfg.source_h5 is not None):
+      raise SystemExit("a data.shards run: grids_dir / source_h5 overrides do not apply (edit the run config's data.shards instead)")
+    if run.data.get("extra_val_sets"):
+      run.data.extra_val_sets = None              # the run's W&B-only validation sets: an eval's are extra_sets (its own seeding)
     if cfg.grids_dir is not None:
       run.diffusion.grids_dir = cfg.grids_dir
     if cfg.source_h5 is not None:
@@ -290,10 +263,36 @@ def main(cfg):
       run.diffusion.cfg = OmegaConf.merge(run.diffusion.get("cfg") or {}, cfg.guidance)
   if not train_gs.diffusion_enabled(run):
     raise SystemExit("not a diffusion-mode run")
+  return run
+
+
+def eval_datamodule(run):
+  """The run's datasets (train_gs.GSDataModule, as it trained; data.shards: its corpus), with this script's own target-view
+  seeding."""
   dm = train_gs.GSDataModule(run)
   dm.setup()
   for ds in dm.val_datasets.values():   # the target views come from this script's own per-volume seed (random.seed below), as in
     ds.seed_targets = False              # every eval so far -- not the validations' seeding, so evals stay paired across code versions
+  return dm
+
+
+def eval_datasets(cfg, run, dm):
+  """({set: dataset}: the run's validation sets, then cfg.extra_sets (extra_dataset), {extra set: its skip_methods})."""
+  datasets, set_skip = dict(dm.val_datasets), {}
+  for name, spec in (cfg.get("extra_sets") or {}).items():   # extra eval sets from other render files (extra_dataset)
+    if name in datasets:
+      raise SystemExit(f"extra_sets.{name}: the run has a validation set of that name")
+    datasets[name] = extra_dataset(name, spec, next(iter(dm.val_datasets.values())), train_gs.x0_encoding(run), run.model.patch_size,
+                                   cfg.out)
+    set_skip[name] = set(spec.get("skip_methods") or [])
+  return datasets, set_skip
+
+
+@hydra.main(version_base=None, config_path="conf", config_name="eval_diffusion")
+def main(cfg):
+  device = torch.device("cuda")
+  run = load_run_config(cfg)
+  dm = eval_datamodule(run)
   module = train_gs.GSLightningModule(run, dm.diffusion_stats).to(device).eval()
   model = module.model
   dssim = DSSIMLoss(reduction="none").to(device)
@@ -317,13 +316,7 @@ def main(cfg):
   outs = {(n, st): d if n is None else os.path.join(cfg.out, f"cs_{n}", os.path.relpath(d, cfg.out))
           for n, _ in schedules for st, d in outs.items()}
   schedule_of = dict(schedules)
-  datasets, set_skip = dict(dm.val_datasets), {}
-  for name, spec in (cfg.get("extra_sets") or {}).items():   # extra eval sets from other render files (extra_dataset)
-    if name in datasets:
-      raise SystemExit(f"extra_sets.{name}: the run has a validation set of that name")
-    datasets[name] = extra_dataset(name, spec, next(iter(dm.val_datasets.values())), train_gs.x0_encoding(run), run.model.patch_size,
-                                   cfg.out)
-    set_skip[name] = set(spec.get("skip_methods") or [])
+  datasets, set_skip = eval_datasets(cfg, run, dm)
   kid = cfg.get("kid")
   kid_on = kid is not None and bool(kid.get("enabled", False))
   if cfg.val_sets is not None:

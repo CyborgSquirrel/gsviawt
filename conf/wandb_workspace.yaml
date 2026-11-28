@@ -4,7 +4,10 @@ project: gsviawt
 name: grid diffusion         # the view's name (a NEW view is created every time it is saved)
 query: "^new100"             # runs shown: a regex on the run name (the runset; a filter, so new runs appear without re-saving)
 validation: big_ema          # which validation's keys to plot: <set>/<validation>/...
-sets: [val_meshes, val_views_sval, val_views_strain]
+# the per-set rows: keep these three (3 columns: one row per metric); an entry may be a list of sets for one column: the unseen
+# meshes are val_meshes (mesh-split runs) or test_shard2 (multi-shard runs: data.extra_val_sets on shard2v2)
+sets: [[test_shard2, val_meshes], val_views_sval, val_views_strain]
+train_set: val_train         # the training-volume validation, in its own section (null: none); not in `sets`
 val_t: [0.25, 0.5, 0.75, 1]  # diffusion.val_t of the runs
 probe_ts: [1, 0.5, 0.2, 0.1, 0.02]   # diffusion.probe.ts of the runs (the x_t reliance section)
 x_axis: train_seconds        # the runs' x-axis (logged on every row by train_gs.py's ProgressWandbLogger)

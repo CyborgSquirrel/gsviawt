@@ -94,6 +94,23 @@ data:
   # An epoch is this many passes over the training volumes (each access draws its own target views, t and noise), e.g. so a
   # one-volume run fills a batch and has epochs of many steps. 1 = one pass.
   repeat: 1
+  # Diffusion mode: several render files + their grids as ONE corpus, a list of {source_h5, grids_dir} (source_h5 null: the grids'
+  # own attribute), instead of diffusion.source_h5 / diffusion.grids_dir (which must be null then). The meshes (mesh_paths) must be
+  # distinct across shards. They become one virtual render file <output_dir>/corpus_<hash>.h5 (gs_dataset.render_corpus): shard k's
+  # rows and mesh ids follow the earlier shards'; everything else -- mesh_split / view_split (by mesh name: a mesh's view split is
+  # the one it gets alone), the validation sets, the x0 normalization (over the whole corpus's training grids, each grid's moments
+  # cached in its own grids dir) -- is as for one render file. null: one render file (diffusion.source_h5 / grids_dir).
+  #   data.shards='[{source_h5:/x/shard1.h5,grids_dir:/x/shard1/grids_sparse},{source_h5:/x/shard3.h5,grids_dir:/x/shard3/grids_sparse}]'
+  # Every diffusion run writes its split to <output_dir>/split.json (train_gs.write_split): held-out meshes and per-mesh held-out
+  # views by mesh name, each mesh's shard.
+  shards: null
+  # Diffusion mode: more validation sets from other render files, name: {source_h5, grids_dir, max_meshes, seed,
+  # max_source_view_num} -- eval_diffusion.py's extra_sets (the same builder, gs_diffusion.extra_dataset: max_meshes of the file's
+  # meshes, a random subset by (seed, name), null: all; sources their views with view number < max_source_view_num; targets any of
+  # the mesh's other views), but seeded like the other validation sets. grids_dir is required. Validated and logged like the other
+  # sets (<name>/<validation>/...); the x0 normalization is the run's. null: none.
+  #   data.extra_val_sets='{test_shard2:{source_h5:/x/shard2.h5,grids_dir:/x/shard2/grids_sparse,max_meshes:null,seed:0,max_source_view_num:45}}'
+  extra_val_sets: null
 
 model:
   patch_size: 14            # WT's patch size; head output grid = sqrt(P) * patch_size per side

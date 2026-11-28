@@ -6,7 +6,9 @@
 
 Sections, in order: the full sample's image quality (the comparable generation metric, as eval_diffusion's), the one-step
 render at each shared timestep of diffusion.val_t, the x_t reliance probe (diffusion.probe: ratio and gain per t), the validation losses, the train losses, the x0 loss per field / per
-timestep bucket (train), the orbits (one panel per set: train and each validation set, one tile per run), the other media, and
+timestep bucket (train), the training volumes (train_set: their own section, so every per-set row is the three held-out sets
+unseen meshes | sval | strain in 3 columns; the unseen-meshes column shows val_meshes (a run with a mesh split) or test_shard2 (a
+multi-shard run's data.extra_val_sets) -- a `sets` entry may be a list of sets for one column), the orbits (one panel per set: train and each validation set, one tile per run), the other media, and
 bookkeeping (validation sizes, standard errors). The runset is a regex on the run name
 (`query`), so runs that match later show up without re-saving. Keys are the ones train_gs.py logs; which ones are comparable
 between runs is noted in the section headers (validation loss/x0 and the gated loss/photom follow diffusion.schedule.phase).
@@ -20,7 +22,27 @@ from omegaconf import DictConfig
 FIELDS = ("opacity", "scale", "rotation", "sh_dc", "offset")      # gs_diffusion.FIELDS (not imported: keeps this torch-free)
 T_BUCKETS = ("t0-0.25", "t0.25-0.5", "t0.5-0.75", "t0.75-1")
 SET_TITLES = {"val_meshes": "unseen meshes", "val_views_sval": "unseen views (sval)", "val_views_strain": "unseen views (strain)",
-              "val_train": "training volumes"}
+              "val_train": "training volumes", "test_shard2": "unseen meshes"}
+
+
+def alternatives(s):
+  """A `sets` entry: a set name, or a list of set names shown in ONE column (one line per key: e.g. the unseen meshes are
+  val_meshes in a run with a mesh split and the extra validation set test_shard2 (data.extra_val_sets) in a multi-shard run)."""
+  return [s] if isinstance(s, str) else [str(a) for a in s]
+
+
+def set_title(s):
+  return SET_TITLES.get(alternatives(s)[0], alternatives(s)[0])
+
+
+def set_keys(cfg, s, key):
+  return [f"{a}/{cfg.validation}/{key}" for a in alternatives(s)]
+
+
+# the train_set section's panels (the held-out sets' rows above stay groups of three: unseen meshes | sval | strain)
+TRAIN_SET_PANELS = (("loss/photom_full_fg_psnr", "full sample fg PSNR"), ("loss/photom_full_psnr", "full sample PSNR"),
+                    ("loss/photom_full_bg_l1", "full sample bg L1 (haze)"), ("loss/photom_full", "full sample L1+D-SSIM"),
+                    ("loss/photom", "rendering term"), ("loss/x0", "x0 loss"))
 
 
 def line(title, ys, x, smoothing=0.0, **kw):
@@ -32,7 +54,7 @@ def line(title, ys, x, smoothing=0.0, **kw):
 
 def per_set(cfg, key, title):
   """One panel per validation set for <set>/<validation>/<key>."""
-  return [line(f"{title}: {SET_TITLES.get(s, s)}", f"{s}/{cfg.validation}/{key}", cfg.x_axis) for s in cfg.sets]
+  return [line(f"{title}: {set_title(s)}", set_keys(cfg, s, key), cfg.x_axis) for s in cfg.sets]
 
 
 def section(name, panels, columns=3, is_open=True):
@@ -50,11 +72,11 @@ def build(cfg):
             + per_set(cfg, "loss/photom_full_psnr", "PSNR")
             + per_set(cfg, "loss/photom_full_bg_l1", "bg L1 (haze)")),
     section("One step at a shared t (comparable across runs; fg PSNR, t = 1: 1-step sample)",
-            [line(f"t = {t}: {SET_TITLES.get(s, s)}", f"{s}/{cfg.validation}/loss/photom_t{t}_fg_psnr", x)
+            [line(f"t = {t}: {set_title(s)}", set_keys(cfg, s, f"loss/photom_t{t}_fg_psnr"), x)
              for t in ts for s in cfg.sets]),
     section("x_t reliance (diffusion.probe; one line per t. Uses x_t: ratio <~ 1 and gain -> ~1 at low t, gain -> 0 at t = 1. "
             "Image lookup: ratio >> 1, gain ~ 0 everywhere)",
-            [line(f"{name}: {SET_TITLES.get(s, s)}", [f"{s}/{cfg.validation}/probe/t{t}/{key}" for t in probe_ts], x, **kw)
+            [line(f"{name}: {set_title(s)}", [k for t in probe_ts for k in set_keys(cfg, s, f"probe/t{t}/{key}")], x, **kw)
              for key, name, kw in (("ratio", "err_model / err_copy (log)", {"log_y": True}), ("gain", "gain", {}))
              for s in cfg.sets]),
     section("Validation losses (loss/photom: the training's rendering term; loss/x0 and loss/photom follow schedule.phase)",
@@ -70,18 +92,22 @@ def build(cfg):
       line("spike-skipped steps", "train/skipped", x, sm),
       line("spike filter average", "train/loss_ema", x),
       line("learning rate (pg1, pg2: the param groups)", ["lr-AdamW/pg1", "lr-AdamW/pg2"], x),
-    ], columns=4),
+      line("epoch (one pass over the training volumes)", "epoch", x),
+    ], columns=3),
+    *([section(f"{SET_TITLES.get(cfg.train_set, cfg.train_set)} (memorisation check: the same metrics on volumes the model trains on)",
+               [line(title, f"{cfg.train_set}/{cfg.validation}/{key}", x) for key, title in TRAIN_SET_PANELS])]
+      if cfg.get("train_set") else []),
     section("x0 loss per field and per t bucket (train)", [
       line("x0 loss per field", [f"train/loss/x0/{f}" for f in FIELDS], x, sm),
       line("x0 loss per t bucket", [f"train/loss/x0/{b}" for b in T_BUCKETS], x, sm),
     ], columns=2, is_open=False),
     section("Orbits per set (one tile per run: its latest orbit; scroll a tile for earlier ones)",
-            [wr.MediaBrowser(title=f"orbits: {SET_TITLES.get(s, s)}", media_keys=[f"{s}/orbit"], mode="gallery",
+            [wr.MediaBrowser(title=f"orbits: {set_title(s)}", media_keys=[f"{a}/orbit" for a in alternatives(s)], mode="gallery",
                              gallery_axis="run", num_columns=int(cfg.orbit_columns))
              for s in ("train", *cfg.sets)], columns=1, is_open=False),
     section("Media", [
-      wr.MediaBrowser(title="panels [GT | render | diff]", media_keys=[f"{s}/panel" for s in ("train", *cfg.sets)]),
-      wr.MediaBrowser(title="scale layers", media_keys=[f"{s}/scale_layers" for s in ("train", *cfg.sets)]),
+      wr.MediaBrowser(title="panels [GT | render | diff]", media_keys=[f"{a}/panel" for s in ("train", *cfg.sets) for a in alternatives(s)]),
+      wr.MediaBrowser(title="scale layers", media_keys=[f"{a}/scale_layers" for s in ("train", *cfg.sets) for a in alternatives(s)]),
     ], columns=2, is_open=False),
     section("Bookkeeping (validation sizes, standard error of the full-sample loss)",
             per_set(cfg, "n_volumes", "volumes scored") + per_set(cfg, "loss_se", "SE of loss"), is_open=False),
