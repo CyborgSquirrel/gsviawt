@@ -516,7 +516,10 @@ def pack_dir(grids_dir, out, progress=None):
   grids_dir, out = os.path.abspath(grids_dir), os.path.abspath(out)
   if not os.path.isdir(grids_dir):
     raise ValueError(f"{grids_dir}: not a directory")
+  tmp = out + ".tmp"
   if os.path.exists(out):
+    if os.path.exists(tmp) and os.path.samefile(out, tmp):   # killed between the link and the temp's removal: out is finished
+      os.remove(tmp)
     raise FileExistsError(f"{out} exists: a packed file is never overwritten (delete it by hand to pack again)")
   if os.path.realpath(os.path.dirname(out)) == os.path.realpath(grids_dir):
     raise ValueError(f"{out}: inside the grids dir it packs (its *.h5 would be taken for a grid)")
@@ -540,7 +543,6 @@ def pack_dir(grids_dir, out, progress=None):
   if len(sources) != 1 or len(shapes) != 1:
     raise ValueError(f"{grids_dir}: the grids disagree on source_h5 {sorted(sources)} / grid_shape {sorted(shapes)}")
   order = sorted(rows)
-  tmp = out + ".tmp"
   if os.path.exists(tmp):
     log.info("removing %s (left by an interrupted run)", tmp)
     os.remove(tmp)

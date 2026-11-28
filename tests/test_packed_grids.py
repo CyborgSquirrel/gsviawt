@@ -164,6 +164,10 @@ def test_kill_during_packing_then_rerun(data, tmp_path):
       gd.build_grid_index(out)
   r = grid_io.pack_dir(data["A"]["grids"], out)
   assert not os.path.exists(out + ".tmp") and r["n_grids"] == 24
+  os.link(out, out + ".tmp")                                                    # killed between the link and the temp's removal:
+  with pytest.raises(FileExistsError):                                          # the finished file stays, the temp goes
+    grid_io.pack_dir(data["A"]["grids"], out)
+  assert not os.path.exists(out + ".tmp") and grid_io.verify_packed(data["A"]["grids"], out) == []
   assert grid_io.verify_packed(data["A"]["grids"], out) == []
   assert sorted(gd.build_grid_index(out)[0]) == sorted(gd.build_grid_index(data["A"]["grids"])[0])
 
