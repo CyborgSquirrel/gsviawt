@@ -1882,7 +1882,7 @@ class GSDiffusionModel(nn.Module):
 
   @torch.no_grad()
   def sample(self, image, hit, seeds=None, steps=None, project=None, floor=None, guidance=None, inject=None, t_min=0.0,
-             lock=None, colour_schedule=None, hidden_shift=None):
+             lock=None, colour_schedule=None, hidden_shift=None, trajectory=None):
     """20 Euler steps of the flow from pure noise -> the Gaussian dict. The noise of volume i is a function of seeds[i] (default:
     eval_seed + i): reproducible. Invalid slots stay at the noise. project: applied to every step's x0 prediction before it is used
     (e.g. format_projection; the last step's x0 prediction is the output).
@@ -1909,7 +1909,14 @@ class GSDiffusionModel(nn.Module):
     hidden_shift (alpha, None: lockstep): Modality Forcing's sampling schedule (arXiv 2606.13676, t_depth = f_alpha(t_rgb)) with
     the visible layer 0 as the leading stream: layer 0 follows t = linspace(1, 0) and layers 1.. follow the SD3 shift of it,
     t_h = alpha t / (1 + (alpha - 1) t) (alpha > 1: the occluded layers stay noisier, MF's default alpha 32); each layer takes the exact
-    Euler step with its own dt, the model given the per-layer t; the guidance interval is checked on layer 0's t."""
+    Euler step with its own dt, the model given the per-layer t; the guidance interval is checked on layer 0's t.
+    trajectory (None: nothing extra; an observer only, the sample is the same with or without it): called as
+    trajectory(step=k, t=t_k, x=x_k, x0_hat=x0_hat_k) at every step k = 0 .. steps - 1 with the state the model is given (normalized,
+    (B, L, C, H, W), after inject / lock; k = 0: the pure noise), its per-layer schedule t (L,) (locked layers: the model is given 0)
+    and the model's x0 prediction from it (after project), then once more with k = steps, the final state (the output's normalized
+    x0) and x0_hat=None. The tensors are the sampler's own (not to be modified in place: copy them)."""
+    if trajectory is not None and self.colour_separate:
+      raise ValueError("trajectory: not with a colour_noise separate model")
     if hidden_shift is not None and (colour_schedule is not None or self.colour_separate):
       raise ValueError("hidden_shift: not with colour_schedule / a colour_noise separate model")
     if colour_schedule is not None and not self.colour_separate:
@@ -1966,9 +1973,13 @@ class GSDiffusionModel(nn.Module):
         x0_hat = project(x0_hat)
       if inject is not None and inj_x0 is None:   # "onestep": the first (t = 1) prediction is the injected x0 from now on
         inj_x0 = x0_hat.detach().clone()
+      if trajectory is not None:
+        trajectory(step=i, t=ts_l[i], x=x, x0_hat=x0_hat)
       dt = t5 - ts_l[i + 1][None, :, None, None, None]
       x_next = x - dt * (x - x0_hat) / (t5.clamp(min=t_min) if t_min > 0 else t5)
       x = x_next if lock is None else torch.where(free[None, :, None, None, None], x_next, x)
+    if trajectory is not None:
+      trajectory(step=steps, t=ts_l[steps], x=x, x0_hat=None)
     return self.decode(x, floor)
 
   @torch.no_grad()

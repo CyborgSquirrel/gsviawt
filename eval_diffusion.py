@@ -44,7 +44,14 @@ Not in conf/eval_diffusion.yaml (so a default eval's summary.json config stays a
                        and the sample's (k = 0) Gaussians as rendered, for rendering elsewhere (e.g. turntables) with the eval's
                        own samples, whatever sampler options made them
   +noise_seed=<k>       the samplers' noise base instead of seed (sample_noise_seed): other noise draws for the same volumes and
-                       target views (those stay on seed); kid.noise_seed, when set, takes precedence; summary.json records it"""
+                       target views (those stay on seed); kid.noise_seed, when set, takes precedence; summary.json records it
+  +save_trajectory=true  per scored volume the sample's whole sampler trajectory (GSDiffusionModel.sample's trajectory hook; only
+                       adds outputs, the sample and every other output are unchanged): <out>/[cs_<name>/][steps<N>/]trajectory/
+                       <set>_<volume>.npz (TrajectoryRecorder.save: the state x_t and the x0 prediction at every step, normalized,
+                       on the hit slots), <set>_<volume>_gaussians.npz (save_gaussians: "sample" = the eval's sample, "x0_hat_last"
+                       = the last step's x0 prediction decoded) and trajectory/metrics.csv (every METRIC of x_t and of x0_hat
+                       decoded, per step, at the volume's target views, sample 0). +trajectory_dtype: the npz's float dtype
+                       (default float16)"""
 import contextlib as ctl
 import csv
 import json
@@ -230,6 +237,55 @@ def load_gaussians(path):
     return {m: {k: f[f"{m}_{k}"] for k in GAUSSIAN_KEYS} for m in methods}, int(f["sh_degree"])
 
 
+class TrajectoryRecorder:
+  """+save_trajectory: GSDiffusionModel.sample's trajectory hook for one volume's sample. Keeps the state x_t (k = 0 .. steps) and the
+  x0 prediction (k = 0 .. steps - 1: the one made from x_t[k]) on the hit slots only (the other slots are never seen by the model,
+  which is given the noise there, nor rendered), and scores both decoded (sample 0) with score (the eval's metrics at the volume's
+  target views): rows (step, kind x_t | x0_hat, the metrics). x_t[steps] is the output: its row = the eval's sample."""
+
+  def __init__(self, model, batch, hit, views, device, floor, score):
+    self.model, self.batch, self.views, self.device, self.floor, self.score = model, batch, views, device, floor, score
+    self.sel = hit[0]                                          # (L, H, W): the valid slots (the same for every sample)
+    self.x_t, self.x0_hat, self.t, self.rows = [], [], [], []
+    self.last_x0_hat = None                                    # the last step's x0 prediction, as the sampler had it (B, L, C, H, W)
+
+  def compact(self, x):
+    """(B, L, C, H, W) -> (B, N, C) float32 on the CPU, the slots in np.nonzero order of the hit mask (layer, y, x)."""
+    return x.float().permute(0, 1, 3, 4, 2)[:, self.sel].cpu()
+
+  def __call__(self, step, t, x, x0_hat):
+    self.t.append(t.float().cpu())
+    if x0_hat is not None:
+      self.last_x0_hat = x0_hat
+    for kind, v, keep in (("x_t", x, self.x_t), ("x0_hat", x0_hat, self.x0_hat)):
+      if v is None:
+        continue
+      keep.append(self.compact(v))
+      m = self.score(render(self.model, self.batch, self.model.decode(v[:1], self.floor), self.views, self.device))
+      self.rows.append({"step": int(step), "kind": kind, "t_layer0": float(t[0]),
+                        "t_layers1_5": float(t[1:].mean()) if len(t) > 1 else float("nan"),
+                        **{k: float(m[k].nanmean()) if torch.isfinite(m[k]).any() else float("nan") for k in METRICS}})
+
+  def save(self, path, dtype, meta):
+    """path (.npz): x_t (steps + 1, B, N, C) and x0_hat (steps, B, N, C) in `dtype` (normalized; x0_hat[k] predicted from x_t[k] at
+    t[k]), t (steps + 1, L) float32 (every layer's schedule t of x_t[k]), hit (L, H, W) bool, xyz_cam (N, 3) float32 (the slots'
+    depth-peel anchors: means = xyz_cam + the decoded offset), x0_mean / x0_std / x0_lo / x0_hi (C,) float32 + decode_clamp (decode:
+    gs_diffusion.decode_x0 of the slots as (1, 1, C, N, 1)), floor_anchor_z (N,) / floor_fx / floor_px (only with a floor), sh_degree,
+    dtype, meta (a JSON string)."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    m, sel = self.model, self.sel.cpu()
+    out = {"x_t": torch.stack(self.x_t).numpy().astype(dtype), "x0_hat": torch.stack(self.x0_hat).numpy().astype(dtype),
+           "t": torch.stack(self.t).numpy().astype(np.float32), "hit": sel.numpy(),
+           "xyz_cam": self.batch["source"]["xyz_cam"][0][sel].float().numpy(),
+           **{k: getattr(m, k).float().cpu().numpy() for k in ("x0_mean", "x0_std", "x0_lo", "x0_hi")},
+           "decode_clamp": np.array(m.decode_clamp), "sh_degree": np.int64(m.max_sh_degree), "dtype": np.array(str(np.dtype(dtype))),
+           "meta": np.array(json.dumps(meta))}
+    if self.floor is not None:
+      out.update(floor_anchor_z=self.floor["anchor_z"][0].cpu()[sel].numpy(), floor_fx=np.float32(self.floor["fx"][0]),
+                 floor_px=np.float32(self.floor["px"]))
+    np.savez(path, **out)
+
+
 def load_checkpoint(module, path):
   ckpt = torch.load(path, map_location="cpu", weights_only=False)
   missing, unexpected = module.load_state_dict(ckpt["state_dict"], strict=False)
@@ -344,6 +400,11 @@ def main(cfg):
   kid_rows = {s: [] for s in outs}
   chosen = scored_volumes(cfg, sets, datasets)
   save_g = bool(cfg.get("save_gaussians", False))
+  save_traj = bool(cfg.get("save_trajectory", False))
+  if save_traj and (cfg.get("layer_stages") or model.colour_separate):
+    raise SystemExit("save_trajectory: not with layer_stages / a colour_noise separate run")
+  traj_dtype = np.dtype(str(cfg.get("trajectory_dtype", "float16")))
+  traj_rows = {s: [] for s in outs}
 
   rows, view_rows = {s: [] for s in outs}, {s: [] for s in outs}
   for ckpt_path in cfg.checkpoints:
@@ -414,10 +475,25 @@ def main(cfg):
                                         [list(map(int, grp)) for grp in cfg.layer_stages], seeds=seeds, steps=steps, floor=floor,
                                         t_min=float(cfg.get("sampler_t_min", 0.0)))
               else:
+                rec = TrajectoryRecorder(model, batch, hit, views, device, floor, M) if save_traj else None
                 g = model.sample(image.expand(K, *image.shape[1:]), hit.expand(K, *hit.shape[1:]), seeds=seeds, steps=steps,
                                  project=project, floor=floor, inject=inject, t_min=float(cfg.get("sampler_t_min", 0.0)), lock=lock,
                                  hidden_shift=cfg.get("hidden_shift"),
-                                 **({"colour_schedule": schedule_of[cs_name]} if schedule_of[cs_name] is not None else {}))
+                                 **({"colour_schedule": schedule_of[cs_name]} if schedule_of[cs_name] is not None else {}),
+                                 **({"trajectory": rec} if rec is not None else {}))
+                if rec is not None:
+                  tdir = os.path.join(outs[out_key], "trajectory")
+                  rec.save(os.path.join(tdir, f"{set_name}_{i}.npz"), traj_dtype,
+                           {**key, "target_views": [int(v) for v in item["target_views"]], "seeds": [int(v) for v in seeds],
+                            "steps": int(steps), "hidden_shift": cfg.get("hidden_shift"),
+                            "t_min": float(cfg.get("sampler_t_min", 0.0)), "samples": K, "dtype": str(traj_dtype),
+                            "x0_hat_index": "x0_hat[k] is the model's prediction from x_t[k] at t[k], k = 0 .. steps - 1; "
+                                            "x_t[0] = the pure noise, x_t[steps] = the output"})
+                  save_gaussians(os.path.join(tdir, f"{set_name}_{i}_gaussians.npz"),
+                                 {"sample": {k: v[:1] for k, v in g.items()},
+                                  "x0_hat_last": model.decode(rec.last_x0_hat[:1], floor)},
+                                 batch, device, model.max_sh_degree)
+                  traj_rows[out_key] += [{**key, **r} for r in rec.rows]
               samples = [render(model, batch, {k: v[j:j + 1] for k, v in g.items()}, views, device) for j in range(K)]
               if save_g:
                 save_gaussians(os.path.join(outs[out_key], "gaussians", f"{set_name}_{i}.npz"),
@@ -462,6 +538,11 @@ def main(cfg):
 
   for out_key, out_dir in outs.items():
     write_outputs(cfg, out_dir, rows[out_key], view_rows[out_key])
+    if save_traj and traj_rows[out_key]:
+      with open(os.path.join(out_dir, "trajectory", "metrics.csv"), "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(traj_rows[out_key][0]))
+        w.writeheader()
+        w.writerows(traj_rows[out_key])
     if kid_on:
       write_kid(out_dir, kid_rows[out_key], {"feature": kid_features.FEATURE_TAG, "steps": out_key[1], "colour_schedule": out_key[0],
                                              "noise_seed": noise_seed, "kid": OmegaConf.to_container(kid)})
